@@ -69,9 +69,11 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--prefill-token-budget N] [--prefill-pack] [--prefill-time-budget-ms N] [--prefill-request-token-cap N] [--log-stats-interval-ms N] [--device "
+           "[--prefill-chunk N] [--prefill-token-budget N] [--prefill-pack] "
+           "[--prefill-time-budget-ms N] [--prefill-request-token-cap N] [--log-stats-interval-ms "
+           "N] [--device "
            "N] "
-           "[--context-cost-presets FILE] "
+           "[--cpu-gpu-overlap] [--cache-prefetch] [--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
@@ -103,7 +105,8 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --prefill-token-budget 0 preserves legacy cold scheduling; positive values\n"
-           "       share work between decode rounds; cold prefill uses --prefill-chunk with min(budget, chunk) floor\n"
+           "       share work between decode rounds; cold prefill uses --prefill-chunk with "
+           "min(budget, chunk) floor\n"
            "       --dspark-dynamic-k requires DSpark confidence weights; maximum K stays "
            "reserved\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
@@ -193,6 +196,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--prefill-request-token-cap"), "prefill-request-token-cap"));
         } else if (arg == "--prefill-pack") {
             options.prefill_pack = true;
+        } else if (arg == "--cpu-gpu-overlap") {
+            options.cpu_gpu_overlap = true;
+        } else if (arg == "--cache-prefetch") {
+            options.cache_prefetch = true;
         } else if (arg == "--prefill-token-budget") {
             options.prefill_token_budget = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--prefill-token-budget"), "prefill-token-budget"));

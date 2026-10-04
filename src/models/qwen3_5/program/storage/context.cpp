@@ -1216,6 +1216,36 @@ bool ProgramImpl::can_plan_materialization() const noexcept {
     return !has_context_transaction() && !pending_transaction_ && !has_unsettled_state_fork();
 }
 
+bool ProgramImpl::kv_restore_blocks_execution() const noexcept {
+    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+    if (transaction == nullptr) { return false; }
+    // An execution unit settles its recurrent-state fork after GPU completion.
+    // The current resource transaction forbids that physical State mutation,
+    // even when its KV pages are disjoint from the restoring destination.
+    if (has_unsettled_state_fork()) { return true; }
+    const auto conflicts = [](const LogicalKVPageStore* pages, const auto& restores) {
+        if (restores.empty()) { return false; }
+        if (pages == nullptr) { return true; }
+        return std::any_of(restores.begin(), restores.end(), [&](const auto& restore) {
+            return pages->restore_blocks_active_execution(restore.logical);
+        });
+    };
+    return conflicts(text_kv_pages.get(), transaction->text_restores) ||
+           conflicts(backend_kv_pages.get(), transaction->backend_restores);
+}
+
+bool ProgramImpl::pending_kv_restore_ready() const {
+    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+    return transaction != nullptr && has_pending_kv_restore() && transaction->transfer_submitted &&
+           context_completion_.ready();
+}
+
+bool ProgramImpl::pending_kv_restore_in_flight() const {
+    const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
+    return transaction != nullptr && has_pending_kv_restore() && transaction->transfer_submitted &&
+           !context_completion_.ready();
+}
+
 bool ProgramImpl::has_unsettled_state_fork() const noexcept {
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         const std::uint32_t continuation = active_continuations[lane];

@@ -10,11 +10,14 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <new>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -290,14 +293,31 @@ void test_kv_store(ninfer::DeviceContext& device) {
         "last address-reference release contributes exact Host allocation credit");
     auto restore_reservation = physical_pages.reserve(2);
     expect(restore_reservation.has_value(), "KV Host restore Device reservation");
-    const std::array restore_destinations{
+    std::array restore_destinations{
         pages.reserve_device_replica(logical_pages[0], *restore_reservation),
         pages.reserve_device_replica(logical_pages[1], *restore_reservation)};
+    expect(!pages.restore_blocks_active_execution(logical_pages[0]),
+           "inactive Host prefix may restore alongside disjoint execution");
+    pages.retain_active_reference(logical_pages[0]);
+    expect(pages.restore_blocks_active_execution(logical_pages[0]),
+           "pending restore of a shared active alias blocks execution");
+    pages.release_active_reference(logical_pages[0]);
+    expect(!pages.restore_blocks_active_execution(logical_pages[0]),
+           "last active alias release removes restore hazard");
+    const auto before_abort = restore_reservation->pages();
+    pages.abort_device_replica(logical_pages[0], *restore_reservation);
+    expect(restore_reservation->pages() == before_abort + 1U &&
+               pages.host_resident(logical_pages[0]) && !pages.device_resident(logical_pages[0]) &&
+               !pages.restore_blocks_active_execution(logical_pages[0]),
+           "cancelled prefetch returns its reserved page and retains current Host source");
+    restore_destinations[0] = pages.reserve_device_replica(logical_pages[0], *restore_reservation);
     physical_pages.copy_from_host(extents.view(second_host_extent), restore_destinations,
                                   device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
+    expect(!pages.restore_blocks_active_execution(logical_pages[0]),
+           "completed and published restore no longer blocks execution");
     expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
            "KV Host restore republishes Device replicas before releasing the extent");
     auto activation = addresses.prepare_activation(*address, 3, 1);
@@ -718,6 +738,35 @@ void test_kv_placement(ninfer::DeviceContext& device) {
     expect(addresses.mapped_pages(*address) == 3 &&
                addresses.committed_frontier(*address) == 192,
            "placement changes device residency, not membership or frontier");
+
+    std::atomic<bool> release_transfer{false};
+    CUDA_CHECK(cudaLaunchHostFunc(
+        device.transfer_stream,
+        [](void* flag) {
+            auto& release       = *static_cast<std::atomic<bool>*>(flag);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!release.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        },
+        &release_transfer));
+    ninfer::CudaCompletionEvent unrelated_transfer(device);
+    unrelated_transfer.record(device.transfer_stream);
+    const auto reserved_before_noop = physical_pages.reserved_pages();
+    const auto unchanged            = addresses.apply_device_placement(
+        *address, extents, std::array<const std::uint32_t, 2>{0U, 2U}, device.transfer_stream);
+    const bool returned_during_transfer = !unrelated_transfer.ready();
+    release_transfer.store(true, std::memory_order_release);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    expect(returned_during_transfer && unchanged.telemetry.publication_wait_ns == 0 &&
+               unchanged.telemetry.no_copy_calls == 1 && unchanged.demoted == 0 &&
+               unchanged.promoted == 0,
+           "unchanged placement must not drain an unrelated transfer stream");
+    expect(read_block_table(physical_tables, 0, 3) == holed &&
+               physical_pages.allocated_pages() == allocated_before - 1U &&
+               physical_pages.reserved_pages() == reserved_before_noop,
+           "unchanged placement preserves the exact row and physical claims");
 
     const auto swapped = addresses.apply_device_placement(
         *address, extents, std::array<const std::uint32_t, 1>{1U}, device.transfer_stream);

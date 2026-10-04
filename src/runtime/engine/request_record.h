@@ -144,11 +144,11 @@ struct RequestRecord {
     }
 
     [[nodiscard]] bool is_decode_ready() const noexcept {
-        return model_state == EngineRequestState::DecodeReady;
+        return model_state == EngineRequestState::DecodeReady && !deferred_capture;
     }
 
     [[nodiscard]] bool is_control_ready() const noexcept {
-        return model_state == EngineRequestState::ControlReady;
+        return model_state == EngineRequestState::ControlReady && !deferred_capture;
     }
 
     [[nodiscard]] bool is_model_finished() const noexcept {
@@ -183,10 +183,12 @@ struct RequestRecord {
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
+    std::optional<typename ModelContract::CaptureOffer> deferred_capture;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    std::exception_ptr base_plan_error; // Deferred CPU-only overlap preparation failure.
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;

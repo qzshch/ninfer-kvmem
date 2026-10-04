@@ -23,11 +23,19 @@ struct DeviceExecutionView {
     }
 };
 
+// Non-owning, worker-scoped CPU work before a compute-stream completion wait.
+// It must not submit CUDA work or mutate any in-flight allocation / mapping.
+struct DeviceWaitWork {
+    void* owner                      = nullptr;
+    void (*run)(void*, cudaStream_t) = nullptr;
+};
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
     cudaDeviceProp props{};
+    const DeviceWaitWork* wait_work = nullptr;
 
     explicit DeviceContext(int device_id = 0);
     ~DeviceContext();
@@ -45,6 +53,22 @@ struct DeviceContext {
     std::size_t total_vram() const noexcept;
     const char* sync_mode() const;
     void synchronize() const;
+};
+
+class ScopedDeviceWaitWork {
+public:
+    ScopedDeviceWaitWork(DeviceContext& device, const DeviceWaitWork* work) noexcept
+        : device_(device), previous_(device.wait_work) {
+        device_.wait_work = work;
+    }
+
+    ~ScopedDeviceWaitWork() { device_.wait_work = previous_; }
+
+    ScopedDeviceWaitWork(const ScopedDeviceWaitWork&)            = delete;
+    ScopedDeviceWaitWork& operator=(const ScopedDeviceWaitWork&) = delete;
+private:
+    DeviceContext& device_;
+    const DeviceWaitWork* previous_;
 };
 
 class CudaEventTimer {

@@ -72,6 +72,8 @@ public:
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           prefill_chunk_(options.prefill_chunk), prefill_pack_(options.prefill_pack),
+          cpu_gpu_overlap_(options.cpu_gpu_overlap), cache_prefetch_(options.cache_prefetch),
+          overlap_completion_(device),
           prefill_budget_(options.prefill_token_budget, options.prefill_time_budget_ms,
                           options.prefill_request_token_cap),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
@@ -503,8 +505,23 @@ private:
 
     class ProgramCallScope {
     public:
-        explicit ProgramCallScope(EngineCore& owner)
-            : owner_(owner), measurement_(owner.begin_host_phase()) {}
+        explicit ProgramCallScope(EngineCore& owner, bool permit_overlap = false)
+            : owner_(owner), measurement_(owner.begin_host_phase()),
+              overlap_before_(owner.cumulative_stats_.host_work.cpu_plan_overlap_host_ns) {
+            if (permit_overlap && owner.cpu_gpu_overlap_) {
+                wait_work_ = {.owner = this, .run = [](void* state, cudaStream_t stream) {
+                                  auto& scope = *static_cast<ProgramCallScope*>(state);
+                                  if (scope.wait_work_attempted_) { return; }
+                                  scope.wait_work_attempted_ = true;
+                                  scope.owner_.plan_during_device_wait(stream);
+                              }};
+                wait_scope_.emplace(owner.device_, &wait_work_);
+            }
+            if constexpr (requires { owner.instance_.program->pending_kv_restore_in_flight(); }) {
+                prefetch_in_flight_ = permit_overlap && owner.cache_prefetch_ &&
+                                      owner.instance_.program->pending_kv_restore_in_flight();
+            }
+        }
 
         ~ProgramCallScope() noexcept { finish(failed_timing_); }
 
@@ -513,8 +530,28 @@ private:
 
         [[nodiscard]] runtime::ExecutionTiming& failed_timing() noexcept { return failed_timing_; }
 
-        void finish(runtime::ExecutionTiming timing) noexcept {
+        void finish(runtime::ExecutionTiming timing, bool executed = true) noexcept {
             if (!active_) { return; }
+            wait_scope_.reset();
+            // synchronize() invokes CPU work inside a recorded completion wait.
+            // Reclassify this subset as Host work; preserve the total wall time.
+            const auto cpu =
+                owner_.cumulative_stats_.host_work.cpu_plan_overlap_host_ns - overlap_before_;
+            const auto reclassified = std::min(cpu, timing.device_wait_ns);
+            timing.device_wait_ns -= reclassified;
+            timing.submit_host_ns += reclassified;
+            if (prefetch_in_flight_ && executed) {
+                ++owner_.cumulative_stats_.host_work.cache_prefetch_units;
+                if constexpr (requires { owner_.instance_.program->pending_kv_restore_ready(); }) {
+                    try {
+                        if (owner_.instance_.program->pending_kv_restore_ready()) {
+                            ++owner_.cumulative_stats_.host_work
+                                  .cache_prefetch_completed_during_units;
+                        }
+                    } catch (...) { /* Actual Program/CUDA failure cleanup owns the error. */
+                    }
+                }
+            }
             owner_.finish_program_call(measurement_, timing);
             active_ = false;
         }
@@ -523,6 +560,11 @@ private:
         EngineCore& owner_;
         HostPhaseMeasurement measurement_;
         runtime::ExecutionTiming failed_timing_;
+        std::uint64_t overlap_before_;
+        DeviceWaitWork wait_work_{};
+        std::optional<ScopedDeviceWaitWork> wait_scope_;
+        bool wait_work_attempted_ = false;
+        bool prefetch_in_flight_  = false;
         bool active_ = true;
     };
 
@@ -616,7 +658,9 @@ private:
         snapshot.prefilling_requests = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (scheduler_.owns_prefill_lane(lane) && slots_[lane] != nullptr &&
-                !slots_[lane]->capture_pending) { ++snapshot.prefilling_requests; }
+                !slots_[lane]->capture_pending && !slots_[lane]->deferred_capture) {
+                ++snapshot.prefilling_requests;
+            }
         }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -627,7 +671,7 @@ private:
             lane_stats.engine_request_id = request->id;
             if (request->terminal_reason) {
                 lane_stats.state = RuntimeLaneState::TerminalPending;
-            } else if (request->capture_pending) {
+            } else if (request->capture_pending || request->deferred_capture) {
                 lane_stats.state = RuntimeLaneState::CapturePending;
             } else if (request->is_prefilling()) {
                 lane_stats.state = RuntimeLaneState::Prefill;
@@ -637,7 +681,9 @@ private:
                 lane_stats.state = RuntimeLaneState::ControlReady;
             }
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
-            if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
+            if (slots_[lane]->capture_pending || slots_[lane]->deferred_capture) {
+                ++snapshot.capture_pending_requests;
+            }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
         }
         if (materializing_) {
@@ -1090,6 +1136,10 @@ private:
             if (!request->sequence || !request->lane || request->lane->value != lane) {
                 throw std::logic_error("active cancellation has no sequence binding");
             }
+            if (request->deferred_capture) {
+                instance_.program->skip_capture(std::move(*request->deferred_capture));
+                request->deferred_capture.reset();
+            }
             (void)request->output.preview_terminal(FinishReason::Cancelled);
             sample_terminal_sparse(request);
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
@@ -1365,7 +1415,7 @@ private:
                                                post_capture_state);
                     }
                     committed.captures[row].reset();
-                    if (!request->capture_pending) {
+                    if (!request->capture_pending && !request->deferred_capture) {
                         request->model_state =
                             continuations[row] == ContinuationAction::ApplyTargetControl
                                 ? EngineRequestState::ControlReady
@@ -1411,10 +1461,16 @@ private:
     void reserve_active_capture(const std::shared_ptr<Request>& request, CaptureOffer&& offer,
                                 EngineRequestState post_capture_state) {
         if (!request->lane || !request->sequence || request->capture_pending ||
-            post_capture_state == EngineRequestState::Materializing ||
+            request->deferred_capture || post_capture_state == EngineRequestState::Materializing ||
             post_capture_state == EngineRequestState::Waiting ||
             post_capture_state == EngineRequestState::ModelFinished) {
             throw std::logic_error("committed capture offer has invalid Engine ownership");
+        }
+        if (!instance_.program->can_plan_materialization()) {
+            request->deferred_capture.emplace(std::move(offer));
+            request->post_capture_state = post_capture_state;
+            ++cumulative_stats_.host_work.deferred_capture_offers;
+            return;
         }
         std::uint64_t blocked = 0;
         {
@@ -1435,6 +1491,22 @@ private:
         request->capture_pending    = true;
         request->post_capture_state = post_capture_state;
         (void)progress_context_transaction(false);
+    }
+
+    void progress_deferred_capture() {
+        if (!instance_.program->can_plan_materialization()) { return; }
+        for (const auto& request : slots_) {
+            if (!request || !request->deferred_capture) { continue; }
+            if (request->cancelled.load(std::memory_order_acquire)) { continue; }
+            const auto after = request->post_capture_state;
+            CaptureOffer offer(std::move(*request->deferred_capture));
+            request->deferred_capture.reset();
+            ++cumulative_stats_.host_work.deferred_capture_resumptions;
+            reserve_active_capture(request, std::move(offer), after);
+            if (!request->capture_pending) { request->model_state = after; }
+            // One global transaction; another lane's offer stays immutable.
+            return;
+        }
     }
 
     void
@@ -1514,11 +1586,14 @@ private:
             }
             if (count < 2) return false;
             nvtx::ScopedRange range(nvtx::Name::Prefill, nvtx::Category::Prefill, count);
-            ProgramCallScope call(*this);
+            ProgramCallScope call(*this, true);
             auto result = instance_.program->advance_prefill_batch(
                 std::span<const typename ModelContract::SequenceHandle>(handles.data(), count),
                 token_budget, &call.failed_timing());
-            if (!result) { call.finish({}); return false; }
+            if (!result) {
+                call.finish({}, false);
+                return false;
+            }
             call.finish(result->timing);
             prefill_budget_.observe(result->work_tokens, result->timing.host_ns() +
                                                          result->timing.device_wait_ns);
@@ -1550,14 +1625,15 @@ private:
             throw std::logic_error("no request owns staged prefill");
         }
         const auto request       = slots_[lane];
-        if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
+        if (request == nullptr || !request->is_prefilling() || request->capture_pending ||
+            request->deferred_capture) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
         setup.finish();
-        ProgramCallScope program_call(*this);
+        ProgramCallScope program_call(*this, true);
         auto progress = [&] {
             if constexpr (requires {
                               instance_.program->advance_prefill(
@@ -1627,6 +1703,7 @@ private:
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
+        if (request->base_plan_error) { std::rethrow_exception(request->base_plan_error); }
         if (!request->base_plan) {
             request->base_plan.emplace(
                 instance_.program->plan_request(request->prompt, request->options.execution));
@@ -1634,6 +1711,37 @@ private:
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
             throw std::logic_error("target request plan has invalid admission accounting");
+        }
+    }
+
+    void plan_during_device_wait(cudaStream_t stream) {
+        if constexpr (requires(const PreparedPrompt& prompt,
+                               const ResolvedExecutionOptions& options) {
+                          instance_.program->plan_request_overlap(prompt, options);
+                      }) {
+            std::shared_ptr<Request> head;
+            {
+                std::lock_guard lock(queue_mutex_);
+                if (!pending_.empty()) { head = pending_.front(); }
+            }
+            if (!head || head->base_plan || head->base_plan_error ||
+                head->cancelled.load(std::memory_order_acquire) || Clock::now() >= head->deadline) {
+                return;
+            }
+            // No physical planning, cache search, admission, publication or CUDA
+            // submission is allowed here. The single mutation owner stays this worker.
+            overlap_completion_.record(stream);
+            if (overlap_completion_.ready()) { return; }
+            const auto started = Clock::now();
+            try {
+                head->base_plan.emplace(
+                    instance_.program->plan_request_overlap(head->prompt, head->options.execution));
+            } catch (...) { head->base_plan_error = std::current_exception(); }
+            const auto elapsed = elapsed_ns(started, Clock::now());
+            auto& stats        = cumulative_stats_.host_work;
+            ++stats.cpu_plan_overlap_invocations;
+            stats.cpu_plan_overlap_host_ns += elapsed;
+            if (!overlap_completion_.ready()) { stats.cpu_plan_fully_covered_ns += elapsed; }
         }
     }
 
@@ -1859,7 +1967,7 @@ private:
     AdmissionProgress try_admit_one() {
         const auto other_runnable = static_cast<std::uint32_t>(
             std::count_if(slots_.begin(), slots_.end(), [](const auto& request) {
-                return request && !request->capture_pending &&
+                return request && !request->capture_pending && !request->deferred_capture &&
                        (request->is_decode_ready() || request->is_prefilling());
             }));
         const PlanningAllowance allowance = PlanningAllowance::boundary(other_runnable);
@@ -2011,7 +2119,7 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
-        ProgramCallScope program_call(*this);
+        ProgramCallScope program_call(*this, true);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
         program_call.finish(pending.execution_timing());
@@ -2176,6 +2284,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                progress_deferred_capture();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -2214,7 +2323,25 @@ private:
                 // Host-to-Device restore owns pending physical replicas until
                 // context publication; rolling/retrieval must not promote them
                 // a second time. The worker keeps polling/cancelling at boundaries.
-                if (instance_.program->has_pending_kv_restore()) {
+                bool restore_blocks_execution = instance_.program->has_pending_kv_restore();
+                if constexpr (requires { instance_.program->kv_restore_blocks_execution(); }) {
+                    if (cache_prefetch_ && restore_blocks_execution) {
+                        restore_blocks_execution = instance_.program->kv_restore_blocks_execution();
+                    }
+                }
+                if (cache_prefetch_ && instance_.program->has_context_transaction() &&
+                    std::any_of(slots_.begin(), slots_.end(), [](const auto& request) {
+                        return request && request->cancelled.load(std::memory_order_acquire);
+                    })) {
+                    // snapshot_cancellations() deliberately withholds cancellation
+                    // while a context transaction owns the topology. Wait for that
+                    // transaction before issuing more work for a cancelled owner.
+                    restore_blocks_execution = true;
+                }
+                if (restore_blocks_execution) {
+                    if (cache_prefetch_) {
+                        ++cumulative_stats_.host_work.cache_prefetch_blocked_boundaries;
+                    }
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     execution_lock.unlock();
@@ -2240,7 +2367,8 @@ private:
                     if (slots_[lane] == nullptr || !slots_[lane]->is_prefilling()) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
-                    runnable_prefills[lane] = !slots_[lane]->capture_pending;
+                    runnable_prefills[lane] =
+                        !slots_[lane]->capture_pending && !slots_[lane]->deferred_capture;
                     runnable_prefill_count += runnable_prefills[lane] ? 1U : 0U;
                 }
                 const auto prefill_lane = scheduler_.runnable_prefill_lane(runnable_prefills);
@@ -2298,6 +2426,9 @@ private:
     const std::chrono::milliseconds pending_timeout_;
     const std::uint32_t prefill_chunk_;
     const bool prefill_pack_;
+    const bool cpu_gpu_overlap_;
+    const bool cache_prefetch_;
+    CudaCompletionEvent overlap_completion_;
     PrefillBudget prefill_budget_;
     ResourceManagement resources_;
 

@@ -903,6 +903,13 @@ public:
     // Materialization must wait until source StateImage forks are settled too.
     [[nodiscard]] bool can_plan_materialization() const noexcept;
     [[nodiscard]] bool has_pending_kv_restore() const noexcept;
+    [[nodiscard]] bool kv_restore_blocks_execution() const noexcept;
+    [[nodiscard]] bool pending_kv_restore_ready() const;
+    [[nodiscard]] bool pending_kv_restore_in_flight() const;
+    // CPU-only immutable model/prompt facts; no physical candidate or resource mutation.
+    [[nodiscard]] RequestBasePlan
+    plan_request_overlap(const PreparedPrompt& prompt,
+                         const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing = nullptr,
                                                   std::uint32_t token_budget              = 0);

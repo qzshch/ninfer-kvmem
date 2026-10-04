@@ -801,6 +801,44 @@ cudaStream_t transfer_stream, const char* trace_phase)
                 outgoing.push_back(page);
             }
         }
+        const bool same_selection =
+            address.device_working_set
+                ? (address.device_working_set->size() == selected_pages.size() &&
+                   std::equal(address.device_working_set->begin(),
+                              address.device_working_set->end(), selected_pages.begin()))
+                : selected_pages.size() == address.page_count;
+        if (same_selection && outgoing.empty() && resident_before == selected_pages.size()) {
+            // ensure_mapped publishes growth on the compute stream; prior placement
+            // publication has completed at the preceding worker boundary. With the
+            // same fully resident set, this row needs no table rewrite or transfer
+            // wait. In particular, do not drain another owner's pending H2D restore.
+            if (sparse_activation_budget_pages_ != 0) {
+                const auto cap = sparse_reservation_cap(address);
+                if (address.reservation.pages() > cap) {
+                    pages_->physical_pool().resize_reservation(address.reservation, cap);
+                }
+            }
+            if (!address.device_working_set) {
+                address.device_working_set.emplace(selected_pages.begin(), selected_pages.end());
+            }
+            counts.telemetry.no_copy_calls = 1;
+            counts.telemetry.total_host_wall_ns =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               TraceClock::now() - trace_begin)
+                                               .count());
+            if (trace) {
+                std::fprintf(
+                    stderr,
+                    "KVPLACEMENT phase=%s row=%d planes=%zu mapped=%u selected=%zu "
+                    "demoted=0 promoted=0 d2h_pages=0 d2h_bytes=0 h2d_bytes=0 "
+                    "d2h_submit_wait_ms=0 h2d_submit_wait_ms=0 total_ms=%.6f unchanged_table=1\n",
+                    trace_phase, bound_row(handle),
+                    pages_->physical_pool().geometry().planes.size(), address.page_count,
+                    selected_pages.size(),
+                    static_cast<double>(counts.telemetry.total_host_wall_ns) * 1e-6);
+            }
+            return counts;
+        }
         if (!outgoing.empty()) {
             std::vector<LogicalKVPageHandle> stale;
             for (const std::uint32_t page : outgoing) {

@@ -441,6 +441,14 @@ public:
         return require(handle).active_references;
     }
 
+    // Any active alias may promote this same logical page while rolling/retrieving.
+    // A pending replica is therefore safe to overlap only with wholly disjoint owners.
+    [[nodiscard]] bool restore_blocks_active_execution(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return true; }
+        const Page& page = pages_[handle.index_];
+        return page.pending_device_replica.has_value() && page.active_references != 0;
+    }
+
     [[nodiscard]] std::uint8_t writer_references(LogicalKVPageHandle handle) const {
         return require(handle).writer_references;
     }

@@ -344,6 +344,19 @@ void Program::finalize_context_transaction() noexcept { impl_->finalize_context_
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 bool Program::has_pending_kv_restore() const noexcept { return impl_->has_pending_kv_restore(); }
 
+bool Program::kv_restore_blocks_execution() const noexcept {
+    return impl_->kv_restore_blocks_execution();
+}
+
+bool Program::pending_kv_restore_ready() const { return impl_->pending_kv_restore_ready(); }
+
+bool Program::pending_kv_restore_in_flight() const { return impl_->pending_kv_restore_in_flight(); }
+
+RequestBasePlan Program::plan_request_overlap(const PreparedPrompt& prompt,
+                                              const runtime::ResolvedExecutionOptions& options) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
+}
+
 bool Program::can_plan_materialization() const noexcept {
     return impl_->can_plan_materialization();
 }

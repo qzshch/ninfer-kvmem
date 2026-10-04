@@ -40,6 +40,8 @@ struct ServeOptions {
     std::uint32_t prefill_time_budget_ms = 0; // Measured mixed-unit target, not a hard deadline.
     std::uint32_t prefill_request_token_cap = 0;
     bool prefill_pack = false; // One submission for ragged rows, retaining scalar compute shapes.
+    bool cpu_gpu_overlap = false;
+    bool cache_prefetch  = false;
     // Sparse KV working-set window in 64-token pages; 0 keeps dense semantics.
     std::uint32_t kvmem_window_pages   = 0;
     std::filesystem::path context_cost_presets;

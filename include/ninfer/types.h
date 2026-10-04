@@ -173,6 +173,8 @@ struct EngineOptions {
     std::uint32_t prefill_time_budget_ms = 0; // Measured mixed-unit target, not a hard deadline.
     std::uint32_t prefill_request_token_cap = 0;
     bool prefill_pack = false; // One submission for ragged rows, retaining scalar compute shapes.
+    bool cpu_gpu_overlap = false; // Immutable FIFO base planning during compute completion.
+    bool cache_prefetch  = false; // Admission H2D restore overlaps disjoint active owners.
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
     // dense full-residency semantics. Experimental sparse mode supports 1..4 active
     // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
@@ -982,6 +984,16 @@ struct RuntimeHostWorkStats {
     std::uint64_t packed_prefill_units   = 0;
     std::uint64_t packed_prefill_tokens  = 0;
     std::uint64_t control_units          = 0;
+
+    // Subsets / observations, not extra wall time or hardware utilization.
+    std::uint64_t cpu_plan_overlap_invocations          = 0;
+    std::uint64_t cpu_plan_overlap_host_ns              = 0;
+    std::uint64_t cpu_plan_fully_covered_ns             = 0;
+    std::uint64_t cache_prefetch_units                  = 0;
+    std::uint64_t cache_prefetch_completed_during_units = 0;
+    std::uint64_t cache_prefetch_blocked_boundaries     = 0;
+    std::uint64_t deferred_capture_offers               = 0;
+    std::uint64_t deferred_capture_resumptions          = 0;
 
     std::uint64_t admission_policy_ns           = 0;
     std::uint64_t context_progress_ns           = 0;

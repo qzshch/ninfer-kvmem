@@ -1202,6 +1202,39 @@ For the experimental full-head DSpark route, see [DSpark](dspark.md).
 
 ### Bounded fair prefill
 
+`--cpu-gpu-overlap` prepares at most one FIFO-head base plan while the compute
+stream has unfinished work. This CPU-only step validates immutable prompt/model
+facts and builds prefix digests. Physical cache matching, admission, resource
+publication, cancellation and output commit remain at completed worker boundaries.
+There is no second mutation owner. Preparation failures are delivered at admission.
+It has little opportunity when all requests are already admitted.
+
+`--cache-prefetch` lets admission-time Host-to-Device checkpoint restores run on
+the transfer stream alongside disjoint active requests. The existing single
+materialization transaction, physical reservations, content epochs and source
+lifetimes bound this work. If any restoring logical page has an active alias,
+or an active recurrent-state fork still needs settlement,
+execution waits for publication as before. Active cancellation also waits for a
+stable transaction boundary. Checkpoint offers produced during another owner's
+restore are held immutable and resumed after the global transaction settles;
+their lanes do not execute further work, and cancellation discards the offer.
+Offers also wait when another lane's StateImage fork prevents resource planning.
+Unchanged resident page tables do not drain unrelated transfer-stream work.
+It introduces no speculative extra
+page allocation or cold-cache transfer. This is a local Host/GPU adaptation of
+hierarchical cache overlap, not SGLang's L3 backend or layer-wise loading.
+
+Both options default to off. Startup JSON records the scope. Throughput JSON
+`host_work.cpu_gpu_overlap` records CPU preparation and a fully-covered Host time
+lower bound (the completion event was still pending after CPU work).
+`host_work.cache_prefetch` counts execution units begun during outstanding H2D,
+completion observed during those units, safety-blocked boundaries, and deferred
+checkpoint offers/resumptions. These event
+observations are not GPU overlap durations; use a CUDA timeline for that measurement.
+CPU work is reclassified from completion wait to Host submission time without
+double-counting wall time. Existing transfer byte/page/time fields retain actual
+cache restoration costs.
+
 `--prefill-pack` is an experimental opt-in with a positive `--prefill-token-budget`.
 It submits non-final text chunks together with one completion wait, preserving
 each request's original projection shapes, attention, convolution, recurrent state

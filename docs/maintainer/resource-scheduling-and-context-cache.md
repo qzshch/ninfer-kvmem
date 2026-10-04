@@ -904,6 +904,10 @@ release 或 victim eviction 通过绝对 `ResourceResult` 报告。
 
 同一时间至多一个 global resource transition。既有 active execution 只有在使用自身既有 reservation、
 且不触碰 transaction mappings 时才能与 transfer 交错。
+`cache_prefetch` 的 KV restore 交错由 Program 对每个 pending logical page 的 active address references 验证：
+全部为零才能运行无关 lane。任何 Main/backend alias、无效 handle 或未知 typed store 都保守阻塞；
+不会在 in-flight copy 中提前发布 page table，也不会在 cancellation 时提前释放 destination reservation 或 Host source。
+这是已准入请求的本地 Host→Device 预取，不是未准入请求额外占用 physical capacity 的预测缓存。
 
 ### 9.4 Commit
 

@@ -174,12 +174,21 @@ int main() {
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("prefill_pack_mode") == "disabled",
                       "disabled prefill mode misreported as packed compute");
+    failures += check(!server.at("engine").at("cpu_gpu_overlap").get<bool>() &&
+                          server.at("engine").at("cache_prefetch_mode") == "disabled",
+                      "overlap / prefetch must default to off");
     engine_options.prefill_pack = true;
+    engine_options.cpu_gpu_overlap = true;
+    engine_options.cache_prefetch  = true;
     const Json grouped_server = Json::parse(format_server_start_json(
         "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
         memory, environment, std::uint64_t{123456}));
     failures += check(grouped_server.at("engine").at("prefill_pack_mode") == "scalar_shape_submission",
                       "grouped submission misreported as shared GEMM");
+    failures += check(grouped_server.at("engine").at("cpu_gpu_overlap").get<bool>() &&
+                          grouped_server.at("engine").at("cache_prefetch_mode") ==
+                              "admission_h2d_disjoint_owners",
+                      "startup must report exact prefetch scope");
     engine_options.prefill_pack = false;
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
@@ -825,6 +834,37 @@ int main() {
         "single-request pretty throughput is noisy or incomplete");
     const Json throughput_json =
         Json::parse(format_throughput_json("serve-test", 5000, throughput));
+    ThroughputReport overlap_report                                         = throughput;
+    overlap_report.previous.host_work.cpu_plan_overlap_invocations          = 1;
+    overlap_report.current.host_work.cpu_plan_overlap_invocations           = 3;
+    overlap_report.previous.host_work.cpu_plan_overlap_host_ns              = 10000;
+    overlap_report.current.host_work.cpu_plan_overlap_host_ns               = 50000;
+    overlap_report.previous.host_work.cpu_plan_fully_covered_ns             = 5000;
+    overlap_report.current.host_work.cpu_plan_fully_covered_ns              = 40000;
+    overlap_report.previous.host_work.cache_prefetch_units                  = 1;
+    overlap_report.current.host_work.cache_prefetch_units                   = 4;
+    overlap_report.previous.host_work.cache_prefetch_completed_during_units = 1;
+    overlap_report.current.host_work.cache_prefetch_completed_during_units  = 2;
+    overlap_report.current.host_work.cache_prefetch_blocked_boundaries      = 1;
+    overlap_report.previous.host_work.deferred_capture_offers               = 2;
+    overlap_report.current.host_work.deferred_capture_offers                = 5;
+    overlap_report.previous.host_work.deferred_capture_resumptions          = 1;
+    overlap_report.current.host_work.deferred_capture_resumptions           = 3;
+    const Json overlap_json =
+        Json::parse(format_throughput_json("serve-test", 5000, overlap_report));
+    const auto& overlap_host = overlap_json.at("host_work");
+    failures += check(
+        overlap_host.at("cpu_gpu_overlap").at("base_plans") == 2 &&
+            overlap_host.at("cpu_gpu_overlap").at("host_ns") == 40000 &&
+            overlap_host.at("cpu_gpu_overlap").at("fully_covered_host_ns_lower_bound") == 35000 &&
+            overlap_host.at("cache_prefetch").at("execution_units_started_during_h2d") == 3 &&
+            overlap_host.at("cache_prefetch").at("h2d_completed_during_execution_units") == 1 &&
+            overlap_host.at("cache_prefetch").at("blocked_boundaries") == 1 &&
+            overlap_host.at("cache_prefetch").at("deferred_capture_offers") == 3 &&
+            overlap_host.at("cache_prefetch").at("deferred_capture_resumptions") == 2 &&
+            overlap_host.at("elapsed_seconds") ==
+                throughput_json.at("host_work").at("elapsed_seconds"),
+        "overlap counters must be interval deltas without double-counting Host wall time");
     failures += check(throughput_json.at("event") == "throughput", "throughput event mismatch");
     const auto& lanes = throughput_json.at("lanes");
     failures += check(lanes.size() == 2 && lanes[0].at("lane_id") == 0 &&

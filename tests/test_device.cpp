@@ -2,6 +2,9 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -106,6 +109,55 @@ int main(int argc, char** argv) {
     if (!transfer_complete) {
         return fail("stream synchronization returned before transfer completed");
     }
+
+    struct WaitProof {
+        std::atomic<bool> release{false};
+        bool called     = false;
+        bool unfinished = false;
+        ninfer::CudaCompletionEvent completion;
+
+        explicit WaitProof(ninfer::DeviceContext& device) : completion(device) {}
+    } proof(ctx);
+
+    // A bounded stream callback makes the unfinished-unit state deterministic.
+    // This is an ownership / event-order test, not a GPU performance measurement.
+    CUDA_CHECK(cudaLaunchHostFunc(
+        ctx.stream,
+        [](void* owner) {
+            auto& p             = *static_cast<WaitProof*>(owner);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!p.release.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        },
+        &proof));
+    const ninfer::DeviceWaitWork work{.owner = &proof, .run = [](void* owner, cudaStream_t stream) {
+                                          auto& p = *static_cast<WaitProof*>(owner);
+                                          p.completion.record(stream);
+                                          p.unfinished = !p.completion.ready();
+                                          p.called     = true;
+                                          p.release.store(true, std::memory_order_release);
+                                      }};
+    {
+        ninfer::ScopedDeviceWaitWork outer(ctx, &work);
+        {
+            ninfer::ScopedDeviceWaitWork disabled(ctx, nullptr);
+            if (ctx.wait_work != nullptr) { return fail("nested work disable failed"); }
+        }
+        ctx.synchronize();
+    }
+    if (!proof.called || !proof.unfinished || ctx.wait_work != nullptr) {
+        return fail("CPU wait work did not run before stream completion / restore scope");
+    }
+    try {
+        ninfer::ScopedDeviceWaitWork restore(ctx, &work);
+        throw std::runtime_error("scope-unwind fixture");
+    } catch (const std::runtime_error&) {}
+    if (ctx.wait_work != nullptr) { return fail("CPU work escaped exception scope"); }
+    proof.called = false;
+    ctx.synchronize();
+    if (proof.called) { return fail("completed scope invoked stale CPU work"); }
 
     const cudaStream_t original_stream = ctx.stream;
     ninfer::DeviceContext moved(std::move(ctx));

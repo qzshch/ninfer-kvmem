@@ -114,9 +114,10 @@ DeviceContext::~DeviceContext() {
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
+      props(other.props), wait_work(other.wait_work) {
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
+    other.wait_work       = nullptr;
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
@@ -130,9 +131,11 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props           = other.props;
     stream          = other.stream;
     transfer_stream = other.transfer_stream;
+    wait_work       = other.wait_work;
 
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
+    other.wait_work       = nullptr;
     return *this;
 }
 
@@ -170,7 +173,12 @@ const char* DeviceContext::sync_mode() const {
     throw std::runtime_error("unknown CUDA synchronization schedule");
 }
 
-void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+void DeviceContext::synchronize() const {
+    if (wait_work != nullptr && wait_work->run != nullptr) {
+        wait_work->run(wait_work->owner, stream);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 

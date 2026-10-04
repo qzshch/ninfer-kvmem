@@ -535,6 +535,9 @@ public:
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool can_plan_materialization() const noexcept;
     [[nodiscard]] bool has_pending_kv_restore() const noexcept;
+    [[nodiscard]] bool kv_restore_blocks_execution() const noexcept;
+    [[nodiscard]] bool pending_kv_restore_ready() const;
+    [[nodiscard]] bool pending_kv_restore_in_flight() const;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing,
                                                   std::uint32_t token_budget = 0);

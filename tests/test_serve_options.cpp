@@ -391,10 +391,11 @@ int main() {
 
     const auto adaptive =
         parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens", "7",
-               "--dspark-dynamic-k", "--prefill-token-budget", "1024", "--prefill-pack"});
+               "--dspark-dynamic-k", "--prefill-token-budget", "1024", "--prefill-pack",
+               "--cpu-gpu-overlap", "--cache-prefetch"});
     failures +=
         check(adaptive.speculative.dspark_dynamic_k && adaptive.prefill_token_budget == 1024 &&
-                  adaptive.prefill_pack,
+                  adaptive.prefill_pack && adaptive.cpu_gpu_overlap && adaptive.cache_prefetch,
               "adaptive DSpark / global prefill options did not reach Engine configuration");
     bool unbudgeted_pack = false;
     try {

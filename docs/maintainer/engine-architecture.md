@@ -386,7 +386,16 @@ query replay 仍走原单 owner 单元。这个路径合并提交及完成等待
 混合负载可用 `prefill_time_budget_ms` 按已完成单元的 Host 与 Device-wait 时间估算下一次
 token grant，保留 25% 余量；这不是实时截止保证，原子 media 单元仍可能超过预算。
 每次切换必须重新绑定该 sequence 的 KV execution row 和 rope delta；这些标量属于共享 IO scratch。
-Host→Device 的 checkpoint KV 恢复尚未发布时暂停 GPU execution unit，仍在 worker boundary 处理取消和事务进度，避免共享历史页被另一路 replay 重复恢复。
+Host→Device 的 checkpoint KV 恢复尚未发布时默认暂停 GPU execution unit，仍在 worker boundary 处理取消和事务进度，避免共享历史页被另一路 replay 重复恢复。
+opt-in `cache_prefetch` 只在 Program 证明所有恢复页均无 active address alias 时允许其他 lane 继续计算；任何共享页冲突仍全局等待。
+恢复对象、Host extent 和 reservation 由原单一事务持有，完成事件之后才能发布或归还。
+其他 lane 在此期间产生的 capture offer 存在该请求的 deferred slot，尚未拥有 global transaction。
+此 lane 不能继续 prefill/decode/control；下一稳定 boundary 先处理 cancellation，再逐一重新评估并预留 capture。
+只有实际 reserved capture 才标记 `capture_pending` 并成为唯一 active_capture_owner。
+存在 active cancellation 时预取交错保守暂停，直到既有事务稳定，避免提前归还仍被事务保护的资源。
+opt-in `cpu_gpu_overlap` 在 compute stream 等待前，由同一个 worker 执行最多一个 FIFO head 的不可变 base plan 准备。
+只读取固定 model/prompt 参数并构建局部计划；禁止 cache physical search、映射/资源修改、CUDA 提交和输出发布。
+请求取消、超时和准备错误在下个正常 boundary 结算，不改变已经发出的 GPU unit。
 query replay 仍按原 prefill chunk 返回取消边界，不省略必要的历史计算。
 
 ### 5.4 Admission invalidation
