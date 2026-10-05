@@ -1,0 +1,24 @@
+# NInfer XGrammar source base
+
+This implementation originates from [XGrammar](https://github.com/mlc-ai/xgrammar),
+commit [`3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0`](https://github.com/mlc-ai/xgrammar/commit/3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0),
+under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+The imported CPU sources and headers are unchanged. NInfer owns the CMake target and will maintain
+its adaptations here, adopting upstream changes selectively. Python/TVM bindings, GPU kernels,
+Web code, upstream tests and build machinery are excluded.
+
+The CPU dependency closure includes Lark and all format converters referenced by the shared
+factories. `cpp/testing.cc` also supplies token-formatting diagnostics used by the matcher and
+compiled grammar; it is part of this library, not a test executable.
+
+Bundled header dependencies:
+
+- `3rdparty/picojson/picojson.h`: XGrammar's modified version, including ordered-object support;
+  its license is in the header.
+- `3rdparty/dlpack/include/dlpack/dlpack.h`: from the upstream submodule at
+  [`bbd2f4d32427e548797929af08cfe2a9cbb3cf12`](https://github.com/dmlc/dlpack/commit/bbd2f4d32427e548797929af08cfe2a9cbb3cf12);
+  see its [LICENSE](3rdparty/dlpack/LICENSE).
+
+`ninfer_xgrammar` is a C++20 static library linked explicitly by consumers. It uses standard
+threads and has no Python, TVM or CUDA runtime dependency. Cpptrace is disabled.
