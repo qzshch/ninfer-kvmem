@@ -110,6 +110,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
 
     ContextCacheOptions& cache      = options.context_cache;
+    if (cache.hicache_ram_capacity_bytes &&
+        (!cache.enabled || cache.kv_file_directory.empty() ||
+         cache.hicache_ram_capacity_bytes % (1ULL << 20) ||
+         cache.hicache_ram_capacity_bytes > cache.host_kv_capacity_bytes)) {
+        throw std::invalid_argument(
+            "HiCache RAM requires enabled file storage, MiB alignment and RAM <= Host KV capacity");
+    }
+    if ((cache.hicache_prefetch || cache.hicache_write_through) &&
+        cache.hicache_ram_capacity_bytes == 0)
+        throw std::invalid_argument(
+            "HiCache prefetch/write-through requires a managed RAM hot set");
     if (options.cache_layerwise_restore) { options.cache_prefetch = true; }
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {

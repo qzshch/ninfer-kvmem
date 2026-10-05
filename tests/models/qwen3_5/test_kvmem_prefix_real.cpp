@@ -78,6 +78,10 @@ void exercise_overlap_prefetch(const char* artifact) {
     if (const char* directory = std::getenv("NINFER_TEST_KV_FILE_DIR")) {
         options.context_cache.kv_file_directory = directory;
     }
+    if (std::getenv("NINFER_TEST_HICACHE") != nullptr) {
+        options.context_cache.hicache_ram_capacity_bytes = 2ULL << 30;
+        options.context_cache.hicache_prefetch           = true;
+    }
     options.context_cache.device_state_slots = 2;
     options.context_cache.host_state_slots   = 4;
     options.context_cache.host_kv_capacity_bytes    = 8ULL << 30;

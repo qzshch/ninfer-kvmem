@@ -24,9 +24,25 @@ struct FileKVSnapshot {
     std::uint64_t pending_reads     = 0;
     std::uint64_t pending_writes    = 0;
     std::uint64_t pending_callbacks = 0;
+    std::size_t ram_capacity_bytes      = 0;
+    std::uint64_t ram_resident_bytes    = 0;
+    std::uint64_t ram_dirty_bytes       = 0;
+    std::uint64_t ram_hit_bytes         = 0;
+    std::uint64_t ram_miss_bytes        = 0;
+    std::uint64_t disk_read_bytes       = 0;
+    std::uint64_t disk_written_bytes    = 0;
+    std::uint64_t disk_read_ns          = 0;
+    std::uint64_t disk_write_ns         = 0;
+    std::uint64_t ram_evictions         = 0;
+    std::uint64_t prefetch_bytes        = 0;
+    std::uint64_t prefetch_hit_bytes    = 0;
+    std::uint64_t prefetch_wasted_bytes = 0;
+    std::uint64_t prefetch_dropped_jobs = 0;
+    std::uint64_t pending_prefetches    = 0;
+    std::uint64_t pending_writebacks    = 0;
 };
 
-// Storage only. The IO thread touches file bytes and fixed pinned staging slots;
+// Storage only. The IO thread touches disk, managed RAM and fixed pinned staging;
 // it never calls CUDA or changes an allocation, logical page or model state.
 // The caller retains source/destination leases until its stream has completed,
 // then checks errors before publishing any replica. Files are instance-local
@@ -54,7 +70,8 @@ public:
     };
 
     FileKVBacking(const std::filesystem::path& directory, std::size_t capacity_bytes,
-                  std::size_t staging_slot_bytes = 16ULL << 20);
+                  std::size_t staging_slot_bytes = 16ULL << 20, std::size_t ram_capacity_bytes = 0,
+                  bool prefetch = false, bool write_through = false);
     ~FileKVBacking();
     FileKVBacking(const FileKVBacking&)            = delete;
     FileKVBacking& operator=(const FileKVBacking&) = delete;
@@ -65,6 +82,9 @@ public:
     void order_after(cudaStream_t caller_stream);
     [[nodiscard]] Transfer read(std::size_t offset, std::size_t bytes);
     [[nodiscard]] Transfer write(std::size_t offset, std::size_t bytes);
+    // Best-effort, bounded L3 -> L2 hints. They never publish a logical replica
+    // or retain an allocation: invalidation epochs discard stale hints.
+    void prefetch(std::size_t offset, std::size_t bytes);
     void check_errors() const;
     // File transfers must unwind and drain their byte worker on submission
     // failure; the ordinary core CUDA checker deliberately aborts the process.

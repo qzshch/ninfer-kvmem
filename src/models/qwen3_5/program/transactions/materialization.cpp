@@ -1102,6 +1102,30 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
     if (!transaction.prepared || transaction.transfer_submitted) {
         throw std::logic_error("materialization transfer batch is not enqueueable");
     }
+    // Prefix source extents are pinned by the sealed transaction. Start bounded
+    // L3 -> L2 hints before submitting the GPU restore batch; the byte worker
+    // cannot change StateImages, page tables or the selected prefix frontier.
+    const auto hint_restores = [&](const auto& restores) {
+        std::size_t begin = 0;
+        while (begin < restores.size()) {
+            std::size_t end = begin + 1;
+            while (end < restores.size() && restores[end].extent == restores[begin].extent &&
+                   restores[end].extent_page == restores[end - 1].extent_page + 1)
+                ++end;
+            const auto source =
+                host_kv_extents->view(restores[begin].extent)
+                    .subview(restores[begin].extent_page, static_cast<std::uint32_t>(end - begin));
+            if (auto* backing = source.file_backing()) {
+                backing->prefetch(source.file_offset(),
+                                  (end - begin) * source.layout().page_stride);
+            }
+            begin = end;
+        }
+    };
+    if (context_cache.hicache_prefetch) {
+        hint_restores(transaction.text_restores);
+        hint_restores(transaction.backend_restores);
+    }
     const auto enqueue_kv =
         [&](LogicalKVPageStore& pages,
             const std::vector<MaterializationTransaction::KVRestorePage>& restores,

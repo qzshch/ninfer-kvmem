@@ -403,6 +403,25 @@ int main() {
                           file_cache.context_cache.host_kv_capacity_bytes == (256ULL << 20),
                       "file KV backing options did not reach Engine configuration");
     const auto layerwise = parse({"ninfer-serve", "model.ninfer", "--cache-layerwise-restore"});
+    const auto hicache =
+        parse({"ninfer-serve", "model.ninfer", "--kv-file-dir", "/tmp/kv", "--host-kv-mib", "1024",
+               "--hicache-ram-mib", "256", "--hicache-prefetch", "--hicache-write-through"});
+    failures += check(hicache.context_cache.hicache_ram_capacity_bytes == (256ULL << 20) &&
+                          hicache.context_cache.hicache_prefetch &&
+                          hicache.context_cache.hicache_write_through,
+                      "HiCache RAM/prefetch did not reach Engine configuration");
+    for (auto arguments :
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--hicache-ram-mib", "256"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-file-dir", "/tmp/kv",
+                                   "--hicache-prefetch"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-file-dir", "/tmp/kv",
+                                   "--host-kv-mib", "256", "--hicache-ram-mib", "257"}}) {
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "HiCache accepted an inconsistent tier budget");
+    }
     failures += check(layerwise.cache_layerwise_restore && layerwise.cache_prefetch,
                       "layerwise restore must imply admission prefetch");
     bool unbudgeted_pack = false;

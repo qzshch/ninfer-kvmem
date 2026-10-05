@@ -101,7 +101,8 @@ std::vector<ninfer::DeviceKVPageLease> allocate(ninfer::DeviceKVPagePool& pool, 
     return result;
 }
 
-void roundtrip(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order, bool file = true) {
+void roundtrip(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order, bool file = true,
+               std::size_t hot_bytes = 0) {
     constexpr unsigned pages = 97;
     const ninfer::KVPageGeometry geometry{.device_plane_order = order,
                                           .planes = {{ninfer::DType::FP8_E4M3FN, 256, 2, 256},
@@ -139,9 +140,10 @@ void roundtrip(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order, 
     std::filesystem::path file_path;
     {
         // Small slots force repeated slot reuse across fragmented copies.
-        ninfer::HostKVArena arena(
-            host_layout.page_stride * pages * 2, layouts,
-            file ? std::filesystem::temp_directory_path() : std::filesystem::path{}, 512ULL << 10);
+        ninfer::HostKVArena arena(host_layout.page_stride * pages * 2, layouts,
+                                  file ? std::filesystem::temp_directory_path()
+                                       : std::filesystem::path{},
+                                  512ULL << 10, hot_bytes);
         auto stored = arena.allocate(host_layout, pages);
         require(stored.has_value(), "file allocation failed");
         auto view = arena.writable_view(*stored);
@@ -446,6 +448,113 @@ void pool_failed_stream(ninfer::DeviceContext& context, bool writing) {
 
 } // namespace
 
+namespace {
+void hierarchical_cache(ninfer::DeviceContext& context, bool write_through) {
+    constexpr std::size_t block = 1ULL << 20;
+    ninfer::DeviceBuffer device(block);
+    std::vector<std::byte> oracle(block), actual(block);
+    for (std::size_t i = 0; i < block; ++i) oracle[i] = std::byte((i * 31 + (i >> 11) * 17) & 255);
+    CUDA_CHECK(cudaMemcpy(device.p, oracle.data(), block, cudaMemcpyHostToDevice));
+    std::filesystem::path path;
+    {
+        ninfer::FileKVBacking store(std::filesystem::temp_directory_path(), 8 * block, block,
+                                    2 * block, true, write_through);
+        path       = store.path();
+        auto write = [&](std::size_t offset, std::size_t bytes = 1ULL << 20) {
+            auto transfer = store.write(offset, bytes);
+            transfer.enqueue_before(store.stream());
+            CUDA_CHECK(cudaMemcpyAsync(transfer.data(), device.p, bytes, cudaMemcpyDeviceToHost,
+                                       store.stream()));
+            transfer.enqueue_after(store.stream());
+            CUDA_CHECK(cudaStreamSynchronize(store.stream()));
+            store.check_errors();
+        };
+        auto read = [&](std::size_t offset, std::size_t bytes = 1ULL << 20) {
+            auto transfer = store.read(offset, bytes);
+            transfer.enqueue_before(store.stream());
+            CUDA_CHECK(cudaMemcpyAsync(device.p, transfer.data(), bytes, cudaMemcpyHostToDevice,
+                                       store.stream()));
+            transfer.enqueue_after(store.stream());
+            CUDA_CHECK(cudaStreamSynchronize(store.stream()));
+            store.check_errors();
+            CUDA_CHECK(cudaMemcpy(actual.data(), device.p, bytes, cudaMemcpyDeviceToHost));
+            require(std::equal(oracle.begin(), oracle.begin() + bytes, actual.begin()),
+                    "HiCache RAM/disk promotion differs from exact byte oracle");
+        };
+        for (unsigned i = 0; i < 6; ++i) {
+            write(i * block);
+            if (!write_through && i == 0) {
+                store.drain();
+                require(store.snapshot().disk_written_bytes == 0 &&
+                            store.snapshot().ram_dirty_bytes == block,
+                        "write-back performed eager SSD writes or lost the RAM owner");
+            }
+        }
+        store.drain();
+        require(store.snapshot().ram_evictions >= 4 &&
+                    store.snapshot().ram_resident_bytes <= 2 * block,
+                "HiCache did not bound the RAM tier");
+        auto before = store.snapshot();
+        read(0);
+        require(store.snapshot().disk_read_bytes - before.disk_read_bytes == block,
+                "cold HiCache restore did not read exactly the disk payload");
+        before = store.snapshot();
+        read(0);
+        require(store.snapshot().disk_read_bytes == before.disk_read_bytes &&
+                    store.snapshot().ram_hit_bytes - before.ram_hit_bytes == block,
+                "warm HiCache restore touched disk or missed managed RAM");
+        // Streaming writes must not flush out a repeatedly read prefix.
+        write(6 * block);
+        write(7 * block);
+        write(5 * block);
+        before = store.snapshot();
+        read(0);
+        require(store.snapshot().disk_read_bytes == before.disk_read_bytes,
+                "streaming writes evicted the protected read prefix");
+        store.prefetch(2 * block, block);
+        store.drain();
+        before = store.snapshot();
+        read(2 * block);
+        require(store.snapshot().prefetch_hit_bytes - before.prefetch_hit_bytes == block &&
+                    store.snapshot().disk_read_bytes == before.disk_read_bytes,
+                "prefetched prefix was not consumed from RAM");
+        // Free/reallocate a subrange sharing a cache block. No neighbour loss,
+        // no stale bytes and no queued hint can resurrect the old generation.
+        store.invalidate(2 * block + 256, 256);
+        write(2 * block + 256, 256);
+        store.drain();
+        read(2 * block, 256);
+        read(2 * block + 256, 256);
+        store.drain();
+        // Completely freed protected blocks must become reusable hot slots.
+        // Otherwise streaming writes evict each other while an empty protected
+        // slot permanently reduces the usable RAM tier.
+        store.invalidate(0, 8 * block);
+        before = store.snapshot();
+        require(before.ram_resident_bytes == 0 && before.ram_dirty_bytes == 0,
+                "freed HiCache allocations retained physical hot ownership");
+        write(6 * block);
+        write(7 * block);
+        store.drain();
+        if (!write_through)
+            require(store.snapshot().disk_written_bytes == before.disk_written_bytes,
+                    "empty protected slots forced unnecessary dirty eviction");
+        read(6 * block);
+        read(7 * block);
+        const auto final = store.snapshot();
+        require((!write_through || final.ram_dirty_bytes == 0) &&
+                    final.ram_dirty_bytes <= 2 * block && final.pending_callbacks == 0 &&
+                    final.pending_prefetches == 0 && final.pending_writebacks == 0 &&
+                    final.pending_reads == 0 && final.pending_writes == 0,
+                "HiCache did not drain transfers/writeback/prefetch leases");
+        require_small_file_cache(path);
+        std::cout << "HiCache exact byte oracle / protected hot set / disk promotion / prefetch / "
+                     "generations passed\n";
+    }
+    require(!std::filesystem::exists(path), "HiCache file was not removed");
+}
+} // namespace
+
 int main() {
     try {
         int devices       = 0;
@@ -456,8 +565,12 @@ int main() {
         }
         CUDA_CHECK(result);
         ninfer::DeviceContext context;
+        hierarchical_cache(context, true);
+        hierarchical_cache(context, false);
         roundtrip(context, ninfer::PagedKVPlaneOrder::PageMajor);
         roundtrip(context, ninfer::PagedKVPlaneOrder::HeadMajor);
+        roundtrip(context, ninfer::PagedKVPlaneOrder::PageMajor, true, 2ULL << 20);
+        roundtrip(context, ninfer::PagedKVPlaneOrder::HeadMajor, true, 2ULL << 20);
         roundtrip(context, ninfer::PagedKVPlaneOrder::PageMajor, false);
         roundtrip(context, ninfer::PagedKVPlaneOrder::HeadMajor, false);
         stale_and_short(context, false);

@@ -628,6 +628,8 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
     const auto chunk_pages = file->slot_bytes() / host.page_stride;
     for (std::size_t begin = 0; begin < destination.size(); begin += chunk_pages) {
         const auto count = std::min(chunk_pages, destination.size() - begin);
+        file->prefetch(source.file_offset() + begin * host.page_stride,
+                       (destination.size() - begin) * host.page_stride);
         std::optional<FileKVBacking::Transfer> transfer;
         try {
             transfer = file->read(source.file_offset() + begin * host.page_stride,

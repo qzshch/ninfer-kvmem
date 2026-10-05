@@ -215,9 +215,13 @@ void HostKVAllocation::disarm() noexcept {
 HostKVArena::HostKVArena(std::size_t capacity_bytes,
                          std::span<const HostKVPageLayout> supported_layouts,
                          const std::filesystem::path& file_directory,
-                         std::size_t file_staging_slot_bytes)
+                         std::size_t file_staging_slot_bytes, std::size_t hot_capacity_bytes,
+                         bool prefetch, bool write_through)
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
+    if ((hot_capacity_bytes || prefetch || write_through) && file_directory.empty()) {
+        throw std::invalid_argument("HiCache hot tier requires file backing");
+    }
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
         const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
         if (planned != layouts_[index]) {
@@ -238,7 +242,8 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         backing_.emplace(capacity_bytes_);
     } else {
         file_ = std::make_unique<FileKVBacking>(file_directory, capacity_bytes_,
-                                                file_staging_slot_bytes);
+                                                file_staging_slot_bytes, hot_capacity_bytes,
+                                                prefetch, write_through);
         for (const auto& layout : layouts_) {
             if (layout.page_stride > file_->slot_bytes()) {
                 throw std::invalid_argument("KV page does not fit file staging slot");
@@ -645,6 +650,7 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     if (!descriptor.active || descriptor.generation != generation) { return false; }
 
     const FreeExtent released{descriptor.offset, descriptor.bytes};
+    if (file_) { file_->invalidate(released.offset, released.bytes); }
     occupied_bytes_ -= descriptor.bytes;
     descriptor.active = false;
     descriptor.offset = 0;

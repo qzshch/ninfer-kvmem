@@ -866,6 +866,14 @@ int main() {
     overlap_report.previous.file_cache.pending_reads                        = 5;
     overlap_report.current.file_cache.pending_reads                         = 2;
     overlap_report.current.file_cache.pending_writes                        = 1;
+    overlap_report.previous.file_cache.ram_hit_bytes                        = 120;
+    overlap_report.current.file_cache.ram_hit_bytes                         = 900;
+    overlap_report.previous.file_cache.disk_read_bytes                      = 60;
+    overlap_report.current.file_cache.disk_read_bytes                       = 260;
+    overlap_report.current.file_cache.ram_capacity_bytes                    = 4096;
+    overlap_report.current.file_cache.ram_resident_bytes                    = 2048;
+    overlap_report.current.file_cache.ram_dirty_bytes                       = 256;
+    overlap_report.current.file_cache.pending_prefetches                    = 3;
     const Json overlap_json =
         Json::parse(format_throughput_json("serve-test", 5000, overlap_report));
     const auto& overlap_host = overlap_json.at("host_work");
@@ -873,6 +881,14 @@ int main() {
                           overlap_json.at("file_kv").at("pending_read_jobs") == 2 &&
                           overlap_json.at("file_kv").at("pending_write_jobs") == 1,
                       "file bytes are deltas while pending IO jobs are live gauges");
+    failures +=
+        check(overlap_json.at("file_kv").at("ram_hit_bytes") == 780 &&
+                  overlap_json.at("file_kv").at("disk_read_bytes") == 200 &&
+                  overlap_json.at("file_kv").at("ram_capacity_bytes") == 4096 &&
+                  overlap_json.at("file_kv").at("ram_resident_bytes") == 2048 &&
+                  overlap_json.at("file_kv").at("ram_dirty_bytes") == 256 &&
+                  overlap_json.at("file_kv").at("pending_prefetch_jobs") == 3,
+              "HiCache physical I/O counters must be deltas; residency/queues must be gauges");
     failures += check(
         overlap_host.at("cpu_gpu_overlap").at("base_plans") == 2 &&
             overlap_host.at("cpu_gpu_overlap").at("host_ns") == 40000 &&

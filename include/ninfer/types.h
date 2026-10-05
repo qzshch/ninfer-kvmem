@@ -146,6 +146,14 @@ struct ContextCacheOptions {
     // Optional instance-local file backing for that logical capacity. Host KV
     // payload uses two fixed 16 MiB staging slots; Host StateImages stay pinned.
     std::filesystem::path kv_file_directory;
+    // With file backing: independent managed RAM hot set (MiB aligned). The
+    // logical Host KV capacity remains the disk address space, not RAM + disk.
+    // Zero retains file-only backing. StateImages/MeanK keep their typed pools.
+    std::size_t hicache_ram_capacity_bytes = 0;
+    bool hicache_prefetch                  = false;
+    // False: write back only on RAM eviction. True: flush dirty blocks while
+    // the byte worker has no demand work, retaining clean RAM replicas.
+    bool hicache_write_through = false;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -953,6 +961,23 @@ struct FileCacheStats {
     std::size_t integrity_bytes   = 0;
     std::uint64_t pending_reads   = 0;
     std::uint64_t pending_writes  = 0;
+    std::size_t ram_capacity_bytes      = 0;
+    std::uint64_t ram_resident_bytes    = 0;
+    std::uint64_t ram_dirty_bytes       = 0;
+    std::uint64_t ram_hit_bytes         = 0;
+    std::uint64_t ram_miss_bytes        = 0;
+    std::uint64_t disk_read_bytes       = 0;
+    std::uint64_t disk_written_bytes    = 0;
+    std::uint64_t disk_read_ns          = 0;
+    std::uint64_t disk_write_ns         = 0;
+    std::uint64_t ram_evictions         = 0;
+    std::uint64_t prefetch_bytes        = 0;
+    std::uint64_t prefetch_hit_bytes    = 0;
+    std::uint64_t prefetch_wasted_bytes = 0;
+    std::uint64_t prefetch_dropped_jobs = 0;
+    std::uint64_t pending_prefetches    = 0;
+    std::uint64_t pending_writebacks    = 0;
+    std::uint64_t pending_callbacks     = 0;
 };
 
 struct MemorySummary {

@@ -296,7 +296,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         host_kv_arena = std::make_unique<HostKVArena>(
             plan.context_cache.host_kv_capacity_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()),
-            plan.context_cache.kv_file_directory);
+            plan.context_cache.kv_file_directory, 16ULL << 20,
+            plan.context_cache.hicache_ram_capacity_bytes, plan.context_cache.hicache_prefetch,
+            plan.context_cache.hicache_write_through);
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
@@ -606,9 +608,34 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
 FileCacheStats ProgramImpl::file_cache_stats() const noexcept {
     if (!host_kv_arena) { return {}; }
     const auto file = host_kv_arena->file_snapshot();
-    return {file.read_bytes,      file.written_bytes, file.read_ns,       file.write_ns,
-            file.staging_wait_ns, file.reads,         file.writes,        file.pinned_bytes,
-            file.integrity_bytes, file.pending_reads, file.pending_writes};
+    return {file.read_bytes,
+            file.written_bytes,
+            file.read_ns,
+            file.write_ns,
+            file.staging_wait_ns,
+            file.reads,
+            file.writes,
+            file.pinned_bytes,
+            file.integrity_bytes,
+            file.pending_reads,
+            file.pending_writes,
+            file.ram_capacity_bytes,
+            file.ram_resident_bytes,
+            file.ram_dirty_bytes,
+            file.ram_hit_bytes,
+            file.ram_miss_bytes,
+            file.disk_read_bytes,
+            file.disk_written_bytes,
+            file.disk_read_ns,
+            file.disk_write_ns,
+            file.ram_evictions,
+            file.prefetch_bytes,
+            file.prefetch_hit_bytes,
+            file.prefetch_wasted_bytes,
+            file.prefetch_dropped_jobs,
+            file.pending_prefetches,
+            file.pending_writebacks,
+            file.pending_callbacks};
 }
 
 MemorySummary ProgramImpl::memory_summary() const noexcept {

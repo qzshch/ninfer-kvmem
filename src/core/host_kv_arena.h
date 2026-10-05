@@ -213,7 +213,9 @@ class HostKVArena {
 public:
     HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts,
                 const std::filesystem::path& file_directory = {},
-                std::size_t file_staging_slot_bytes         = 16ULL << 20);
+                std::size_t file_staging_slot_bytes         = 16ULL << 20,
+                std::size_t hot_capacity_bytes = 0, bool prefetch = false,
+                bool write_through = false);
 
     void check_io_errors() const {
         if (file_) file_->check_errors();

@@ -29,6 +29,9 @@ namespace {
 using Clock                                   = std::chrono::steady_clock;
 constexpr std::size_t kSector                 = 256;
 constexpr std::size_t kMaximumQueuedTransfers = 8192;
+constexpr std::size_t kHotBlock               = 1ULL << 20;
+constexpr std::size_t kHotSectors             = kHotBlock / kSector;
+constexpr std::size_t kMaximumPrefetches      = 128;
 
 std::uint64_t elapsed(Clock::time_point begin) {
     return static_cast<std::uint64_t>(
@@ -166,6 +169,295 @@ struct FileKVBacking::Impl {
     std::atomic<std::uint64_t> pending_reads{0}, pending_writes{0};
     std::atomic<std::uint64_t> pending_callbacks{0};
 
+    // The RAM tier is owned memory, not the filesystem page cache or the two
+    // pinned transfer slots. A protected read set survives streaming writes.
+    struct HotSlot {
+        std::size_t block = std::numeric_limits<std::size_t>::max();
+        int previous = -1, next = -1;
+        bool protected_set = false;
+        std::array<std::uint8_t, kHotSectors> valid{}, prefetched{};
+    };
+
+    struct Prefetch {
+        std::size_t block;
+        std::uint64_t epoch;
+    };
+
+    std::size_t ram_capacity = 0;
+    bool prefetch_enabled    = false;
+    bool write_through       = false;
+    std::unique_ptr<std::byte[]> ram;
+    std::vector<HotSlot> hot;
+    std::vector<int> free_hot;
+    std::vector<int> block_slots;
+    std::vector<std::uint64_t> block_epochs;
+    std::array<int, 2> heads{-1, -1}, ends{-1, -1};
+    std::size_t protected_count = 0, next_hot = 0;
+    // Sector written values: 0 absent, 1 clean disk copy, 2 dirty RAM owner.
+    mutable std::mutex hot_mutex;
+    std::deque<Prefetch> prefetch_queue;
+    std::atomic<std::uint64_t> ram_resident_bytes{0}, ram_dirty_bytes{0};
+    std::atomic<std::uint64_t> ram_hit_bytes{0}, ram_miss_bytes{0};
+    std::atomic<std::uint64_t> disk_read_bytes{0}, disk_written_bytes{0};
+    std::atomic<std::uint64_t> disk_read_ns{0}, disk_write_ns{0}, ram_evictions{0};
+    std::atomic<std::uint64_t> prefetch_bytes{0}, prefetch_hit_bytes{0};
+    std::atomic<std::uint64_t> prefetch_wasted_bytes{0}, prefetch_dropped_jobs{0};
+    std::atomic<std::uint64_t> pending_prefetches{0}, pending_writebacks{0};
+
+    void unlink_hot(int index) {
+        auto& slot    = hot[index];
+        const int set = slot.protected_set ? 1 : 0;
+        if (slot.previous >= 0)
+            hot[slot.previous].next = slot.next;
+        else
+            heads[set] = slot.next;
+        if (slot.next >= 0)
+            hot[slot.next].previous = slot.previous;
+        else
+            ends[set] = slot.previous;
+        if (slot.protected_set) --protected_count;
+        slot.previous = slot.next = -1;
+    }
+
+    void link_hot(int index, bool protect) {
+        auto& slot         = hot[index];
+        const int set      = protect ? 1 : 0;
+        slot.protected_set = protect;
+        slot.previous      = -1;
+        slot.next          = heads[set];
+        if (heads[set] >= 0)
+            hot[heads[set]].previous = index;
+        else
+            ends[set] = index;
+        heads[set] = index;
+        if (protect) ++protected_count;
+    }
+
+    void touch_hot(int index, bool demand_read) {
+        const bool protect = demand_read || hot[index].protected_set;
+        unlink_hot(index);
+        link_hot(index, protect);
+        const auto limit = std::max<std::size_t>(1, hot.size() * 3 / 4);
+        if (protected_count > limit) {
+            const int demote = ends[1];
+            unlink_hot(demote);
+            link_hot(demote, false);
+        }
+    }
+
+    void disk_io(std::size_t offset, std::byte* buffer, std::size_t bytes, bool writing) {
+        const auto begin_time = Clock::now();
+        std::size_t completed = 0;
+        while (completed != bytes) {
+            const auto count =
+                writing ? ::pwrite(fd, buffer + completed, bytes - completed, offset + completed)
+                        : ::pread(fd, buffer + completed, bytes - completed, offset + completed);
+            if (count < 0) {
+                if (errno == EINTR) continue;
+                io_error(writing ? "pwrite" : "pread");
+            }
+            if (!count) throw std::runtime_error("file KV short positional IO");
+            completed += static_cast<std::size_t>(count);
+        }
+        if (writing) {
+            disk_written_bytes += bytes;
+            disk_write_ns += elapsed(begin_time);
+        } else {
+            disk_read_bytes += bytes;
+            disk_read_ns += elapsed(begin_time);
+        }
+    }
+
+    void evict_file_pages(std::size_t offset, std::size_t bytes, bool writing) {
+        if (writing) {
+            const auto start = Clock::now();
+            while (::fdatasync(fd) != 0) {
+                if (errno == EINTR) continue;
+                io_error("fdatasync");
+            }
+            disk_write_ns += elapsed(start);
+        }
+        const auto begin = offset / system_page_bytes * system_page_bytes;
+        const auto end =
+            (offset + bytes + system_page_bytes - 1) / system_page_bytes * system_page_bytes;
+        const auto result = ::posix_fadvise(fd, begin, end - begin, POSIX_FADV_DONTNEED);
+        if (result)
+            throw std::runtime_error(std::string("file KV cache eviction: ") +
+                                     std::strerror(result));
+    }
+
+    // Called with hot_mutex, only on the byte worker. Clean-sector publication
+    // follows successful writeback. A disk failure poisons the whole instance.
+    void flush_hot(int index) {
+        auto& slot = hot[index];
+        if (slot.block == std::numeric_limits<std::size_t>::max()) { return; }
+        const auto base    = slot.block * kHotSectors;
+        const auto sectors = std::min(kHotSectors, written.size() - base);
+        bool wrote         = false;
+        for (std::size_t s = 0; s < sectors;) {
+            if (!slot.valid[s] || written[base + s] != 2) {
+                ++s;
+                continue;
+            }
+            auto end = s + 1;
+            while (end < sectors && slot.valid[end] && written[base + end] == 2) ++end;
+            auto* data = ram.get() + static_cast<std::size_t>(index) * kHotBlock + s * kSector;
+            disk_io((base + s) * kSector, data, (end - s) * kSector, true);
+            s     = end;
+            wrote = true;
+        }
+        if (!wrote) return;
+        evict_file_pages(slot.block * kHotBlock, sectors * kSector, true);
+        for (std::size_t s = 0; s < sectors; ++s) {
+            if (slot.valid[s] && written[base + s] == 2) {
+                written[base + s] = 1;
+                ram_dirty_bytes -= kSector;
+            }
+        }
+    }
+
+    int acquire_hot(std::size_t block, bool demand_read) {
+        if (const int found = block_slots[block]; found >= 0) {
+            touch_hot(found, demand_read);
+            return found;
+        }
+        int index;
+        if (!free_hot.empty()) {
+            index = free_hot.back();
+            free_hot.pop_back();
+        } else if (next_hot < hot.size())
+            index = static_cast<int>(next_hot++);
+        else {
+            index        = ends[0] >= 0 ? ends[0] : ends[1];
+            auto& victim = hot[index];
+            flush_hot(index);
+            for (std::size_t s = 0; s < kHotSectors; ++s) {
+                if (victim.valid[s]) ram_resident_bytes -= kSector;
+                if (victim.prefetched[s]) prefetch_wasted_bytes += kSector;
+            }
+            block_slots[victim.block] = -1;
+            unlink_hot(index);
+            victim.valid.fill(0);
+            victim.prefetched.fill(0);
+            ++ram_evictions;
+        }
+        hot[index].block   = block;
+        block_slots[block] = index;
+        link_hot(index, false);
+        if (demand_read) touch_hot(index, true);
+        return index;
+    }
+
+    void cached_io(const Transfer::State& state) {
+        std::lock_guard lock(hot_mutex);
+        for (std::size_t done = 0; done < state.bytes;) {
+            const auto offset = state.offset + done;
+            const auto block  = offset / kHotBlock;
+            const auto local  = offset % kHotBlock;
+            const auto bytes  = std::min(state.bytes - done, kHotBlock - local);
+            const int index   = acquire_hot(block, !state.writing);
+            auto& slot        = hot[index];
+            auto* data        = ram.get() + static_cast<std::size_t>(index) * kHotBlock + local;
+            const auto first  = local / kSector;
+            const auto base   = offset / kSector;
+            if (state.writing) {
+                std::memcpy(data, state.buffer + done, bytes);
+                for (std::size_t s = 0; s < bytes / kSector; ++s) {
+                    if (!slot.valid[first + s]) ram_resident_bytes += kSector;
+                    if (written[base + s] != 2) ram_dirty_bytes += kSector;
+                    if (slot.prefetched[first + s]) prefetch_wasted_bytes += kSector;
+                    slot.valid[first + s]      = 1;
+                    slot.prefetched[first + s] = 0;
+                    checksums[base + s]        = checksum(data + s * kSector);
+                    written[base + s]          = 2;
+                }
+            } else {
+                for (std::size_t s = 0; s < bytes / kSector;) {
+                    if (!written[base + s]) throw std::runtime_error("HiCache missing payload");
+                    if (slot.valid[first + s]) {
+                        if (checksum(data + s * kSector) != checksums[base + s])
+                            throw std::runtime_error("HiCache corrupt RAM payload");
+                        ram_hit_bytes += kSector;
+                        if (slot.prefetched[first + s]) {
+                            prefetch_hit_bytes += kSector;
+                            slot.prefetched[first + s] = 0;
+                        }
+                        ++s;
+                        continue;
+                    }
+                    auto end = s + 1;
+                    while (end < bytes / kSector && !slot.valid[first + end] &&
+                           written[base + end] == 1)
+                        ++end;
+                    if (written[base + s] != 1)
+                        throw std::logic_error("HiCache lost dirty RAM owner");
+                    disk_io((base + s) * kSector, data + s * kSector, (end - s) * kSector, false);
+                    evict_file_pages((base + s) * kSector, (end - s) * kSector, false);
+                    for (; s < end; ++s) {
+                        if (checksum(data + s * kSector) != checksums[base + s])
+                            throw std::runtime_error("HiCache corrupt disk payload");
+                        slot.valid[first + s] = 1;
+                        ram_resident_bytes += kSector;
+                        ram_miss_bytes += kSector;
+                    }
+                }
+                std::memcpy(state.buffer + done, data, bytes);
+            }
+            done += bytes;
+        }
+    }
+
+    void prefetch_block(const Prefetch& hint) {
+        std::lock_guard lock(hot_mutex);
+        if (block_epochs[hint.block] != hint.epoch) {
+            ++prefetch_dropped_jobs;
+            return;
+        }
+        const auto base    = hint.block * kHotSectors;
+        const auto sectors = std::min(kHotSectors, written.size() - base);
+        // A hint must not replace a dirty/absent sector or evict an entire hot
+        // block merely to discover there is no published cold payload.
+        const int prior = block_slots[hint.block];
+        bool needed     = false;
+        for (std::size_t s = 0; s < sectors; ++s) {
+            if (written[base + s] == 1 && (prior < 0 || !hot[prior].valid[s])) {
+                needed = true;
+                break;
+            }
+        }
+        if (!needed) return;
+        const int index = acquire_hot(hint.block, false);
+        auto& slot      = hot[index];
+        auto* data      = ram.get() + static_cast<std::size_t>(index) * kHotBlock;
+        for (std::size_t s = 0; s < sectors;) {
+            if (slot.valid[s] || written[base + s] != 1) {
+                ++s;
+                continue;
+            }
+            auto end = s + 1;
+            while (end < sectors && !slot.valid[end] && written[base + end] == 1) ++end;
+            disk_io((base + s) * kSector, data + s * kSector, (end - s) * kSector, false);
+            evict_file_pages((base + s) * kSector, (end - s) * kSector, false);
+            for (; s < end; ++s) {
+                if (checksum(data + s * kSector) != checksums[base + s])
+                    throw std::runtime_error("HiCache corrupt prefetched payload");
+                slot.valid[s] = slot.prefetched[s] = 1;
+                ram_resident_bytes += kSector;
+                prefetch_bytes += kSector;
+            }
+        }
+    }
+
+    void background_writeback() {
+        std::lock_guard lock(hot_mutex);
+        // At most one block between demand jobs. No additional dirty buffers.
+        for (std::size_t index = 0; index < next_hot; ++index) {
+            const auto before = ram_dirty_bytes.load();
+            flush_hot(static_cast<int>(index));
+            if (ram_dirty_bytes.load() != before) return;
+        }
+    }
+
     void enqueue_callback(const std::shared_ptr<Transfer::State>& state, cudaStream_t target,
                           bool before) {
         auto context    = std::make_unique<Callback>();
@@ -222,6 +514,12 @@ struct FileKVBacking::Impl {
     }
 
     void io(const Transfer::State& state) {
+        if (ram_capacity) {
+            cached_io(state);
+            return;
+        }
+        std::lock_guard lock(hot_mutex);
+        const auto disk_start = Clock::now();
         std::size_t completed = 0;
         while (completed != state.bytes) {
             const auto count = state.writing
@@ -267,19 +565,58 @@ struct FileKVBacking::Impl {
             throw std::runtime_error(std::string("file KV cache eviction: ") +
                                      std::strerror(advice));
         }
+        if (state.writing) {
+            disk_written_bytes += state.bytes;
+            disk_write_ns += elapsed(disk_start);
+        } else {
+            disk_read_bytes += state.bytes;
+            disk_read_ns += elapsed(disk_start);
+        }
     }
 
     void run() noexcept {
         for (;;) {
             std::shared_ptr<Transfer::State> state;
+            std::optional<Prefetch> hint;
+            bool writeback = false;
             {
                 std::unique_lock lock(mutex);
-                cv.wait(lock, [&] { return stopping || !queue.empty(); });
-                if (queue.empty()) { return; }
-                state = std::move(queue.front());
-                queue.pop_front();
+                cv.wait(lock, [&] {
+                    return stopping || !queue.empty() || !prefetch_queue.empty() ||
+                           (!error && write_through && ram_dirty_bytes.load() != 0);
+                });
+                if (!queue.empty()) {
+                    state = std::move(queue.front());
+                    queue.pop_front();
+                } else if (!prefetch_queue.empty()) {
+                    hint = prefetch_queue.front();
+                    prefetch_queue.pop_front();
+                } else if (!error && write_through && ram_dirty_bytes.load() != 0) {
+                    writeback = true;
+                    ++pending_writebacks;
+                } else if (stopping)
+                    return;
             }
             cv.notify_all();
+            if (hint || writeback) {
+                try {
+                    {
+                        std::lock_guard lock(mutex);
+                        if (error) std::rethrow_exception(error);
+                    }
+                    if (hint)
+                        prefetch_block(*hint);
+                    else
+                        background_writeback();
+                } catch (...) { remember_error(); }
+                if (hint)
+                    --pending_prefetches;
+                else
+                    --pending_writebacks;
+                cv.notify_all();
+                continue;
+            }
+            if (!state) continue;
             const auto waiting = Clock::now();
             state->wait_predecessor();
             if (state->writing) {
@@ -328,6 +665,7 @@ struct FileKVBacking::Impl {
                 state->cv.notify_all();
                 if (aborted) { state->finish(); }
             }
+            cv.notify_all();
         }
     }
 };
@@ -362,11 +700,14 @@ void FileKVBacking::Transfer::retire_after_drain() noexcept {
 }
 
 FileKVBacking::FileKVBacking(const std::filesystem::path& directory, std::size_t capacity_bytes,
-                             std::size_t staging_slot_bytes)
+                             std::size_t staging_slot_bytes, std::size_t ram_capacity_bytes,
+                             bool prefetch, bool write_through)
     : impl_(std::make_unique<Impl>()) {
     if (capacity_bytes == 0 || capacity_bytes % kSector || capacity_bytes > (64ULL << 30) ||
         staging_slot_bytes == 0 || staging_slot_bytes % kSector ||
-        staging_slot_bytes > (64ULL << 20)) {
+        staging_slot_bytes > (64ULL << 20) || ram_capacity_bytes > capacity_bytes ||
+        ram_capacity_bytes % kHotBlock ||
+        ((prefetch || write_through) && ram_capacity_bytes == 0)) {
         throw std::invalid_argument("file KV capacity/staging geometry is invalid");
     }
     std::filesystem::create_directories(directory);
@@ -396,6 +737,16 @@ FileKVBacking::FileKVBacking(const std::filesystem::path& directory, std::size_t
         for (auto& slot : impl_->slots) { slot.emplace(impl_->slot_bytes); }
         impl_->checksums.resize(capacity_bytes / kSector);
         impl_->written.resize(capacity_bytes / kSector);
+        impl_->ram_capacity     = ram_capacity_bytes;
+        impl_->prefetch_enabled = prefetch;
+        impl_->write_through    = write_through;
+        if (ram_capacity_bytes) {
+            impl_->ram = std::make_unique<std::byte[]>(ram_capacity_bytes);
+            impl_->hot.resize(ram_capacity_bytes / kHotBlock);
+            impl_->free_hot.reserve(impl_->hot.size());
+            impl_->block_slots.resize((capacity_bytes + kHotBlock - 1) / kHotBlock, -1);
+            impl_->block_epochs.resize(impl_->block_slots.size());
+        }
         check_cuda_submission(cudaStreamCreateWithFlags(&impl_->stream, cudaStreamNonBlocking));
         check_cuda_submission(
             cudaEventCreateWithFlags(&impl_->source_ready, cudaEventDisableTiming));
@@ -484,6 +835,36 @@ FileKVBacking::Transfer FileKVBacking::write(std::size_t offset, std::size_t byt
     return submit(offset, bytes, true);
 }
 
+void FileKVBacking::prefetch(std::size_t offset, std::size_t bytes) {
+    if (!impl_->prefetch_enabled || !bytes) return;
+    check_errors();
+    if (offset > impl_->capacity || bytes > impl_->capacity - offset)
+        throw std::out_of_range("HiCache prefetch exceeds backing");
+    // Read ahead no further than two transfer chunks, independent of the
+    // logical request length. Hints have lower priority than demand transfers.
+    const auto end = offset + std::min({bytes, 2 * impl_->slot_bytes, impl_->ram_capacity});
+    for (auto block = offset / kHotBlock; block <= (end - 1) / kHotBlock; ++block) {
+        std::uint64_t epoch;
+        {
+            std::lock_guard lock(impl_->hot_mutex);
+            epoch = impl_->block_epochs[block];
+        }
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->prefetch_queue.size() == kMaximumPrefetches) {
+            ++impl_->prefetch_dropped_jobs;
+            break;
+        }
+        const auto duplicate = std::any_of(
+            impl_->prefetch_queue.begin(), impl_->prefetch_queue.end(),
+            [&](const auto& hint) { return hint.block == block && hint.epoch == epoch; });
+        if (!duplicate) {
+            impl_->prefetch_queue.push_back({block, epoch});
+            ++impl_->pending_prefetches;
+        }
+    }
+    impl_->cv.notify_all();
+}
+
 void FileKVBacking::check_errors() const {
     std::lock_guard lock(impl_->mutex);
     if (impl_->error) { std::rethrow_exception(impl_->error); }
@@ -529,13 +910,44 @@ void FileKVBacking::invalidate(std::size_t offset, std::size_t bytes) noexcept {
         bytes > impl_->capacity - offset) {
         std::terminate();
     }
+    std::lock_guard lock(impl_->hot_mutex);
+    if (impl_->ram_capacity && bytes) {
+        for (auto block = offset / kHotBlock; block <= (offset + bytes - 1) / kHotBlock; ++block) {
+            ++impl_->block_epochs[block];
+            const int index = impl_->block_slots[block];
+            if (index < 0) continue;
+            auto& slot       = impl_->hot[index];
+            const auto begin = std::max(offset, block * kHotBlock);
+            const auto end   = std::min(offset + bytes, (block + 1) * kHotBlock);
+            for (auto p = begin; p < end; p += kSector) {
+                const auto s = (p % kHotBlock) / kSector;
+                if (slot.valid[s]) impl_->ram_resident_bytes -= kSector;
+                if (slot.prefetched[s]) impl_->prefetch_wasted_bytes += kSector;
+                if (impl_->written[p / kSector] == 2) impl_->ram_dirty_bytes -= kSector;
+                slot.valid[s] = slot.prefetched[s] = 0;
+            }
+            if (std::none_of(slot.valid.begin(), slot.valid.end(),
+                             [](std::uint8_t valid) { return valid != 0; })) {
+                impl_->unlink_hot(index);
+                impl_->block_slots[block] = -1;
+                slot.block                = std::numeric_limits<std::size_t>::max();
+                impl_->free_hot.push_back(index);
+            }
+        }
+    }
     std::fill_n(impl_->written.begin() + offset / kSector, bytes / kSector, 0);
+    impl_->cv.notify_all();
 }
 
 void FileKVBacking::drain() {
     for (const auto& tail : impl_->tails) {
         if (tail) tail->wait_done();
     }
+    std::unique_lock lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        return impl_->pending_prefetches.load() == 0 && impl_->pending_writebacks.load() == 0 &&
+               (!impl_->write_through || impl_->error || impl_->ram_dirty_bytes.load() == 0);
+    });
 }
 
 FileKVSnapshot FileKVBacking::snapshot() const noexcept {
@@ -547,11 +959,30 @@ FileKVSnapshot FileKVBacking::snapshot() const noexcept {
             .reads           = impl_->reads.load(),
             .writes          = impl_->writes.load(),
             .pinned_bytes    = impl_->slot_bytes * impl_->slots.size(),
-            .integrity_bytes =
-                impl_->checksums.size() * sizeof(std::uint32_t) + impl_->written.size(),
-            .pending_reads     = impl_->pending_reads.load(),
-            .pending_writes    = impl_->pending_writes.load(),
-            .pending_callbacks = impl_->pending_callbacks.load()};
+            .integrity_bytes = impl_->checksums.size() * sizeof(std::uint32_t) +
+                               impl_->written.size() + impl_->hot.size() * sizeof(Impl::HotSlot) +
+                               impl_->free_hot.capacity() * sizeof(int) +
+                               impl_->block_slots.size() * sizeof(int) +
+                               impl_->block_epochs.size() * sizeof(std::uint64_t),
+            .pending_reads         = impl_->pending_reads.load(),
+            .pending_writes        = impl_->pending_writes.load(),
+            .pending_callbacks     = impl_->pending_callbacks.load(),
+            .ram_capacity_bytes    = impl_->ram_capacity,
+            .ram_resident_bytes    = impl_->ram_resident_bytes.load(),
+            .ram_dirty_bytes       = impl_->ram_dirty_bytes.load(),
+            .ram_hit_bytes         = impl_->ram_hit_bytes.load(),
+            .ram_miss_bytes        = impl_->ram_miss_bytes.load(),
+            .disk_read_bytes       = impl_->disk_read_bytes.load(),
+            .disk_written_bytes    = impl_->disk_written_bytes.load(),
+            .disk_read_ns          = impl_->disk_read_ns.load(),
+            .disk_write_ns         = impl_->disk_write_ns.load(),
+            .ram_evictions         = impl_->ram_evictions.load(),
+            .prefetch_bytes        = impl_->prefetch_bytes.load(),
+            .prefetch_hit_bytes    = impl_->prefetch_hit_bytes.load(),
+            .prefetch_wasted_bytes = impl_->prefetch_wasted_bytes.load(),
+            .prefetch_dropped_jobs = impl_->prefetch_dropped_jobs.load(),
+            .pending_prefetches    = impl_->pending_prefetches.load(),
+            .pending_writebacks    = impl_->pending_writebacks.load()};
 }
 
 } // namespace ninfer

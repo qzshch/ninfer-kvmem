@@ -78,6 +78,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] [--kv-file-dir DIR] "
+           "[--hicache-ram-mib N] [--hicache-prefetch] [--hicache-write-through] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
@@ -123,6 +124,8 @@ std::string serve_usage_text(const char* argv0) {
            "--host-kv-mib uses MiB\n"
            "       --kv-file-dir uses instance-local file KV backing and 32 MiB pinned staging; "
            "files are removed at engine shutdown\n"
+           "       --hicache-ram-mib adds a bounded RAM hot set to file storage; "
+           "--hicache-prefetch enables best-effort disk-to-RAM read-ahead\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -262,6 +265,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--kv-file-dir cannot be empty");
             }
             context_capacity_explicit = true;
+        } else if (arg == "--hicache-ram-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--hicache-ram-mib"), "hicache-ram-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20))
+                throw std::invalid_argument("--hicache-ram-mib is out of range");
+            options.context_cache.hicache_ram_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit                        = true;
+        } else if (arg == "--hicache-prefetch") {
+            options.context_cache.hicache_prefetch = true;
+            context_capacity_explicit              = true;
+        } else if (arg == "--hicache-write-through") {
+            options.context_cache.hicache_write_through = true;
+            context_capacity_explicit                   = true;
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
@@ -386,6 +402,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
+    const auto& cache = options.context_cache;
+    if (cache.hicache_ram_capacity_bytes &&
+        (cache.kv_file_directory.empty() ||
+         cache.hicache_ram_capacity_bytes > cache.host_kv_capacity_bytes))
+        throw std::invalid_argument(
+            "--hicache-ram-mib requires --kv-file-dir and RAM <= --host-kv-mib");
+    if ((cache.hicache_prefetch || cache.hicache_write_through) &&
+        !cache.hicache_ram_capacity_bytes)
+        throw std::invalid_argument("HiCache prefetch/write-through requires --hicache-ram-mib");
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kvmem_window_pages == 0 &&
