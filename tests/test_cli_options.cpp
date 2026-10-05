@@ -32,6 +32,10 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

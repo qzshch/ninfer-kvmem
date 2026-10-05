@@ -767,10 +767,32 @@ int test_stream() {
     return failures;
 }
 
+int test_constrained_decoding() {
+    int failures               = 0;
+    auto body                  = base_request();
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
+    const auto request         = parse(body);
+    failures += check(
+        to_request_options(request.generation, {}, semantics(request.generation), true).grammar ==
+            "root ::= \"yes\"",
+        "Anthropic GBNF extension was lost in Engine translation");
+    body["tools"] = Json::array({ordinary_tool()});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted active tools");
+    body["tool_choice"] = Json{{"type", "none"}};
+    failures += check(parse(body).generation.grammar == "root ::= \"yes\"",
+                      "inactive tools blocked grammar");
+    body["stop_sequences"] = Json::array({"yes"});
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "grammar admitted custom stop sequences");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_constrained_decoding();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

@@ -1113,6 +1113,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                  std::to_string(maximum_prompt_tokens));
     }
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
+    output.continuation_content        = rendered.continuation_content;
     output.input_ids                   = std::move(encoded.input_ids);
     output.retrieval_query             = encoded.retrieval_query;
     output.instruction_spans           = std::move(encoded.instruction_spans);

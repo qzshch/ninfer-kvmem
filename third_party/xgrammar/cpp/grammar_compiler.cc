@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <semaphore>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -1067,6 +1068,9 @@ class GrammarCompilerSub {
   const TokenizerInfo tokenizer_info_;
   /*! \brief The maximum number of threads to use. */
   const int max_threads_;
+  // NInfer bounds cold compilation across caller threads. Hot cache lookups and same-key
+  // single-flight waits do not acquire a permit. Its adapter selects one thread per compile.
+  std::counting_semaphore<2> compilation_slots_{2};
 
   /*! \brief The manager of the rule level cache.*/
   std::optional<RuleLevelCache> rule_level_cache_;
@@ -1096,6 +1100,11 @@ static void CheckTokenIdsInVocab(const Grammar& grammar, int vocab_size) {
 }
 
 CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_unoptimized) {
+  struct Permit {
+    std::counting_semaphore<2>& slots;
+    explicit Permit(std::counting_semaphore<2>& value) : slots(value) { slots.acquire(); }
+    ~Permit() { slots.release(); }
+  } permit(compilation_slots_);
   auto compiled_grammar_impl = std::make_shared<CompiledGrammar::Impl>();
   compiled_grammar_impl->grammar = GrammarOptimizer::Apply(grammar_unoptimized);
   compiled_grammar_impl->tokenizer_info = tokenizer_info_;

@@ -50,6 +50,12 @@ ninfer::SpeculativeBackend backend(std::string_view name) {
     throw std::invalid_argument("NINFER_TEST_BACKEND must be none, mtp, dflash or dflash2");
 }
 
+std::string grammar_prefix() {
+    std::string prefix;
+    for (char c = 'a'; c <= 'z'; ++c) prefix.append(17 + c - 'a', c);
+    return prefix;
+}
+
 ninfer::RequestOptions request(std::uint32_t outputs) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
@@ -57,6 +63,15 @@ ninfer::RequestOptions request(std::uint32_t outputs) {
     options.execution.allow_prefix_reuse      = false;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
+    if (setting("NINFER_TEST_GRAMMAR", "0") == "1") {
+        std::string source = "root ::= ";
+        for (char c = 'a'; c <= 'z'; ++c) {
+            source += "\"" + std::string(1, c) + "\"{" + std::to_string(17 + c - 'a') + "} ";
+        }
+        options.grammar                     = source + "\"z\"{65536}";
+        options.stop.include_model_defaults = true;
+        options.output.raw                  = false;
+    }
     return options;
 }
 
@@ -174,6 +189,16 @@ public:
                                      result.finish_reason == ninfer::FinishReason::OutputLimit),
                 "resumed request did not honor its original output budget");
         // Compare only the two publication views of this request, never different math paths.
+        if (setting("NINFER_TEST_GRAMMAR", "0") == "1") {
+            const auto expected = grammar_prefix();
+            require(!content_.empty() && reasoning_.empty() &&
+                        (content_.size() <= expected.size()
+                             ? expected.starts_with(content_)
+                             : content_.starts_with(expected) &&
+                                   content_.find_first_not_of('z', expected.size()) ==
+                                       std::string::npos),
+                    "recovery or cancellation changed the grammar position");
+        }
         require(content_ == result.content && reasoning_ == result.reasoning,
                 "stream and terminal response disagree after recovery");
         require(result.reused_prompt_tokens == 0 &&

@@ -1,0 +1,206 @@
+#include "ninfer/engine.h"
+
+#include <nlohmann/json.hpp>
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
+
+namespace {
+void require(bool condition, const char* message) {
+    if (!condition) { throw std::runtime_error(message); }
+}
+
+ninfer::PromptInput prompt(bool thinking = false) {
+    ninfer::PromptInput input;
+    input.options.enable_thinking = thinking;
+    input.messages.push_back({.role  = ninfer::ChatRole::User,
+                              .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                         .text = "Return the requested answer."}}});
+    input.context_cache.session_key = "grammar-test";
+    return input;
+}
+
+ninfer::RequestOptions literal(const std::string& answer, float temperature = 0.0f) {
+    ninfer::RequestOptions request;
+    request.grammar                           = "root ::= " + nlohmann::json(answer).dump();
+    request.execution.requested_output_tokens = 160;
+    request.execution.sampling.temperature    = temperature;
+    request.execution.sampling.top_k          = 20;
+    request.execution.sampling.seed           = 78123;
+    return request;
+}
+
+struct Sink final : ninfer::OutputSink {
+    std::string content;
+
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress) override {}
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta delta) override {
+        if (delta.channel == ninfer::OutputChannel::Content) { content += delta.text; }
+    }
+};
+} // namespace
+
+int main(int argc, char** argv) {
+    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    if (!artifact || !*artifact) {
+        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        return 77;
+    }
+    try {
+        const std::string backend = argc > 1 ? argv[1] : "none";
+        ninfer::EngineOptions options;
+        options.artifact_path   = artifact;
+        options.max_context     = 1024;
+        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+        options.max_concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 2;
+        options.enable_vision   = argc > 4 && std::string_view(argv[4]) == "vision";
+        options.prefill_chunk   = 128;
+        options.kv_cache        = ninfer::KvCacheStorage::Fp8E4M3Row256;
+        options.context_cache.device_state_slots  = 8;
+        options.context_cache.host_capacity_bytes = 128ULL << 20;
+        options.use_cuda_graph = argc < 3 || std::string_view(argv[2]) != "eager";
+        if (backend == "mtp")
+            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+        else if (backend == "dflash")
+            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+        else if (backend == "dflash2")
+            options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        else
+            require(backend == "none", "unknown backend");
+        if (backend != "none") {
+            options.speculative.draft_tokens  = 3;
+            options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        }
+        ninfer::Engine engine(options);
+        const std::string answer =
+            "  {\"value\":\"你好\",\"literal\":\"<tool_call>x</tool_call>\"}";
+        for (float temperature : {0.0f, 0.8f}) {
+            Sink sink;
+            auto request                                 = literal(answer, temperature);
+            request.execution.sampling.presence_penalty  = 0.5f;
+            request.execution.sampling.frequency_penalty = 0.125f;
+            const auto result = engine.generate(engine.prepare(prompt()), request, &sink);
+            require(result.content == answer && sink.content == answer && result.tool_calls.empty(),
+                    "grammar content bytes or streaming publication changed");
+            require(result.finish_reason == ninfer::FinishReason::StopToken,
+                    "grammar did not finish through EOS");
+            if (backend != "none")
+                require(result.speculative.rounds > 0, "constraint bypassed speculative backend");
+            std::cout << "literal temp=" << temperature << " reuse=" << result.reused_prompt_tokens
+                      << " prepare_ms=" << result.timings.prepare_seconds * 1000
+                      << " decode_ms=" << result.timings.decode_seconds * 1000 << '\n';
+        }
+
+        auto thinking                      = literal(answer);
+        thinking.execution.thinking.budget = 2;
+        auto thought = engine.generate(engine.prepare(prompt(true)), thinking);
+        require(thought.content == answer && thought.thinking.applied &&
+                    thought.thinking.injected_tokens > 0,
+                "thinking control broke constrained content");
+
+        auto continued = prompt();
+        continued.context_cache.session_key.reset();
+        continued.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        const std::string prefix       = "{\"value\":";
+        const std::string whole        = prefix + "\"你好\"}";
+        continued.messages.push_back(
+            {.role  = ninfer::ChatRole::Assistant,
+             .parts = {{.kind = ninfer::MessagePartKind::Text, .text = prefix}}});
+        const auto suffix = engine.generate(engine.prepare(continued), literal(whole));
+        require(prefix + suffix.content == whole,
+                "continuation matcher did not start at rendered content prefix");
+
+        ninfer::RequestOptions free;
+        free.execution.requested_output_tokens = 12;
+        free.execution.sampling.temperature    = 0.0f;
+        std::vector<ninfer::GenerationHandle> mixed;
+        for (unsigned row = 0; row < options.max_concurrency; ++row) {
+            const std::string row_answer = answer + std::to_string(row);
+            mixed.push_back(engine.submit(engine.prepare(prompt()),
+                                          row % 2 ? free : literal(row_answer, 0.8f)));
+        }
+        for (unsigned row = 0; row < mixed.size(); ++row) {
+            const auto result = mixed[row].wait();
+            if (row % 2 == 0)
+                require(result.content == answer + std::to_string(row),
+                        "mixed batch used another row's grammar");
+        }
+        if (options.enable_vision) {
+            auto image_prompt = prompt();
+            ninfer::MessagePart image;
+            image.kind               = ninfer::MessagePartKind::Media;
+            image.media.kind         = ninfer::MediaKind::Image;
+            image.media.media_type   = "image/x-portable-pixmap";
+            image.media.source_name  = "pattern.ppm";
+            const std::string header = "P6\n64 64\n255\n";
+            image.media.bytes.assign(header.begin(), header.end());
+            image.media.bytes.resize(header.size() + 64 * 64 * 3, 42);
+            image_prompt.messages[0].parts.insert(image_prompt.messages[0].parts.begin(),
+                                                  std::move(image));
+            require(engine.generate(engine.prepare(image_prompt), literal(answer)).content ==
+                        answer,
+                    "Vision prefill lost first-token grammar binding");
+        }
+
+        auto truncated                              = literal(std::string(1024, 'a'));
+        truncated.grammar                           = "root ::= \"a\"{1024}";
+        truncated.execution.requested_output_tokens = 2;
+        auto partial = engine.generate(engine.prepare(prompt()), truncated);
+        require(partial.finish_reason == ninfer::FinishReason::OutputLimit &&
+                    !partial.content.empty() &&
+                    partial.content.find_first_not_of('a') == std::string::npos,
+                "length-limited output is not a valid grammar prefix");
+        const auto raw_prompt = engine.tokenize_text("A raw prompt checkpoint. Answer: ");
+        auto seed             = literal("yes");
+        seed.execution.requested_output_tokens = 1;
+        (void)engine.generate(engine.prepare_tokens(raw_prompt), seed);
+        const auto hit = engine.generate(engine.prepare_tokens(raw_prompt), literal("no"));
+        require(hit.content == "no" && hit.reused_prompt_tokens == raw_prompt.size(),
+                "exact prefix hit reused grammar state or bypassed first-token mask");
+        auto raw = engine.generate(engine.prepare_tokens(engine.tokenize_text("Answer: ")),
+                                   literal(answer));
+        require(raw.content == answer, "raw-token prompt did not constrain newly generated bytes");
+
+        // Cross a context profile during generation, then return to short, differently masked
+        // requests. This exercises repeated handoffs and profile changes on the same Program.
+        std::vector<ninfer::TokenId> long_prompt(480, 198);
+        std::string long_answer;
+        for (unsigned i = 0; i < 80; ++i) { long_answer += std::to_string(i) + ":a;"; }
+        auto long_request                              = literal(long_answer);
+        long_request.execution.allow_prefix_reuse      = false;
+        long_request.execution.requested_output_tokens = 500;
+        const auto long_result = engine.generate(engine.prepare_tokens(long_prompt), long_request);
+        require(long_result.content == long_answer, "context profile change lost grammar position");
+        for (const std::string answer_after : {"after-long", "different mask"}) {
+            auto next                         = literal(answer_after);
+            next.execution.allow_prefix_reuse = false;
+            require(engine.generate(engine.prepare(prompt()), next).content == answer_after,
+                    "short request reused a stale draft handoff or mask");
+        }
+
+        auto invalid    = literal("yes");
+        invalid.grammar = "root ::= missing";
+        bool rejected   = false;
+        try {
+            (void)engine.submit(engine.prepare(prompt()), invalid);
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::InvalidGrammar;
+        }
+        require(rejected && engine.is_available(),
+                "invalid grammar was not isolated before admission");
+        require(engine.generate(engine.prepare(prompt()), literal("yes")).content == "yes",
+                "Engine did not remain usable after rejected request");
+        std::cout << "GBNF " << backend << (options.use_cuda_graph ? " graph" : " eager")
+                  << ": content, sampling, thinking, continuation, mixed batch, truncation, raw "
+                     "input passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "GBNF integration: " << error.what() << '\n';
+        return 1;
+    }
+}

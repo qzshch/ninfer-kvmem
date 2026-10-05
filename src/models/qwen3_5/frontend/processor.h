@@ -100,6 +100,7 @@ struct ProcessorOptions {
 
 struct ProcessedInput {
     bool starts_in_reasoning = false;
+    std::string continuation_content;
     std::vector<int> input_ids;
     std::optional<qwen3_5::TokenSpan> retrieval_query;
     std::vector<qwen3_5::TokenSpan> instruction_spans;

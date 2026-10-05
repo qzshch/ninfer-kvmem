@@ -1663,6 +1663,44 @@ public:
         expect_empty("snapshot fact fixture leaked physical resources");
     }
 
+    void grammar_row_failure() {
+        struct Masks final : runtime::TokenMaskProvider {
+            bool constrained(std::size_t row) const noexcept override { return row == 0; }
+
+            std::uint32_t fill(std::size_t, std::span<const TokenId> drafts,
+                               std::span<std::uint32_t> words) override {
+                std::fill(words.begin(), words.end(), 0);
+                const auto stride = words.size() / (drafts.size() + 1);
+                for (std::size_t col = 0; col <= drafts.size(); ++col) words[col * stride] = 1;
+                return 1; // The first predicted position is a real dead end.
+            }
+        } masks;
+
+        auto base        = request(32);
+        const auto first = bind(base, 0);
+        finish_prefill(first, 32, false);
+        const auto second = bind(base, 1);
+        finish_prefill(second, 32, false);
+        const std::array<qwen::SequenceHandle, 2> members{first, second};
+        const std::array<qwen::ExecutionUnit, 2> units{
+            {{first, qwen::ExecutionUnitKind::Decode, 1},
+             {second, qwen::ExecutionUnitKind::Decode, 1}}};
+        require(static_cast<bool>(program_.reserve_units(units)), "grammar mixed unit reservation");
+        const std::array<runtime::RoundBudget, 2> budgets{{{1}, {1}}};
+        auto pending = program_.decode(members, budgets, nullptr, &masks);
+        require(pending.constraint_failed(0) && !pending.constraint_failed(1),
+                "grammar failure lost its row");
+        const std::array<runtime::CommitDecision, 2> decisions{
+            {{.terminal = true, .failed = true}, {.accepted_tokens = 1}}};
+        auto committed = program_.commit(std::move(pending), decisions);
+        require(committed.rows[0].disposition == runtime::CommitDisposition::FailedReleased &&
+                    committed.rows[1].disposition == runtime::CommitDisposition::Active,
+                "grammar failure contaminated a healthy row");
+        require(program_.abort(second).status == runtime::ConsumeStatus::Consumed,
+                "healthy row was released by another row's grammar error");
+        expect_empty("grammar row failure leaked physical resources");
+    }
+
 
 private:
     DeviceContext& device_;
@@ -1699,7 +1737,7 @@ void shared_capture_alignment(DeviceContext& device, const qwen::execution::Para
             {{sequence, qwen::ExecutionUnitKind::Prefill}}};
         require(static_cast<bool>(program.reserve_units(units)),
                 "aligned capture could not reserve its prefill unit");
-        auto step = program.advance_prefill(sequence, nullptr);
+        auto step = program.advance_prefill(sequence, nullptr, nullptr);
         if (step.pending) {
             const std::array<runtime::CommitDecision, 1> accepted{{{.accepted_tokens = 1}}};
             const auto committed = program.commit(std::move(*step.pending), accepted, {}, nullptr);
@@ -1866,7 +1904,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
 
     const auto initial = bind(0, nullptr);
     reserve(initial, qwen::ExecutionUnitKind::Prefill);
-    auto begin = program.advance_prefill(initial, nullptr);
+    auto begin = program.advance_prefill(initial, nullptr, nullptr);
     require(begin.complete && begin.pending && begin.pending->tokens().size() == 1,
             "sampling-count fixture did not produce exactly one Begin token");
     const TokenId first = begin.pending->tokens().front();
@@ -2725,6 +2763,7 @@ int main(int argc, char** argv) {
             fixture.demotion_holder_changes();
             fixture.batched_physical_demotions();
             fixture.physical_facts();
+            fixture.grammar_row_failure();
         }
         program.reset();
         options.kv_capacity    = KvCapacityPolicy::explicit_capacity(kCapacity);

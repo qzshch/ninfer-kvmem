@@ -377,9 +377,16 @@ inline std::string EscapeString(uint8_t raw_char) {
 
 inline std::string EscapeString(std::string raw_str) {
   std::string res;
-  auto codepoints = ParseUTF8(raw_str.c_str(), true);
-  for (auto c : codepoints) {
-    res += EscapeString(c);
+  size_t offset = 0;
+  while (offset < raw_str.size()) {
+    auto [codepoint, length] = ParseNextUTF8(raw_str.c_str() + offset);
+    if (codepoint == CharHandlingError::kInvalidUTF8) {
+      res += EscapeString(static_cast<uint8_t>(raw_str[offset]));
+      ++offset;
+    } else {
+      res += EscapeString(codepoint);
+      offset += static_cast<size_t>(length);
+    }
   }
   return res;
 }

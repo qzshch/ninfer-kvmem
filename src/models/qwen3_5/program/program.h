@@ -268,7 +268,8 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
+          constraint_failed_(other.constraint_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -287,6 +288,10 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
+    [[nodiscard]] bool constraint_failed(std::size_t row) const {
+        return constraint_failed_.at(row);
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -298,6 +303,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> constraint_failed_{};
 
     friend struct detail::ContractAccess;
 };
@@ -469,7 +475,8 @@ public:
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
+                    runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] std::uint32_t packable_prefill_tokens(SequenceHandle sequence) const;
     [[nodiscard]] PrefillBatchProgress
     advance_prefill_batch(std::span<const SequenceHandle> sequences,
@@ -478,7 +485,8 @@ public:
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing = nullptr);
+                                      runtime::ExecutionTiming* failed_timing = nullptr,
+                                      runtime::TokenMaskProvider* masks       = nullptr);
     // Forced control contributes to counts once. Replay does not call this operation.
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,

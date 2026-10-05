@@ -9,6 +9,8 @@
 
 #include <cstdint>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -259,6 +261,15 @@ int main(int argc, char** argv) {
         input.options.reasoning_effort = cli.reasoning_effort;
 
         ninfer::RequestOptions request;
+        if (!cli.grammar_path.empty()) {
+            std::ifstream file(cli.grammar_path, std::ios::binary);
+            if (!file) {
+                throw std::invalid_argument("cannot open grammar file: " +
+                                            cli.grammar_path.string());
+            }
+            request.grammar = std::string(std::istreambuf_iterator<char>(file), {});
+            if (file.bad()) { throw std::runtime_error("failed to read grammar file"); }
+        }
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;

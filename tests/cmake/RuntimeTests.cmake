@@ -17,3 +17,7 @@ ninfer_add_test(ninfer_kv_capacity_test
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+
+ninfer_add_test(ninfer_grammar_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_grammar.cpp"
+  LIBRARIES ninfer_grammar)

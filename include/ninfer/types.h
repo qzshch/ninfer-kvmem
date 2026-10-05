@@ -196,6 +196,7 @@ struct KvmemDiagnostics {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
@@ -310,6 +311,8 @@ struct OutputOptions {
 };
 
 struct RequestOptions {
+    // GBNF constrains generated content. Chat reasoning retains the model's framing.
+    std::optional<std::string> grammar;
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
@@ -533,6 +536,8 @@ struct PromptInput {
 };
 
 enum class RequestErrorKind : std::uint8_t {
+    InvalidGrammar,
+    ConstraintDeadEnd,
     ContextLengthExceeded,
     ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,

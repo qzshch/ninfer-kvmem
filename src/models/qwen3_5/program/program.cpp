@@ -256,8 +256,9 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
-PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t) {
-    return impl_->advance_prefill(h, t);
+PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
+                                         runtime::TokenMaskProvider* m) {
+    return impl_->advance_prefill(h, t, m);
 }
 
 std::uint32_t Program::packable_prefill_tokens(SequenceHandle h) const {
@@ -274,8 +275,9 @@ ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTimin
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> s,
-                             std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t) {
-    return impl_->decode(s, b, t);
+                             std::span<const runtime::RoundBudget> b, runtime::ExecutionTiming* t,
+                             runtime::TokenMaskProvider* m) {
+    return impl_->decode(s, b, t, m);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(

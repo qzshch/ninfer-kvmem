@@ -1068,6 +1068,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                         result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

@@ -283,34 +283,29 @@ int test_prompt_cache_boundaries() {
 }
 
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
-        {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
-        {"guided_json", Json{{"type", "object"}}},
-        {"guided_regex", "[a-z]+"},
-        {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
-    };
-    for (const auto& [field, value] : active) {
-        Json body            = base_request();
-        body[field]          = value;
-        const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.find(field) != std::string::npos,
-                  std::string(field) + " constrained decoding is explicitly rejected");
+    int failures               = 0;
+    Json body                  = base_request();
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
+    const auto parsed          = parse(body);
+    failures += check(parsed.generation.grammar == "root ::= \"yes\" | \"no\"" &&
+                          options(parsed.generation).grammar == parsed.generation.grammar,
+                      "GBNF must survive protocol-to-Engine translation");
+    body["stop"] = "yes";
+    failures += check(api_error([&] { (void)parse(body); }).param == "structured_outputs.grammar",
+                      "grammar with custom stops accepted");
+    for (const auto& value : {Json{{"grammar", ""}}, Json{{"json", Json::object()}}, Json("bad")}) {
+        body                       = base_request();
+        body["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                          "malformed structured_outputs accepted");
     }
-
-    Json neutral                  = base_request();
-    neutral["grammar"]            = "";
-    neutral["structured_outputs"] = nullptr;
-    neutral["guided_json"]        = nullptr;
-    neutral["guided_regex"]       = nullptr;
-    neutral["guided_choice"]      = nullptr;
-    neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
-                      "neutral constrained-decoding extension values are accepted");
+    for (const char* alias :
+         {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
+        body        = base_request();
+        body[alias] = "root ::= \"yes\"";
+        failures += check(api_error([&] { (void)parse(body); }).param == alias,
+                          "unsupported constrained-decoding alias accepted");
+    }
     return failures;
 }
 

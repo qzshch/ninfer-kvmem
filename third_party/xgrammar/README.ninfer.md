@@ -4,9 +4,12 @@ This implementation originates from [XGrammar](https://github.com/mlc-ai/xgramma
 commit [`3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0`](https://github.com/mlc-ai/xgrammar/commit/3641b5c21e70a6c5515ad9eca24fcbee21ee6ad0),
 under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-The imported CPU sources and headers are unchanged. NInfer owns the CMake target and will maintain
-its adaptations here, adopting upstream changes selectively. Python/TVM bindings, GPU kernels,
+NInfer owns the CMake target and maintains its adaptations here, adopting upstream changes
+selectively. Cold compilation is limited to two concurrent callers per compiler; the adapter
+uses one caller thread per compile, without creating a thread pool. Python/TVM bindings, GPU kernels,
 Web code, upstream tests and build machinery are excluded.
+
+Grammar string escaping preserves embedded NUL bytes, including in compilation cache keys.
 
 The CPU dependency closure includes Lark and all format converters referenced by the shared
 factories. `cpp/testing.cc` also supplies token-formatting diagnostics used by the matcher and

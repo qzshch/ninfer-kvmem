@@ -46,6 +46,19 @@ Changes to the file take effect after restarting NInfer:
   --chat-template tools/chat_templates/qwen3_8.jinja --prompt "Hello"
 ```
 
+`--grammar-file FILE` constrains the answer with a GBNF grammar whose entry rule is `root`:
+
+```bash
+printf 'root ::= "yes" | "no"\n' > answer.gbnf
+./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+  --prompt "Is 17 prime?" --no-thinking --grammar-file answer.gbnf --max-new 64
+```
+
+GBNF supports recursive rules, Unicode character classes and repetition. It works with ordinary
+decoding, MTP, DFlash and DFlash2. Thinking may precede the constrained answer; an output limit or
+cancellation can leave the answer incomplete. Custom stops and `--raw-output` cannot be combined
+with a grammar.
+
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
 `--reasoning-effort none` requests disabled thinking; other effort values cannot be combined with
 `--no-thinking`. The template interprets the selected effort. `--greedy` selects exact argmax

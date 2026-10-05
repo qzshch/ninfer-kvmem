@@ -125,14 +125,26 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes JSON response formats, nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+GBNF constrained decoding is available through the NInfer extension `structured_outputs.grammar`
+on Chat Completions, Responses and Anthropic Messages:
+
+```json
+{"structured_outputs": {"grammar": "root ::= \"yes\" | \"no\""}}
+```
+
+The grammar constrains answer content; thinking is separate. It supports recursive rules, Unicode,
+repetition, streaming and all speculative backends. For assistant continuation, the grammar covers
+the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
+output limits and cancellation can produce an incomplete answer. Active tools and custom stops
+cannot be combined with a grammar; `tool_choice:"none"` is allowed. OpenAI errors use
+`invalid_grammar` for invalid grammars and `constraint_dead_end` for a reachable prefix without a
+legal next token. Anthropic reports these through its `invalid_request_error` envelope.
+The `grammar` and `guided_*` aliases are not accepted.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,

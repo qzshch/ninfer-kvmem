@@ -163,6 +163,22 @@ struct DecodeGraphTopology {
 struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;
     std::vector<DecodeGraphTopology> topologies;
+    DecodeGraphProfile& select(std::uint32_t batch_size, std::uint32_t frontier);
+    DecodeGraphExecutable& install(DecodeGraphProfile& profile);
+};
+
+// A Forward stage publishes these IDs before target execution finishes. Program owns the
+// pinned storage and external event together; both outlive the graphs that reference them.
+struct DFlashDraftHandoff {
+    PinnedHostBuffer ids;
+    CudaCompletionEvent ready;
+
+    DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
+        : ids(count * sizeof(TokenId)), ready(device) {}
+
+    [[nodiscard]] std::span<TokenId> tokens() const noexcept {
+        return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
+    }
 };
 
 struct KvmemLaneState {
@@ -361,14 +377,15 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
 
-    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
+                                                  runtime::TokenMaskProvider*);
     [[nodiscard]] std::uint32_t packable_prefill_tokens(SequenceHandle) const;
     [[nodiscard]] PrefillBatchProgress advance_prefill_batch(std::span<const SequenceHandle>,
                                                              runtime::ExecutionTiming*);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
-                                      runtime::ExecutionTiming*);
+                                      runtime::ExecutionTiming*, runtime::TokenMaskProvider*);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t,
                          std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
@@ -455,6 +472,13 @@ public:
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    Tensor grammar_masks_device;
+    std::optional<PinnedHostBuffer> grammar_masks_host;
+    std::optional<DFlashDraftHandoff> dflash_draft_handoff;
+    std::array<std::uint32_t, kMaximumConcurrency> grammar_dead_positions{};
+    ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
+                                        std::span<const TokenId> drafts);
     Tensor token_counts;
 
     VisionHandoffState vision_handoff;
@@ -462,10 +486,6 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::vector<CheckpointSlot> checkpoints;
-
-    DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily mtp_graphs;
-    DecodeGraphFamily dflash_graphs;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -566,6 +586,12 @@ public:
     std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 
+    // Captured transfers and external events reference the buffers and events declared above.
+    // Families are destroyed first, including when startup throws.
+    DecodeGraphFamily ordinary_graphs;
+    DecodeGraphFamily speculative_forward_graphs;
+    DecodeGraphFamily speculative_finish_graphs;
+
     [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
     [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
                                           std::uint32_t mtp_extent) const;
@@ -641,7 +667,8 @@ public:
                                      std::uint64_t) const;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_raw(std::span<const std::uint32_t>,
                                                             std::span<const runtime::RoundBudget>,
-                                                            runtime::ExecutionTiming*);
+                                                            runtime::ExecutionTiming*,
+                                                            runtime::TokenMaskProvider*);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
@@ -665,17 +692,16 @@ public:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
-    [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                          std::span<const runtime::RoundBudget> budgets,
-                          runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
+        std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets,
-                     runtime::ExecutionTiming* failed_timing);
+                     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing);
+                        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
 };
 } // namespace ninfer::models::qwen3_5::detail
