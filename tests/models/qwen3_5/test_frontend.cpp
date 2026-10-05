@@ -2061,7 +2061,7 @@ int test_constrained_thinking_control(const Frontend& frontend) {
     const auto bare_close = frontend.tokenize_text("</think>");
     auto session          = frontend.make_output_session(
         prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
-        "root ::= \" yes\"");
+        ninfer::OutputConstraint::grammar("root ::= \" yes\""));
     const auto decision = session.preview_model(bare_close, 512, ninfer::FinishReason::OutputLimit);
     int failures =
         check(decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,

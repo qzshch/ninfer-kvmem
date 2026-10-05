@@ -324,7 +324,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 16, "report schema v16");
+    failures += expect(report.at("schema_version") == 17, "report schema v17");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -436,7 +436,7 @@ int test_constrained_batch_metrics() {
     failures += expect(report["tests"][0]["reps"][1]["row"] == 1,
                        "report retains concurrent request identity");
     failures += expect_throws<std::invalid_argument>(
-        [] { (void)parse_for_test({"bench", "--weights", "model.ninfer", "--mixed-grammar"}); },
+        [] { (void)parse_for_test({"bench", "--weights", "model.ninfer", "--mixed-constraints"}); },
         "mixed grammar needs a grammar and multiple requests");
     return failures;
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -36,7 +38,7 @@ public:
     GrammarCompiler(std::vector<std::string> vocabulary, std::vector<std::int32_t> eos,
                     std::size_t cache_bytes);
     ~GrammarCompiler();
-    [[nodiscard]] std::unique_ptr<GrammarSession> compile(const std::string& source,
+    [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           std::string_view reasoning_close,
                                                           std::string_view continuation);
 

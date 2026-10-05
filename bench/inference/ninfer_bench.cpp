@@ -61,8 +61,9 @@ bool has_decode_tests(const std::vector<ninfer::bench::BenchTest>& tests) {
     return false;
 }
 
-ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test,
-                                         const std::string& grammar) {
+ninfer::RequestOptions
+benchmark_request(const ninfer::bench::BenchTest& test,
+                  const std::optional<ninfer::OutputConstraint>& constraint) {
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
     options.execution.allow_prefix_reuse      = false;
@@ -70,8 +71,8 @@ ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test,
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
     options.output.preserve_special_tokens    = true;
-    if (!grammar.empty()) {
-        options.grammar                        = grammar;
+    if (constraint) {
+        options.constraint                     = constraint;
         options.stop.include_model_defaults    = true;
         options.output.raw                     = false;
         options.output.preserve_special_tokens = false;
@@ -98,16 +99,19 @@ void run_repetition(ninfer::Engine& engine, const ninfer::bench::BenchEnvironmen
     }
     const auto started = std::chrono::steady_clock::now();
     for (std::uint32_t row = 0; row < env.concurrency; ++row) {
-        const bool constrained = !env.grammar.empty() && (!env.mixed_grammar || row % 2 == 0);
-        handles.push_back(engine.submit(std::move(prompts[row]),
-                                        benchmark_request(test, constrained ? env.grammar : "")));
+        const bool constrained =
+            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
+        handles.push_back(
+            engine.submit(std::move(prompts[row]),
+                          benchmark_request(test, constrained ? env.constraint : std::nullopt)));
     }
     for (auto& handle : handles) { generated.push_back(handle.wait()); }
     const double wall_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     for (std::uint32_t row = 0; row < env.concurrency; ++row) {
         auto& result           = generated[row];
-        const bool constrained = !env.grammar.empty() && (!env.mixed_grammar || row % 2 == 0);
+        const bool constrained =
+            env.constraint.has_value() && (!env.mixed_constraints || row % 2 == 0);
         const auto count       = static_cast<std::uint32_t>(result.generated_token_ids.size());
         const bool at_limit    = result.finish_reason == ninfer::FinishReason::OutputLimit &&
                               count == test.requested_output_tokens();
@@ -208,15 +212,20 @@ int main(int argc, char** argv) {
         env.corpus_path              = options.corpus_path;
         env.corpus_tokens            = corpus.size();
         env.concurrency              = options.concurrency;
-        env.grammar_file             = options.grammar_file;
-        env.mixed_grammar            = options.mixed_grammar;
-        if (!options.grammar_file.empty()) {
-            std::ifstream input(options.grammar_file, std::ios::binary);
-            if (!input) {
-                throw std::runtime_error("cannot read grammar: " + options.grammar_file);
+        env.constraint_file          = options.constraint_file;
+        env.mixed_constraints        = options.mixed_constraints;
+        if (options.constraint_kind) {
+            if (*options.constraint_kind == ninfer::OutputConstraintKind::JsonObject) {
+                env.constraint = ninfer::OutputConstraint::json_object();
+            } else {
+                std::ifstream input(options.constraint_file, std::ios::binary);
+                if (!input)
+                    throw std::runtime_error("cannot read constraint: " + options.constraint_file);
+                std::string source(std::istreambuf_iterator<char>(input), {});
+                if (input.bad()) throw std::runtime_error("failed to read constraint file");
+                env.constraint =
+                    ninfer::OutputConstraint{*options.constraint_kind, std::move(source)};
             }
-            env.grammar.assign(std::istreambuf_iterator<char>(input), {});
-            if (env.grammar.empty()) { throw std::invalid_argument("grammar file is empty"); }
         }
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =

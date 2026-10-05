@@ -10,6 +10,11 @@ uses one caller thread per compile, without creating a thread pool. Python/TVM b
 Web code, upstream tests and build machinery are excluded.
 
 Grammar string escaping preserves embedded NUL bytes, including in compilation cache keys.
+The prepared-grammar cache shares one budget and single-flight mechanism across GBNF and JSON;
+its miss factory covers validation, conversion and output framing within the cold-compile limit.
+JSON adaptations preserve literal data in cache keys, reject unsupported unions, resolve local
+JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
+Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
 
 The CPU dependency closure includes Lark and all format converters referenced by the shared
 factories. `cpp/testing.cc` also supplies token-formatting diagnostics used by the matcher and

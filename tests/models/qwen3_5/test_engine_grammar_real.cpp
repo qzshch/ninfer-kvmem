@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -22,7 +23,8 @@ ninfer::PromptInput prompt(bool thinking = false) {
 
 ninfer::RequestOptions literal(const std::string& answer, float temperature = 0.0f) {
     ninfer::RequestOptions request;
-    request.grammar                           = "root ::= " + nlohmann::json(answer).dump();
+    request.constraint =
+        ninfer::OutputConstraint::grammar("root ::= " + nlohmann::json(answer).dump());
     request.execution.requested_output_tokens = 160;
     request.execution.sampling.temperature    = temperature;
     request.execution.sampling.top_k          = 20;
@@ -148,7 +150,7 @@ int main(int argc, char** argv) {
         }
 
         auto truncated                              = literal(std::string(1024, 'a'));
-        truncated.grammar                           = "root ::= \"a\"{1024}";
+        truncated.constraint = ninfer::OutputConstraint::grammar("root ::= \"a\"{1024}");
         truncated.execution.requested_output_tokens = 2;
         auto partial = engine.generate(engine.prepare(prompt()), truncated);
         require(partial.finish_reason == ninfer::FinishReason::OutputLimit &&
@@ -183,8 +185,90 @@ int main(int argc, char** argv) {
                     "short request reused a stale draft handoff or mask");
         }
 
+        // JSON entry points use the same tokenizer, row mapping and transaction path as GBNF.
+        const nlohmann::ordered_json schema = {
+            {"type", "object"},
+            {"properties",
+             {{"description", {{"type", "string"}, {"enum", {"你好", "code"}}}},
+              {"values",
+               {{"type", "array"},
+                {"items", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}}},
+                {"minItems", 2},
+                {"maxItems", 2}}}}},
+            {"required", {"description", "values"}},
+            {"additionalProperties", false}};
+        auto json_request       = literal("unused", 0.8f);
+        json_request.constraint = ninfer::OutputConstraint::json_schema(schema.dump());
+        const auto record       = [&](const nlohmann::ordered_json& spec,
+                                const ninfer::GenerationResult& value) {
+            require(value.finish_reason == ninfer::FinishReason::StopToken,
+                          "JSON generation was truncated");
+            require(nlohmann::json::accept(value.content), "JSON output is not parseable");
+            if (const char* report = std::getenv("NINFER_TEST_SCHEMA_REPORT")) {
+                std::ofstream file(report, std::ios::app);
+                file << nlohmann::ordered_json{{"schema", spec}, {"content", value.content}}.dump()
+                     << '\n';
+                require(bool(file), "could not record schema validation output");
+            }
+        };
+        const auto structured = engine.generate(engine.prepare(prompt()), json_request);
+        record(schema, structured);
+        const auto parsed = nlohmann::json::parse(structured.content);
+        require(parsed.size() == 2 && parsed.contains("description") &&
+                    parsed["values"].size() == 2,
+                "schema fields missing");
+        auto json_thinking                      = json_request;
+        json_thinking.execution.thinking.budget = 2;
+        record(schema, engine.generate(engine.prepare(prompt(true)), json_thinking));
+        auto json_prompt                      = prompt();
+        json_prompt.messages[0].parts[0].text = "Return exactly the JSON object {\"ok\":true}.";
+        auto object_request                   = json_request;
+        object_request.constraint             = ninfer::OutputConstraint::json_object();
+        object_request.execution.sampling.temperature = 0;
+        record({{"type", "object"}}, engine.generate(engine.prepare(json_prompt), object_request));
+
+        const auto fixed  = nlohmann::ordered_json{{"const", {{"text", "你好\n"}, {"n", 2}}}};
+        auto continuation = prompt();
+        continuation.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        continuation.context_cache.session_key.reset();
+        const std::string json_prefix = "{\"text\":";
+        continuation.messages.push_back(
+            {.role  = ninfer::ChatRole::Assistant,
+             .parts = {{.kind = ninfer::MessagePartKind::Text, .text = json_prefix}}});
+        auto fixed_request       = json_request;
+        fixed_request.constraint = ninfer::OutputConstraint::json_schema(fixed.dump());
+        auto continued_json      = engine.generate(engine.prepare(continuation), fixed_request);
+        continued_json.content   = json_prefix + continued_json.content;
+        record(fixed, continued_json);
+        auto changed       = json_request;
+        changed.constraint = ninfer::OutputConstraint::json_schema(R"({"const":{"changed":true}})");
+        const auto changed_result = engine.generate(engine.prepare(prompt()), changed);
+        record({{"const", {{"changed", true}}}}, changed_result);
+        require(changed_result.reused_prompt_tokens > 0,
+                "schema switch did not exercise prefix reuse");
+
+        std::vector<ninfer::GenerationHandle> json_batch;
+        for (unsigned row = 0; row < options.max_concurrency; ++row) {
+            auto selected = row % 3 == 0 ? json_request : row % 3 == 1 ? object_request : free;
+            json_batch.push_back(engine.submit(engine.prepare(json_prompt), selected));
+        }
+        for (unsigned row = 0; row < json_batch.size(); ++row) {
+            const auto value = json_batch[row].wait();
+            if (row % 3 == 0)
+                record(schema, value);
+            else if (row % 3 == 1)
+                record({{"type", "object"}}, value);
+        }
+        auto limited       = json_request;
+        limited.constraint = ninfer::OutputConstraint::json_schema(
+            R"({"type":"array","items":{"const":"word"},"minItems":128,"maxItems":128})");
+        limited.execution.requested_output_tokens = 2;
+        require(engine.generate(engine.prepare(prompt()), limited).finish_reason ==
+                    ninfer::FinishReason::OutputLimit,
+                "JSON truncation was reported as normal completion");
+
         auto invalid    = literal("yes");
-        invalid.grammar = "root ::= missing";
+        invalid.constraint = ninfer::OutputConstraint::grammar("root ::= missing");
         bool rejected   = false;
         try {
             (void)engine.submit(engine.prepare(prompt()), invalid);
@@ -195,9 +279,9 @@ int main(int argc, char** argv) {
                 "invalid grammar was not isolated before admission");
         require(engine.generate(engine.prepare(prompt()), literal("yes")).content == "yes",
                 "Engine did not remain usable after rejected request");
-        std::cout << "GBNF " << backend << (options.use_cuda_graph ? " graph" : " eager")
+        std::cout << "constraints " << backend << (options.use_cuda_graph ? " graph" : " eager")
                   << ": content, sampling, thinking, continuation, mixed batch, truncation, raw "
-                     "input passed\n";
+                     "input, JSON/schema passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "GBNF integration: " << error.what() << '\n';

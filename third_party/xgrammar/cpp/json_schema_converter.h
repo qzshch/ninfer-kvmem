@@ -70,6 +70,7 @@ struct NullSpec {
 };
 
 struct AnySpec {
+  bool allowed = true;
   std::string ToString() const;
 };
 
@@ -503,6 +504,7 @@ class JSONSchemaConverter {
 
   GrammarBuilder builder_;
   IndentManager indent_manager_;
+  std::string comma_separator_;
   int32_t colon_expr_id_;
   bool any_whitespace_;
   std::optional<int> max_whitespace_cnt_;
@@ -533,13 +535,6 @@ class JSONSchemaConverter {
 
   std::unordered_map<std::string, int32_t> uri_to_rule_id_;  // For circular reference handling
   RefResolver ref_resolver_;  // Resolves $ref URI to SchemaSpecPtr at generate time
-
-  // Trie over property names, for key patterns that exclude specific properties
-  struct TrieNode {
-    bool is_terminal = false;
-    std::map<uint8_t, TrieNode> children;
-  };
-  int32_t BuildTrieBody(const TrieNode& node, const std::string& rule_name);
 
   // Reused grammar expression ids
   std::optional<int32_t> empty_expr_id_;

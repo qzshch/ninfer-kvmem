@@ -1028,6 +1028,7 @@ class GrammarCompilerSub {
         rule_level_cache_(rule_level_cache) {}
 
   CompiledGrammar CompileBuiltinJSONGrammar();
+  CompiledGrammar CompilePreparedGrammar(const std::function<Grammar()>& factory);
 
   CompiledGrammar CompileJSONSchema(
       const std::string& schema,
@@ -1054,6 +1055,12 @@ class GrammarCompilerSub {
  private:
   /*! \brief The main logic. Compile the grammar with multi-threading. */
   CompiledGrammar MultiThreadCompileGrammar(Grammar grammar);
+  CompiledGrammar CompileImpl(Grammar grammar);
+  struct Permit {
+    std::counting_semaphore<2>& slots;
+    explicit Permit(std::counting_semaphore<2>& value) : slots(value) { slots.acquire(); }
+    ~Permit() { slots.release(); }
+  };
   /*! \brief Optimization for TagDispatch.
    *  \param compiled_grammar_impl the compiled_grammar to be optimized.
    *  \param tag_dispatch_rule_id_to_second_slicing_bitset Return value. Mapping from the rule_id to
@@ -1100,11 +1107,17 @@ static void CheckTokenIdsInVocab(const Grammar& grammar, int vocab_size) {
 }
 
 CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_unoptimized) {
-  struct Permit {
-    std::counting_semaphore<2>& slots;
-    explicit Permit(std::counting_semaphore<2>& value) : slots(value) { slots.acquire(); }
-    ~Permit() { slots.release(); }
-  } permit(compilation_slots_);
+  Permit permit(compilation_slots_);
+  return CompileImpl(std::move(grammar_unoptimized));
+}
+
+CompiledGrammar GrammarCompilerSub::CompilePreparedGrammar(
+    const std::function<Grammar()>& factory) {
+  Permit permit(compilation_slots_);
+  return CompileImpl(factory());
+}
+
+CompiledGrammar GrammarCompilerSub::CompileImpl(Grammar grammar_unoptimized) {
   auto compiled_grammar_impl = std::make_shared<CompiledGrammar::Impl>();
   compiled_grammar_impl->grammar = GrammarOptimizer::Apply(grammar_unoptimized);
   compiled_grammar_impl->tokenizer_info = tokenizer_info_;
@@ -1368,12 +1381,17 @@ class GrammarCompilerCacheKeys {
     XGRAMMAR_EQUAL_BY_MEMBERS(LarkKey, &LarkKey::lark_string, &LarkKey::named_grammars);
   };
 
+  struct PreparedGrammarKey {
+    std::string identity;
+    XGRAMMAR_EQUAL_BY_MEMBERS(PreparedGrammarKey, &PreparedGrammarKey::identity);
+  };
+
   struct BuiltinJSONGrammarKey {
     XGRAMMAR_EQUAL_BY_MEMBERS_EMPTY(BuiltinJSONGrammarKey);
   };
 
-  using UnionKey = std::
-      variant<SchemaKey, StructuralTagKey, GrammarKey, RegexKey, LarkKey, BuiltinJSONGrammarKey>;
+  using UnionKey = std::variant<SchemaKey, StructuralTagKey, GrammarKey, RegexKey, LarkKey,
+                                BuiltinJSONGrammarKey, PreparedGrammarKey>;
 };
 
 }  // namespace xgrammar
@@ -1429,6 +1447,8 @@ struct hash<xgrammar::GrammarCompilerCacheKeys::LarkKey> {
 }  // namespace std
 
 XGRAMMAR_HASH_BY_MEMBERS_EMPTY(xgrammar::GrammarCompilerCacheKeys::BuiltinJSONGrammarKey);
+XGRAMMAR_HASH_BY_MEMBERS(xgrammar::GrammarCompilerCacheKeys::PreparedGrammarKey,
+                         &xgrammar::GrammarCompilerCacheKeys::PreparedGrammarKey::identity);
 
 namespace xgrammar {
 
@@ -1467,6 +1487,13 @@ class GrammarCompiler::Impl {
   }
 
   CompiledGrammar CompileBuiltinJSONGrammar();
+  CompiledGrammar CompileCachedGrammar(const std::string& key,
+                                       const std::function<Grammar()>& factory) {
+    if (!cache_enabled_) return no_cache_compiler_.CompilePreparedGrammar(factory);
+    return grammar_level_cache_.Get(
+        GrammarCompilerCacheKeys::PreparedGrammarKey{key},
+        [&](const auto&) { return no_cache_compiler_.CompilePreparedGrammar(factory); });
+  }
 
   CompiledGrammar CompileJSONSchema(
       const std::string& schema,
@@ -1741,4 +1768,8 @@ int64_t GrammarCompiler::GetCacheSizeBytes() const { return pimpl_->GetCacheSize
 
 int64_t GrammarCompiler::CacheLimitBytes() const { return pimpl_->CacheLimitBytes(); }
 
+CompiledGrammar GrammarCompiler::CompileCachedGrammar(const std::string& key,
+                                                      const std::function<Grammar()>& factory) {
+  return pimpl_->CompileCachedGrammar(key, factory);
+}
 }  // namespace xgrammar

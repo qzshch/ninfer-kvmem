@@ -21,3 +21,13 @@ ninfer_add_test(ninfer_sampling_defaults_test
 ninfer_add_test(ninfer_grammar_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_grammar.cpp"
   LIBRARIES ninfer_grammar)
+
+
+ninfer_add_test(ninfer_json_schema_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_json_schema.cpp"
+  LIBRARIES ninfer_grammar ninfer::json)
+
+add_test(NAME ninfer_json_schema_oracle_test
+  COMMAND ${CMAKE_COMMAND} -E env
+    "NINFER_SCHEMA_PROBE=$<TARGET_FILE:ninfer_json_schema_test>"
+    ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_json_schema.py)

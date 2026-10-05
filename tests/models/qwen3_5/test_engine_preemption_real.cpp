@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -63,12 +64,23 @@ ninfer::RequestOptions request(std::uint32_t outputs) {
     options.execution.allow_prefix_reuse      = false;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
-    if (setting("NINFER_TEST_GRAMMAR", "0") == "1") {
+    if (setting("NINFER_TEST_CONSTRAINT", "none") != "none") {
         std::string source = "root ::= ";
         for (char c = 'a'; c <= 'z'; ++c) {
             source += "\"" + std::string(1, c) + "\"{" + std::to_string(17 + c - 'a') + "} ";
         }
-        options.grammar                     = source + "\"z\"{65536}";
+        if (setting("NINFER_TEST_CONSTRAINT", "none") == "json_schema") {
+            std::string pattern = "^";
+            for (char c = 'a'; c <= 'z'; ++c)
+                pattern += std::string(1, c) + "{" + std::to_string(17 + c - 'a') + "}";
+            pattern += "z{65536}$";
+            options.constraint = ninfer::OutputConstraint::json_schema(
+                nlohmann::json{{"type", "string"}, {"pattern", pattern}}.dump());
+        } else {
+            require(setting("NINFER_TEST_CONSTRAINT", "none") == "grammar",
+                    "unknown test constraint");
+            options.constraint = ninfer::OutputConstraint::grammar(source + "\"z\"{65536}");
+        }
         options.stop.include_model_defaults = true;
         options.output.raw                  = false;
     }
@@ -189,8 +201,11 @@ public:
                                      result.finish_reason == ninfer::FinishReason::OutputLimit),
                 "resumed request did not honor its original output budget");
         // Compare only the two publication views of this request, never different math paths.
-        if (setting("NINFER_TEST_GRAMMAR", "0") == "1") {
-            const auto expected = grammar_prefix();
+        if (setting("NINFER_TEST_CONSTRAINT", "none") != "none") {
+            const auto expected =
+                (setting("NINFER_TEST_CONSTRAINT", "none") == "json_schema" ? std::string("\"")
+                                                                            : std::string{}) +
+                grammar_prefix();
             require(!content_.empty() && reasoning_.empty() &&
                         (content_.size() <= expected.size()
                              ? expected.starts_with(content_)

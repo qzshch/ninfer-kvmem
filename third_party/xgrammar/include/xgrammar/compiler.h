@@ -11,6 +11,7 @@
 #include <xgrammar/tokenizer_info.h>
 
 #include <cstddef>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -84,6 +85,11 @@ class GrammarCompiler {
 
   /*! \brief Get the compiled grammar for pure JSON. */
   CompiledGrammar CompileBuiltinJSONGrammar();
+
+  // Build and compile on a cache miss; the caller's key describes the complete source and
+  // composition. The factory runs synchronously and is never retained by the cache.
+  CompiledGrammar CompileCachedGrammar(const std::string& key,
+                                       const std::function<Grammar()>& factory);
 
   /*!
    * \brief Get the compiled grammar for a Lark grammar string.

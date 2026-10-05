@@ -15,6 +15,19 @@
 
 namespace ninfer::bench {
 namespace {
+std::string_view constraint_name(const std::optional<OutputConstraint>& constraint) {
+    if (!constraint) return "none";
+    switch (constraint->kind) {
+    case OutputConstraintKind::Grammar:
+        return "grammar";
+    case OutputConstraintKind::JsonObject:
+        return "json_object";
+    case OutputConstraintKind::JsonSchema:
+        return "json_schema";
+    }
+    throw std::logic_error("unknown output constraint");
+}
+
 
 int parse_int(std::string_view text, const char* label) {
     if (text.empty()) { throw std::invalid_argument(std::string(label) + " is empty"); }
@@ -292,7 +305,10 @@ std::string usage_text(std::string_view program) {
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
         << "  --concurrency <1..8>       simultaneous requests per repetition (default: 1)\n"
         << "  --grammar-file <path>      constrain output with GBNF\n"
-        << "  --mixed-grammar            apply grammar to alternate requests; requires concurrency "
+        << "  --json-object              constrain output to a JSON object\n"
+        << "  --json-schema-file <path>  constrain output with JSON Schema\n"
+        << "  --mixed-constraints        apply constraints to alternate requests; requires "
+           "concurrency "
            ">= 2\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
@@ -325,7 +341,7 @@ BenchOptions parse_args(int argc, char** argv) {
     bool saw_artifact = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
-        auto value = [&](const char* flag) -> std::string {
+        auto value = [&](std::string_view flag) -> std::string {
             if (i + 1 >= argc) {
                 throw std::invalid_argument(std::string(flag) + " requires value");
             }
@@ -342,10 +358,17 @@ BenchOptions parse_args(int argc, char** argv) {
             options.corpus_path = value("--corpus");
         } else if (arg == "--concurrency") {
             options.concurrency = parse_u32(value("--concurrency"), "concurrency");
-        } else if (arg == "--grammar-file") {
-            options.grammar_file = value("--grammar-file");
-        } else if (arg == "--mixed-grammar") {
-            options.mixed_grammar = true;
+        } else if (arg == "--grammar-file" || arg == "--json-schema-file" ||
+                   arg == "--json-object") {
+            if (options.constraint_kind)
+                throw std::invalid_argument("select only one output constraint");
+            options.constraint_kind = arg == "--grammar-file" ? OutputConstraintKind::Grammar
+                                      : arg == "--json-schema-file"
+                                          ? OutputConstraintKind::JsonSchema
+                                          : OutputConstraintKind::JsonObject;
+            if (arg != "--json-object") options.constraint_file = value(arg);
+        } else if (arg == "--mixed-constraints") {
+            options.mixed_constraints = true;
         } else if (arg == "-p" || arg == "--n-prompt") {
             auto parsed = parse_int_list(value("--n-prompt"), "n-prompt");
             options.n_prompt.insert(options.n_prompt.end(), parsed.begin(), parsed.end());
@@ -398,8 +421,9 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--concurrency must be in [1,8]");
     }
-    if (options.mixed_grammar && (options.grammar_file.empty() || options.concurrency < 2)) {
-        throw std::invalid_argument("--mixed-grammar requires --grammar-file and concurrency >= 2");
+    if (options.mixed_constraints && (!options.constraint_kind || options.concurrency < 2)) {
+        throw std::invalid_argument(
+            "--mixed-constraints requires an output constraint and concurrency >= 2");
     }
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
@@ -626,9 +650,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " concurrency=" << env.concurrency
-        << " grammar=" << (env.grammar_file.empty() ? "none" : env.grammar_file)
-        << (env.mixed_grammar ? " (mixed)" : "") << " kv_cache=" << kv_cache_name(env.kv_cache)
+        << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
+        << (env.mixed_constraints ? " (mixed)" : "") << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
         << " draft_tokens=" << env.speculative.draft_tokens
         << " proposal_head=" << proposal_head_name(env.speculative.proposal_head)
@@ -745,9 +768,11 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"concurrency\": " << env.concurrency << ",\n"
-        << "    \"grammar_file\": \"" << json_escape(env.grammar_file) << "\",\n"
-        << "    \"grammar\": \"" << json_escape(env.grammar) << "\",\n"
-        << "    \"mixed_grammar\": " << (env.mixed_grammar ? "true" : "false") << ",\n"
+        << "    \"constraint_file\": \"" << json_escape(env.constraint_file) << "\",\n"
+        << "    \"constraint_type\": \"" << constraint_name(env.constraint) << "\",\n"
+        << "    \"constraint_source\": \""
+        << json_escape(env.constraint ? env.constraint->source : "") << "\",\n"
+        << "    \"mixed_constraints\": " << (env.mixed_constraints ? "true" : "false") << ",\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
@@ -845,7 +870,7 @@ std::string csv_field(std::string_view value) {
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,architecture,prefill_signature,model_name,artifact_path,max_"
-           "context,prefill_chunk,concurrency,grammar_file,mixed_grammar,"
+           "context,prefill_chunk,concurrency,constraint_type,constraint_file,mixed_constraints,"
            "speculative_"
            "backend,draft_tokens,"
            "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
@@ -874,9 +899,9 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.architecture
             << ',' << env.load.prefill_signature << ',' << csv_field(env.load.model_name) << ','
             << csv_field(env.artifact_path) << ',' << env.max_context << ',' << env.prefill_chunk
-            << ',' << env.concurrency << ',' << csv_field(env.grammar_file) << ','
-            << (env.mixed_grammar ? "true" : "false") << ','
-            << product::speculative_backend_name(env.speculative.backend) << ','
+            << ',' << env.concurrency << ',' << constraint_name(env.constraint) << ','
+            << csv_field(env.constraint_file) << ',' << (env.mixed_constraints ? "true" : "false")
+            << ',' << product::speculative_backend_name(env.speculative.backend) << ','
             << env.speculative.draft_tokens << ','
             << proposal_head_name(env.speculative.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative) << ','

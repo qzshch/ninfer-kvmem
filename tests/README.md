@@ -195,10 +195,13 @@ Public-HTTP latency and output gaps are measured separately by the
 [TTFT campaign](../tools/bench/ttft/README.md).
 
 `ninfer_qwen3_5_grammar_real_test [none|mtp|dflash|dflash2] [graph|eager] [concurrency] [vision]` uses
-`NINFER_TEST_ARTIFACT` to check GBNF content, sampling, thinking, continuation, prefix reuse and
-mixed batches. Set `NINFER_TEST_GRAMMAR=1` on the preemption test to check matcher continuity
-through Snapshot/Replay and cancellation. `ninfer_grammar_test` covers CPU grammar semantics;
-the sampling and speculative Op tests qualify masks against independent mathematical oracles.
+`NINFER_TEST_ARTIFACT` to check GBNF/JSON/schema content, sampling, thinking, continuation, prefix reuse
+and mixed batches. Set `NINFER_TEST_CONSTRAINT=grammar` or `json_schema` on the preemption test to
+check matcher continuity through Snapshot/Replay and cancellation. `ninfer_grammar_test` and
+`ninfer_json_schema_test` cover CPU language semantics. `ninfer_json_schema_oracle_test` compares
+supported schemas with the independent Python `jsonschema` validator; install its dependency with
+`python3 -m pip install -r tests/text/requirements.txt` in the selected test environment.
+The sampling and speculative Op tests qualify masks against independent mathematical oracles.
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
 

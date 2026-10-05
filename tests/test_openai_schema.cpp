@@ -146,7 +146,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -287,8 +286,8 @@ int test_constrained_decoding_extensions() {
     Json body                  = base_request();
     body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
     const auto parsed          = parse(body);
-    failures += check(parsed.generation.grammar == "root ::= \"yes\" | \"no\"" &&
-                          options(parsed.generation).grammar == parsed.generation.grammar,
+    failures += check(parsed.generation.constraint->source == "root ::= \"yes\" | \"no\"" &&
+                          options(parsed.generation).constraint == parsed.generation.constraint,
                       "GBNF must survive protocol-to-Engine translation");
     body["stop"] = "yes";
     failures += check(api_error([&] { (void)parse(body); }).param == "structured_outputs.grammar",
@@ -306,6 +305,32 @@ int test_constrained_decoding_extensions() {
         failures += check(api_error([&] { (void)parse(body); }).param == alias,
                           "unsupported constrained-decoding alias accepted");
     }
+    body                    = base_request();
+    body["response_format"] = Json{{"type", "json_object"}};
+    failures += check(options(parse(body).generation).constraint->kind ==
+                          ninfer::OutputConstraintKind::JsonObject,
+                      "JSON object mode lost in Engine translation");
+    const Json schema = {
+        {"type", "object"},
+        {"properties", {{"description", {{"type", "string"}}}, {"a", {{"type", "integer"}}}}}};
+    body["response_format"] =
+        Json{{"type", "json_schema"},
+             {"json_schema", {{"name", "answer"}, {"strict", false}, {"schema", schema}}}};
+    const auto typed = parse(body).generation;
+    failures += check(typed.constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          typed.constraint->source == schema.dump() &&
+                          typed.constraint_param == "response_format.json_schema.schema",
+                      "JSON schema source/order or diagnostic location lost");
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures +=
+        check(api_error([&] { (void)parse(body); }).status == 400, "conflicting formats accepted");
+    const auto error = request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::UnsupportedJsonSchema, "unsupported keyword",
+                             "/properties/x/format"),
+        typed.constraint_param);
+    failures += check(error.param == "response_format.json_schema.schema/properties/x/format" &&
+                          error.code == "unsupported_json_schema",
+                      "schema error lost its source path");
     return failures;
 }
 

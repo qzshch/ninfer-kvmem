@@ -201,7 +201,8 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking, options.grammar);
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.constraint);
             if (Clock::now() >= pending_deadline) {
                 throw RequestError(RequestErrorKind::QueueTimeout,
                                    "inference request expired during grammar preparation");

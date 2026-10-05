@@ -134,8 +134,8 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "malformed schema was accepted");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -772,19 +772,29 @@ int test_constrained_decoding() {
     auto body                  = base_request();
     body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
     const auto request         = parse(body);
-    failures += check(
-        to_request_options(request.generation, {}, semantics(request.generation), true).grammar ==
-            "root ::= \"yes\"",
-        "Anthropic GBNF extension was lost in Engine translation");
+    failures +=
+        check(to_request_options(request.generation, {}, semantics(request.generation), true)
+                      .constraint->source == "root ::= \"yes\"",
+              "Anthropic GBNF extension was lost in Engine translation");
     body["tools"] = Json::array({ordinary_tool()});
     failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
                       "grammar admitted active tools");
     body["tool_choice"] = Json{{"type", "none"}};
-    failures += check(parse(body).generation.grammar == "root ::= \"yes\"",
+    failures += check(parse(body).generation.constraint->source == "root ::= \"yes\"",
                       "inactive tools blocked grammar");
     body["stop_sequences"] = Json::array({"yes"});
     failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
                       "grammar admitted custom stop sequences");
+    body = base_request();
+    body["output_config"] =
+        Json{{"format", {{"type", "json_schema"}, {"schema", {{"type", "object"}}}}}};
+    const auto schema_request = parse(body).generation;
+    failures += check(schema_request.constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          schema_request.constraint_param == "output_config.format.schema",
+                      "Anthropic JSON schema source lost");
+    body["structured_outputs"] = Json{{"grammar", "root ::= \"x\""}};
+    failures += check(api_param([&] { (void)parse(body); }) == "structured_outputs.grammar",
+                      "Anthropic conflicting output formats accepted");
     return failures;
 }
 

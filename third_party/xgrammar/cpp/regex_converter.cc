@@ -219,7 +219,7 @@ std::string RegexConverter::HandleEscapeInCharClass() {
     return R"(\x00-\x08\x0E-\x1F\x21-\x9F\xA1-\U0010FFFF)";
   } else {
     auto res = HandleCharEscape();
-    if (res == "]" || res == "-") {
+    if (res == "]" || res == "-" || res == "^" || res == "[") {
       return "\\" + res;
     } else {
       return res;
