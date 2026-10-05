@@ -196,6 +196,12 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
         lanes[row] = lane;
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
+    if (layerwise_restore_ && std::find(lane_span.begin(), lane_span.end(),
+                                        layerwise_restore_->lane) != lane_span.end()) {
+        // Graph decode has compact batch views rather than an owning scalar
+        // prefill view. Preserve its fixed topology with a complete dependency.
+        context_completion_.wait(device.stream);
+    }
     try {
         runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
@@ -292,6 +298,12 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         lanes[row] = lane;
     }
 
+    if (layerwise_restore_ &&
+        std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(members.size()),
+                  layerwise_restore_->lane) !=
+            lanes.begin() + static_cast<std::ptrdiff_t>(members.size())) {
+        context_completion_.wait(device.stream);
+    }
     const bool count_forced_tokens = std::any_of(
         lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(members.size()),
         [&](std::uint32_t lane) { return requests[lane].sampling_host.token_counts != nullptr; });
@@ -797,6 +809,7 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
 }
 
 void ProgramImpl::fail_all_cleanup() noexcept {
+    drain_layerwise_restore();
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {
         if (transaction->transfer_submitted && device.transfer_stream != nullptr) {

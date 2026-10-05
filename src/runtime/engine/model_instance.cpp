@@ -110,8 +110,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
 
     ContextCacheOptions& cache      = options.context_cache;
+    if (options.cache_layerwise_restore) { options.cache_prefetch = true; }
     const std::uint32_t concurrency = options.max_concurrency;
     if (!cache.enabled) {
+        if (!cache.kv_file_directory.empty()) {
+            throw std::invalid_argument("file KV backing requires enabled context storage");
+        }
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
@@ -129,6 +133,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
 
     cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    if (!cache.kv_file_directory.empty() &&
+        (cache.host_kv_capacity_bytes == 0 || cache.host_kv_capacity_bytes % 256 ||
+         cache.host_kv_capacity_bytes > (64ULL << 30))) {
+        throw std::invalid_argument("file KV capacity must be a 256-byte multiple in (0,64 GiB]");
+    }
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));

@@ -143,6 +143,21 @@ public:
         return reservation;
     }
 
+    // Reserve the largest physically contiguous prefix. A caller requiring the whole set
+    // must retain all reservations before copying or publishing any of them.
+    [[nodiscard]] std::optional<HostKVExtentReservation>
+    prepare_prefix(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership,
+                   bool pin_active_writers = false) {
+        const auto limit = static_cast<std::uint32_t>(
+            std::min<std::size_t>(membership.size(), free_membership_count_));
+        if (free_count_ == 0 || limit == 0) { return std::nullopt; }
+        const auto count = arena_->max_allocatable_pages(page_layout(pages), limit);
+        if (count == 0) { return std::nullopt; }
+        return prepare(pages, membership.first(count), pin_active_writers);
+    }
+
+    void check_io_errors() const { arena_->check_io_errors(); }
+
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {
         validate(reservation);
         return arena_->writable_view(*extents_[reservation.descriptor_].allocation);
@@ -178,7 +193,8 @@ public:
         return extents_[reservation.descriptor_].page_count;
     }
 
-    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
+    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) {
+        arena_->check_io_errors();
         if (!valid(reservation)) { std::terminate(); }
         Extent& extent     = extents_[reservation.descriptor_];
         std::uint32_t node = extent.head;
@@ -846,33 +862,56 @@ cudaStream_t transfer_stream, const char* trace_phase)
                 if (!pages_->host_replica_current(logical)) { stale.push_back(logical); }
             }
             if (!stale.empty()) {
-                auto backup = host_kv_extents.prepare(*pages_, stale, true);
-                if (!backup) { throw std::bad_alloc(); }
-                placement_scratch_.clear();
-                for (const LogicalKVPageHandle logical : stale) {
-                    placement_scratch_.push_back(pages_->physical(logical));
+                std::vector<HostKVExtentReservation> backups;
+                backups.reserve(stale.size());
+                placement_scratch_.reserve(stale.size());
+                std::size_t reserved = 0;
+                while (reserved < stale.size()) {
+                    auto backup = host_kv_extents.prepare_prefix(
+                        *pages_, std::span(stale).subspan(reserved), true);
+                    if (!backup) { throw std::bad_alloc(); }
+                    reserved += host_kv_extents.page_count(*backup);
+                    backups.push_back(std::move(*backup));
                 }
-                const auto destination = host_kv_extents.writable_view(*backup);
+                // All byte ranges and source pins exist before the first DMA. Failed
+                // preparation rolls them all back without changing any published replica.
                 d2h_pages = stale.size();
-                d2h_bytes = plan_host_kv_transfer_work(
-                    destination.layout(), static_cast<std::uint32_t>(stale.size()), 1).payload_bytes;
+                d2h_bytes = plan_host_kv_transfer_work(host_kv_extents.page_layout(*pages_),
+                                                       static_cast<std::uint32_t>(stale.size()),
+                                                       static_cast<std::uint32_t>(backups.size()))
+                                .payload_bytes;
                 const auto copy_begin = TraceClock::now();
-                pages_->physical_pool().copy_to_host(
-                    placement_scratch_, destination,
-                    transfer_stream);
-                if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
-                    throw std::runtime_error("KV device placement stage-out transfer failed");
+                try {
+                    for (auto& backup : backups) {
+                        placement_scratch_.resize(host_kv_extents.page_count(backup));
+                        host_kv_extents.device_sources(backup, placement_scratch_);
+                        pages_->physical_pool().copy_to_host(placement_scratch_,
+                                                             host_kv_extents.writable_view(backup),
+                                                             transfer_stream);
+                    }
+                    if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
+                        throw std::runtime_error("KV device placement stage-out transfer failed");
+                    }
+                    host_kv_extents.check_io_errors();
+                } catch (...) {
+                    // Earlier extents may already be submitted. Keep every reservation
+                    // and source pin alive until that stream is drained.
+                    (void)cudaStreamSynchronize(transfer_stream);
+                    throw;
                 }
                 counts.telemetry.d2h_submit_wait_ns = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - copy_begin).count());
                 d2h_ms = static_cast<double>(counts.telemetry.d2h_submit_wait_ns) / 1.0e6;
-                (void)host_kv_extents.publish(std::move(*backup));
+                for (auto& backup : backups) { (void)host_kv_extents.publish(std::move(backup)); }
             }
             for (const std::uint32_t page : outgoing) {
                 // A pinned page belongs to a pending active snapshot or transfer: demoting
                 // it would break that publication. Keep it resident; the next placement
                 // reconsiders once the pin clears.
-                if (pages_->source_pins(membership(address, page)) != 0) { continue; }
+                if (pages_->source_pins(membership(address, page)) != 0 ||
+                    !pages_->device_payload_ready(membership(address, page))) {
+                    continue;
+                }
                 // A physical replica can back several live rows with different
                 // retrieval sets. Keep it until no other row can read it.
                 const auto logical = membership(address, page);

@@ -393,8 +393,12 @@ opt-in `cache_prefetch` 只在 Program 证明所有恢复页均无 active addres
 此 lane 不能继续 prefill/decode/control；下一稳定 boundary 先处理 cancellation，再逐一重新评估并预留 capture。
 只有实际 reserved capture 才标记 `capture_pending` 并成为唯一 active_capture_owner。
 存在 active cancellation 时预取交错保守暂停，直到既有事务稳定，避免提前归还仍被事务保护的资源。
-opt-in `cpu_gpu_overlap` 在 compute stream 等待前，由同一个 worker 执行最多一个 FIFO head 的不可变 base plan 准备。
-只读取固定 model/prompt 参数并构建局部计划；禁止 cache physical search、映射/资源修改、CUDA 提交和输出发布。
+opt-in `cpu_gpu_overlap` 在 compute stream 等待前，由同一个 worker 发布上一单元已提交的输出，然后执行最多一个 FIFO head 的不可变 base plan 准备。
+只有非终止 decode 单元的 owning output/timing 值可暂存，容量固定为最多一个单元的 lane 数。
+Frontend stop/control、Program 和资源提交均在下一单元前完成，不推迟模型状态决策，不复用未消费的 GPU workspace。
+第一 token 和终止单元立即发布；取消、失败、control、恢复阻塞和 idle 边界先排空，零 GPU 工作单元在提交前排空。
+base plan 只读取固定 model/prompt 参数并构建局部计划；禁止 cache physical search、映射/资源修改和模型 CUDA 提交。
+输出发布与计划准备分别计数，完全被等待覆盖的 Host 时间只是事件观测下界，不能直接称为吞吐收益。
 请求取消、超时和准备错误在下个正常 boundary 结算，不改变已经发出的 GPU unit。
 query replay 仍按原 prefill chunk 返回取消边界，不省略必要的历史计算。
 

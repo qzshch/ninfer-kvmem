@@ -916,6 +916,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    if (ph == Phase::Prefill) { kv_.wait_restore_layer(static_cast<std::uint32_t>(fidx)); }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {

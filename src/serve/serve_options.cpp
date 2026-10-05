@@ -73,10 +73,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefill-time-budget-ms N] [--prefill-request-token-cap N] [--log-stats-interval-ms "
            "N] [--device "
            "N] "
-           "[--cpu-gpu-overlap] [--cache-prefetch] [--context-cost-presets FILE] "
+           "[--cpu-gpu-overlap] [--cache-prefetch] [--cache-layerwise-restore] "
+           "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] [--kv-file-dir DIR] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
@@ -120,6 +121,8 @@ std::string serve_usage_text(const char* argv0) {
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       --kv-file-dir uses instance-local file KV backing and 32 MiB pinned staging; "
+           "files are removed at engine shutdown\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -200,6 +203,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.cpu_gpu_overlap = true;
         } else if (arg == "--cache-prefetch") {
             options.cache_prefetch = true;
+        } else if (arg == "--cache-layerwise-restore") {
+            options.cache_layerwise_restore = true;
+            options.cache_prefetch          = true;
         } else if (arg == "--prefill-token-budget") {
             options.prefill_token_budget = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--prefill-token-budget"), "prefill-token-budget"));
@@ -249,6 +255,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-state-slots") {
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--kv-file-dir") {
+            options.context_cache.kv_file_directory = require_value("--kv-file-dir");
+            if (options.context_cache.kv_file_directory.empty()) {
+                throw std::invalid_argument("--kv-file-dir cannot be empty");
+            }
             context_capacity_explicit = true;
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");

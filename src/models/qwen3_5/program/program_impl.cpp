@@ -48,11 +48,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), prefill_service_chunk(plan.prefill_service_chunk),
       kvmem_window_pages(plan.kvmem_window_pages),
-      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
-      dspark_dynamic_k(plan.dspark_dynamic_k), kv_storage(plan.kv_storage),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      cache_layerwise_restore(plan.cache_layerwise_restore), draft_window(plan.draft_window),
+      speculative_backend(plan.speculative_backend), dspark_dynamic_k(plan.dspark_dynamic_k),
+      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -78,11 +78,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                                              sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
+      restore_state_backend_ready_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
+    }
+    restore_layers_ready_.reserve(parameters.model.config().text.full_attention_layers);
+    for (std::uint32_t i = 0; i < parameters.model.config().text.full_attention_layers; ++i) {
+        restore_layers_ready_.emplace_back(device_in);
     }
     dflash_diagnostic_max_rounds = diagnostic_environment_value(
         std::getenv("NINFER_DFLASH_DIAGNOSTIC_ROUNDS"), 0, 256);
@@ -255,7 +260,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // whole logical context.
         const auto budget = kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
         text_kv_addresses->set_sparse_activation_budget(budget);
+        text_kv_addresses->set_reclaim_inactive_device_duplicates(
+            !context_cache.kv_file_directory.empty());
         if (backend_kv_addresses) {
+            backend_kv_addresses->set_reclaim_inactive_device_duplicates(
+                !context_cache.kv_file_directory.empty());
             backend_kv_addresses->set_sparse_activation_budget(
                 budget + (speculative_backend == SpeculativeBackend::Mtp
                               ? (draft_window - 1U + kPagedKVPageSize - 1U) / kPagedKVPageSize
@@ -279,11 +288,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
         StartupPhaseScope host_kv_phase(
-            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
+            startup_observer,
+            plan.context_cache.kv_file_directory.empty() ? StartupPhase::HostKvPin
+                                                         : StartupPhase::FileKvPrepare,
+            StartupProgressUnit::Bytes,
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         host_kv_arena = std::make_unique<HostKVArena>(
             plan.context_cache.host_kv_capacity_bytes,
-            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()),
+            plan.context_cache.kv_file_directory);
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
@@ -570,6 +583,7 @@ void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass reso
 runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
     runtime::ContextResourceClass resource, runtime::ContextTransferDirection direction,
     TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
+    if (host_kv_arena) { host_kv_arena->check_io_errors(); }
     const double elapsed_ns =
         static_cast<double>(
             context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
@@ -587,6 +601,14 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
         .work       = work,
         .elapsed_ns = measured_ns,
     };
+}
+
+FileCacheStats ProgramImpl::file_cache_stats() const noexcept {
+    if (!host_kv_arena) { return {}; }
+    const auto file = host_kv_arena->file_snapshot();
+    return {file.read_bytes,      file.written_bytes, file.read_ns,       file.write_ns,
+            file.staging_wait_ns, file.reads,         file.writes,        file.pinned_bytes,
+            file.integrity_bytes, file.pending_reads, file.pending_writes};
 }
 
 MemorySummary ProgramImpl::memory_summary() const noexcept {
@@ -638,6 +660,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
+        out.host_kv_pinned_bytes   = host_kv_arena->pinned_bytes();
+        out.file_cache             = file_cache_stats();
     }
     return out;
 }

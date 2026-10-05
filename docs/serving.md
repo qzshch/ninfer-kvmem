@@ -910,7 +910,9 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-kv-mib N` | shared Main/Backend KV capacity in MiB, pinned unless file backing is selected | `8192` |
+| `--kv-file-dir DIR` | instance-local file KV backing with two 16 MiB pinned staging slots | disabled |
+| `--cache-layerwise-restore` | restore an aligned pinned Main-KV owner with layer-specific readiness dependencies; implies cache prefetch | disabled |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -1202,7 +1204,12 @@ For the experimental full-head DSpark route, see [DSpark](dspark.md).
 
 ### Bounded fair prefill
 
-`--cpu-gpu-overlap` prepares at most one FIFO-head base plan while the compute
+`--cpu-gpu-overlap` also publishes at most one previous committed decode unit's
+owning output while the next compute unit is unfinished. First-token and terminal
+publication stay immediate; cancellation, control and idle boundaries flush any
+pending output once. Model, resource and stop decisions remain ordered before
+the next unit. The published payload owns its data and never refers to Program
+workspace. It also prepares at most one FIFO-head base plan while the compute
 stream has unfinished work. This CPU-only step validates immutable prompt/model
 facts and builds prefix digests. Physical cache matching, admission, resource
 publication, cancellation and output commit remain at completed worker boundaries.
@@ -1221,10 +1228,48 @@ their lanes do not execute further work, and cancellation discards the offer.
 Offers also wait when another lane's StateImage fork prevents resource planning.
 Unchanged resident page tables do not drain unrelated transfer-stream work.
 It introduces no speculative extra
-page allocation or cold-cache transfer. This is a local Host/GPU adaptation of
-hierarchical cache overlap, not SGLang's L3 backend or layer-wise loading.
+  page allocation or cold-cache transfer.
 
-Both options default to off. Startup JSON records the scope. Throughput JSON
+`--cache-layerwise-restore` additionally admits the restoring owner once its
+StateImage and backend data are ready. Each Main-attention layer waits on its
+own recorded transfer event, after its projection and before reading KV. Physical
+page ownership remains reserved; the source and destination cannot be recycled
+until the complete payload event settles. Full, immutable, page-aligned pinned
+restores qualify. Ragged tails, active aliases, unsettled StateImage forks and
+file-backed records use the complete restore dependency. Graph decode and forced
+control also wait for complete Main data, preserving their fixed consumer views.
+The `layerwise_admissions`, `layerwise_completions`, and
+`units_started_before_all_layers_ready` counters distinguish actual execution.
+
+`--kv-file-dir DIR` selects a bounded instance-local file instead of pinning the
+entire KV byte capacity. Two fixed 16 MiB staging slots feed a byte-only IO worker
+and a private CUDA transfer stream, allowing the next chunk to be read ahead while
+the current chunk transfers. Write completion includes positional IO and integrity
+metadata; short IO and corruption fail before replica publication. The instance
+is poisoned if stream synchronization fails: all staging predecessors are cancelled
+and discarded CUDA callback objects are released before joining the IO worker.
+The callback registry owns userdata until execution or failed-stream cleanup.
+Writeback is flushed before requesting eviction of clean file pages, and implicit filesystem
+read-ahead is disabled. This prevents dirty page-cache growth from undoing the
+memory saving on the qualified WSL setup; filesystem advice is not a portable
+hard RAM limit. Metadata uses
+five bytes per 256-byte sector. Host StateImages remain separately pinned. Files
+are removed at shutdown and cannot be reused across engine instances. The option
+adds CPU, file-system and page-cache costs, so it is a capacity choice that must
+be measured against pinned Host storage, rather than an assumed speedup. The
+`file_kv` throughput object reports bytes, IO-plus-integrity/flush CPU time, worker
+dependency wait and pinned/metadata capacities; these times are not GPU utilization
+or time saved by overlap. Pending read/write jobs are live gauges, independently
+sampled from the byte worker's atomics while model publication is waiting. This
+sampling touches no CUDA state or page topology; its timestamp differs from the
+published scheduler snapshot.
+
+Catalog transfer-event durations span the ordered transfer pipeline. With file
+backing they include dependencies on file IO and staging callbacks, so bytes
+divided by those durations are not a measurement of PCIe bandwidth. Use actual
+GPU memcpy intervals from a separate profiler capture for that distinction.
+
+These overlap options default to off. Startup JSON records the scope. Throughput JSON
 `host_work.cpu_gpu_overlap` records CPU preparation and a fully-covered Host time
 lower bound (the completion event was still pending after CPU work).
 `host_work.cache_prefetch` counts execution units begun during outstanding H2D,

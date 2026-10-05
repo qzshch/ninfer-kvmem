@@ -906,6 +906,8 @@ public:
     [[nodiscard]] bool kv_restore_blocks_execution() const noexcept;
     [[nodiscard]] bool pending_kv_restore_ready() const;
     [[nodiscard]] bool pending_kv_restore_in_flight() const;
+    [[nodiscard]] bool layerwise_restore_pending() const noexcept;
+    [[nodiscard]] std::vector<runtime::ContextTransferObservation> progress_layerwise_restore();
     // CPU-only immutable model/prompt facts; no physical candidate or resource mutation.
     [[nodiscard]] RequestBasePlan
     plan_request_overlap(const PreparedPrompt& prompt,
@@ -976,6 +978,8 @@ public:
     [[nodiscard]] SparseKvmemSnapshot sparse_kvmem_snapshot() const noexcept;
     [[nodiscard]] std::array<std::uint64_t, kMaximumConcurrency> sparse_kvmem_epochs() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // IO atomics and immutable capacities only; safe alongside the owning worker.
+    [[nodiscard]] FileCacheStats file_cache_stats() const noexcept;
     void reset_memory_peaks() noexcept;
 
 private:

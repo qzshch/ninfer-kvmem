@@ -841,25 +841,52 @@ int main() {
     overlap_report.current.host_work.cpu_plan_overlap_host_ns               = 50000;
     overlap_report.previous.host_work.cpu_plan_fully_covered_ns             = 5000;
     overlap_report.current.host_work.cpu_plan_fully_covered_ns              = 40000;
+    overlap_report.previous.host_work.cpu_publish_overlap_rows              = 2;
+    overlap_report.current.host_work.cpu_publish_overlap_rows               = 7;
+    overlap_report.previous.host_work.cpu_publish_overlap_host_ns           = 1000;
+    overlap_report.current.host_work.cpu_publish_overlap_host_ns            = 4500;
+    overlap_report.previous.host_work.cpu_publish_fully_covered_ns          = 700;
+    overlap_report.current.host_work.cpu_publish_fully_covered_ns           = 2400;
     overlap_report.previous.host_work.cache_prefetch_units                  = 1;
     overlap_report.current.host_work.cache_prefetch_units                   = 4;
     overlap_report.previous.host_work.cache_prefetch_completed_during_units = 1;
     overlap_report.current.host_work.cache_prefetch_completed_during_units  = 2;
     overlap_report.current.host_work.cache_prefetch_blocked_boundaries      = 1;
+    overlap_report.previous.host_work.layerwise_restore_admissions          = 1;
+    overlap_report.current.host_work.layerwise_restore_admissions           = 3;
+    overlap_report.previous.host_work.layerwise_restore_completions         = 1;
+    overlap_report.current.host_work.layerwise_restore_completions          = 3;
+    overlap_report.current.host_work.layerwise_restore_execution_units      = 4;
     overlap_report.previous.host_work.deferred_capture_offers               = 2;
     overlap_report.current.host_work.deferred_capture_offers                = 5;
     overlap_report.previous.host_work.deferred_capture_resumptions          = 1;
     overlap_report.current.host_work.deferred_capture_resumptions           = 3;
+    overlap_report.previous.file_cache.read_bytes                           = 100;
+    overlap_report.current.file_cache.read_bytes                            = 700;
+    overlap_report.previous.file_cache.pending_reads                        = 5;
+    overlap_report.current.file_cache.pending_reads                         = 2;
+    overlap_report.current.file_cache.pending_writes                        = 1;
     const Json overlap_json =
         Json::parse(format_throughput_json("serve-test", 5000, overlap_report));
     const auto& overlap_host = overlap_json.at("host_work");
+    failures += check(overlap_json.at("file_kv").at("read_bytes") == 600 &&
+                          overlap_json.at("file_kv").at("pending_read_jobs") == 2 &&
+                          overlap_json.at("file_kv").at("pending_write_jobs") == 1,
+                      "file bytes are deltas while pending IO jobs are live gauges");
     failures += check(
         overlap_host.at("cpu_gpu_overlap").at("base_plans") == 2 &&
             overlap_host.at("cpu_gpu_overlap").at("host_ns") == 40000 &&
             overlap_host.at("cpu_gpu_overlap").at("fully_covered_host_ns_lower_bound") == 35000 &&
+            overlap_host.at("cpu_gpu_overlap").at("previous_output_rows") == 5 &&
+            overlap_host.at("cpu_gpu_overlap").at("previous_output_host_ns") == 3500 &&
+            overlap_host.at("cpu_gpu_overlap")
+                    .at("previous_output_fully_covered_host_ns_lower_bound") == 1700 &&
             overlap_host.at("cache_prefetch").at("execution_units_started_during_h2d") == 3 &&
             overlap_host.at("cache_prefetch").at("h2d_completed_during_execution_units") == 1 &&
             overlap_host.at("cache_prefetch").at("blocked_boundaries") == 1 &&
+            overlap_host.at("cache_prefetch").at("layerwise_admissions") == 2 &&
+            overlap_host.at("cache_prefetch").at("layerwise_completions") == 2 &&
+            overlap_host.at("cache_prefetch").at("units_started_before_all_layers_ready") == 4 &&
             overlap_host.at("cache_prefetch").at("deferred_capture_offers") == 3 &&
             overlap_host.at("cache_prefetch").at("deferred_capture_resumptions") == 2 &&
             overlap_host.at("elapsed_seconds") ==

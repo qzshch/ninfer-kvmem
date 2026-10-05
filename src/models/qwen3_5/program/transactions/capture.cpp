@@ -354,7 +354,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
+    if (!can_plan_materialization() || !valid_capture_offer(offer)) {
         throw std::logic_error("capture transaction is not reservable");
     }
     if (cancellation.requested()) {
@@ -835,6 +835,7 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
 }
 
 ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction& transaction) {
+    if (host_kv_arena) { host_kv_arena->check_io_errors(); }
     if (!transaction.prepared || transaction.lane >= max_concurrency ||
         transaction.lane_epoch != lane_epochs[transaction.lane] || transaction.published) {
         throw std::logic_error("active capture transaction is stale");

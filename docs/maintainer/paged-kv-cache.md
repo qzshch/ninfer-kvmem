@@ -742,6 +742,12 @@ address contract。Op 的数值与性能准入规则见 [Op development](op-deve
 
 ## 11. CUDA Graph 与 table publication
 
+Host KV 的总空闲字节不代表可申请同样大小的连续 extent。驻留页重选时，换出页按当前
+allocator geometry 分为连续 extents；所有 extent、membership 与源页 pin 必须在首次 DMA
+之前预留。任一预留失败会释放整个集合，保持已发布副本和 execution table 不变。所有
+复制完成、文件 IO 错误检查通过后才一起发布 Host 副本，随后才能释放 outgoing Device
+replicas。分块不扩充 Host 配额，也不允许在部分复制完成时发布部分 selection。
+
 Plane bases与 block-table matrix base在 Engine lifetime内稳定。跨 replay变化的是：
 
 - table content；
@@ -787,6 +793,35 @@ consumer，且 replay in-flight期间不得改写同一 row。
 ---
 
 ## 13. 实现位置
+
+可选文件 backing 使用相同的 canonical Host page 布局、extent membership 和 generation。
+Host view 显式携带文件 offset，不能把空的 `data()` 当作锁页指针传给 CUDA。Core 将记录分成
+固定 staging slot 可容纳的完整页组，私有 stream 上的 host callback 与字节 I/O worker 只交接
+缓冲区就绪，不修改 page topology，也不在 callback/worker 中调用 CUDA。源和目的 leases 由
+原 Program 事务保留至 caller-stream 完成；发布任何 Host/Device replica 前再次检查 I/O 错误。
+取消和提交失败先排空依赖，再归还 slot；实例销毁删除临时文件。这不是持久化 checkpoint ABI。
+文件 tier 禁止隐式文件系统 read-ahead；每个写块完成 writeback 后，对已读写范围请求丢弃 clean
+page cache。只调用 DONTNEED 不能丢弃 dirty page，也不能依赖 Linux MemAvailable 判断 Windows
+commit 安全。flush/eviction 的成本计入 I/O 时间，性能与内存资格须在实际文件系统上测试；
+文件系统 advice 不是所有操作系统上的严格 RAM quota。
+文件 backing 的 sparse address 在最后 active 引用释放时，归还已有 current Host replica 的
+无 pin、无 writer、无 pending DMA 的 Device duplicate。只删除可重建副本，不改变 logical
+coverage、checkpoint frontier 或内容；另一 active alias 仍可读取的页保留。这避免一次 query
+retrieval 后留下的显存副本占满最小窗口池，阻挡下一次首遍窗口恢复。pinned backing 保留原策略。
+字节 worker 的计数使用原子变量，`file_cache_stats()` 只读这些变量和 immutable capacities，
+可由 Engine stats getter 独立采样，不读 GPU 或 page topology。它与模型发布快照的时点分开；
+JSONL 的 pending jobs 是 live gauges，I/O 字节和耗时仍是 interval deltas，不当作 GPU 等待时间。
+
+逐层 pinned restore 区分 physical residency 和 payload readiness。提前准入的完整页带
+`scheduled_restore`，所有 plane 到齐前不可淘汰、截断、dematerialize 或释放最后引用，Host
+source 也不可 detach。Program 只把记录过的 layer event 绑定到恢复 owner 的 consumer view，
+State/backend 先完成；attention 读取前必须 wait。既有 batch table consumer 也要显式 wait，
+不能仅依赖 scalar `layer_view`。Graph/forced control 保持完整依赖。完成后一次性清除 payload
+lease，资源账本只补传输观测，不重复 adopt 物理资源。此期间暂停新资源规划和 terminal/cancel
+释放；滚动映射保留仍在加载的物理页，下一稳定边界再处理淘汰。
+同一 Program unit 的 query probe 之后若要重排 KV，先发布已完成的 payload readiness，再释放
+相关页；改变仍在搬运的集合须等待完整事件。传输观测在目的 handle 失效前保存，Engine 在下一
+boundary 只收取保存的观测。未改变的第一遍映射保留逐层依赖，不提前全量同步。
 
 | 职责 | 主要位置 |
 |---|---|

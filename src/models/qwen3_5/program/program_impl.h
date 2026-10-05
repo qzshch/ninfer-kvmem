@@ -538,6 +538,10 @@ public:
     [[nodiscard]] bool kv_restore_blocks_execution() const noexcept;
     [[nodiscard]] bool pending_kv_restore_ready() const;
     [[nodiscard]] bool pending_kv_restore_in_flight() const;
+    [[nodiscard]] bool layerwise_restore_pending() const noexcept;
+    [[nodiscard]] std::vector<runtime::ContextTransferObservation> progress_layerwise_restore();
+    void publish_layerwise_payload_ready(bool wait);
+    void drain_layerwise_restore() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing,
                                                   std::uint32_t token_budget = 0);
@@ -602,6 +606,7 @@ public:
     }
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] FileCacheStats file_cache_stats() const noexcept;
 
     void reset_memory_peaks() noexcept;
 
@@ -619,6 +624,7 @@ public:
     const std::uint32_t prefill_service_chunk;
     // Sparse working-set window (pages) for prefill rolling; 0 keeps dense semantics.
     const std::uint32_t kvmem_window_pages;
+    const bool cache_layerwise_restore;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const bool dspark_dynamic_k;
@@ -890,6 +896,7 @@ private:
         std::vector<runtime::ContextTransferObservation> transfer_observations;
         runtime::ContextOperationCounts operations;
         bool state_restored                 = false;
+        bool layerwise_restore              = false;
         bool transfer_submitted             = false;
         std::uint8_t transfer_timer_mask    = 0;
         bool prefix_tail_submitted          = false;
@@ -904,6 +911,18 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    CudaCompletionEvent restore_state_backend_ready_;
+    std::vector<CudaCompletionEvent> restore_layers_ready_;
+
+    struct LayerwiseRestore {
+        std::uint32_t lane = 0;
+        MaterializationTransaction transfers;
+        bool payload_ready_published = false;
+    };
+
+    std::optional<LayerwiseRestore> layerwise_restore_;
+    [[nodiscard]] bool can_restore_layerwise(const MaterializationTransaction&) const;
+    void publish_layerwise_materialization_transfers(MaterializationTransaction&);
     std::vector<TokenId> materialization_ledger_;
     qwen3_5::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_5::detail::PrefixShortlistDigests materialization_prefix_digests_;
@@ -981,7 +1000,8 @@ private:
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);
-    void record_materialization_transfer_observations(MaterializationTransaction& transaction);
+    void record_materialization_transfer_observations(MaterializationTransaction& transaction,
+                                                      bool partial = false);
     void publish_materialization_transfers(MaterializationTransaction& transaction);
     void prepare_prefix_forks(MaterializationTransaction& transaction);
     void prepare_consumed_source(MaterializationTransaction& transaction);

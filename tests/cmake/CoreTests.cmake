@@ -40,6 +40,15 @@ ninfer_add_test(ninfer_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_file_kv_cache_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_kv_cache.cpp"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_file_kv_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+target_link_options(ninfer_file_kv_cache_test PRIVATE
+  "LINKER:--wrap=cudaLaunchHostFunc"
+  "LINKER:--wrap=cudaMemcpy2DAsync"
+  "LINKER:--wrap=cudaStreamSynchronize")
+
 ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)

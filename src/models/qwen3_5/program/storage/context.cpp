@@ -1207,16 +1207,19 @@ void ProgramImpl::settle_state_fork(SequenceState& sequence) {
 }
 
 bool ProgramImpl::has_pending_kv_restore() const noexcept {
+    if (layerwise_restore_) { return true; }
     const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
     return transaction != nullptr &&
            (!transaction->text_restores.empty() || !transaction->backend_restores.empty());
 }
 
 bool ProgramImpl::can_plan_materialization() const noexcept {
-    return !has_context_transaction() && !pending_transaction_ && !has_unsettled_state_fork();
+    return !has_context_transaction() && !layerwise_restore_ && !pending_transaction_ &&
+           !has_unsettled_state_fork();
 }
 
 bool ProgramImpl::kv_restore_blocks_execution() const noexcept {
+    if (layerwise_restore_) { return false; } // Only the admitted owner has layer-fenced views.
     const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
     if (transaction == nullptr) { return false; }
     // An execution unit settles its recurrent-state fork after GPU completion.
@@ -1235,12 +1238,14 @@ bool ProgramImpl::kv_restore_blocks_execution() const noexcept {
 }
 
 bool ProgramImpl::pending_kv_restore_ready() const {
+    if (layerwise_restore_) { return context_completion_.ready(); }
     const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
     return transaction != nullptr && has_pending_kv_restore() && transaction->transfer_submitted &&
            context_completion_.ready();
 }
 
 bool ProgramImpl::pending_kv_restore_in_flight() const {
+    if (layerwise_restore_) { return !context_completion_.ready(); }
     const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_);
     return transaction != nullptr && has_pending_kv_restore() && transaction->transfer_submitted &&
            !context_completion_.ready();
@@ -1650,7 +1655,12 @@ qwen3_5::PagedKVCacheView ProgramImpl::text_kv_view(const SequenceState& sequenc
     if (!sequence.kv || !text_kv_addresses->active(sequence.kv->text)) {
         throw std::logic_error("sequence has no active KV execution mapping");
     }
-    return decoder->text_kv.execution_view(text_kv_addresses->execution_row(sequence.kv->text));
+    auto view =
+        decoder->text_kv.execution_view(text_kv_addresses->execution_row(sequence.kv->text));
+    if (layerwise_restore_ && layerwise_restore_->lane == sequence.lane) {
+        view = view.with_restore_dependencies(restore_layers_ready_, device.stream);
+    }
+    return view;
 }
 
 qwen3_5::PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& sequence) const {

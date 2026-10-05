@@ -992,6 +992,112 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
     }
 }
 
+bool ProgramImpl::can_restore_layerwise(const MaterializationTransaction& transaction) const {
+    if (!cache_layerwise_restore || layerwise_restore_ || restore_layers_ready_.empty() ||
+        !context_cache.kv_file_directory.empty() || transaction.text_restores.empty() ||
+        !transaction.plan || !transaction.plan->impl_ || has_unsettled_state_fork() ||
+        !transaction.text_activation_frontier ||
+        *transaction.text_activation_frontier % kPagedKVPageSize != 0) {
+        return false;
+    }
+    const auto& details = *transaction.plan->impl_;
+    // A ragged tail needs a fully restored source before COW. Backend bridges
+    // and file records retain the complete-restore path; no dependency is omitted.
+    if (details.backend_prefix_fork_required &&
+        (!transaction.backend_activation_frontier ||
+         *transaction.backend_activation_frontier % kPagedKVPageSize != 0)) {
+        return false;
+    }
+    const auto clean = [](const LogicalKVPageStore& pages, const auto& restores) {
+        return std::all_of(restores.begin(), restores.end(), [&](const auto& restore) {
+            return !pages.restore_blocks_active_execution(restore.logical) &&
+                   pages.committed_columns(restore.logical) == kPagedKVPageSize;
+        });
+    };
+    return clean(*text_kv_pages, transaction.text_restores) &&
+           (!backend_kv_pages || clean(*backend_kv_pages, transaction.backend_restores));
+}
+
+void ProgramImpl::publish_layerwise_materialization_transfers(
+    MaterializationTransaction& transaction) {
+    if (!transaction.layerwise_restore || layerwise_restore_ ||
+        !restore_state_backend_ready_.ready()) {
+        throw std::logic_error("layerwise materialization has no ready State/backend dependency");
+    }
+    const auto main_bit = static_cast<std::uint8_t>(
+        1U << context_resource_index(runtime::ContextResourceClass::MainKV));
+    const auto main_timer = transaction.transfer_timer_mask & main_bit;
+    transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~main_bit);
+    record_materialization_transfer_observations(transaction, true);
+    if (transaction.state_restore) {
+        state_store->publish_transfer(std::move(*transaction.state_restore), true);
+        transaction.state_restore.reset();
+        transaction.state_restored = true;
+    }
+    for (const auto& restore : transaction.backend_restores) {
+        backend_kv_pages->publish_device_replica(restore.logical);
+    }
+    transaction.backend_restores.clear();
+    transaction.backend_restore_destinations.clear();
+    for (const auto& restore : transaction.text_restores) {
+        text_kv_pages->publish_scheduled_device_replica(restore.logical);
+    }
+    layerwise_restore_.emplace();
+    auto& load                               = *layerwise_restore_;
+    load.lane                                = transaction.destination.value;
+    load.transfers.text_restores             = std::move(transaction.text_restores);
+    load.transfers.text_restore_destinations = std::move(transaction.text_restore_destinations);
+    load.transfers.transfer_timer_mask       = main_timer;
+    load.transfers.transfer_submitted        = true;
+    transaction.transfer_submitted           = false;
+    if (transaction.plan->impl_->text_prefix_fork_required ||
+        transaction.plan->impl_->backend_prefix_fork_required) {
+        prepare_prefix_forks(transaction);
+        if (transaction.transfer_submitted) {
+            throw std::logic_error("aligned layerwise restore unexpectedly needed tail COW");
+        }
+    }
+}
+
+bool ProgramImpl::layerwise_restore_pending() const noexcept {
+    return layerwise_restore_.has_value();
+}
+
+std::vector<runtime::ContextTransferObservation> ProgramImpl::progress_layerwise_restore() {
+    if (!layerwise_restore_ || !context_completion_.ready()) { return {}; }
+    publish_layerwise_payload_ready(false);
+    auto& load        = *layerwise_restore_;
+    auto observations = std::move(load.transfers.transfer_observations);
+    layerwise_restore_.reset();
+    advance_resource_revision();
+    return observations;
+}
+
+void ProgramImpl::publish_layerwise_payload_ready(bool wait) {
+    if (!layerwise_restore_ || layerwise_restore_->payload_ready_published) { return; }
+    if (wait) { context_completion_.synchronize(); }
+    if (!context_completion_.ready()) { return; }
+    auto& load = *layerwise_restore_;
+    // Record handles before query-driven remapping can release a destination.
+    record_materialization_transfer_observations(load.transfers);
+    for (const auto& restore : load.transfers.text_restores) {
+        text_kv_pages->complete_scheduled_device_replica(restore.logical);
+    }
+    load.payload_ready_published = true;
+    // Engine drains these observations at its next boundary, without a second
+    // physical adoption or a stale handle query.
+}
+
+void ProgramImpl::drain_layerwise_restore() noexcept {
+    if (!layerwise_restore_) { return; }
+    try {
+        context_completion_.synchronize();
+        (void)progress_layerwise_restore();
+    } catch (...) {
+        // CUDA failure cleanup still drains streams before backing destruction.
+    }
+}
+
 void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& transaction) {
     if (!transaction.prepared || transaction.transfer_submitted) {
         throw std::logic_error("materialization transfer batch is not enqueueable");
@@ -1000,12 +1106,13 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
         [&](LogicalKVPageStore& pages,
             const std::vector<MaterializationTransaction::KVRestorePage>& restores,
             const std::vector<DeviceKVPageHandle>& destinations,
-            runtime::ContextResourceClass resource) {
+            runtime::ContextResourceClass resource, std::size_t first_plane = 0,
+            std::size_t plane_count = 0, bool time_transfer = true) {
             if (restores.size() != destinations.size()) {
                 throw std::logic_error("KV restore bookkeeping is not row aligned");
             }
             if (restores.empty()) { return; }
-            start_context_transfer_timer(resource);
+            if (time_transfer) { start_context_transfer_timer(resource); }
             std::size_t begin = 0;
             while (begin < restores.size()) {
                 std::size_t end = begin + 1;
@@ -1017,21 +1124,45 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
                     host_kv_extents->view(restores[begin].extent)
                         .subview(restores[begin].extent_page,
                                  static_cast<std::uint32_t>(end - begin));
-                pages.physical_pool().copy_from_host(
-                    source,
-                    std::span<const DeviceKVPageHandle>(destinations.data() + begin, end - begin),
-                    device.transfer_stream);
+                const auto target =
+                    std::span<const DeviceKVPageHandle>(destinations.data() + begin, end - begin);
+                if (plane_count == 0) {
+                    pages.physical_pool().copy_from_host(source, target, device.transfer_stream);
+                } else {
+                    pages.physical_pool().copy_from_host_planes(
+                        source, target, first_plane, plane_count, device.transfer_stream);
+                }
                 begin = end;
             }
-            stop_context_transfer_timer(resource);
-            transaction.transfer_timer_mask |= 1U << context_resource_index(resource);
+            if (time_transfer) {
+                stop_context_transfer_timer(resource);
+                transaction.transfer_timer_mask |= 1U << context_resource_index(resource);
+            }
         };
-    enqueue_kv(*text_kv_pages, transaction.text_restores, transaction.text_restore_destinations,
-               runtime::ContextResourceClass::MainKV);
+    transaction.layerwise_restore = can_restore_layerwise(transaction);
+    if (!transaction.layerwise_restore) {
+        enqueue_kv(*text_kv_pages, transaction.text_restores, transaction.text_restore_destinations,
+                   runtime::ContextResourceClass::MainKV);
+    }
     if (!transaction.backend_restores.empty()) {
         enqueue_kv(*backend_kv_pages, transaction.backend_restores,
                    transaction.backend_restore_destinations,
                    runtime::ContextResourceClass::BackendKV);
+    }
+    if (transaction.layerwise_restore) {
+        restore_state_backend_ready_.record(device.transfer_stream);
+        start_context_transfer_timer(runtime::ContextResourceClass::MainKV);
+        const auto planes =
+            text_kv_pages->physical_pool().plane_count() / restore_layers_ready_.size();
+        for (std::size_t layer = 0; layer < restore_layers_ready_.size(); ++layer) {
+            enqueue_kv(*text_kv_pages, transaction.text_restores,
+                       transaction.text_restore_destinations, runtime::ContextResourceClass::MainKV,
+                       layer * planes, planes, false);
+            restore_layers_ready_[layer].record(device.transfer_stream);
+        }
+        stop_context_transfer_timer(runtime::ContextResourceClass::MainKV);
+        transaction.transfer_timer_mask |=
+            1U << context_resource_index(runtime::ContextResourceClass::MainKV);
     }
     const bool any = transaction.state_restore.has_value() || !transaction.text_restores.empty() ||
                      !transaction.backend_restores.empty();
@@ -1046,8 +1177,9 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
 }
 
 void ProgramImpl::record_materialization_transfer_observations(
-    MaterializationTransaction& transaction) {
-    if (!transaction.transfer_submitted || !context_completion_.ready()) {
+    MaterializationTransaction& transaction, bool partial) {
+    if (!transaction.transfer_submitted ||
+        !(partial ? restore_state_backend_ready_.ready() : context_completion_.ready())) {
         throw std::logic_error("materialization transfer observation is not complete");
     }
     const auto record = [&](runtime::ContextResourceClass resource,
@@ -1133,6 +1265,7 @@ void ProgramImpl::record_materialization_transfer_observations(
 }
 
 void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& transaction) {
+    if (host_kv_arena) { host_kv_arena->check_io_errors(); }
     record_materialization_transfer_observations(transaction);
     const auto enqueue_retained_tail_backups = [&]() {
         bool submitted     = false;
@@ -1351,6 +1484,7 @@ void ProgramImpl::prepare_pressure_bookkeeping(MaterializationTransaction::Press
 }
 
 void ProgramImpl::publish_pressure_host_releases(MaterializationTransaction::PressureWork& work) {
+    if (host_kv_arena) { host_kv_arena->check_io_errors(); }
     detail::PhysicalDelta delta;
     if (work.option.evicts_continuation || work.completed || work.submitted) { return; }
     const bool valid_owner =
@@ -2127,7 +2261,9 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     if (transaction.transfer_submitted) {
-        if (!context_completion_.ready()) {
+        const bool early = transaction.layerwise_restore && restore_state_backend_ready_.ready() &&
+                           !transaction.cancel_pending && !context_completion_.ready();
+        if (!early && !context_completion_.ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -2135,7 +2271,11 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             abort_transaction();
             return out;
         }
-        publish_materialization_transfers(transaction);
+        if (early) {
+            publish_layerwise_materialization_transfers(transaction);
+        } else {
+            publish_materialization_transfers(transaction);
+        }
         if (transaction.transfer_submitted) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
@@ -2155,7 +2295,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             return out;
         }
     }
-    if (cancellation.requested()) {
+    if (cancellation.requested() && !layerwise_restore_) {
         abort_transaction();
         return out;
     }

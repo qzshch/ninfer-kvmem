@@ -80,6 +80,7 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t prefill_service_chunk     = 0;
     std::uint32_t kvmem_window_pages        = 0;
+    bool cache_layerwise_restore            = false;
     std::uint32_t draft_window              = 0;
     bool dspark_dynamic_k                   = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
@@ -106,6 +107,7 @@ struct SequencePlanImpl {
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t prefill_service_chunk     = 0;
     std::uint32_t kvmem_window_pages        = 0;
+    bool cache_layerwise_restore            = false;
     std::uint32_t draft_window              = 0;
     bool dspark_dynamic_k                   = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;

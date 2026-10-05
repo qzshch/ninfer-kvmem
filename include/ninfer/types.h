@@ -101,6 +101,7 @@ enum class StartupPhase : std::uint8_t {
     ProgramInitialize,
     HostStatePin,
     HostKvPin,
+    FileKvPrepare,
     CudaGraphPrepare,
     EngineFinalize,
 };
@@ -142,6 +143,9 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Optional instance-local file backing for that logical capacity. Host KV
+    // payload uses two fixed 16 MiB staging slots; Host StateImages stay pinned.
+    std::filesystem::path kv_file_directory;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -173,8 +177,10 @@ struct EngineOptions {
     std::uint32_t prefill_time_budget_ms = 0; // Measured mixed-unit target, not a hard deadline.
     std::uint32_t prefill_request_token_cap = 0;
     bool prefill_pack = false; // One submission for ragged rows, retaining scalar compute shapes.
-    bool cpu_gpu_overlap = false; // Immutable FIFO base planning during compute completion.
+    bool cpu_gpu_overlap =
+        false; // Previous committed output and FIFO planning during compute wait.
     bool cache_prefetch  = false; // Admission H2D restore overlaps disjoint active owners.
+    bool cache_layerwise_restore = false; // Recorded layer fences for pinned, aligned restores.
     // Sparse KV working-set window in 64-token pages for prefill rolling; 0 keeps the
     // dense full-residency semantics. Experimental sparse mode supports 1..4 active
     // lanes; higher concurrency is rejected. Device/Host headroom must cover all lanes.
@@ -935,6 +941,20 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+struct FileCacheStats {
+    std::uint64_t read_bytes      = 0;
+    std::uint64_t written_bytes   = 0;
+    std::uint64_t read_ns         = 0;
+    std::uint64_t write_ns        = 0;
+    std::uint64_t staging_wait_ns = 0;
+    std::uint64_t reads           = 0;
+    std::uint64_t writes          = 0;
+    std::size_t pinned_bytes      = 0;
+    std::size_t integrity_bytes   = 0;
+    std::uint64_t pending_reads   = 0;
+    std::uint64_t pending_writes  = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -961,6 +981,8 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    std::size_t host_kv_pinned_bytes              = 0;
+    FileCacheStats file_cache;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -989,9 +1011,15 @@ struct RuntimeHostWorkStats {
     std::uint64_t cpu_plan_overlap_invocations          = 0;
     std::uint64_t cpu_plan_overlap_host_ns              = 0;
     std::uint64_t cpu_plan_fully_covered_ns             = 0;
+    std::uint64_t cpu_publish_overlap_rows              = 0;
+    std::uint64_t cpu_publish_overlap_host_ns           = 0;
+    std::uint64_t cpu_publish_fully_covered_ns          = 0;
     std::uint64_t cache_prefetch_units                  = 0;
     std::uint64_t cache_prefetch_completed_during_units = 0;
     std::uint64_t cache_prefetch_blocked_boundaries     = 0;
+    std::uint64_t layerwise_restore_admissions          = 0;
+    std::uint64_t layerwise_restore_completions         = 0;
+    std::uint64_t layerwise_restore_execution_units     = 0;
     std::uint64_t deferred_capture_offers               = 0;
     std::uint64_t deferred_capture_resumptions          = 0;
 
@@ -1051,6 +1079,7 @@ struct RuntimeLaneStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    FileCacheStats file_cache;
     RuntimeHostWorkStats host_work;
     std::uint32_t lane_count = 0;
     std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};

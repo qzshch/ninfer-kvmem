@@ -114,6 +114,7 @@ class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
 class HostKVAllocationConstView;
+struct HostKVPageLayout;
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
 class DeviceKVPageHandle {
@@ -244,11 +245,26 @@ public:
     void copy_from_host(HostKVAllocationConstView source,
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
+    // A layer loader owns the completion dependency for this plane range.
+    // Full file records use the ordinary staged route, not repeated disk reads
+    // of every layer's record. Partial copies require pinned Host backing.
+    void copy_from_host_planes(HostKVAllocationConstView source,
+                               std::span<const DeviceKVPageHandle> destination,
+                               std::size_t first_plane, std::size_t plane_count,
+                               cudaStream_t stream) const;
 
 private:
     friend class DeviceKVPageLease;
     friend class DeviceKVPageReservation;
     friend class KVExecutionTablePool;
+
+    void copy_to_host_bytes(std::span<const DeviceKVPageHandle> source,
+                            const HostKVPageLayout& host, std::byte* destination,
+                            cudaStream_t stream, bool file_submission = false) const;
+    void copy_from_host_bytes(const HostKVPageLayout& host, const std::byte* source,
+                              std::span<const DeviceKVPageHandle> destination, cudaStream_t stream,
+                              std::size_t first_plane = 0, std::size_t plane_count = 0,
+                              bool file_submission = false) const;
 
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;

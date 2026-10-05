@@ -404,6 +404,11 @@ public:
         return require(handle).device_replica.has_value();
     }
 
+    [[nodiscard]] bool device_payload_ready(LogicalKVPageHandle handle) const {
+        const auto& page = require(handle);
+        return page.device_replica.has_value() && !page.scheduled_restore;
+    }
+
     [[nodiscard]] bool host_resident(LogicalKVPageHandle handle) const {
         return require(handle).host_replica.has_value();
     }
@@ -510,6 +515,22 @@ public:
         page.destination_pinned = false;
     }
 
+    // Physical ownership can be adopted before all planes arrive only by an
+    // execution view carrying recorded per-layer CUDA dependencies. The worker
+    // forbids new resource planning and drains this lease before cancellation.
+    void publish_scheduled_device_replica(LogicalKVPageHandle handle) {
+        publish_device_replica(handle);
+        require(handle).scheduled_restore = true;
+    }
+
+    void complete_scheduled_device_replica(LogicalKVPageHandle handle) {
+        auto& page = require(handle);
+        if (!page.scheduled_restore || !page.device_replica || !host_replica_current(handle)) {
+            throw std::logic_error("scheduled KV restore lost its immutable source");
+        }
+        page.scheduled_restore = false;
+    }
+
     void abort_device_replica(LogicalKVPageHandle handle,
                               DeviceKVPageReservation& reservation) noexcept {
         if (!valid(handle)) { return; }
@@ -538,8 +559,8 @@ public:
     [[nodiscard]] bool drop_device_replica_within_active(LogicalKVPageHandle handle) noexcept {
         if (!valid(handle)) { return false; }
         Page& page = pages_[handle.index_];
-        if (!page.device_replica || !host_replica_current(handle) ||
-            page.pending_device_replica || page.source_pins != 0 || page.destination_pinned) {
+        if (!page.device_replica || !host_replica_current(handle) || page.pending_device_replica ||
+            page.scheduled_restore || page.source_pins != 0 || page.destination_pinned) {
             return false;
         }
         page.device_replica.reset();
@@ -557,8 +578,9 @@ public:
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return page.device_replica && host_replica_current(handle) &&
-               !page.pending_device_replica && page.writer_references == 0 &&
-               page.active_references == 0 && page.source_pins == 0 && !page.destination_pinned;
+               !page.pending_device_replica && !page.scheduled_restore &&
+               page.writer_references == 0 && page.active_references == 0 &&
+               page.source_pins == 0 && !page.destination_pinned;
     }
 
     void retain_active_reference(LogicalKVPageHandle handle) {
@@ -667,7 +689,7 @@ public:
         Page& page = require(handle);
         if (columns > page.committed_columns || columns < page.protected_columns ||
             page.references != 1 || page.writer_references != 1 || page.source_pins != 0 ||
-            page.destination_pinned || page.host_replica) {
+            page.destination_pinned || page.scheduled_restore || page.host_replica) {
             throw std::invalid_argument("logical KV page is not destructively truncatable");
         }
         if (columns != page.committed_columns) {
@@ -683,8 +705,8 @@ public:
         const Page& page = pages_[handle.index_];
         return columns <= page.committed_columns && columns >= page.protected_columns &&
                page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
-               !page.destination_pinned && (host_will_be_released || !page.host_replica) &&
-               page.device_replica.has_value();
+               !page.destination_pinned && !page.scheduled_restore &&
+               (host_will_be_released || !page.host_replica) && page.device_replica.has_value();
     }
 
     [[nodiscard]] bool can_destructive_truncate_inactive(LogicalKVPageHandle handle,
@@ -693,7 +715,7 @@ public:
         const Page& page = pages_[handle.index_];
         return columns <= page.committed_columns && page.references == 1 &&
                page.writer_references == 0 && page.source_pins == 0 && !page.destination_pinned &&
-               !page.host_replica && page.device_replica.has_value();
+               !page.scheduled_restore && !page.host_replica && page.device_replica.has_value();
     }
 
     [[nodiscard]] bool
@@ -703,7 +725,7 @@ public:
         const Page& page = pages_[handle.index_];
         return columns <= page.committed_columns && page.references == 1 &&
                page.writer_references == 0 && page.source_pins == 0 && !page.destination_pinned &&
-               page.device_replica.has_value();
+               !page.scheduled_restore && page.device_replica.has_value();
     }
 
     void destructive_truncate_inactive(LogicalKVPageHandle handle, std::uint32_t columns) {
@@ -722,7 +744,8 @@ public:
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
-               !page.destination_pinned && !page.host_replica && page.device_replica.has_value();
+               !page.destination_pinned && !page.scheduled_restore && !page.host_replica &&
+               page.device_replica.has_value();
     }
 
     [[nodiscard]] bool can_release_reference(LogicalKVPageHandle handle,
@@ -731,7 +754,7 @@ public:
         const Page& page = pages_[handle.index_];
         if (page.references == 0 || (writer && page.writer_references != 1) ||
             page.active_references >= page.references || page.source_pins != 0 ||
-            page.destination_pinned) {
+            page.destination_pinned || (page.scheduled_restore && page.references == 1)) {
             return false;
         }
         return true;
@@ -743,7 +766,8 @@ public:
         const Page& page = pages_[handle.index_];
         return page.references != 0 && page.active_references != 0 &&
                page.active_references <= page.references && page.writer_references <= 1 &&
-               page.source_pins == 0 && !page.destination_pinned;
+               page.source_pins == 0 && !page.destination_pinned &&
+               (!page.scheduled_restore || page.references > 1);
     }
 
     [[nodiscard]] bool release_reference(LogicalKVPageHandle handle, bool writer) noexcept {
@@ -800,7 +824,7 @@ public:
                                            HostKVExtentCapability extent) noexcept {
         if (!valid(handle)) { return false; }
         Page& page = pages_[handle.index_];
-        if (!page.host_replica || page.host_replica->extent != extent ||
+        if (!page.host_replica || page.host_replica->extent != extent || page.scheduled_restore ||
             (!page.device_replica && page.references != 0)) {
             return false;
         }
@@ -814,7 +838,8 @@ public:
     void dematerialize(LogicalKVPageHandle handle, DeviceKVPageReservation& reservation) {
         Page& page = require(handle);
         if (page.references != 1 || page.writer_references != 1 || page.source_pins != 0 ||
-            page.destination_pinned || page.host_replica || !page.device_replica) {
+            page.destination_pinned || page.scheduled_restore || page.host_replica ||
+            !page.device_replica) {
             throw std::logic_error("logical KV page is shared or has no Device replica");
         }
         physical_->dematerialize_one(reservation, std::move(*page.device_replica));
@@ -842,6 +867,7 @@ private:
         bool occupied                   = false;
         std::optional<DeviceKVPageLease> device_replica;
         std::optional<DeviceKVPageLease> pending_device_replica;
+        bool scheduled_restore = false;
         std::optional<HostKVPageReplica> host_replica;
     };
 
@@ -871,6 +897,7 @@ private:
         page.destination_pinned = false;
         page.occupied           = false;
         page.pending_device_replica.reset();
+        page.scheduled_restore = false;
         page.host_replica.reset();
         if (++page.generation == 0) { ++page.generation; }
         free_[free_count_++] = handle.index_;
@@ -1024,6 +1051,12 @@ public:
     void set_sparse_activation_budget(std::uint32_t pages) noexcept {
         sparse_activation_budget_pages_ = pages;
     }
+
+    // File-backed sparse caches keep inactive, current replicas in the backing
+    // tier. This does not evict logical coverage or allocate/copy any payload.
+    void set_reclaim_inactive_device_duplicates(bool enabled) noexcept {
+        reclaim_inactive_device_duplicates_ = enabled;
+    }
     [[nodiscard]] bool page_in_device_working_set(KVAddressSpaceHandle handle,
                                                   std::uint32_t page) const {
         return page_in_working_set(require(handle), page);
@@ -1169,6 +1202,13 @@ public:
         address.row.reset();
         address.reservation.release();
         address.active = false;
+        if (reclaim_inactive_device_duplicates_ && address.device_working_set) {
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                // The store checks all active aliases, pins, writer ownership,
+                // current Host coverage and pending DMA before releasing a copy.
+                (void)pages_->drop_device_replica(membership(address, page));
+            }
+        }
     }
 
     [[nodiscard]] KVPrefixForkReservation
@@ -2139,6 +2179,7 @@ private:
     KVExecutionTablePool* tables_ = nullptr;
     std::uint32_t page_capacity_  = 0;
     std::uint32_t sparse_activation_budget_pages_ = 0;
+    bool reclaim_inactive_device_duplicates_      = false;
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;

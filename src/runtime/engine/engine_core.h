@@ -73,7 +73,7 @@ public:
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           prefill_chunk_(options.prefill_chunk), prefill_pack_(options.prefill_pack),
           cpu_gpu_overlap_(options.cpu_gpu_overlap), cache_prefetch_(options.cache_prefetch),
-          overlap_completion_(device),
+          file_kv_(!options.context_cache.kv_file_directory.empty()), overlap_completion_(device),
           prefill_budget_(options.prefill_token_budget, options.prefill_time_budget_ms,
                           options.prefill_request_token_cap),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
@@ -264,8 +264,15 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats out;
+        {
+            std::lock_guard lock(stats_mutex_);
+            out = published_stats_;
+        }
+        // The byte-only worker can progress while model publication is waiting.
+        // Sample its atomics without touching GPU state, page topology or queues.
+        if (file_kv_) { out.file_cache = instance_.program->file_cache_stats(); }
+        return out;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -507,19 +514,22 @@ private:
     public:
         explicit ProgramCallScope(EngineCore& owner, bool permit_overlap = false)
             : owner_(owner), measurement_(owner.begin_host_phase()),
-              overlap_before_(owner.cumulative_stats_.host_work.cpu_plan_overlap_host_ns) {
+              overlap_before_(owner.cumulative_stats_.host_work.cpu_plan_overlap_host_ns +
+                              owner.cumulative_stats_.host_work.cpu_publish_overlap_host_ns) {
             if (permit_overlap && owner.cpu_gpu_overlap_) {
                 wait_work_ = {.owner = this, .run = [](void* state, cudaStream_t stream) {
                                   auto& scope = *static_cast<ProgramCallScope*>(state);
                                   if (scope.wait_work_attempted_) { return; }
                                   scope.wait_work_attempted_ = true;
-                                  scope.owner_.plan_during_device_wait(stream);
+                                  scope.owner_.publish_and_plan_during_device_wait(stream);
                               }};
                 wait_scope_.emplace(owner.device_, &wait_work_);
             }
             if constexpr (requires { owner.instance_.program->pending_kv_restore_in_flight(); }) {
                 prefetch_in_flight_ = permit_overlap && owner.cache_prefetch_ &&
                                       owner.instance_.program->pending_kv_restore_in_flight();
+                layerwise_in_flight_ =
+                    prefetch_in_flight_ && owner.instance_.program->layerwise_restore_pending();
             }
         }
 
@@ -535,12 +545,16 @@ private:
             wait_scope_.reset();
             // synchronize() invokes CPU work inside a recorded completion wait.
             // Reclassify this subset as Host work; preserve the total wall time.
-            const auto cpu =
-                owner_.cumulative_stats_.host_work.cpu_plan_overlap_host_ns - overlap_before_;
+            const auto cpu = owner_.cumulative_stats_.host_work.cpu_plan_overlap_host_ns +
+                             owner_.cumulative_stats_.host_work.cpu_publish_overlap_host_ns -
+                             overlap_before_;
             const auto reclassified = std::min(cpu, timing.device_wait_ns);
             timing.device_wait_ns -= reclassified;
             timing.submit_host_ns += reclassified;
             if (prefetch_in_flight_ && executed) {
+                if (layerwise_in_flight_) {
+                    ++owner_.cumulative_stats_.host_work.layerwise_restore_execution_units;
+                }
                 ++owner_.cumulative_stats_.host_work.cache_prefetch_units;
                 if constexpr (requires { owner_.instance_.program->pending_kv_restore_ready(); }) {
                     try {
@@ -565,6 +579,7 @@ private:
         std::optional<ScopedDeviceWaitWork> wait_scope_;
         bool wait_work_attempted_ = false;
         bool prefetch_in_flight_  = false;
+        bool layerwise_in_flight_ = false;
         bool active_ = true;
     };
 
@@ -651,6 +666,7 @@ private:
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
+        if (file_kv_) { snapshot.file_cache = instance_.program->file_cache_stats(); }
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
@@ -868,6 +884,35 @@ private:
         if (streaming) { request->cv.notify_one(); }
     }
 
+    struct PendingPublication {
+        std::shared_ptr<Request> request;
+        PublishedOutput output;
+        std::optional<GenerationTimingObservation> timing;
+    };
+
+    // At most one completed unit is staged. It owns only output values, never
+    // the model workspace or an uncommitted Frontend preview. Terminal paths
+    // flush before moving request content into the result.
+    void flush_pending_publications() {
+        while (publication_begin_ != publication_end_) {
+            auto publication = std::move(*pending_publications_[publication_begin_]);
+            pending_publications_[publication_begin_++].reset();
+            append_output(publication.request, std::move(publication.output),
+                          std::move(publication.timing));
+        }
+        publication_begin_ = publication_end_ = 0;
+    }
+
+    void stage_publication(const std::shared_ptr<Request>& request, PublishedOutput output,
+                           std::optional<GenerationTimingObservation> timing) {
+        if (output.empty() && !timing) { return; }
+        if (publication_end_ == pending_publications_.size()) {
+            throw std::logic_error("previous-unit publication exceeded fixed row capacity");
+        }
+        pending_publications_[publication_end_++].emplace(
+            PendingPublication{request, std::move(output), std::move(timing)});
+    }
+
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
         if (!request->observation.prompt_progress) { return; }
         if (!request->admitted_begin || !request->admitted_at) {
@@ -957,6 +1002,7 @@ private:
     }
 
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        flush_pending_publications();
         release_planning_state(request);
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
@@ -975,6 +1021,7 @@ private:
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
+        flush_pending_publications();
         sample_terminal_sparse(request);
         HostPhaseMeasurement completion = begin_host_phase();
         double prompt_wall_seconds      = 0.0;
@@ -1045,6 +1092,7 @@ private:
     }
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
+        flush_pending_publications();
         (void)request->output.preview_terminal(FinishReason::Cancelled);
         append_output(request, request->output.commit_preview());
         complete_success(request, FinishReason::Cancelled);
@@ -1070,7 +1118,10 @@ private:
         // An already-issued active unit may finish while another row owns the global resource
         // transaction.  Its cancellation cannot release topology until that transaction reaches
         // a stable terminal state.
-        if (instance_.program->has_context_transaction()) { return cancelled; }
+        if (instance_.program->has_context_transaction() ||
+            instance_.program->layerwise_restore_pending()) {
+            return cancelled;
+        }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
                 cancelled[lane] = slots_[lane]->cancelled.load(std::memory_order_acquire);
@@ -1085,7 +1136,7 @@ private:
         if (manager_transaction != program_transaction) {
             throw std::logic_error("Engine and Program disagree before terminal settlement");
         }
-        if (program_transaction) { return false; }
+        if (program_transaction || instance_.program->layerwise_restore_pending()) { return false; }
 
         bool changed = false;
         for (;;) {
@@ -1203,6 +1254,9 @@ private:
                         bool decode_round,
                         const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
+        // A Program need not synchronize through DeviceContext (for example a
+        // zero-work unit). Keep the publication bound and event order in that case.
+        flush_pending_publications();
         const std::size_t row_count = lane_indices.size();
         if (row_count == 0 || row_count != pending.row_count() || pending.row_stride() == 0 ||
             (!pending.row_counts().empty() && pending.row_counts().size() != row_count) ||
@@ -1388,7 +1442,11 @@ private:
                 }
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
-                append_output(request, std::move(published), std::move(timing));
+                if (cpu_gpu_overlap_ && decode_round && !terminal_in_batch) {
+                    stage_publication(request, std::move(published), std::move(timing));
+                } else {
+                    append_output(request, std::move(published), std::move(timing));
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -1714,7 +1772,21 @@ private:
         }
     }
 
-    void plan_during_device_wait(cudaStream_t stream) {
+    void publish_and_plan_during_device_wait(cudaStream_t stream) {
+        if (publication_begin_ != publication_end_) {
+            overlap_completion_.record(stream);
+            const bool pending = !overlap_completion_.ready();
+            const auto rows    = publication_end_ - publication_begin_;
+            const auto started = Clock::now();
+            flush_pending_publications();
+            const auto elapsed = elapsed_ns(started, Clock::now());
+            auto& stats        = cumulative_stats_.host_work;
+            stats.cpu_publish_overlap_rows += rows;
+            stats.cpu_publish_overlap_host_ns += elapsed;
+            if (pending && !overlap_completion_.ready()) {
+                stats.cpu_publish_fully_covered_ns += elapsed;
+            }
+        }
         if constexpr (requires(const PreparedPrompt& prompt,
                                const ResolvedExecutionOptions& options) {
                           instance_.program->plan_request_overlap(prompt, options);
@@ -1728,8 +1800,8 @@ private:
                 head->cancelled.load(std::memory_order_acquire) || Clock::now() >= head->deadline) {
                 return;
             }
-            // No physical planning, cache search, admission, publication or CUDA
-            // submission is allowed here. The single mutation owner stays this worker.
+            // No physical planning, cache search, admission or model submission
+            // is allowed here. The single mutation owner stays this worker.
             overlap_completion_.record(stream);
             if (overlap_completion_.ready()) { return; }
             const auto started = Clock::now();
@@ -1838,6 +1910,9 @@ private:
                     terminal.activation.reset();
                     const SequenceHandle sequence = activation.sequence();
                     resources_.adopt(*instance_.program, std::move(activation));
+                    if (instance_.program->layerwise_restore_pending()) {
+                        ++cumulative_stats_.host_work.layerwise_restore_admissions;
+                    }
                     request->sequence.emplace(sequence);
                     request->budget.emplace(std::move(control.budget));
                     request->lane.emplace(control.destination);
@@ -2251,6 +2326,16 @@ private:
         publish_runtime_stats();
     }
 
+    void progress_layerwise_payload() {
+        if (!instance_.program->layerwise_restore_pending()) { return; }
+        auto observations = instance_.program->progress_layerwise_restore();
+        if (!instance_.program->layerwise_restore_pending()) {
+            ++cumulative_stats_.host_work.layerwise_restore_completions;
+            resources_.observe_payload_transfers(observations);
+            request_admission_check();
+        }
+    }
+
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
         for (;;) {
@@ -2280,6 +2365,7 @@ private:
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
+                progress_layerwise_payload();
                 (void)progress_context_transaction(have_pending);
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
@@ -2317,6 +2403,7 @@ private:
                 // Cancellation is sampled once for the execution unit. A request arriving while
                 // the GPU unit is in flight is observed at the next worker boundary; commit does
                 // not reinterpret an already-issued unit with a later atomic read.
+                progress_layerwise_payload();
                 const auto cancelled_at_unit_start = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_unit_start, boundary);
                 // A retained sparse source can alias another lane's history. Its
@@ -2329,7 +2416,9 @@ private:
                         restore_blocks_execution = instance_.program->kv_restore_blocks_execution();
                     }
                 }
-                if (cache_prefetch_ && instance_.program->has_context_transaction() &&
+                if (cache_prefetch_ &&
+                    (instance_.program->has_context_transaction() ||
+                     instance_.program->layerwise_restore_pending()) &&
                     std::any_of(slots_.begin(), slots_.end(), [](const auto& request) {
                         return request && request->cancelled.load(std::memory_order_acquire);
                     })) {
@@ -2339,6 +2428,7 @@ private:
                     restore_blocks_execution = true;
                 }
                 if (restore_blocks_execution) {
+                    flush_pending_publications();
                     if (cache_prefetch_) {
                         ++cumulative_stats_.host_work.cache_prefetch_blocked_boundaries;
                     }
@@ -2352,6 +2442,7 @@ private:
                 const ControlMembership control_membership =
                     scheduler_.build_control_membership(slots_, max_concurrency_);
                 if (!control_membership.empty()) {
+                    flush_pending_publications();
                     set_host_work_class(HostWorkClass::Control);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
@@ -2402,6 +2493,7 @@ private:
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                flush_pending_publications();
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 HostPhaseMeasurement cleanup   = begin_host_phase();
@@ -2428,7 +2520,11 @@ private:
     const bool prefill_pack_;
     const bool cpu_gpu_overlap_;
     const bool cache_prefetch_;
+    const bool file_kv_;
     CudaCompletionEvent overlap_completion_;
+    std::array<std::optional<PendingPublication>, kMaximumConcurrency> pending_publications_{};
+    std::size_t publication_begin_ = 0;
+    std::size_t publication_end_   = 0;
     PrefillBudget prefill_budget_;
     ResourceManagement resources_;
 

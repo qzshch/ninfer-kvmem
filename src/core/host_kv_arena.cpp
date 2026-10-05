@@ -146,7 +146,9 @@ HostKVAllocationView HostKVAllocationView::subview(std::uint32_t begin, std::uin
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+        handle_, data_ ? data_ + static_cast<std::size_t>(begin) * layout_->page_stride : nullptr,
+        layout_, count, file_,
+        file_offset_ + static_cast<std::size_t>(begin) * layout_->page_stride);
 }
 
 bool HostKVAllocationConstView::valid() const noexcept {
@@ -164,7 +166,9 @@ HostKVAllocationConstView HostKVAllocationConstView::subview(std::uint32_t begin
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationConstView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+        handle_, data_ ? data_ + static_cast<std::size_t>(begin) * layout_->page_stride : nullptr,
+        layout_, count, file_,
+        file_offset_ + static_cast<std::size_t>(begin) * layout_->page_stride);
 }
 
 HostKVAllocation::~HostKVAllocation() { (void)release(); }
@@ -209,7 +213,9 @@ void HostKVAllocation::disarm() noexcept {
 }
 
 HostKVArena::HostKVArena(std::size_t capacity_bytes,
-                         std::span<const HostKVPageLayout> supported_layouts)
+                         std::span<const HostKVPageLayout> supported_layouts,
+                         const std::filesystem::path& file_directory,
+                         std::size_t file_staging_slot_bytes)
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
@@ -228,7 +234,17 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
 
-    backing_.emplace(capacity_bytes_);
+    if (file_directory.empty()) {
+        backing_.emplace(capacity_bytes_);
+    } else {
+        file_ = std::make_unique<FileKVBacking>(file_directory, capacity_bytes_,
+                                                file_staging_slot_bytes);
+        for (const auto& layout : layouts_) {
+            if (layout.page_stride > file_->slot_bytes()) {
+                throw std::invalid_argument("KV page does not fit file staging slot");
+            }
+        }
+    }
     const auto smallest = std::min_element(
         layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;
@@ -276,6 +292,16 @@ bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pag
     return find_free_extent(layout.page_stride * static_cast<std::size_t>(pages)).has_value();
 }
 
+std::uint32_t HostKVArena::max_allocatable_pages(const HostKVPageLayout& layout,
+                                                 std::uint32_t limit) const noexcept {
+    if (limit == 0 || free_descriptors_.empty() || !find_layout(layout)) { return 0; }
+    std::size_t count = 0;
+    for (const FreeExtent& extent : free_extents_) {
+        count = std::max(count, std::min<std::size_t>(limit, extent.bytes / layout.page_stride));
+    }
+    return static_cast<std::uint32_t>(count);
+}
+
 std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
                                                       std::uint32_t pages) noexcept {
     const std::optional<std::uint32_t> layout_index = find_layout(layout);
@@ -303,6 +329,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     descriptor.layout      = *layout_index;
     descriptor.pages       = pages;
     descriptor.active      = true;
+    if (file_) { file_->invalidate(offset, bytes); }
     occupied_bytes_ += bytes;
     bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
@@ -584,7 +611,8 @@ HostKVAllocationView HostKVArena::writable_view(HostKVAllocation& allocation) {
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationView(allocation.handle(), allocation_data(descriptor),
-                                &layouts_[descriptor.layout], descriptor.pages);
+                                &layouts_[descriptor.layout], descriptor.pages, file_.get(),
+                                descriptor.offset);
 }
 
 HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) const {
@@ -593,7 +621,8 @@ HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) 
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationConstView(allocation.handle(), allocation_data(descriptor),
-                                     &layouts_[descriptor.layout], descriptor.pages);
+                                     &layouts_[descriptor.layout], descriptor.pages, file_.get(),
+                                     descriptor.offset);
 }
 
 bool HostKVArena::valid_handle(HostKVAllocationHandle handle) const noexcept {

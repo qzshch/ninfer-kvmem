@@ -531,6 +531,12 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
             monotonic_delta(previous.cpu_plan_overlap_host_ns, current.cpu_plan_overlap_host_ns),
         .cpu_plan_fully_covered_ns =
             monotonic_delta(previous.cpu_plan_fully_covered_ns, current.cpu_plan_fully_covered_ns),
+        .cpu_publish_overlap_rows =
+            monotonic_delta(previous.cpu_publish_overlap_rows, current.cpu_publish_overlap_rows),
+        .cpu_publish_overlap_host_ns  = monotonic_delta(previous.cpu_publish_overlap_host_ns,
+                                                        current.cpu_publish_overlap_host_ns),
+        .cpu_publish_fully_covered_ns = monotonic_delta(previous.cpu_publish_fully_covered_ns,
+                                                        current.cpu_publish_fully_covered_ns),
         .cache_prefetch_units =
             monotonic_delta(previous.cache_prefetch_units, current.cache_prefetch_units),
         .cache_prefetch_completed_during_units =
@@ -538,6 +544,12 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
                             current.cache_prefetch_completed_during_units),
         .cache_prefetch_blocked_boundaries = monotonic_delta(
             previous.cache_prefetch_blocked_boundaries, current.cache_prefetch_blocked_boundaries),
+        .layerwise_restore_admissions      = monotonic_delta(previous.layerwise_restore_admissions,
+                                                             current.layerwise_restore_admissions),
+        .layerwise_restore_completions     = monotonic_delta(previous.layerwise_restore_completions,
+                                                             current.layerwise_restore_completions),
+        .layerwise_restore_execution_units = monotonic_delta(
+            previous.layerwise_restore_execution_units, current.layerwise_restore_execution_units),
         .deferred_capture_offers =
             monotonic_delta(previous.deferred_capture_offers, current.deferred_capture_offers),
         .deferred_capture_resumptions = monotonic_delta(previous.deferred_capture_resumptions,
@@ -634,6 +646,7 @@ std::string format_server_start_json(
         {"prefill_pack", engine_options.prefill_pack},
         {"cpu_gpu_overlap", engine_options.cpu_gpu_overlap},
         {"cache_prefetch", engine_options.cache_prefetch},
+        {"cache_layerwise_restore", engine_options.cache_layerwise_restore},
         {"cache_prefetch_mode",
          engine_options.cache_prefetch ? "admission_h2d_disjoint_owners" : "disabled"},
         {"prefill_pack_mode", engine_options.prefill_pack ? "scalar_shape_submission" : "disabled"},
@@ -663,6 +676,7 @@ std::string format_server_start_json(
               {"total_device_state_slots", total_device_state_slots},
               {"host_state_slots", cache.host_state_slots},
               {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
+              {"kv_file_directory", cache.kv_file_directory.string()},
               {"max_private_continuations", cache.max_private_continuations.value()},
               {"max_shared_prefixes", cache.max_shared_prefixes.value()},
               {"max_long_anchors_per_continuation",
@@ -690,6 +704,8 @@ std::string format_server_start_json(
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
+             {"host_kv_pinned_bytes", memory.host_kv_pinned_bytes},
+             {"file_kv_integrity_bytes", memory.file_cache.integrity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
@@ -884,9 +900,16 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
            {"cpu_gpu_overlap",
             Json{{"base_plans", host.cpu_plan_overlap_invocations},
                  {"host_ns", host.cpu_plan_overlap_host_ns},
-                 {"fully_covered_host_ns_lower_bound", host.cpu_plan_fully_covered_ns}}},
+                 {"fully_covered_host_ns_lower_bound", host.cpu_plan_fully_covered_ns},
+                 {"previous_output_rows", host.cpu_publish_overlap_rows},
+                 {"previous_output_host_ns", host.cpu_publish_overlap_host_ns},
+                 {"previous_output_fully_covered_host_ns_lower_bound",
+                  host.cpu_publish_fully_covered_ns}}},
            {"cache_prefetch",
             Json{{"execution_units_started_during_h2d", host.cache_prefetch_units},
+                 {"layerwise_admissions", host.layerwise_restore_admissions},
+                 {"layerwise_completions", host.layerwise_restore_completions},
+                 {"units_started_before_all_layers_ready", host.layerwise_restore_execution_units},
                  {"h2d_completed_during_execution_units", host.cache_prefetch_completed_during_units},
                  {"blocked_boundaries", host.cache_prefetch_blocked_boundaries},
                  {"deferred_capture_offers", host.deferred_capture_offers},
@@ -1019,6 +1042,23 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    const auto& file_previous = previous.file_cache;
+    const auto& file_current  = current.file_cache;
+    record["file_kv"]         = Json{
+                {"read_bytes", monotonic_delta(file_previous.read_bytes, file_current.read_bytes)},
+                {"written_bytes", monotonic_delta(file_previous.written_bytes, file_current.written_bytes)},
+                {"read_ns", monotonic_delta(file_previous.read_ns, file_current.read_ns)},
+                {"write_ns", monotonic_delta(file_previous.write_ns, file_current.write_ns)},
+                {"io_worker_dependency_wait_ns",
+                 monotonic_delta(file_previous.staging_wait_ns, file_current.staging_wait_ns)},
+                {"reads", monotonic_delta(file_previous.reads, file_current.reads)},
+                {"writes", monotonic_delta(file_previous.writes, file_current.writes)},
+                {"pinned_bytes", file_current.pinned_bytes},
+                {"integrity_bytes", file_current.integrity_bytes},
+                {"pending_read_jobs", file_current.pending_reads},
+                {"pending_write_jobs", file_current.pending_writes},
+                {"sampling", "live_io_atomics_separate_from_model_publication_snapshot"},
+                {"basis", "positional_io_integrity_flush_eviction_cpu_time_not_engine_or_gpu_wait"}};
     return record.dump();
 }
 

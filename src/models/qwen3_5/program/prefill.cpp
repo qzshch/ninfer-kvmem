@@ -1449,6 +1449,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint32_t prompt_tokens,
                                              std::uint32_t cursor,
                                              std::uint32_t backend_valid, bool retrieved_history) {
+    if (layerwise_restore_ && layerwise_restore_->lane == sequence.lane) {
+        publish_layerwise_payload_ready(false);
+    }
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     constexpr std::uint32_t sink_pages = 2U;  // one 128-token retrieval block
     const std::uint32_t next_target =
@@ -1480,6 +1483,20 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
                             : prefill_window_page_set(committed_pages, sink_pages,
                                                       kvmem_window_pages - sink_pages);
     append_prefill_growth_pages(window, committed_pages, mapped_pages);
+    if (layerwise_restore_ && layerwise_restore_->lane == sequence.lane &&
+        !layerwise_restore_->payload_ready_published) {
+        for (std::uint32_t page = 0; page < mapped_pages; ++page) {
+            const auto logical = text_kv_addresses->logical_page(sequence.kv->text, page);
+            if (text_kv_pages->device_resident(logical) &&
+                !text_kv_pages->device_payload_ready(logical) &&
+                !std::binary_search(window.begin(), window.end(), page)) {
+                // A changing placement must not recycle a DMA destination.
+                // The unchanged first-pass mapping keeps its per-layer overlap.
+                publish_layerwise_payload_ready(true);
+                break;
+            }
+        }
+    }
     const auto phase = retrieved_history ? KvmemPlacementPhase::Replay : KvmemPlacementPhase::Prefill;
     const auto placement = text_kv_addresses->apply_device_placement(sequence.kv->text, *host_kv_extents, window,
                                               device.transfer_stream,
@@ -1781,6 +1798,9 @@ void ProgramImpl::finalize_kvmem_query(SequenceState& sequence, std::uint32_t pr
 // Replaces the rolling recency window with the retrieval-scored window once a turn's
 // query mean exists. Retrieval and recent pages share one bounded device window.
 void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
+    if (layerwise_restore_ && layerwise_restore_->lane == sequence.lane) {
+        publish_layerwise_payload_ready(true);
+    }
     auto& sparse = kvmem_lanes_.at(sequence.lane);
     constexpr std::uint32_t kBlockTokens = 128U;
     const std::uint32_t mapped = text_kv_addresses->mapped_pages(sequence.kv->text);

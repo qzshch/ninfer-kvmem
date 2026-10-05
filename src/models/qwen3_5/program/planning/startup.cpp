@@ -899,6 +899,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->prefill_service_chunk = inputs.prefill_service_chunk == 0
                                      ? inputs.prefill_chunk : inputs.prefill_service_chunk;
     impl->kvmem_window_pages   = inputs.kvmem_window_pages;
+    impl->cache_layerwise_restore = inputs.cache_layerwise_restore;
     impl->draft_window         = inputs.draft_window;
     impl->dspark_dynamic_k     = inputs.dspark_dynamic_k;
     impl->speculative_backend  = inputs.speculative_backend;
@@ -962,29 +963,31 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
     SequencePlanningInputs inputs{
-        .parameters           = &parameters,
-        .capacity             = options.max_context,
-        .max_concurrency      = options.max_concurrency,
-        .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
+        .parameters      = &parameters,
+        .capacity        = options.max_context,
+        .max_concurrency = options.max_concurrency,
+        .prefill_chunk   = std::min(options.prefill_chunk, options.max_context),
         // A shared budget may leave a one-token grant after another owner's
         // capture/rewrite split. Service accounting needs a true unit bound;
         // physical workspace and latency costing retain the configured chunk.
-        .prefill_service_chunk = options.prefill_token_budget == 0 &&
+        .prefill_service_chunk   = options.prefill_token_budget == 0 &&
                                          options.prefill_time_budget_ms == 0 &&
                                          options.prefill_request_token_cap == 0
-                                     ? options.prefill_chunk : 1U,
-        .kvmem_window_pages   = options.kvmem_window_pages,
-        .draft_window         = options.speculative.draft_tokens,
-        .dspark_dynamic_k     = options.speculative.dspark_dynamic_k,
-        .speculative_backend  = options.speculative.backend,
-        .kv_storage           = options.kv_cache,
-        .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options),
-        .use_cuda_graph       = options.use_cuda_graph,
-        .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .device               = options.device,
-        .multiprocessor_count = device.multiprocessor_count(),
-        .context_cache        = options.context_cache,
+                                       ? options.prefill_chunk
+                                       : 1U,
+        .kvmem_window_pages      = options.kvmem_window_pages,
+        .cache_layerwise_restore = options.cache_layerwise_restore,
+        .draft_window            = options.speculative.draft_tokens,
+        .dspark_dynamic_k        = options.speculative.dspark_dynamic_k,
+        .speculative_backend     = options.speculative.backend,
+        .kv_storage              = options.kv_cache,
+        .proposal_head           = options.speculative.proposal_head,
+        .features                = models::load_options(options),
+        .use_cuda_graph          = options.use_cuda_graph,
+        .causal_scoring          = options.purpose == EnginePurpose::CausalScoring,
+        .device                  = options.device,
+        .multiprocessor_count    = device.multiprocessor_count(),
+        .context_cache           = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Reserve an independent window plus transient chunk growth for every lane.

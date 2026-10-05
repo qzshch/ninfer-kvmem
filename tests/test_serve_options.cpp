@@ -397,6 +397,14 @@ int main() {
         check(adaptive.speculative.dspark_dynamic_k && adaptive.prefill_token_budget == 1024 &&
                   adaptive.prefill_pack && adaptive.cpu_gpu_overlap && adaptive.cache_prefetch,
               "adaptive DSpark / global prefill options did not reach Engine configuration");
+    const auto file_cache =
+        parse({"ninfer-serve", "model.ninfer", "--kv-file-dir", "/tmp/kv", "--host-kv-mib", "256"});
+    failures += check(file_cache.context_cache.kv_file_directory == "/tmp/kv" &&
+                          file_cache.context_cache.host_kv_capacity_bytes == (256ULL << 20),
+                      "file KV backing options did not reach Engine configuration");
+    const auto layerwise = parse({"ninfer-serve", "model.ninfer", "--cache-layerwise-restore"});
+    failures += check(layerwise.cache_layerwise_restore && layerwise.cache_prefetch,
+                      "layerwise restore must imply admission prefetch");
     bool unbudgeted_pack = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--prefill-pack"});

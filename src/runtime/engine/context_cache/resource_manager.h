@@ -1142,6 +1142,13 @@ public:
         demand_epoch_ = 0;
     }
 
+    // A published layer-fenced payload keeps its original physical entitlement.
+    // Completion contributes transfer observations, not a second resource adoption.
+    void
+    observe_payload_transfers(std::span<const ContextTransferObservation> observations) noexcept {
+        for (const auto& observation : observations) { observe_transfer(observation); }
+    }
+
 private:
     struct Candidate {
         std::optional<AdmissionCandidate> plan;

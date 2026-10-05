@@ -336,6 +336,7 @@ Program::prove_persistent_backfill(const RequestBasePlan& blocked_head,
 
 ContextTransactionProgress
 Program::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    if (impl_->host_kv_arena) { impl_->host_kv_arena->check_io_errors(); }
     return impl_->progress_context_transaction(cancellation);
 }
 
@@ -349,6 +350,14 @@ bool Program::kv_restore_blocks_execution() const noexcept {
 }
 
 bool Program::pending_kv_restore_ready() const { return impl_->pending_kv_restore_ready(); }
+
+bool Program::layerwise_restore_pending() const noexcept {
+    return impl_->layerwise_restore_pending();
+}
+
+std::vector<runtime::ContextTransferObservation> Program::progress_layerwise_restore() {
+    return impl_->progress_layerwise_restore();
+}
 
 bool Program::pending_kv_restore_in_flight() const { return impl_->pending_kv_restore_in_flight(); }
 
@@ -365,6 +374,7 @@ bool Program::can_plan_materialization() const noexcept {
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing,
                                          std::uint32_t token_budget) {
+    if (impl_->host_kv_arena) { impl_->host_kv_arena->check_io_errors(); }
     return impl_->advance_prefill(sequence, failed_timing, token_budget);
 }
 
@@ -372,6 +382,7 @@ std::optional<PrefillBatchProgress>
 Program::advance_prefill_batch(std::span<const SequenceHandle> sequences,
                               std::uint32_t token_budget,
                               runtime::ExecutionTiming* failed_timing) {
+    if (impl_->host_kv_arena) { impl_->host_kv_arena->check_io_errors(); }
     return impl_->advance_prefill_batch(sequences, token_budget, failed_timing);
 }
 
@@ -448,6 +459,7 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming* failed_timing) {
+    if (impl_->host_kv_arena) { impl_->host_kv_arena->check_io_errors(); }
     return impl_->decode(sequences, budgets, failed_timing);
 }
 
@@ -464,6 +476,7 @@ CommitResult Program::commit(PendingBatch&& pending,
                              std::span<const runtime::CommitDecision> decisions,
                              runtime::CommitObservation observation,
                              runtime::ExecutionTiming* failed_timing) {
+    if (impl_->host_kv_arena) { impl_->host_kv_arena->check_io_errors(); }
     return impl_->commit(std::move(pending), decisions, observation, failed_timing);
 }
 
@@ -504,6 +517,8 @@ std::array<std::uint64_t, kMaximumConcurrency> Program::sparse_kvmem_epochs() co
 }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
+
+FileCacheStats Program::file_cache_stats() const noexcept { return impl_->file_cache_stats(); }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 

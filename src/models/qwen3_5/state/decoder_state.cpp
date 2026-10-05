@@ -95,7 +95,29 @@ std::uint32_t PagedKVCacheView::max_context() const noexcept {
 
 PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
     if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
+    wait_restore_layer(layer);
     return cache_->layer_view(layer, block_table_);
+}
+
+void PagedKVCacheView::wait_restore_layer(std::uint32_t layer) const {
+    if (!restore_dependencies_.empty()) {
+        if (layer >= restore_dependencies_.size()) {
+            throw std::out_of_range("KV layer restore dependency is out of range");
+        }
+        restore_dependencies_[layer].wait(compute_stream_);
+    }
+}
+
+PagedKVCacheView
+PagedKVCacheView::with_restore_dependencies(std::span<const CudaCompletionEvent> layers,
+                                            cudaStream_t compute_stream) const {
+    if (cache_ == nullptr || layers.size() != cache_->layers()) {
+        throw std::invalid_argument("KV restore dependency count differs from layer count");
+    }
+    auto view                  = *this;
+    view.restore_dependencies_ = layers;
+    view.compute_stream_       = compute_stream;
+    return view;
 }
 
 PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) const {

@@ -74,11 +74,17 @@ void exercise_overlap_prefetch(const char* artifact) {
     options.enable_vision                    = true;
     options.cpu_gpu_overlap                  = true;
     options.cache_prefetch                   = true;
+    options.cache_layerwise_restore = std::getenv("NINFER_TEST_LAYERWISE_RESTORE") != nullptr;
+    if (const char* directory = std::getenv("NINFER_TEST_KV_FILE_DIR")) {
+        options.context_cache.kv_file_directory = directory;
+    }
     options.context_cache.device_state_slots = 2;
     options.context_cache.host_state_slots   = 4;
     options.context_cache.host_kv_capacity_bytes    = 8ULL << 30;
     options.context_cache.max_private_continuations = 2;
     options.context_cache.max_shared_prefixes       = 8;
+    const bool file_mode  = !options.context_cache.kv_file_directory.empty();
+    const bool layer_mode = options.cache_layerwise_restore;
     ninfer::Engine engine(std::move(options));
     const auto input = [](std::string tag, int repetitions, bool counting = false) {
         ninfer::PromptInput out;
@@ -105,6 +111,44 @@ void exercise_overlap_prefetch(const char* artifact) {
     auto original = input("A-17319", 8000);
     std::cerr << "phase overlap cold\n";
     const auto cold = engine.generate(engine.prepare(original), generation(32));
+    if (layer_mode) {
+        const auto before    = engine.runtime_stats().host_work.layerwise_restore_admissions;
+        bool observed        = false;
+        auto interrupted     = engine.submit(engine.prepare(original), generation(32));
+        const auto cancelled = interrupted.wait(
+            nullptr, ninfer::CancellationView([&] {
+                observed = observed ||
+                           engine.runtime_stats().host_work.layerwise_restore_admissions > before;
+                return observed;
+            }));
+        require(observed && cancelled.finish_reason == ninfer::FinishReason::Cancelled,
+                "cancellation did not exercise an admitted pending layer payload");
+        require(engine.runtime_stats().running_requests == 0,
+                "cancelled restoring owner retained an active lane");
+    }
+    if (file_mode) {
+        const auto before = engine.runtime_stats().file_cache.read_bytes;
+        bool observed     = false;
+        auto survivor     = engine.submit(engine.prepare(input("FILE-CANCEL-SURVIVOR", 10, true)),
+                                          generation(1024));
+        auto interrupted  = engine.submit(engine.prepare(original), generation(32));
+        const auto cancelled =
+            interrupted.wait(nullptr, ninfer::CancellationView([&] {
+                                 const auto stats = engine.runtime_stats();
+                                 observed = observed || (stats.materializing_requests != 0 &&
+                                                         stats.file_cache.read_bytes > before &&
+                                                         stats.file_cache.pending_reads != 0);
+                                 return observed;
+                             }));
+        require(observed && cancelled.finish_reason == ninfer::FinishReason::Cancelled,
+                "file cancellation did not observe actual reads during materialization");
+        require(survivor.wait().generated_token_ids.size() == 1024,
+                "file restore cancellation damaged the disjoint decoder");
+        const auto drained = engine.runtime_stats().file_cache;
+        require(drained.pending_reads == 0 && drained.pending_writes == 0,
+                "cancelled file materialization retained unfinished IO");
+        std::cout << "file-cancel observed reads during materialization\n";
+    }
     std::cerr << "phase overlap warm\n";
     const auto warm = engine.generate(engine.prepare(original), generation(32));
     require(cold.prompt.prompt_tokens > 36864, "prefetch fixture did not cross the window");
@@ -129,6 +173,13 @@ void exercise_overlap_prefetch(const char* artifact) {
                 "disjoint owner failed during Host restore");
     }
     const auto stats = engine.runtime_stats();
+    if (layer_mode) {
+        require(stats.host_work.layerwise_restore_admissions > 0,
+                "aligned Host owner was never admitted before all layers completed");
+        require(stats.host_work.layerwise_restore_admissions ==
+                    stats.host_work.layerwise_restore_completions,
+                "a layerwise payload lease was left unsettled");
+    }
     require(stats.host_work.cache_prefetch_units > 0, "no execution began during outstanding H2D");
     require(stats.host_work.deferred_capture_offers == stats.host_work.deferred_capture_resumptions,
             "a checkpoint offer was lost or left deferred");

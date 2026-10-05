@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "core/device.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -48,6 +49,10 @@ public:
 
     [[nodiscard]] std::uint32_t max_context() const noexcept;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer) const;
+    void wait_restore_layer(std::uint32_t layer) const;
+    [[nodiscard]] PagedKVCacheView
+    with_restore_dependencies(std::span<const CudaCompletionEvent> layers,
+                              cudaStream_t compute_stream) const;
 
 private:
     friend class PagedKVCache;
@@ -55,6 +60,8 @@ private:
 
     const PagedKVCache* cache_ = nullptr;
     Tensor block_table_;
+    std::span<const CudaCompletionEvent> restore_dependencies_;
+    cudaStream_t compute_stream_ = nullptr;
 };
 
 class PagedKVCache {
