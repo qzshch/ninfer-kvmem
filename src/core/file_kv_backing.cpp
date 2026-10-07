@@ -209,33 +209,6 @@ struct FileKVBacking::Impl {
     std::atomic<std::uint64_t> prefetch_bytes{0}, prefetch_hit_bytes{0};
     std::atomic<std::uint64_t> prefetch_wasted_bytes{0}, prefetch_dropped_jobs{0};
     std::atomic<std::uint64_t> pending_prefetches{0}, pending_writebacks{0};
-    // hot_mutex serializes sector ownership. Publish standalone telemetry once
-    // per hot block, rather than issuing atomic RMWs for each 256-byte sector.
-    // Unwinding must also publish sectors already processed before corruption.
-    struct HotCounters {
-        Impl& owner;
-        std::int64_t resident = 0, dirty = 0;
-        std::uint64_t hit = 0, miss = 0, prefetched = 0, prefetch_hit = 0, wasted = 0;
-
-        static void add(std::atomic<std::uint64_t>& counter, std::uint64_t bytes) noexcept {
-            if (bytes) counter.fetch_add(bytes, std::memory_order_relaxed);
-        }
-        static void adjust(std::atomic<std::uint64_t>& counter, std::int64_t bytes) noexcept {
-            if (bytes > 0)
-                counter.fetch_add(static_cast<std::uint64_t>(bytes), std::memory_order_relaxed);
-            else if (bytes < 0)
-                counter.fetch_sub(static_cast<std::uint64_t>(-bytes), std::memory_order_relaxed);
-        }
-        ~HotCounters() {
-            adjust(owner.ram_resident_bytes, resident);
-            adjust(owner.ram_dirty_bytes, dirty);
-            add(owner.ram_hit_bytes, hit);
-            add(owner.ram_miss_bytes, miss);
-            add(owner.prefetch_bytes, prefetched);
-            add(owner.prefetch_hit_bytes, prefetch_hit);
-            add(owner.prefetch_wasted_bytes, wasted);
-        }
-    };
     struct WrittenRange { std::size_t offset, bytes; };
     // At most 64 MiB of newly written filesystem pages, plus the current read,
     // can be pending eviction. Keep this fixed rather than scaling with cold capacity.
@@ -399,11 +372,10 @@ struct FileKVBacking::Impl {
         }
         if (!wrote) return;
         record_disk_batch(slot.block * kHotBlock, sectors * kSector);
-        HotCounters counters{*this};
         for (std::size_t s = 0; s < sectors; ++s) {
             if (slot.valid[s] && written[base + s] == 2) {
                 written[base + s] = 1;
-                counters.dirty -= kSector;
+                ram_dirty_bytes -= kSector;
             }
         }
     }
@@ -423,10 +395,9 @@ struct FileKVBacking::Impl {
             index        = ends[0] >= 0 ? ends[0] : ends[1];
             auto& victim = hot[index];
             flush_hot(index);
-            HotCounters counters{*this};
             for (std::size_t s = 0; s < kHotSectors; ++s) {
-                if (victim.valid[s]) counters.resident -= kSector;
-                if (victim.prefetched[s]) counters.wasted += kSector;
+                if (victim.valid[s]) ram_resident_bytes -= kSector;
+                if (victim.prefetched[s]) prefetch_wasted_bytes += kSector;
             }
             block_slots[victim.block] = -1;
             unlink_hot(index);
@@ -453,13 +424,12 @@ struct FileKVBacking::Impl {
             auto* data        = ram.get() + static_cast<std::size_t>(index) * kHotBlock + local;
             const auto first  = local / kSector;
             const auto base   = offset / kSector;
-            HotCounters counters{*this};
             if (state.writing) {
                 std::memcpy(data, state.buffer + done, bytes);
                 for (std::size_t s = 0; s < bytes / kSector; ++s) {
-                    if (!slot.valid[first + s]) counters.resident += kSector;
-                    if (written[base + s] != 2) counters.dirty += kSector;
-                    if (slot.prefetched[first + s]) counters.wasted += kSector;
+                    if (!slot.valid[first + s]) ram_resident_bytes += kSector;
+                    if (written[base + s] != 2) ram_dirty_bytes += kSector;
+                    if (slot.prefetched[first + s]) prefetch_wasted_bytes += kSector;
                     slot.valid[first + s]      = 1;
                     slot.prefetched[first + s] = 0;
                     checksums[base + s]        = checksum(data + s * kSector);
@@ -471,9 +441,9 @@ struct FileKVBacking::Impl {
                     if (slot.valid[first + s]) {
                         if (checksum(data + s * kSector) != checksums[base + s])
                             throw std::runtime_error("HiCache corrupt RAM payload");
-                        counters.hit += kSector;
+                        ram_hit_bytes += kSector;
                         if (slot.prefetched[first + s]) {
-                            counters.prefetch_hit += kSector;
+                            prefetch_hit_bytes += kSector;
                             slot.prefetched[first + s] = 0;
                         }
                         ++s;
@@ -491,8 +461,8 @@ struct FileKVBacking::Impl {
                         if (checksum(data + s * kSector) != checksums[base + s])
                             throw std::runtime_error("HiCache corrupt disk payload");
                         slot.valid[first + s] = 1;
-                        counters.resident += kSector;
-                        counters.miss += kSector;
+                        ram_resident_bytes += kSector;
+                        ram_miss_bytes += kSector;
                     }
                 }
                 std::memcpy(state.buffer + done, data, bytes);
@@ -525,7 +495,6 @@ struct FileKVBacking::Impl {
         const int index = acquire_hot(hint.block, false);
         auto& slot      = hot[index];
         auto* data      = ram.get() + static_cast<std::size_t>(index) * kHotBlock;
-        HotCounters counters{*this};
         for (std::size_t s = 0; s < sectors;) {
             if (slot.valid[s] || written[base + s] != 1) {
                 ++s;
@@ -539,8 +508,8 @@ struct FileKVBacking::Impl {
                 if (checksum(data + s * kSector) != checksums[base + s])
                     throw std::runtime_error("HiCache corrupt prefetched payload");
                 slot.valid[s] = slot.prefetched[s] = 1;
-                counters.resident += kSector;
-                counters.prefetched += kSector;
+                ram_resident_bytes += kSector;
+                prefetch_bytes += kSector;
             }
         }
     }
@@ -1002,12 +971,11 @@ void FileKVBacking::invalidate(std::size_t offset, std::size_t bytes) noexcept {
             auto& slot       = impl_->hot[index];
             const auto begin = std::max(offset, block * kHotBlock);
             const auto end   = std::min(offset + bytes, (block + 1) * kHotBlock);
-            Impl::HotCounters counters{*impl_};
             for (auto p = begin; p < end; p += kSector) {
                 const auto s = (p % kHotBlock) / kSector;
-                if (slot.valid[s]) counters.resident -= kSector;
-                if (slot.prefetched[s]) counters.wasted += kSector;
-                if (impl_->written[p / kSector] == 2) counters.dirty -= kSector;
+                if (slot.valid[s]) impl_->ram_resident_bytes -= kSector;
+                if (slot.prefetched[s]) impl_->prefetch_wasted_bytes += kSector;
+                if (impl_->written[p / kSector] == 2) impl_->ram_dirty_bytes -= kSector;
                 slot.valid[s] = slot.prefetched[s] = 0;
             }
             if (std::none_of(slot.valid.begin(), slot.valid.end(),

@@ -79,12 +79,6 @@ Outgoing placement stages every necessary Host extent before changing a row.
 Epoch invalidation precedes extent reuse. Callbacks, cancellation and cleanup
 retain their capabilities through completion.
 
-RAM byte counters are published at hot-block boundaries (at most 1 MiB), under
-the same ownership lock as sector mutations. Snapshot reads remain nonblocking;
-an in-progress block can be temporarily absent from the telemetry. Completed
-transfers and invalidations publish exact totals, including sectors processed
-before an integrity failure. Checksums still cover every 256-byte sector.
-
 File writeback batches span multiple demand jobs. Transfer completion means
 readable bytes and their integrity records, not crash durability. Before a write
 would exceed 64 MiB plus one system page of conservatively charged filesystem
