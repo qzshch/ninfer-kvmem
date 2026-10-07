@@ -130,6 +130,8 @@ int main() {
     memory.host_context_capacity_bytes       = 64ULL << 20;
     memory.host_context_occupied_bytes       = 12ULL << 20;
     memory.host_context_reserved_bytes       = 4ULL << 20;
+    memory.host_context_resident_bytes       = 64ULL << 20;
+    memory.host_context_metadata_bytes       = 1ULL << 20;
     memory.host_state_occupied_slots         = 1;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
 
@@ -237,6 +239,8 @@ int main() {
     failures += check(server.at("memory").at("host_context_capacity_bytes") == (64ULL << 20) &&
                           server.at("memory").at("host_context_occupied_bytes") == (12ULL << 20) &&
                           server.at("memory").at("host_context_reserved_bytes") == (4ULL << 20) &&
+                          server.at("memory").at("host_context_resident_bytes") == (64ULL << 20) &&
+                          server.at("memory").at("host_context_metadata_bytes") == (1ULL << 20) &&
                           server.at("memory").at("host_state_occupied_slots") == 1 &&
                           server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
                       "Host context-cache memory ledger missing");
@@ -723,6 +727,8 @@ int main() {
     throughput.current.host_state_occupied_slots        = 1;
     throughput.current.host_context_occupied_bytes      = 16ULL << 20;
     throughput.current.host_context_reserved_bytes      = 4ULL << 20;
+    throughput.current.host_context_resident_bytes      = 64ULL << 20;
+    throughput.current.host_context_metadata_bytes      = 1ULL << 20;
     throughput.current.host_context_peak_occupied_bytes = 20ULL << 20;
     throughput.current.last_selected_frontier_tokens    = 64;
     throughput.current.pressure_spill_pages             = 4;
@@ -802,7 +808,11 @@ int main() {
         throughput_json.at("context_cache").at("occupancy").at("host_context_occupied_bytes") ==
                 (16ULL << 20) &&
             throughput_json.at("context_cache").at("occupancy").at("host_context_reserved_bytes") ==
-                (4ULL << 20),
+                (4ULL << 20) &&
+            throughput_json.at("context_cache").at("occupancy").at("host_context_resident_bytes") ==
+                (64ULL << 20) &&
+            throughput_json.at("context_cache").at("occupancy").at("host_context_metadata_bytes") ==
+                (1ULL << 20),
         "unified Host occupied and reserved gauges missing");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
