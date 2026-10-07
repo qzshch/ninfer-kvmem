@@ -83,6 +83,13 @@ public:
 
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
+    [[nodiscard]] std::size_t free_bytes() const noexcept { return arena_->free_bytes(); }
+
+    [[nodiscard]] std::uint32_t max_allocatable_pages(const LogicalKVPageStore& pages,
+                                                    std::uint32_t limit) const {
+        return arena_->max_allocatable_pages(page_layout(pages), limit);
+    }
+
     [[nodiscard]] const HostKVPageLayout& page_layout(const LogicalKVPageStore& pages) const {
         const HostKVPageLayout* layout = arena_->layout_for(pages.physical_pool().geometry());
         if (layout == nullptr) {
@@ -820,12 +827,14 @@ KVAddressSpaceStore::apply_device_placement(KVAddressSpaceHandle handle,
                     std::fprintf(stderr,
                                  "KVPLACEMENT capacity phase=%s kind=Host extents=%u/%u "
                                  "remaining=%zu host=%d current=%d writers=%u references=%u "
-                                 "pins=%u committed=%u\n",
+                                 "pins=%u committed=%u free_bytes=%zu max_pages=%u\n",
                                  trace_phase, host_kv_extents.occupied(),
                                  host_kv_extents.capacity(), stale.size() - reserved,
                                  pages_->host_resident(page), pages_->host_replica_current(page),
                                  pages_->writer_references(page), pages_->address_references(page),
-                                 pages_->source_pins(page), pages_->committed_columns(page));
+                                 pages_->source_pins(page), pages_->committed_columns(page),
+                                 host_kv_extents.free_bytes(),
+                                 host_kv_extents.max_allocatable_pages(*pages_, 1));
                     throw std::bad_alloc();
                 }
                 reserved += host_kv_extents.page_count(*backup);

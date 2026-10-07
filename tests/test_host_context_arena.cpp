@@ -1,6 +1,7 @@
 #include "core/host_context_arena.h"
 
 #include <cuda_runtime_api.h>
+#include <array>
 
 #include <cstring>
 #include <iostream>
@@ -73,7 +74,17 @@ void test_fragmentation_and_split() {
     }
     expect(arena.free_bytes() == 1024 && !arena.can_allocate(512) && !arena.allocate(512),
            "actual contiguous extents, not total free bytes, govern availability");
+    const std::array<ninfer::HostPageDemand, 2> mixed = {{{512, 1}, {256, 2}}};
+    expect(arena.page_allocation_shortage(mixed) == 1024 &&
+               arena.occupied_bytes() == 1024 && arena.reserved_bytes() == 0,
+           "complete-page quote rejects fragmented capacity without changing source ownership");
+    const std::array<ninfer::HostPageDemand, 1> small = {{{256, 4}}};
+    expect(arena.page_allocation_shortage(small) == 0,
+           "separate complete-page runs are admissible without one contiguous large allocation");
     (void)pieces[1].release();
+    expect(arena.page_allocation_shortage(mixed) == 0 &&
+               arena.page_allocation_shortage(mixed, 512) == 256,
+           "coalescing and external metadata both affect the complete execution quote");
     auto merged = arena.allocate(768);
     expect(merged.has_value(), "adjacent released split pieces coalesce for another geometry");
     bool invalid_split_rejected = false;
