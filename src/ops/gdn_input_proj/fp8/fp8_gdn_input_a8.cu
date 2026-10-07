@@ -5,7 +5,10 @@
 
 namespace ninfer::ops::detail {
 namespace {
-using Tma64x128  = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
+// Keep the same A8 quantization and ordered K contraction, using explicit staged
+// copies for small repeated prefill chunks. The TMA 64x128 profile intermittently
+// changed the segmented Z output during repeated whole-model execution.
+using Small64x128 = Fp8A8T64R128K128;
 using Tma192x128 = Fp8A8TmaMmaSchedule<192, 128, 128, 3, 4, 2, 1>;
 using MidBulk = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
@@ -32,7 +35,7 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 64) return launch.template operator()<Fp8A8T64R128K256>();
-    if (x.ne[1] <= 128) return launch.template operator()<Tma64x128>();
+    if (x.ne[1] <= 128) return launch.template operator()<Small64x128>();
     if (x.ne[1] <= 192) return launch.template operator()<Tma192x128>();
     // Smaller output tiles leave only two full-K tiles to split near the 512-token anchor.
     if (x.ne[1] > 384 && x.ne[1] <= 512) return launch.template operator()<MidBulk>();
