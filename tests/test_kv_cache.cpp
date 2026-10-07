@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <new>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -159,6 +161,33 @@ bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t pag
         }
     }
     return true;
+}
+
+int exercise_async_mapping_source(ninfer::DeviceContext& context) {
+    auto plan = plan_cache(2, 2, 1, {.planes = {{ninfer::DType::I8, 8, 2, 256}}});
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    auto pages = materialize(pool, 2);
+    auto row = tables.acquire(0);
+    ninfer::PinnedHostBuffer snapshots(4 * sizeof(std::int32_t));
+    auto* values = static_cast<std::int32_t*>(snapshots.data());
+    // The host source of the first upload must remain immutable until its DMA
+    // completes, even when another publication is queued on the same stream.
+    CUDA_CHECK(cudaLaunchHostFunc(context.stream, [](void*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }, nullptr));
+    tables.publish(row.handle(), 0, pages, context.stream);
+    CUDA_CHECK(cudaMemcpyAsync(values, tables.row(row.handle()).data,
+                               2 * sizeof(std::int32_t), cudaMemcpyDeviceToHost, context.stream));
+    tables.publish_holes(row.handle(), 0, 2, context.stream);
+    CUDA_CHECK(cudaMemcpyAsync(values + 2, tables.row(row.handle()).data,
+                               2 * sizeof(std::int32_t), cudaMemcpyDeviceToHost, context.stream));
+    context.synchronize();
+    return expect(values[0] == 0 && values[1] == 1,
+                  "a later publication overwrote the pinned source of an in-flight table upload") +
+           expect(values[2] == ninfer::kPagedKVPageHole && values[3] == ninfer::kPagedKVPageHole,
+                  "the final execution table did not publish its holes");
 }
 
 int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
@@ -501,7 +530,8 @@ int main() {
 
     try {
         ninfer::DeviceContext context(0);
-        int failures = exercise_reservation_and_mapping(context);
+        int failures = exercise_async_mapping_source(context);
+        failures += exercise_reservation_and_mapping(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{

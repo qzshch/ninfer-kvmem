@@ -23,6 +23,7 @@ struct RequestLifetime;
 struct RequestCapacity;
 
 struct GenerationMetrics {
+    ninfer::KvmemDiagnostics kvmem;
     std::uint64_t engine_request_id       = 0;
     std::uint32_t computed_prefill_tokens = 0;
     double prepare_seconds                = 0.0;

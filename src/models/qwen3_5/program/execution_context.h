@@ -38,6 +38,11 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    float* kvmem_q_sum                = nullptr;
+    float* kvmem_k_sum                = nullptr;
+    std::uint32_t kvmem_capture_slots = 0;
+    std::uint32_t kvmem_query_begin   = 0;
+    std::uint32_t kvmem_query_end     = 0;
 };
 
 struct PrefillContext {

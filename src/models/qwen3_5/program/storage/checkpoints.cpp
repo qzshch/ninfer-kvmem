@@ -124,6 +124,48 @@ bool ProgramImpl::revoke_snapshot(ResumeState& paused) noexcept {
     return true;
 }
 
+FileCacheStats ProgramImpl::file_cache_stats() const noexcept {
+    FileCacheStats out;
+    if (host_kv_arena && host_kv_arena->file_backed()) {
+        const auto file                      = host_kv_arena->file_snapshot();
+        out.read_bytes            = file.read_bytes;
+        out.written_bytes         = file.written_bytes;
+        out.read_ns               = file.read_ns;
+        out.write_ns              = file.write_ns;
+        out.staging_wait_ns       = file.staging_wait_ns;
+        out.reads                 = file.reads;
+        out.writes                = file.writes;
+        out.pinned_bytes          = file.pinned_bytes;
+        out.integrity_bytes       = file.integrity_bytes;
+        out.pending_reads         = file.pending_reads;
+        out.pending_writes        = file.pending_writes;
+        out.ram_capacity_bytes    = file.ram_capacity_bytes;
+        out.ram_resident_bytes    = file.ram_resident_bytes;
+        out.ram_dirty_bytes       = file.ram_dirty_bytes;
+        out.ram_hit_bytes         = file.ram_hit_bytes;
+        out.ram_miss_bytes        = file.ram_miss_bytes;
+        out.disk_read_bytes       = file.disk_read_bytes;
+        out.disk_written_bytes    = file.disk_written_bytes;
+        out.disk_read_ns          = file.disk_read_ns;
+        out.disk_write_ns         = file.disk_write_ns;
+        out.disk_pwrite_ns        = file.disk_pwrite_ns;
+        out.disk_sync_ns          = file.disk_sync_ns;
+        out.disk_sync_calls       = file.disk_sync_calls;
+        out.disk_high_water_bytes = file.disk_high_water_bytes;
+        out.filesystem_pending_bytes = file.filesystem_pending_bytes;
+        out.filesystem_write_budget_bytes = file.filesystem_write_budget_bytes;
+        out.ram_evictions         = file.ram_evictions;
+        out.prefetch_bytes        = file.prefetch_bytes;
+        out.prefetch_hit_bytes    = file.prefetch_hit_bytes;
+        out.prefetch_wasted_bytes = file.prefetch_wasted_bytes;
+        out.prefetch_dropped_jobs = file.prefetch_dropped_jobs;
+        out.pending_prefetches    = file.pending_prefetches;
+        out.pending_writebacks    = file.pending_writebacks;
+        out.pending_callbacks     = file.pending_callbacks;
+    }
+    return out;
+}
+
 PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     PhysicalUsageSnapshot out;
     if (state_store) {
@@ -145,9 +187,12 @@ PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     if (host_context_arena) {
         out.occupied.host_bytes      = host_context_arena->occupied_bytes();
         out.capacity.host_bytes      = host_context_arena->capacity_bytes();
+        out.host_resident_bytes      = host_context_arena->resident_bytes();
+        out.host_metadata_bytes      = host_context_arena->metadata_bytes();
         out.host_reserved_bytes      = host_context_arena->reserved_bytes();
         out.host_peak_occupied_bytes = host_context_arena->peak_occupied_bytes();
     }
+    out.file_cache = file_cache_stats();
     return out;
 }
 
@@ -374,12 +419,17 @@ std::optional<std::size_t> ProgramImpl::pause_host_bytes(SequenceHandle handle) 
     std::size_t bytes = state_store->host_resident(sequence.state.read)
                             ? 0
                             : state_images->host_layout().image_bytes;
-    const auto count  = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
+    if (kvmem_window_pages && control.lifecycle == Lifecycle::Prefilling &&
+        kvmem_lanes_[lane].query_checkpoint_valid) {
+        bytes += state_images->host_layout().image_bytes +
+                 kvmem_lanes_[lane].query_key_checkpoint.bytes();
+    }
+    const auto count = [&](const KVAddressSpaceStore& addresses, const LogicalKVPageStore& pages,
                            KVAddressSpaceHandle address, std::uint32_t target) {
         const auto mapped   = addresses.mapped_pages(address);
         const auto required = kv_pages_for_frontier(target);
         const auto stride   = (&pages == text_kv_pages.get() ? text_host_kv_page_stride
-                                                              : backend_host_kv_page_stride);
+                                                             : backend_host_kv_page_stride);
         for (std::uint32_t i = 0; i < std::min<std::uint32_t>(mapped, required); ++i) {
             const auto page = addresses.logical_page(address, i);
             // Deactivation removes this request's active reference. Other resident readers

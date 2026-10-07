@@ -34,6 +34,12 @@ struct DFlashPersistentLayout {
 
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
+    std::optional<TensorLayout> kvmem_query_sum;
+    std::optional<TensorLayout> kvmem_key_sums;
+    std::optional<TensorLayout> kvmem_query_key_checkpoint;
+    std::optional<TensorLayout> kvmem_query_tail_hidden;
+    std::optional<LinearAttentionStatePoolLayout> kvmem_query_checkpoint;
+    std::optional<CyclicKVCacheLayout> kvmem_draft_checkpoint;
     qwen3_5::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
@@ -73,6 +79,7 @@ struct SequencePlanningInputs {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
+    std::uint32_t kvmem_window_pages        = 0;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
@@ -92,6 +99,7 @@ struct SequencePlanImpl {
     std::uint32_t kv_capacity               = 0;
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
+    std::uint32_t kvmem_window_pages        = 0;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;

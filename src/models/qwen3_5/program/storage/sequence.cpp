@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "ninfer/ops/scalar.h"
 
 #include <algorithm>
 #include <array>
@@ -105,6 +106,16 @@ void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
 void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     // The caller settles real GPU readers before reaching this destruction boundary.
     const auto lane = sequence.lane;
+    if (kvmem_window_pages) {
+        auto& sparse = kvmem_lanes_[lane];
+        sparse.index.truncate_to(0);
+        sparse.query.clear();
+        sparse.query_count.clear();
+        sparse.retrieved_pages.clear();
+        sparse.media_groups.clear();
+        sparse.capture_begin = sparse.query_begin = sparse.query_end = 0;
+        sparse.query_checkpoint_valid                                = false;
+    }
     request.prefill.reset();
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
@@ -115,6 +126,10 @@ void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) n
 }
 
 void ProgramImpl::clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept {
+    // A failed execution can share pages with an unpublished asynchronous bind.
+    // Drain and retire that transaction's source/destination leases before releasing
+    // the failed history; otherwise cleanup can terminate on a still-pinned page.
+    abort_context();
     for (const auto lane : lanes) {
         if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
     }
@@ -137,6 +152,19 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& state) const no
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& state, std::uint32_t main,
                                             std::uint32_t backend) {
+    if (kvmem_window_pages) {
+        const auto& request = requests[state.lane];
+        if (request.lifecycle == Lifecycle::Prefilling ||
+            request.lifecycle == Lifecycle::Replaying) {
+            roll_sparse_prefill_window(
+                state, capacity, state.text_kv_valid, backend_kv_valid(state),
+                request.lifecycle == Lifecycle::Replaying ||
+                    (request.prefill && (request.prefill->query_replay_cursor.has_value() ||
+                                         request.prefill->canonical_retrieval)));
+        } else {
+            roll_sparse_decode_window(state);
+        }
+    }
     text_kv_addresses->ensure_mapped_to_tokens(state.kv->text, main, device.stream);
     if (state.kv->backend) {
         backend_kv_addresses->ensure_mapped_to_tokens(*state.kv->backend, backend, device.stream);
@@ -169,8 +197,9 @@ PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& state) const {
 }
 
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
-        cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
+    // Pass control values in kernel arguments rather than enqueueing a copy from
+    // a stack object whose lifetime ends when this method returns.
+    ops::set_i32_scalar(tensor, value, device.stream);
 }
 
 void ProgramImpl::ordered_reset(SequenceState& state) {

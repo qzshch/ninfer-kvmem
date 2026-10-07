@@ -865,6 +865,64 @@ int main() {
     input.close();
     std::filesystem::remove(log_path);
 
+    outcome.metrics.kvmem.enabled                   = true;
+    outcome.metrics.kvmem.placement[0][0].d2h_bytes = 987654321ULL;
+    outcome.metrics.kvmem.replay_tokens             = 513;
+    const auto sparse_done =
+        Json::parse(format_request_done_json("server-test", 123, context, outcome));
+    failures +=
+        check(sparse_done.at("kvmem").at("placement").at("prefill").at("main").at("d2h_bytes") ==
+                      987654321ULL &&
+                  sparse_done.at("kvmem").at("replay").at("tokens") == 513,
+              "sparse copy and replay work lost their exact request scope");
+    throughput.current.file_cache.disk_read_bytes   = 42424242;
+    throughput.current.file_cache.disk_pwrite_ns = 101;
+    throughput.current.file_cache.disk_sync_ns = 202;
+    throughput.current.file_cache.disk_sync_calls = 3;
+    throughput.current.file_cache.disk_high_water_bytes = 4096;
+    throughput.current.file_cache.filesystem_pending_bytes = 2048;
+    throughput.current.file_cache.filesystem_write_budget_bytes = 67112960;
+    throughput.current.file_cache.pending_callbacks = 2;
+    throughput.current.host_context_metadata_bytes  = 256;
+    const auto tiered_json = Json::parse(format_throughput_json("server-test", 123, throughput));
+    failures += check(tiered_json.at("hicache").at("disk_read_bytes") == 42424242 &&
+                          tiered_json.at("hicache").at("pending_callbacks") == 2 &&
+                          tiered_json.at("hicache").at("host_metadata_bytes") == 256 &&
+                          tiered_json.at("hicache").at("disk_pwrite_ns") == 101 &&
+                          tiered_json.at("hicache").at("disk_sync_ns") == 202 &&
+                          tiered_json.at("hicache").at("disk_sync_calls") == 3 &&
+                          tiered_json.at("hicache").at("disk_high_water_bytes") == 4096 &&
+                          tiered_json.at("hicache").at("filesystem_pending_bytes") == 2048 &&
+                          tiered_json.at("hicache").at("filesystem_write_budget_bytes") == 67112960,
+                      "tiered gauges or lifetime counters were omitted from periodic telemetry");
+
+    throughput.current.lane_count = 3;
+    throughput.previous.lanes[0].computed_prefill_tokens = 100;
+    throughput.current.lanes[0].computed_prefill_tokens = 150;
+    throughput.previous.lanes[0].committed_decode_tokens = 30;
+    throughput.current.lanes[0].committed_decode_tokens = 60;
+    throughput.current.lanes[0].state = ninfer::RuntimeLaneState::Decode;
+    throughput.current.lanes[0].engine_request_id = 40;
+    throughput.current.lanes[1].computed_prefill_tokens = 50;
+    throughput.current.lanes[1].committed_decode_tokens = 10;
+    throughput.current.lanes[1].state = ninfer::RuntimeLaneState::Prefill;
+    throughput.current.lanes[1].engine_request_id = 41;
+    throughput.previous.lanes[2].committed_decode_tokens = 7;
+    throughput.current.lanes[2].committed_decode_tokens = 7;
+    const auto lane_json = Json::parse(format_throughput_json("server-test", 123, throughput));
+    const auto& lanes = lane_json.at("lanes");
+    failures += check(lanes.size() == 3 && lanes[0].at("state") == "decode_ready" &&
+                          lanes[1].at("state") == "prefill" &&
+                          lanes[0].at("engine_request_id") == 40 &&
+                          lanes[2].at("engine_request_id").is_null() &&
+                          lanes[2].at("throughput_tokens_per_second").at("decode") == 0,
+                      "lane gauges retained an old request or dropped an idle lane");
+    failures += check(lanes[0].at("tokens").at("computed_prefill") == 50 &&
+                          lanes[0].at("throughput_tokens_per_second").at("decode") == 15 &&
+                          lanes[1].at("throughput_tokens_per_second").at("decode") == 5 &&
+                          lanes[1].at("tokens").at("computed_prefill") == 50,
+                      "lane rates did not use interval deltas matching aggregate token counts");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -135,7 +135,18 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
             run_pages = 0;
         };
         std::optional<HostKVPageReplica> previous;
+        const auto selected =
+            kvmem_window_pages
+                ? kvmem_restore_pages(addresses, address, frontier, prompt,
+                                      kvmem_same_prompt_source(record, prompt)
+                                          ? std::span(record.kvmem_features->retrieved_pages)
+                                          : std::span<const std::uint32_t>{})
+                : std::vector<std::uint32_t>{};
         for (std::uint32_t index = 0; index < count; ++index) {
+            if (kvmem_window_pages &&
+                !std::binary_search(selected.begin(), selected.end(), index)) {
+                continue;
+            }
             const auto page = addresses.logical_page(address, index);
             if (pages.device_resident(page)) { continue; }
             const auto replica = pages.host_replica(page);

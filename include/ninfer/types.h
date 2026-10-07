@@ -122,6 +122,44 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
+struct FileCacheStats {
+    std::uint64_t read_bytes            = 0;
+    std::uint64_t written_bytes         = 0;
+    std::uint64_t read_ns               = 0;
+    std::uint64_t write_ns              = 0;
+    std::uint64_t staging_wait_ns       = 0;
+    std::uint64_t reads                 = 0;
+    std::uint64_t writes                = 0;
+    std::size_t pinned_bytes            = 0;
+    std::size_t integrity_bytes         = 0;
+    std::uint64_t pending_reads         = 0;
+    std::uint64_t pending_writes        = 0;
+    std::size_t ram_capacity_bytes      = 0;
+    std::uint64_t ram_resident_bytes    = 0;
+    std::uint64_t ram_dirty_bytes       = 0;
+    std::uint64_t ram_hit_bytes         = 0;
+    std::uint64_t ram_miss_bytes        = 0;
+    std::uint64_t disk_read_bytes       = 0;
+    std::uint64_t disk_written_bytes    = 0;
+    std::uint64_t disk_read_ns          = 0;
+    std::uint64_t disk_write_ns         = 0;
+    std::uint64_t disk_pwrite_ns        = 0;
+    std::uint64_t disk_sync_ns          = 0;
+    std::uint64_t disk_sync_calls       = 0;
+    std::uint64_t disk_high_water_bytes = 0;
+    // Conservative page-rounded charge for unsynced file writes (gauge).
+    std::uint64_t filesystem_pending_bytes = 0;
+    std::uint64_t filesystem_write_budget_bytes = 0;
+    std::uint64_t ram_evictions         = 0;
+    std::uint64_t prefetch_bytes        = 0;
+    std::uint64_t prefetch_hit_bytes    = 0;
+    std::uint64_t prefetch_wasted_bytes = 0;
+    std::uint64_t prefetch_dropped_jobs = 0;
+    std::uint64_t pending_prefetches    = 0;
+    std::uint64_t pending_writebacks    = 0;
+    std::uint64_t pending_callbacks     = 0;
+};
+
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
@@ -133,6 +171,13 @@ struct ContextCacheOptions {
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
+    // Instance-local KV L3; shares the Host extent ledger with upstream StateImages.
+    // With L3 enabled, pinned State backing grows lazily under this separate physical limit.
+    std::filesystem::path kv_file_directory;
+    std::size_t hicache_ram_capacity_bytes   = 0;
+    std::size_t hicache_state_capacity_bytes = 8ULL << 30;
+    bool hicache_prefetch                    = false;
+    bool hicache_write_through               = false;
 };
 
 struct ContextCostOptions {
@@ -140,6 +185,49 @@ struct ContextCostOptions {
     // nonempty runtime preset independently overrides its matching machine transfer and
     // artifact-prefill components; absent entries retain the preceding numerical layer.
     std::filesystem::path preset_path;
+};
+
+enum class KvmemPlacementPhase : std::uint8_t { Prefill, Retrieval, Replay, Decode };
+
+struct KvmemPlacementStats {
+    std::uint64_t calls          = 0;
+    std::uint64_t no_copy_calls  = 0;
+    std::uint64_t demoted_pages  = 0;
+    std::uint64_t promoted_pages = 0;
+    std::uint64_t d2h_pages      = 0;
+    std::uint64_t d2h_bytes      = 0;
+    std::uint64_t h2d_bytes      = 0;
+    // Copy submit+existing wait and table-publication wait are subsets of total Host wall.
+    std::uint64_t d2h_submit_wait_ns  = 0;
+    std::uint64_t h2d_submit_wait_ns  = 0;
+    std::uint64_t publication_wait_ns = 0;
+    std::uint64_t total_host_wall_ns  = 0;
+};
+
+// Request-owned direct sparse-KV diagnostics. These are observed Host wall/blocked
+// intervals, not GPU kernel times. They require no additional synchronization.
+
+struct KvmemDiagnostics {
+    bool enabled = false;
+    // [Prefill,Retrieval,Replay,Decode][Main,Backend]; physical rows do not identify requests.
+    std::array<std::array<KvmemPlacementStats, 2>, 4> placement{};
+    std::uint64_t key_capture_calls            = 0;
+    std::uint64_t key_capture_d2h_bytes        = 0;
+    std::uint64_t key_capture_submit_wait_ns   = 0;
+    std::uint64_t key_capture_host_wall_ns     = 0;
+    std::uint64_t query_capture_calls          = 0;
+    std::uint64_t query_capture_d2h_bytes      = 0;
+    std::uint64_t query_capture_submit_wait_ns = 0;
+    std::uint64_t query_capture_host_wall_ns   = 0;
+    std::uint64_t selection_calls              = 0;
+    std::uint64_t scored_blocks                = 0;
+    std::uint64_t selection_host_wall_ns       = 0;
+    std::uint64_t replay_tokens                = 0;
+    std::uint64_t replay_units                 = 0;
+    // Entire scheduler replay step, including nested replay placement and existing waits.
+    std::uint64_t replay_step_host_wall_ns        = 0;
+    std::uint64_t replay_execution_host_ns        = 0;
+    std::uint64_t replay_execution_device_wait_ns = 0;
 };
 
 struct EngineOptions {
@@ -152,6 +240,8 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t kvmem_window_pages =
+        0; // 64-token pages per lane; zero retains dense upstream behavior.
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -672,6 +762,7 @@ struct PreparationControl {
 // and other request lifetime. They are not Host-work phases. GenerationEngineTiming below is the
 // direct, mutually-exclusive Host observation contract.
 struct GenerationTimings {
+    KvmemDiagnostics kvmem;
     double prepare_seconds     = 0.0;
     double first_token_seconds = 0.0;
     double vision_seconds      = 0.0;
@@ -843,6 +934,9 @@ struct MemorySummary {
     std::size_t kv_payload_bytes                  = 0;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.
+    FileCacheStats file_cache;
+    std::size_t host_context_resident_bytes = 0;
+    std::size_t host_context_metadata_bytes = 0;
     std::size_t host_context_capacity_bytes = 0;
     std::size_t host_context_occupied_bytes = 0;
     std::size_t host_context_reserved_bytes = 0;
@@ -874,9 +968,35 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+enum class RuntimeLaneState : std::uint8_t {
+    Idle,
+    Binding,
+    Prefill,
+    Decode,
+    Replay,
+    CapturePending,
+    TerminalPending,
+};
+
+struct RuntimeLaneStats {
+    RuntimeLaneState state = RuntimeLaneState::Idle;
+    std::uint64_t engine_request_id = 0;
+    std::uint64_t generated_tokens = 0;
+    std::uint64_t computed_prefill_tokens = 0;
+    std::uint64_t committed_decode_tokens = 0;
+    std::uint64_t replayed_tokens = 0;
+    std::uint64_t decode_rounds = 0;
+    std::uint64_t prefill_units = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    std::uint32_t lane_count = 0;
+    std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
+    FileCacheStats file_cache;
+    std::size_t host_context_resident_bytes = 0;
+    std::size_t host_context_metadata_bytes = 0;
     RuntimeHostWorkStats host_work;
     // Full prompt counted once when initial binding succeeds; includes reused tokens.
     std::uint64_t prompt_tokens = 0;

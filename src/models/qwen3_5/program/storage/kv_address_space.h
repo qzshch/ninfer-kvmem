@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/program/storage/logical_kv_store.h"
+#include "ninfer/types.h"
 
 #include <algorithm>
 #include <array>
@@ -235,6 +236,9 @@ public:
                        std::int32_t execution_row,
                        std::optional<std::uint32_t> activation_frontier = std::nullopt) {
         Address& address = require(handle);
+        growth_pages     = std::min(
+            growth_pages,
+            sparse_growth_limit(handle, activation_frontier.value_or(address.committed_frontier)));
         if (address.active || address.row || address.reservation.valid() ||
             growth_pages > page_capacity_ ||
             (activation_frontier && *activation_frontier > address.committed_frontier)) {
@@ -245,7 +249,10 @@ public:
         DeviceKVPageReservation reservation = pages_->physical_pool().make_empty_reservation();
         std::uint32_t missing_replicas      = 0;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            if (!pages_->device_resident(membership(address, page))) { ++missing_replicas; }
+            if (page_in_working_set(address, page) &&
+                !pages_->device_resident(membership(address, page))) {
+                ++missing_replicas;
+            }
         }
         if (growth_pages > page_capacity_ - required_pages) {
             throw std::invalid_argument("KV activation growth exceeds address capacity");
@@ -292,24 +299,23 @@ public:
         }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
-            if (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
-                                                      !pages_->can_set_writer(logical, true))) {
+            if (page_in_working_set(address, page) &&
+                (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
+                                                       !pages_->can_set_writer(logical, true)))) {
                 throw std::logic_error("KV activation has an unavailable Device page");
             }
         }
-        publish_scratch_.clear();
-        for (std::uint32_t page = 0; page < address.page_count; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(address, page)));
-        }
-        tables_->publish(activation.row_->handle(), 0, publish_scratch_, stream);
-        address.reservation = std::move(activation.page_reservation_);
+        publish_membership(address, stream, activation.row_->handle());
         address.row.emplace(std::move(*activation.row_));
         activation.row_.reset();
-        address.active    = true;
-        activation.owner_ = nullptr;
+        address.reservation = std::move(activation.page_reservation_);
+        address.active      = true;
+        activation.owner_   = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
-            if (pages_->address_references(logical) == 1) { pages_->set_writer(logical, true); }
+            if (page_in_working_set(address, page) && pages_->address_references(logical) == 1) {
+                pages_->set_writer(logical, true);
+            }
             pages_->retain_active_reference(logical);
         }
     }
@@ -339,6 +345,7 @@ public:
                         std::int32_t execution_row) {
         Address& source      = require(source_handle);
         Address& destination = require(destination_handle);
+        growth_pages         = std::min(growth_pages, sparse_growth_limit(source_handle, frontier));
         if (source.active || source.row || source.reservation.valid()) {
             throw std::logic_error("KV retained-prefix source is still active");
         }
@@ -359,10 +366,21 @@ public:
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
             const std::uint32_t required      = page < full_pages ? page_size : tail_columns;
-            if (!pages_->device_resident(logical) ||
-                pages_->committed_columns(logical) < required || !pages_->can_pin_source(logical) ||
+            if ((!pages_->device_resident(logical) &&
+                 (!pages_->host_replica_current(logical) || page >= full_pages ||
+                  page_in_working_set(source, page))) ||
+                pages_->committed_columns(logical) < required ||
+                (pages_->device_resident(logical) && !pages_->can_pin_source(logical)) ||
                 (page < full_pages && !pages_->can_retain_reference(logical, false))) {
-                throw std::logic_error("KV retained-prefix source is not stable");
+                throw std::logic_error(
+                    "KV retained-prefix source is not stable: page=" + std::to_string(page) +
+                    " committed=" + std::to_string(pages_->committed_columns(logical)) +
+                    " required=" + std::to_string(required) +
+                    " device=" + std::to_string(pages_->device_resident(logical)) +
+                    " host=" + std::to_string(pages_->host_replica_current(logical)) +
+                    " selected=" + std::to_string(page_in_working_set(source, page)) +
+                    " writers=" + std::to_string(pages_->writer_references(logical)) +
+                    " references=" + std::to_string(pages_->address_references(logical)));
             }
         }
 
@@ -414,7 +432,10 @@ public:
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
-            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical) ||
+            if (pages_->source_pins(logical) == 0 ||
+                (!pages_->device_resident(logical) &&
+                 (!pages_->host_replica_current(logical) || page >= fork.full_pages_ ||
+                  page_in_working_set(source, page))) ||
                 (page < fork.full_pages_ && !pages_->can_retain_reference(logical, false))) {
                 throw std::logic_error("KV prefix-fork source changed before publication");
             }
@@ -424,18 +445,11 @@ public:
             throw std::logic_error("KV prefix-fork tail destination is stale");
         }
 
-        publish_scratch_.clear();
-        for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
-            publish_scratch_.push_back(pages_->physical(membership(source, page)));
-        }
-        if (fork.tail_destination_) {
-            publish_scratch_.push_back(pages_->physical(*fork.tail_destination_));
-        }
         auto directory = prefix_directory(source, fork.full_pages_);
         if (fork.tail_destination_) {
             directory_slot(directory, fork.full_pages_) = *fork.tail_destination_;
         }
-        tables_->publish(fork.row_->handle(), 0, publish_scratch_, stream);
+        publish_prefix(fork.row_->handle(), source, required_pages, fork.tail_destination_, stream);
 
         for (std::uint32_t page = 0; page < fork.full_pages_; ++page) {
             const LogicalKVPageHandle logical = membership(source, page);
@@ -446,8 +460,9 @@ public:
             pages_->publish_transfer_destination(*fork.tail_destination_, true);
             fork.tail_destination_.reset();
         }
-        destination.directory          = std::move(directory);
-        destination.page_count         = required_pages;
+        destination.directory  = std::move(directory);
+        destination.page_count = required_pages;
+        copy_working_set(source, destination);
         destination.committed_frontier = fork.frontier_;
         destination.reservation        = std::move(fork.page_reservation_);
         destination.row.emplace(std::move(*fork.row_));
@@ -502,8 +517,11 @@ public:
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto page     = membership(source, i);
             const auto required = i < full_pages ? page_size : tail_columns;
-            if (!pages_->device_resident(page) || pages_->committed_columns(page) < required ||
-                (!pages_->can_pin_source(page) && !pages_->can_pin_active_source(page)) ||
+            if ((!pages_->device_resident(page) &&
+                 (!pages_->host_replica_current(page) || i >= full_pages)) ||
+                pages_->committed_columns(page) < required ||
+                (pages_->device_resident(page) && !pages_->can_pin_source(page) &&
+                 !pages_->can_pin_active_source(page)) ||
                 (i < full_pages && !pages_->can_retain_reference(page, false))) {
                 throw std::logic_error("active KV prefix-view source is not stable");
             }
@@ -556,7 +574,9 @@ public:
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto page     = membership(source, i);
             const auto required = i < full_pages ? page_size : view.frontier_ % page_size;
-            if (page != view.sources_[i] || !pages_->device_resident(page) ||
+            if (page != view.sources_[i] ||
+                (!pages_->device_resident(page) &&
+                 (!pages_->host_replica_current(page) || i >= full_pages)) ||
                 pages_->source_pins(page) == 0 || pages_->committed_columns(page) < required ||
                 (i < full_pages && !pages_->can_retain_reference(page, false))) {
                 throw std::logic_error("active KV prefix-view source changed before publication");
@@ -583,8 +603,9 @@ public:
             pages_->protect_coverage(*view.tail_destination_, view.frontier_ % page_size);
             view.tail_destination_.reset();
         }
-        destination.directory           = std::move(directory);
-        destination.page_count          = count;
+        destination.directory  = std::move(directory);
+        destination.page_count = count;
+        copy_working_set(source, destination);
         destination.committed_frontier  = view.frontier_;
         destination.checkpoint_frontier = view.frontier_;
         for (std::uint32_t i = 0; i < count; ++i) { pages_->unpin_source(membership(source, i)); }
@@ -606,6 +627,71 @@ public:
         view.owner_ = nullptr;
     }
 
+    struct KVPlacementCounts {
+        std::uint32_t promoted = 0;
+        std::uint32_t demoted  = 0;
+        KvmemPlacementStats telemetry;
+    };
+
+    KVPlacementCounts apply_device_placement(KVAddressSpaceHandle, HostKVExtentStore&,
+                                             std::span<const std::uint32_t>, cudaStream_t,
+                                             const char* = "other");
+
+    [[nodiscard]] std::uint32_t sparse_growth_limit(KVAddressSpaceHandle handle,
+                                                    std::uint32_t frontier) const {
+        if (!sparse_activation_budget_pages_) { return std::numeric_limits<std::uint32_t>::max(); }
+        const auto& address    = require(handle);
+        const auto count       = pages_for_tokens(frontier);
+        std::uint32_t selected = 0;
+        for (std::uint32_t p = 0; p < count; ++p) {
+            selected += page_in_working_set(address, p) || p + 1U == count;
+        }
+        return selected >= sparse_activation_budget_pages_
+                   ? 0U
+                   : sparse_activation_budget_pages_ - selected;
+    }
+
+    void set_sparse_activation_budget(std::uint32_t pages) noexcept {
+        sparse_activation_budget_pages_ = pages;
+    }
+
+    [[nodiscard]] bool page_in_device_working_set(KVAddressSpaceHandle handle,
+                                                  std::uint32_t page) const {
+        return page_in_working_set(require(handle), page);
+    }
+
+    void set_restore_working_set(KVAddressSpaceHandle handle,
+                                 std::span<const std::uint32_t> selected) {
+        auto& address = require(handle);
+        if (address.active || address.row || address.reservation.valid()) {
+            throw std::logic_error("cannot change an executing KV restore selection");
+        }
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+            if (selected[i] >= address.page_count || (i && selected[i] <= selected[i - 1])) {
+                throw std::invalid_argument("invalid sparse restore selection");
+            }
+        }
+        address.device_working_set.emplace(selected.begin(), selected.end());
+    }
+
+    // A changed query restores a different set from its inactive donor. Keeping both sets
+    // resident can unnecessarily reject a reusable checkpoint in a one-window pool. Retire
+    // only current Host-backed replicas outside the destination selection; selected pages,
+    // active aliases and pending source leases remain untouched. No logical history is lost.
+    [[nodiscard]] std::uint32_t reclaim_unselected_restore_replicas(KVAddressSpaceHandle handle,
+                                                                    std::uint32_t limit) {
+        const auto& address = require(handle);
+        if (address.active || address.row || !address.device_working_set) { return 0; }
+        std::uint32_t reclaimed = 0;
+        for (std::uint32_t p = 0; p < address.page_count && reclaimed < limit; ++p) {
+            if (!page_in_working_set(address, p) &&
+                pages_->drop_device_replica(logical_page(handle, p))) {
+                ++reclaimed;
+            }
+        }
+        return reclaimed;
+    }
+
     // A reservation covers a finite execution or recovery interval. Resizing is atomic at the pool;
     // callers combining several addresses retain their old counts until the group is acquired.
     void reserve_growth(KVAddressSpaceHandle handle, std::uint32_t growth_pages) {
@@ -613,7 +699,8 @@ public:
         if (growth_pages > page_capacity_ - address.page_count) {
             throw std::invalid_argument("KV growth exceeds address capacity");
         }
-        pages_->physical_pool().resize_reservation(address.reservation, growth_pages);
+        pages_->physical_pool().resize_reservation(
+            address.reservation, std::min(growth_pages, sparse_reservation_cap(address)));
     }
 
     void release_growth(KVAddressSpaceHandle handle) {
@@ -628,7 +715,37 @@ public:
         if (target > page_capacity_) {
             throw std::invalid_argument("KV unit exceeds address capacity");
         }
-        return target > address.page_count ? target - address.page_count : 0U;
+        return std::min(target > address.page_count ? target - address.page_count : 0U,
+                        sparse_reservation_cap(address));
+    }
+
+    // Query replay rewinds an unpublished suffix after admission. Its future
+    // growth is measured from that boundary, not from the probe's current extent.
+    [[nodiscard]] std::uint32_t replay_growth_pages_for_tokens(
+        KVAddressSpaceHandle handle, std::uint32_t rewind_tokens, std::uint32_t tokens) const {
+        const auto& address = require(handle);
+        const auto rewind = pages_for_tokens(rewind_tokens);
+        const auto target = pages_for_tokens(tokens);
+        if (rewind_tokens > address.committed_frontier ||
+            rewind_tokens < address.checkpoint_frontier ||
+            rewind > address.page_count || target > page_capacity_) {
+            throw std::invalid_argument("KV replay growth is outside retained coverage");
+        }
+        return std::min(target > rewind ? target - rewind : 0U,
+                        sparse_reservation_cap(address, rewind));
+    }
+
+    void reserve_replay_growth(KVAddressSpaceHandle handle, std::uint32_t rewind_tokens,
+                               std::uint32_t growth_pages) {
+        auto& address = require_active(handle);
+        const auto rewind = pages_for_tokens(rewind_tokens);
+        if (rewind_tokens > address.committed_frontier ||
+            rewind_tokens < address.checkpoint_frontier ||
+            rewind > address.page_count || growth_pages > page_capacity_ - rewind) {
+            throw std::invalid_argument("KV replay reservation exceeds rewound capacity");
+        }
+        pages_->physical_pool().resize_reservation(
+            address.reservation, std::min(growth_pages, sparse_reservation_cap(address, rewind)));
     }
 
     void settle_growth(KVAddressSpaceHandle handle, std::uint32_t frontier,
@@ -682,6 +799,11 @@ public:
             directory_slot(address.directory, begin + offset) = added[offset];
         }
         address.page_count = target;
+        if (address.device_working_set) {
+            for (auto page = begin; page < target; ++page) {
+                address.device_working_set->push_back(page);
+            }
+        }
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
@@ -703,6 +825,8 @@ public:
         }
         address.committed_frontier = frontier;
     }
+
+    void truncate_for_replay(KVAddressSpaceHandle, std::uint32_t, HostKVExtentStore&);
 
     void destructive_truncate(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
@@ -741,6 +865,7 @@ public:
             }
         }
         trim_unique_suffix(address.directory, directory_capacity_, target);
+        trim_working_set(address, target);
         address.committed_frontier = frontier;
     }
 
@@ -795,7 +920,8 @@ public:
                 pages_->destructive_truncate_inactive(tail, columns);
             }
         }
-        address.directory           = std::move(directory);
+        address.directory = std::move(directory);
+        trim_working_set(address, target);
         address.committed_frontier  = frontier;
         address.checkpoint_frontier = 0;
         rebuild_checkpoint_protection();
@@ -857,8 +983,9 @@ public:
             const LogicalKVPageHandle logical = membership(address, index);
             if (!pages_->release_reference(logical, false)) { std::terminate(); }
         }
-        address.directory           = std::move(directory);
-        address.committed_frontier  = frontier;
+        address.directory          = std::move(directory);
+        address.committed_frontier = frontier;
+        trim_working_set(address, target);
         address.checkpoint_frontier = std::min(address.checkpoint_frontier, frontier);
         rebuild_checkpoint_protection();
     }
@@ -988,6 +1115,7 @@ private:
 
     struct Address {
         Directory directory;
+        std::optional<std::vector<std::uint32_t>> device_working_set;
         std::uint32_t generation          = 1;
         std::uint32_t page_count          = 0;
         std::uint32_t committed_frontier  = 0;
@@ -1005,6 +1133,50 @@ private:
     [[nodiscard]] static std::uint32_t next_generation(std::uint32_t generation) noexcept {
         ++generation;
         return generation == 0 ? 1 : generation;
+    }
+
+    static void trim_working_set(Address& address, std::uint32_t count) {
+        if (address.device_working_set) {
+            auto& set = *address.device_working_set;
+            set.erase(std::lower_bound(set.begin(), set.end(), count), set.end());
+        }
+    }
+
+    static void copy_working_set(const Address& source, Address& destination) {
+        destination.device_working_set = source.device_working_set;
+        if (destination.device_working_set) {
+            auto& set = *destination.device_working_set;
+            set.erase(std::lower_bound(set.begin(), set.end(), destination.page_count), set.end());
+            if (destination.page_count &&
+                !std::binary_search(set.begin(), set.end(), destination.page_count - 1U)) {
+                set.push_back(destination.page_count - 1U);
+            }
+        }
+    }
+
+    void publish_prefix(KVExecutionRowHandle row, const Address& source, std::uint32_t count,
+                        std::optional<LogicalKVPageHandle> tail, cudaStream_t stream) {
+        for (std::uint32_t page = 0; page < count;) {
+            const auto live = [&](std::uint32_t p) {
+                return (tail && p + 1U == count) ||
+                       (page_in_working_set(source, p) &&
+                        pages_->device_resident(membership(source, p)));
+            };
+            const bool resident = live(page);
+            auto end            = page + 1U;
+            while (end < count && live(end) == resident) { ++end; }
+            if (resident) {
+                publish_scratch_.clear();
+                for (auto p = page; p < end; ++p) {
+                    publish_scratch_.push_back(
+                        pages_->physical(tail && p + 1U == count ? *tail : membership(source, p)));
+                }
+                tables_->publish(row, page, publish_scratch_, stream);
+            } else {
+                tables_->publish_holes(row, page, end - page, stream);
+            }
+            page = end;
+        }
     }
 
     void rebuild_checkpoint_protection() noexcept {
@@ -1154,9 +1326,73 @@ private:
         }
     }
 
-    LogicalKVPageStore* pages_    = nullptr;
-    KVExecutionTablePool* tables_ = nullptr;
-    std::uint32_t page_capacity_  = 0;
+    [[nodiscard]] std::uint32_t sparse_reservation_cap(
+        const Address& address, std::uint32_t through = std::numeric_limits<std::uint32_t>::max()) const {
+        if (sparse_activation_budget_pages_ == 0) {
+            return std::numeric_limits<std::uint32_t>::max();
+        }
+        std::uint32_t resident = 0;
+        for (std::uint32_t page = 0; page < std::min(address.page_count, through); ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            if (page_in_working_set(address, page) && pages_->device_resident(logical)) {
+                ++resident;
+            }
+        }
+        return sparse_activation_budget_pages_ > resident
+                   ? sparse_activation_budget_pages_ - resident
+                   : 0U;
+    }
+
+    [[nodiscard]] bool page_in_working_set(const Address& address,
+                                           std::uint32_t page) const noexcept {
+        return !address.device_working_set ||
+               std::binary_search(address.device_working_set->begin(),
+                                  address.device_working_set->end(), page);
+    }
+
+    void publish_membership(const Address& address, cudaStream_t stream,
+                            std::optional<KVExecutionRowHandle> reserved_row = std::nullopt) {
+        if (!address.row && !reserved_row) {
+            throw std::logic_error("KV address space has no execution row");
+        }
+        // Membership outside this address's working set stays a hole even if
+        // another address currently owns a Device replica of the same logical page.
+        // Growth is recorded in the working set when it materializes.
+        std::uint32_t page = 0;
+        while (page < address.page_count) {
+            const bool live = page_in_working_set(address, page) &&
+                              pages_->device_resident(membership(address, page));
+            std::uint32_t end = page + 1U;
+            if (live) {
+                publish_scratch_.clear();
+                publish_scratch_.push_back(pages_->physical(membership(address, page)));
+                while (end < address.page_count && page_in_working_set(address, end) &&
+                       pages_->device_resident(membership(address, end))) {
+                    publish_scratch_.push_back(pages_->physical(membership(address, end)));
+                    ++end;
+                }
+                tables_->publish(reserved_row.value_or(address.row ? address.row->handle()
+                                                                   : KVExecutionRowHandle{}),
+                                 page, publish_scratch_, stream);
+            } else {
+                while (end < address.page_count &&
+                       (!page_in_working_set(address, end) ||
+                        !pages_->device_resident(membership(address, end)))) {
+                    ++end;
+                }
+                tables_->publish_holes(reserved_row.value_or(address.row ? address.row->handle()
+                                                                         : KVExecutionRowHandle{}),
+                                       page, end - page, stream);
+            }
+            page = end;
+        }
+    }
+
+    LogicalKVPageStore* pages_                    = nullptr;
+    KVExecutionTablePool* tables_                 = nullptr;
+    std::uint32_t sparse_activation_budget_pages_ = 0;
+    std::vector<DeviceKVPageHandle> placement_scratch_;
+    std::uint32_t page_capacity_ = 0;
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::uint64_t directory_capacity_ = kDirectoryChunkPages;

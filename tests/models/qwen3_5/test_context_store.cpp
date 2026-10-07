@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 
 #include "models/qwen3_5/state/state_image.h"
+#include "models/qwen3_5/state/decoder_state.h"
 
 #include <cuda_runtime.h>
 
@@ -12,6 +13,9 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fcntl.h>
+#include <unistd.h>
 #include <iostream>
 #include <new>
 #include <span>
@@ -1250,6 +1254,386 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
            "retiring the final history and views leaked KV storage");
 }
 
+void test_sparse_shared_history(ninfer::DeviceContext& device, bool file) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto pool_layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 10, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 16, .table_rows = 2});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, pool_layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(file ? 1ULL << 20 : host_layout.page_stride * 16,
+                                    host_layout.page_stride,
+                                    file ? std::optional<std::size_t>(0) : std::nullopt);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(
+        ledger, layouts, file ? std::filesystem::temp_directory_path() : std::filesystem::path{},
+        host_layout.page_stride * 2, file ? 1ULL << 20 : 0, file, file);
+    store::HostKVExtentStore extents(host, 16);
+    store::LogicalKVPageStore pages(pool, 26);
+    store::KVAddressSpaceStore addresses(pages, tables, 4, 16);
+    const auto source = addresses.create_active(8, 0, device.stream);
+    if (!source) { throw std::runtime_error("sparse fixture source failed"); }
+    addresses.ensure_mapped_to_tokens(*source, 512, device.stream);
+    device.synchronize();
+    const auto& plane = pool.plane(0);
+    for (std::uint32_t p = 0; p < 8; ++p) {
+        auto* data =
+            static_cast<std::byte*>(plane.data) + read_block_table(tables, 0, 8)[p] * plane.nb[3];
+        CUDA_CHECK(cudaMemsetAsync(data, 0x30 + p, plane.nb[3], device.stream));
+    }
+    addresses.commit_frontier(*source, 512);
+    device.synchronize();
+    addresses.set_sparse_activation_budget(6);
+    const std::array first{0U, 1U, 7U};
+    const auto offload = addresses.apply_device_placement(*source, extents, first,
+                                                          device.transfer_stream, "test-prefill");
+    expect(offload.demoted == 5 && pool.allocated_pages() == 3 &&
+               addresses.mapped_pages(*source) == 8 && addresses.committed_frontier(*source) == 512,
+           "sparse offload preserves logical history with a bounded physical working set");
+    auto row = read_block_table(tables, 0, 8);
+    expect(row[2] == ninfer::kPagedKVPageHole && row[7] >= 0,
+           "evicted pages publish holes while the append frontier stays resident");
+    addresses.reserve_growth(*source, 2);
+    const std::array second{0U, 3U, 7U};
+    const auto restored = addresses.apply_device_placement(
+        *source, extents, second, device.transfer_stream, "test-retrieval");
+    expect(
+        restored.promoted == 1 && restored.demoted == 1 &&
+            addresses.reserved_growth_pages(*source) == 2 && pool.reserved_pages() == 2,
+        "retrieval promotion consumes its own reservation and preserves the granted growth margin");
+    std::vector<std::byte> actual(plane.nb[3]);
+    CUDA_CHECK(cudaMemcpy(actual.data(),
+                          static_cast<std::byte*>(plane.data) +
+                              read_block_table(tables, 0, 8)[3] * plane.nb[3],
+                          actual.size(), cudaMemcpyDeviceToHost));
+    expect(
+        std::all_of(actual.begin(), actual.end(), [](std::byte b) { return b == std::byte{0x33}; }),
+        "restored history equals the original bytes across the RAM/disk boundary");
+    addresses.deactivate(*source);
+    const auto branch = addresses.create_inactive();
+    if (!branch) { throw std::runtime_error("sparse fixture branch failed"); }
+    auto fork = addresses.prepare_prefix_fork(*source, *branch, 449, 2, 1);
+    pool.copy_page(addresses.prefix_fork_tail_source(fork),
+                   addresses.prefix_fork_tail_destination(fork), device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    device.synchronize();
+    const auto branch_row = read_block_table(tables, 1, 8);
+    expect(branch_row[2] == ninfer::kPagedKVPageHole &&
+               branch_row[3] == read_block_table(tables, 0, 8)[3] &&
+               branch_row[7] != read_block_table(tables, 0, 8)[7],
+           "sparse prefix fork shares selected full pages, preserves holes and copies the partial "
+           "tail");
+    const std::array third{0U, 4U, 7U};
+    const auto leased_page = addresses.logical_page(*source, 3);
+    pages.pin_source(leased_page);
+    (void)addresses.apply_device_placement(*branch, extents, third, device.transfer_stream,
+                                           "test-pending-bind");
+    expect(pages.device_resident(leased_page) && pages.source_pins(leased_page) == 1 &&
+               read_block_table(tables, 1, 8)[3] == ninfer::kPagedKVPageHole,
+           "pending binding retains its inactive checkpoint's selected Device replica while "
+           "another lane changes its working set");
+    const auto pending_branch = addresses.create_inactive();
+    if (!pending_branch) { throw std::runtime_error("pending binding fixture failed"); }
+    auto pending_fork = addresses.prepare_prefix_fork(*source, *pending_branch, 449, 0, 0);
+    pages.unpin_source(leased_page);
+    expect(pages.source_pins(leased_page) == 1,
+           "fork preparation takes over the temporary binding source lease");
+    pool.copy_page(addresses.prefix_fork_tail_source(pending_fork),
+                   addresses.prefix_fork_tail_destination(pending_fork), device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(pending_fork), device.stream);
+    expect(pages.source_pins(leased_page) == 0 &&
+               addresses.release_after_deactivate(*pending_branch),
+           "binding completion retires each temporary and definitive source lease exactly once");
+    (void)addresses.apply_device_placement(*branch, extents, second, device.transfer_stream,
+                                           "test-restore-reader");
+    addresses.activate(*source, 0, 0, device.stream);
+    device.synchronize();
+    const auto shared_reader = addresses.apply_device_placement(
+        *branch, extents, third, device.transfer_stream, "test-shared-reader");
+    expect(shared_reader.promoted == 1 && shared_reader.demoted == 0 &&
+               read_block_table(tables, 0, 8)[3] >= 0 &&
+               read_block_table(tables, 1, 8)[3] == ninfer::kPagedKVPageHole,
+           "one row's eviction cannot recycle another row's selected shared physical page");
+    expect(addresses.release_after_deactivate(*source), "sparse source retirement failed");
+    (void)addresses.apply_device_placement(*branch, extents, third, device.transfer_stream,
+                                           "test-retire-reader");
+    expect(
+        pool.allocated_pages() == 3 && addresses.reserved_growth_pages(*branch) == 2,
+        "last shared reader retirement makes the old replica reclaimable without changing permits");
+    addresses.ensure_mapped_to_tokens(*branch, 577, device.stream);
+    addresses.commit_frontier(*branch, 577);
+    device.synchronize();
+    expect(addresses.mapped_pages(*branch) == 10 && pool.reserved_pages() == 0,
+           "a sparse history grows its logical directory only within the already granted margin");
+    expect(addresses.release_after_deactivate(*branch), "branch teardown failed");
+    (void)extents.release_unreferenced();
+    expect(pages.occupied() == 0 && pool.allocated_pages() == 0 && pool.reserved_pages() == 0 &&
+               ledger.occupied_bytes() == 0,
+           "sparse cancellation retires all Device, Host and directory ownership");
+}
+
+void test_replay_growth_at_logical_capacity(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens = ninfer::kPagedKVPageSize,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto pool_layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 3, .table_rows = 1});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, pool_layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 8, host_layout.page_stride);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(ledger, layouts);
+    store::HostKVExtentStore extents(host, 8);
+    store::LogicalKVPageStore pages(pool, 8);
+    store::KVAddressSpaceStore addresses(pages, tables, 1, 3);
+    addresses.set_sparse_activation_budget(5);
+    const auto source = addresses.create_active(3, 0, device.stream);
+    if (!source) { throw std::runtime_error("replay growth source failed"); }
+    addresses.ensure_mapped_to_tokens(*source, 192, device.stream);
+    addresses.commit_frontier(*source, 192);
+    device.synchronize();
+    expect(addresses.growth_pages_for_tokens(*source, 192) == 0 &&
+               addresses.replay_growth_pages_for_tokens(*source, 128, 192) == 1,
+           "query replay demand starts at its future rewind even at full logical capacity");
+    const auto table = read_block_table(tables, 0, 3);
+    auto foreign = pool.reserve(5);
+    expect(foreign.has_value(), "replay growth foreign claim failed");
+    bool refused = false;
+    try {
+        addresses.reserve_replay_growth(*source, 128, 1);
+    } catch (const std::bad_alloc&) { refused = true; }
+    expect(refused && addresses.mapped_pages(*source) == 3 &&
+               addresses.committed_frontier(*source) == 192 &&
+               addresses.reserved_growth_pages(*source) == 0 && pool.reserved_pages() == 5 &&
+               read_block_table(tables, 0, 3) == table,
+           "failed replay growth reservation neither rewinds nor mutates the executing row");
+    foreign.reset();
+    addresses.reserve_replay_growth(*source, 128, 1);
+    addresses.truncate_for_replay(*source, 128, extents);
+    foreign = pool.reserve(pool.available_pages());
+    expect(foreign.has_value() && pool.available_pages() == 0,
+           "competing claim did not cover the remaining pool");
+    addresses.ensure_mapped_to_tokens(*source, 192, device.stream);
+    addresses.commit_frontier(*source, 192);
+    device.synchronize();
+    expect(addresses.mapped_pages(*source) == 3 &&
+               addresses.reserved_growth_pages(*source) == 0,
+           "admitted replay growth survives a later competing allocation");
+    foreign.reset();
+    expect(addresses.release_after_deactivate(*source) && pool.allocated_pages() == 0 &&
+               pool.reserved_pages() == 0,
+           "replay growth fixture retires all pages and reservations");
+}
+
+void test_sparse_idle_replica_reclamation(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 8, .table_rows = 2});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 16, host_layout.page_stride);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(ledger, layouts);
+    store::HostKVExtentStore extents(host, 16);
+    store::LogicalKVPageStore pages(pool, 24);
+    store::KVAddressSpaceStore addresses(pages, tables, 3, 8);
+    const auto cached = addresses.create_active(4, 0, device.stream);
+    const auto target = addresses.create_active(4, 1, device.stream);
+    if (!cached || !target) { throw std::runtime_error("idle reclamation fixture failed"); }
+    addresses.ensure_mapped_to_tokens(*cached, 256, device.stream);
+    addresses.ensure_mapped_to_tokens(*target, 256, device.stream);
+    addresses.commit_frontier(*cached, 256);
+    addresses.commit_frontier(*target, 256);
+    device.synchronize();
+    std::vector<store::LogicalKVPageHandle> cached_pages;
+    for (unsigned i = 0; i < 4; ++i) { cached_pages.push_back(addresses.logical_page(*cached, i)); }
+    auto backup = extents.prepare(pages, cached_pages, true);
+    if (!backup) { throw std::runtime_error("idle fixture backup failed"); }
+    pool.copy_to_host(extents.device_sources(*backup), extents.writable_view(*backup),
+                      device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*backup));
+    addresses.deactivate(*cached);
+    pages.pin_source(cached_pages[0]);
+    const std::array narrow{0U, 3U};
+    (void)addresses.apply_device_placement(*target, extents, narrow, device.transfer_stream,
+                                           "test-idle-narrow");
+    addresses.reserve_growth(*target, 1);
+    expect(pool.available_pages() == 1, "idle fixture did not force transient page pressure");
+    const std::array full{0U, 1U, 2U, 3U};
+    const auto placed = addresses.apply_device_placement(
+        *target, extents, full, device.transfer_stream, "test-idle-expand");
+    expect(placed.promoted == 2 && placed.demoted == 1 && pages.device_resident(cached_pages[0]) &&
+               !pages.device_resident(cached_pages[1]) &&
+               pages.host_replica_current(cached_pages[1]) &&
+               addresses.mapped_pages(*cached) == 4 &&
+               addresses.committed_frontier(*cached) == 256 &&
+               addresses.reserved_growth_pages(*target) == 1 && pool.reserved_pages() == 1,
+           "retrieval reclaims only a redundant inactive replica, preserves the pending binding "
+           "and retains its complete logical history and granted growth");
+    addresses.set_restore_working_set(*cached, narrow);
+    pages.pin_source(cached_pages[2]);
+    expect(addresses.reclaim_unselected_restore_replicas(*cached, 1) == 0 &&
+               pages.device_resident(cached_pages[0]) && pages.device_resident(cached_pages[2]),
+           "changed-query restoration must retain selected and pending donor replicas");
+    pages.unpin_source(cached_pages[2]);
+    expect(addresses.reclaim_unselected_restore_replicas(*cached, 1) == 1 &&
+               !pages.device_resident(cached_pages[2]) &&
+               pages.host_replica_current(cached_pages[2]) &&
+               pages.device_resident(cached_pages[0]) && pages.device_resident(cached_pages[3]) &&
+               addresses.committed_frontier(*cached) == 256,
+           "changed-query binding can retire an unselected redundant donor without losing history");
+    pages.unpin_source(cached_pages[0]);
+    expect(addresses.release_after_deactivate(*cached) &&
+               addresses.release_after_deactivate(*target),
+           "idle fixture cleanup failed");
+    (void)extents.release_unreferenced();
+    expect(pages.occupied() == 0 && pool.allocated_pages() == 0 && pool.reserved_pages() == 0 &&
+               ledger.occupied_bytes() == 0,
+           "idle reclamation leaked logical, Device or Host ownership");
+}
+
+void test_sparse_offload_rollback(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto pool_layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 8, .table_rows = 1});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, pool_layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 2, host_layout.page_stride);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(ledger, layouts);
+    store::HostKVExtentStore extents(host, 2);
+    store::LogicalKVPageStore pages(pool, 10);
+    store::KVAddressSpaceStore addresses(pages, tables, 1, 8);
+    const auto source = addresses.create_active(8, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, 512, device.stream);
+    addresses.commit_frontier(*source, 512);
+    device.synchronize();
+    const auto before = read_block_table(tables, 0, 8);
+    bool rejected     = false;
+    try {
+        const std::array selected{0U, 7U};
+        (void)addresses.apply_device_placement(*source, extents, selected, device.transfer_stream,
+                                               "test-host-pressure");
+    } catch (const std::bad_alloc&) { rejected = true; }
+    expect(rejected && pool.allocated_pages() == 8 && host.occupied_bytes() == 0 &&
+               ledger.reserved_bytes() == 0 && read_block_table(tables, 0, 8) == before,
+           "insufficient Host capacity rolls back every reserved extent before any page/table "
+           "publication");
+    expect(addresses.release_after_deactivate(*source) && pages.occupied() == 0,
+           "failed sparse offload remains cancellable without leaked source pins");
+}
+
+void test_sparse_corrupt_restore(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 16, .table_rows = 1});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 8, host_layout.page_stride, 0);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(ledger, layouts, std::filesystem::temp_directory_path(),
+                             host_layout.page_stride * 2);
+    store::HostKVExtentStore extents(host, 8);
+    store::LogicalKVPageStore pages(pool, 16);
+    store::KVAddressSpaceStore addresses(pages, tables, 1, 16);
+    auto source = addresses.create_active(8, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, 512, device.stream);
+    addresses.commit_frontier(*source, 512);
+    device.synchronize();
+    const std::array keep{0U, 7U};
+    (void)addresses.apply_device_placement(*source, extents, keep, device.transfer_stream,
+                                           "fault-offload");
+    const auto replica = pages.host_replica(addresses.logical_page(*source, 3));
+    const auto view    = extents.view(replica.extent).subview(replica.page_offset, 1);
+    const int fd       = ::open(view.file_backing()->path().c_str(), O_RDWR);
+    if (fd < 0) { throw std::runtime_error("corruption fixture open failed"); }
+    const std::byte value{0xff};
+    const auto written = ::pwrite(fd, &value, 1, view.file_offset());
+    ::close(fd);
+    if (written != 1) { throw std::runtime_error("corruption fixture write failed"); }
+    addresses.reserve_growth(*source, 2);
+    const auto before = read_block_table(tables, 0, 8);
+    bool rejected     = false;
+    try {
+        const std::array incoming{0U, 3U, 7U};
+        (void)addresses.apply_device_placement(*source, extents, incoming, device.transfer_stream,
+                                               "fault-restore");
+    } catch (const std::runtime_error&) { rejected = true; }
+    expect(rejected && pool.allocated_pages() == 2 && pool.reserved_pages() == 2 &&
+               !pages.device_resident(addresses.logical_page(*source, 3)) &&
+               read_block_table(tables, 0, 8) == before,
+           "corrupt disk restore aborts unpublished destinations and preserves the granted "
+           "growth/table");
+    expect(addresses.release_after_deactivate(*source), "poisoned source teardown failed");
+    (void)extents.release_unreferenced();
+    expect(pages.occupied() == 0 && pool.allocated_pages() == 0 && pool.reserved_pages() == 0 &&
+               host.occupied_bytes() == 0,
+           "failed restore can retire every poisoned allocation without leaking leases");
+}
+
+void test_sparse_decoder_capacity() {
+    ninfer::models::qwen3_5::DecoderStateSpec spec{.full_attention_layers     = 1,
+                                                   .capacity                  = 4096,
+                                                   .kv_heads                  = 1,
+                                                   .attention_head_dim        = 256,
+                                                   .text_physical_page_groups = 8};
+    ninfer::LayoutBuilder dense;
+    bool rejected = false;
+    try {
+        (void)ninfer::models::qwen3_5::plan_decoder_state(dense, spec);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    expect(rejected, "dense planning retains its complete resident capacity requirement");
+    spec.kvmem_window_pages = 8;
+    ninfer::LayoutBuilder sparse;
+    const auto layout = ninfer::models::qwen3_5::plan_decoder_state(sparse, spec);
+    expect(layout.text_kv.max_context == 4096 && layout.text_kv.pages.spec.page_group_count == 8,
+           "sparse decoder plans bounded physical capacity independently of logical context");
+}
+
 } // namespace
 
 int main() {
@@ -1263,10 +1647,17 @@ int main() {
 
     try {
         ninfer::DeviceContext device(0);
+        test_sparse_decoder_capacity();
         test_state_store(device);
         test_kv_store(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
+        test_sparse_shared_history(device, false);
+        test_sparse_shared_history(device, true);
+        test_replay_growth_at_logical_capacity(device);
+        test_sparse_idle_replica_reclamation(device);
+        test_sparse_offload_rollback(device);
+        test_sparse_corrupt_restore(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
         device.synchronize();

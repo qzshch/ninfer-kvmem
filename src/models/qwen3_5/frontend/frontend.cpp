@@ -737,6 +737,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                   control, impl_->max_context);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+        result.retrieval_query     = processed.retrieval_query;
         result.starts_in_reasoning = processed.starts_in_reasoning;
         result.token_types         = std::move(processed.token_types);
         result.positions           = std::move(processed.positions);

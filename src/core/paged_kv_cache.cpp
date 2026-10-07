@@ -672,16 +672,23 @@ template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                   std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                  cudaStream_t stream) const {
+                                  cudaStream_t stream, bool file_submission) const {
     TransferWork work;
+    const auto check = [file_submission](cudaError_t error) {
+        if (file_submission) {
+            FileKVBacking::check_cuda_submission(error);
+        } else {
+            CUDA_CHECK(error);
+        }
+    };
     const auto copy = [&](unsigned char* device_base, std::size_t device_pitch, auto* host_base,
                           std::size_t host_pitch, std::size_t width, std::size_t height) {
         if constexpr (ToHost) {
-            CUDA_CHECK(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width,
-                                         height, cudaMemcpyDeviceToHost, stream));
+            check(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width, height,
+                                    cudaMemcpyDeviceToHost, stream));
         } else {
-            CUDA_CHECK(cudaMemcpy2DAsync(device_base, device_pitch, host_base, host_pitch, width,
-                                         height, cudaMemcpyHostToDevice, stream));
+            check(cudaMemcpy2DAsync(device_base, device_pitch, host_base, host_pitch, width, height,
+                                    cudaMemcpyHostToDevice, stream));
         }
         ++work.copy_operations;
     };
@@ -767,7 +774,36 @@ TransferWork DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> 
         throw std::invalid_argument("Paged KV D2H geometry or extent is inconsistent");
     }
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
-    return copy_host_pages<true>(source, destination.data(), stream);
+    const auto& host = destination.layout();
+    auto* file       = destination.file_backing();
+    if (!file) { return copy_host_pages<true>(source, destination.data(), stream); }
+    TransferWork work;
+    const auto chunk_pages = file->slot_bytes() / host.page_stride;
+    for (std::size_t begin = 0; begin < source.size(); begin += chunk_pages) {
+        const auto count = std::min(chunk_pages, source.size() - begin);
+        std::optional<FileKVBacking::Transfer> transfer;
+        try {
+            transfer = file->write(destination.file_offset() + begin * host.page_stride,
+                                   count * host.page_stride);
+            file->order_before(stream);
+            transfer->enqueue_before(file->stream());
+            const auto part = copy_host_pages<true>(source.subspan(begin, count), transfer->data(),
+                                                    file->stream(), true);
+            work.payload_bytes += part.payload_bytes;
+            work.copy_operations += part.copy_operations;
+            transfer->enqueue_after(file->stream());
+            file->order_after(stream);
+        } catch (...) {
+            if (transfer) transfer->abort();
+            if (cudaStreamSynchronize(file->stream()) != cudaSuccess) {
+                file->abort_after_failed_stream();
+            }
+            if (transfer) transfer->retire_after_drain();
+            file->drain();
+            throw;
+        }
+    }
+    return work;
 }
 
 TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
@@ -778,7 +814,38 @@ TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
-    return copy_host_pages<false>(destination, source.data(), stream);
+    const auto& host = source.layout();
+    auto* file       = source.file_backing();
+    if (!file) { return copy_host_pages<false>(destination, source.data(), stream); }
+    TransferWork work;
+    const auto chunk_pages = file->slot_bytes() / host.page_stride;
+    for (std::size_t begin = 0; begin < destination.size(); begin += chunk_pages) {
+        const auto count = std::min(chunk_pages, destination.size() - begin);
+        file->prefetch(source.file_offset() + begin * host.page_stride,
+                       (destination.size() - begin) * host.page_stride);
+        std::optional<FileKVBacking::Transfer> transfer;
+        try {
+            transfer = file->read(source.file_offset() + begin * host.page_stride,
+                                  count * host.page_stride);
+            file->order_before(stream);
+            transfer->enqueue_before(file->stream());
+            const auto part = copy_host_pages<false>(destination.subspan(begin, count),
+                                                     transfer->data(), file->stream(), true);
+            work.payload_bytes += part.payload_bytes;
+            work.copy_operations += part.copy_operations;
+            transfer->enqueue_after(file->stream());
+            file->order_after(stream);
+        } catch (...) {
+            if (transfer) transfer->abort();
+            if (cudaStreamSynchronize(file->stream()) != cudaSuccess) {
+                file->abort_after_failed_stream();
+            }
+            if (transfer) transfer->retire_after_drain();
+            file->drain();
+            throw;
+        }
+    }
+    return work;
 }
 
 std::vector<DeviceKVPageReservation>
@@ -852,6 +919,7 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
                                            const DeviceKVPagePool& pages)
     : spec_(layout.spec), pages_(&pages), block_tables_(layout.block_tables.bind(backing)),
       host_shadow_(checked_table_bytes(layout.spec)),
+      shadow_upload_done_(static_cast<std::size_t>(layout.spec.table_rows), nullptr),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false),
       row_generations_(static_cast<std::size_t>(layout.spec.table_rows), 1) {
     if (block_tables_.dtype != DType::I32 ||
@@ -859,6 +927,27 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
             checked_i32(spec_.logical_page_capacity, "Paged KV logical page capacity") ||
         block_tables_.ne[1] != spec_.table_rows) {
         throw std::logic_error("Paged KV execution-table layout is inconsistent");
+    }
+}
+
+KVExecutionTablePool::~KVExecutionTablePool() {
+    // The pinned upload source must outlive every outstanding publication.
+    for (auto event : shadow_upload_done_) {
+        if (event) {
+            (void)cudaEventSynchronize(event);
+            (void)cudaEventDestroy(event);
+        }
+    }
+}
+
+void KVExecutionTablePool::prepare_shadow(KVExecutionRowHandle row_handle) {
+    auto& event = shadow_upload_done_.at(static_cast<std::size_t>(row_handle.row_));
+    if (event) {
+        // Stream ordering protects Device accesses, but it does not keep a Host
+        // source immutable. Retire this row's previous DMA before changing it.
+        CUDA_CHECK(cudaEventSynchronize(event));
+    } else {
+        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
 }
 
@@ -900,6 +989,7 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
         page_handles.size() > logical_page_capacity() - logical_begin) {
         throw std::invalid_argument("Paged KV mapping publication is outside its execution row");
     }
+    prepare_shadow(row_handle);
     auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
                    static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() +
                    logical_begin;
@@ -917,6 +1007,7 @@ void KVExecutionTablePool::publish(KVExecutionRowHandle row_handle, std::uint32_
         page_leases.size() > logical_page_capacity() - logical_begin) {
         throw std::invalid_argument("Paged KV mapping publication is outside its execution row");
     }
+    prepare_shadow(row_handle);
     auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
                    static_cast<std::size_t>(row_handle.row_) * logical_page_capacity() +
                    logical_begin;
@@ -936,11 +1027,25 @@ void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
     if (!valid_handle(row_handle) || count > logical_page_capacity()) {
         throw std::invalid_argument("Repeated Paged KV mapping is outside its execution row");
     }
+    prepare_shadow(row_handle);
     const std::int32_t physical = pages_->physical_index(page);
     auto* shadow                = static_cast<std::int32_t*>(host_shadow_.data()) +
                    static_cast<std::size_t>(row_handle.row_) * logical_page_capacity();
     std::fill_n(shadow, count, physical);
     publish_indices(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
+}
+
+void KVExecutionTablePool::publish_holes(KVExecutionRowHandle handle, std::uint32_t begin,
+                                         std::uint32_t count, cudaStream_t stream) {
+    if (!valid_handle(handle) || begin > logical_page_capacity() ||
+        count > logical_page_capacity() - begin) {
+        throw std::invalid_argument("KV hole publication exceeds its execution row");
+    }
+    prepare_shadow(handle);
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
+                   static_cast<std::size_t>(handle.row_) * logical_page_capacity() + begin;
+    std::fill_n(shadow, count, kPagedKVPageHole);
+    publish_indices(handle, begin, std::span<const std::int32_t>(shadow, count), stream);
 }
 
 void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
@@ -952,6 +1057,8 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaEventRecord(shadow_upload_done_.at(static_cast<std::size_t>(row_handle.row_)),
+                               stream));
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

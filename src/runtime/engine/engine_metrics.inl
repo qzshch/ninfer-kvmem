@@ -174,14 +174,31 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
     snapshot.replaying_requests               = 0;
+    if constexpr (requires { physical.file_cache; physical.host_resident_bytes; }) {
+        snapshot.file_cache = physical.file_cache;
+        snapshot.host_context_resident_bytes = physical.host_resident_bytes;
+        snapshot.host_context_metadata_bytes = physical.host_metadata_bytes;
+    }
     snapshot.host_context_occupied_bytes      = physical.occupied.host_bytes;
     snapshot.host_state_occupied_slots        = physical.host_state_slots;
     snapshot.host_kv_occupied_bytes           = physical.host_kv_bytes;
     snapshot.host_context_reserved_bytes      = physical.host_reserved_bytes;
     snapshot.host_context_peak_occupied_bytes = physical.host_peak_occupied_bytes;
     snapshot.materializing_requests           = materializing_.has_value() ? 1U : 0U;
+    snapshot.lane_count = max_concurrency_;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+        auto& lane_stats = snapshot.lanes[lane];
+        lane_stats.state = RuntimeLaneState::Idle;
+        lane_stats.engine_request_id = 0;
         if (slots_[lane] == nullptr) { continue; }
+        const auto& request = slots_[lane];
+        lane_stats.engine_request_id = request->id;
+        lane_stats.state = request->terminal_reason ? RuntimeLaneState::TerminalPending
+                         : request->capture_pending ? RuntimeLaneState::CapturePending
+                         : request->is_prefilling() ? RuntimeLaneState::Prefill
+                         : request->is_replaying() ? RuntimeLaneState::Replay
+                         : request->is_decode_ready() ? RuntimeLaneState::Decode
+                                                      : RuntimeLaneState::Binding;
         ++snapshot.running_requests;
         if (slots_[lane]->is_prefilling()) { ++snapshot.prefilling_requests; }
         if (slots_[lane]->is_replaying()) { ++snapshot.replaying_requests; }

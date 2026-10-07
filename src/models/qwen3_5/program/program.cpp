@@ -292,6 +292,8 @@ AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); 
 
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
+FileCacheStats Program::file_cache_stats() const noexcept { return impl_->file_cache_stats(); }
+
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }

@@ -29,6 +29,7 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/span_accumulate.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
@@ -871,6 +872,38 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                              dimension(config_.attention->num_key_value_heads), T});
     ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
     ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
+    if (kvmem_q_sum_ != nullptr && T > 0) {
+        // Capture pre-RoPE features: the query tail feeds the Q sum and every key
+        // contributes to its global 128-token block's ring slot, across chunk splits.
+        const std::int32_t rows_q = dimension(config_.attention->query_width());
+        const std::int32_t rows_k = dimension(config_.attention->key_width());
+        Tensor q_capture(qn.view({rows_q, T}));
+        Tensor q_sum(kvmem_q_sum_ + static_cast<std::size_t>(fidx) * rows_q, DType::FP32, {rows_q});
+        const std::uint32_t chunk_end = text_kv_base_ + static_cast<std::uint32_t>(T);
+        const auto q_begin            = std::max(text_kv_base_, kvmem_query_begin_);
+        const auto q_end              = std::min(chunk_end, kvmem_query_end_);
+        if (q_begin < q_end) {
+            ops::span_accumulate(q_capture, q_begin - text_kv_base_, q_end - q_begin, q_sum, s);
+        }
+        const auto first_block = text_kv_base_ / execution::kKvmemCaptureBlockTokens;
+        const auto last_block  = (chunk_end + execution::kKvmemCaptureBlockTokens - 1U) /
+                                execution::kKvmemCaptureBlockTokens;
+        if (last_block > first_block) {
+            Tensor k_capture(kn.view({rows_k, T}));
+            for (auto block = first_block; block < last_block; ++block) {
+                const auto begin =
+                    std::max(text_kv_base_, block * execution::kKvmemCaptureBlockTokens);
+                const auto end =
+                    std::min(chunk_end, (block + 1U) * execution::kKvmemCaptureBlockTokens);
+                const std::uint32_t slot = block % kvmem_capture_slots_;
+                Tensor k_sum(kvmem_k_sum_ +
+                                 (static_cast<std::size_t>(fidx) * kvmem_capture_slots_ + slot) *
+                                     rows_k,
+                             DType::FP32, {rows_k});
+                ops::span_accumulate(k_capture, begin - text_kv_base_, end - begin, k_sum, s);
+            }
+        }
+    }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =

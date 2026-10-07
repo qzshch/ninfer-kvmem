@@ -10,9 +10,11 @@ namespace ninfer::models::qwen3_5::detail {
 
 bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
     if (!context_transaction_ || !valid_sequence(sequence)) { return false; }
-    const auto& tx = *context_transaction_;
-    return tx.kind == ContextOperationKind::Bind && (tx.text_view || tx.backend_view) &&
-           sequences[ContractAccess::lane(sequence).value].kv == tx.source_history;
+    const auto& tx  = *context_transaction_;
+    const auto lane = ContractAccess::lane(sequence).value;
+    return tx.kind == ContextOperationKind::Bind &&
+           ((tx.restoring_alias_lanes & (1U << lane)) ||
+            ((tx.text_view || tx.backend_view) && sequences[lane].kv == tx.source_history));
 }
 
 void ProgramImpl::enqueue_state_backup(ContextTransaction& tx) {
@@ -145,6 +147,7 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
     // are already complete; an unready event yields without synchronizing or spinning.
     for (std::uint32_t phase = 0; phase < 2; ++phase) {
         if (tx.submitted && !context_completion_.ready()) { return out; }
+        if (host_kv_arena) { host_kv_arena->check_io_errors(); }
         for (const auto& transfer : tx.transfers) {
             tx.observations.push_back(context_transfer_observation(
                 transfer.resource, transfer.direction, transfer.work, transfer.page_count,
@@ -196,6 +199,11 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
     return out;
 }
 
+void ProgramImpl::release_binding_source_pins(ContextTransaction& tx) {
+    for (const auto& [pages, page] : tx.binding_source_pins) { pages->unpin_source(page); }
+    tx.binding_source_pins.clear();
+}
+
 void ProgramImpl::abort_context() noexcept {
     if (!context_transaction_) { return; }
     auto& tx = *context_transaction_;
@@ -204,6 +212,7 @@ void ProgramImpl::abort_context() noexcept {
         // itself so every submitted reader has retired before releasing its source/destination.
         // CUDA failure is already fatal to the Engine; it must not prevent CPU ownership cleanup.
         (void)cudaStreamSynchronize(device.transfer_stream);
+        release_binding_source_pins(tx);
         if (tx.state_transfer) {
             state_store->abort_transfer(std::move(*tx.state_transfer));
             tx.state_transfer.reset();

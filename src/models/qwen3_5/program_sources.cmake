@@ -1,4 +1,6 @@
 target_sources(ninfer_model_runtime PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/program/retrieval/block_retrieval.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/retrieval/kvmem.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/decoder_state.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/state_image.cpp"

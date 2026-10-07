@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 
 #include <algorithm>
 #include <array>
@@ -84,13 +85,17 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         return {};
     }
     ContextTransaction transaction;
-    transaction.kind               = ContextOperationKind::Bind;
-    transaction.lane               = lane;
-    transaction.epoch              = lane_epochs[lane];
-    transaction.base               = base.impl_;
-    transaction.resume             = resume;
-    transaction.source             = source;
-    transaction.source_history     = source ? checkpoint(*source).kv : nullptr;
+    transaction.kind                  = ContextOperationKind::Bind;
+    transaction.lane                  = lane;
+    transaction.epoch                 = lane_epochs[lane];
+    transaction.base                  = base.impl_;
+    transaction.resume                = resume;
+    transaction.source                = source;
+    transaction.source_history        = source ? checkpoint(*source).kv : nullptr;
+    transaction.source_kvmem_features = source ? checkpoint(*source).kvmem_features : nullptr;
+    transaction.source_canonical_retrieval =
+        source && !resume && kvmem_window_pages &&
+        kvmem_same_prompt_source(checkpoint(*source), *base.impl_->prompt);
     transaction.reuse_frontier     = source ? checkpoint(*source).frontier : 0;
     transaction.backend_frontier   = source ? checkpoint(*source).backend_frontier : 0;
     transaction.source_tail_hidden = source && checkpoint(*source).tail_hidden_valid;
@@ -193,13 +198,49 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
     const auto& coverage      = transaction.reservation_demand;
     const auto main_prefix    = kv_pages_for_frontier(transaction.reuse_frontier);
     const auto backend_prefix = kv_pages_for_frontier(transaction.backend_frontier);
-    const auto main_growth    = kv_pages_for_frontier(coverage.main_frontier) > main_prefix
+    auto main_growth          = kv_pages_for_frontier(coverage.main_frontier) > main_prefix
                                     ? kv_pages_for_frontier(coverage.main_frontier) - main_prefix
                                     : 0U;
-    const auto backend_growth =
-        kv_pages_for_frontier(coverage.backend_frontier) > backend_prefix
-            ? kv_pages_for_frontier(coverage.backend_frontier) - backend_prefix
-            : 0U;
+    auto backend_growth       = kv_pages_for_frontier(coverage.backend_frontier) > backend_prefix
+                                    ? kv_pages_for_frontier(coverage.backend_frontier) - backend_prefix
+                                    : 0U;
+    // An owned pause snapshot may contain a completed private query before the
+    // public prompt is complete, or an active generation's selected history. Its
+    // current retrieval features govern the first restored execution; complete
+    // typed-input equality is only the rule for an unrelated cached donor.
+    const auto* snapshot_features =
+        own_snapshot ? resume->impl_->kvmem_features.get() : nullptr;
+    const auto set_restore    = [&](KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
+                                 std::uint32_t frontier) {
+        if (!kvmem_window_pages || addresses.active(address)) { return; }
+        const auto selected =
+            kvmem_restore_pages(addresses, address, frontier, *base.impl_->prompt,
+                                snapshot_features && !snapshot_features->retrieved_pages.empty()
+                                    ? std::span(snapshot_features->retrieved_pages)
+                                : transaction.source_canonical_retrieval
+                                    ? std::span(transaction.source_kvmem_features->retrieved_pages)
+                                    : std::span<const std::uint32_t>{});
+        addresses.set_restore_working_set(address, selected);
+    };
+    if (source) {
+        const auto& record = checkpoint(*source);
+        set_restore(*text_kv_addresses, record.kv->text, transaction.reuse_frontier);
+        if (record.kv->backend) {
+            set_restore(*backend_kv_addresses, *record.kv->backend, transaction.backend_frontier);
+        }
+    }
+    if (kvmem_window_pages) {
+        const auto budget = kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
+        main_growth       = std::min(
+            main_growth, source ? text_kv_addresses->sparse_growth_limit(
+                                      checkpoint(*source).kv->text, transaction.reuse_frontier)
+                                      : budget);
+        backend_growth = std::min(backend_growth, source && checkpoint(*source).kv->backend
+                                                      ? backend_kv_addresses->sparse_growth_limit(
+                                                            *checkpoint(*source).kv->backend,
+                                                            transaction.backend_frontier)
+                                                      : budget + 1U);
+    }
     const auto collect = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                              KVAddressSpaceHandle address, std::uint32_t count,
                              runtime::ContextResourceClass resource) {
@@ -208,8 +249,32 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         transfer.resource = resource;
         transfer.restore  = true;
         for (std::uint32_t i = 0; i < count; ++i) {
+            if (kvmem_window_pages && !addresses.page_in_device_working_set(address, i) &&
+                i + 1U != count) {
+                continue;
+            }
             const auto page = addresses.logical_page(address, i);
-            if (!pages.device_resident(page)) { transfer.logical.push_back(page); }
+            if (!pages.device_resident(page)) {
+                transfer.logical.push_back(page);
+                if (kvmem_window_pages) {
+                    // Prefix aliases share logical pages at the same original position.
+                    // A different executing history may retrieve this Host-only page while
+                    // our asynchronous restore owns its unpublished Device destination.
+                    // Record that dependency once, rather than letting placement start a
+                    // second restore or scanning whole histories every scheduler round.
+                    for (const auto& running : sequences) {
+                        if (!running.kv || running.lane == lane) { continue; }
+                        const auto alias = resource == runtime::ContextResourceClass::MainKV
+                                               ? std::optional(running.kv->text)
+                                               : running.kv->backend;
+                        if (alias && addresses.active(*alias) &&
+                            i < addresses.mapped_pages(*alias) &&
+                            addresses.logical_page(*alias, i) == page) {
+                            transaction.restoring_alias_lanes |= 1U << running.lane;
+                        }
+                    }
+                }
+            }
         }
         return transfer;
     };
@@ -234,6 +299,21 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         source && !transaction.borrow_backend && transaction.backend_frontier % kPagedKVPageSize
             ? 1U
             : 0U;
+    if (source && kvmem_window_pages) {
+        const auto reclaim = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                 KVAddressSpaceHandle address, std::uint32_t needed) {
+            const auto available = pages.physical_pool().available_pages();
+            if (needed <= available) { return; }
+            (void)addresses.reclaim_unselected_restore_replicas(address, needed - available);
+        };
+        const auto& record = checkpoint(*source);
+        reclaim(*text_kv_addresses, *text_kv_pages, record.kv->text,
+                main_missing + main_growth + main_tail);
+        if (record.kv->backend) {
+            reclaim(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend,
+                    backend_missing + backend_growth + backend_tail);
+        }
+    }
     const auto usage = physical_usage();
     runtime::ContextResourceUsage shortage;
     const bool needs_state_slot =
@@ -258,6 +338,34 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
     auto& tx = *context_transaction_;
     if (source) { ++checkpoints[source->index].pins; }
     try {
+        if (source && kvmem_window_pages) {
+            // A checkpoint lease preserves the logical history, but does not preserve Device
+            // placement. Another lane can retrieve a different working set while our State
+            // restore is in flight. Pin the already-resident source pages until the synchronous
+            // fork/activation preparation takes over; missing pages have destination leases.
+            tx.binding_source_pins.reserve(std::min(main_prefix, kvmem_window_pages + 1U) +
+                                           std::min(backend_prefix, kvmem_window_pages + 1U));
+            const auto pin = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                 KVAddressSpaceHandle address, std::uint32_t count) {
+                for (std::uint32_t i = 0; i < count; ++i) {
+                    if (!addresses.page_in_device_working_set(address, i) && i + 1U != count) {
+                        continue;
+                    }
+                    const auto page = addresses.logical_page(address, i);
+                    if (!pages.device_resident(page)) { continue; }
+                    if (!pages.can_pin_source(page) && !pages.can_pin_active_source(page)) {
+                        throw std::logic_error("binding cannot lease its resident source page");
+                    }
+                    tx.binding_source_pins.emplace_back(&pages, page);
+                    pages.pin_source(page);
+                }
+            };
+            const auto& record = checkpoint(*source);
+            pin(*text_kv_addresses, *text_kv_pages, record.kv->text, main_prefix);
+            if (record.kv->backend) {
+                pin(*backend_kv_addresses, *backend_kv_pages, *record.kv->backend, backend_prefix);
+            }
+        }
         tx.carried_pins.reserve(tx.carried_points.size());
         tx.carried_clones.reserve(tx.carried_points.size());
         for (const auto point : tx.carried_points) {
@@ -394,6 +502,9 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
 }
 
 void ProgramImpl::prepare_binding(ContextTransaction& tx) {
+    // No Engine mutation can interleave this synchronous handoff. In particular, a borrowed
+    // unique history must drop the temporary read pins before it acquires writer ownership.
+    release_binding_source_pins(tx);
     const auto prepare = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                              KVAddressSpaceHandle destination,
                              std::optional<KVAddressSpaceHandle> source, std::uint32_t prefix,
@@ -403,7 +514,11 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
                              std::optional<KVActivationReservation>& activation,
                              std::optional<KVActivePrefixViewReservation>& view) {
         const auto count = kv_pages_for_frontier(target), prior = kv_pages_for_frontier(prefix);
-        const auto growth = count > prior ? count - prior : 0U;
+        auto growth = count > prior ? count - prior : 0U;
+        if (kvmem_window_pages) {
+            growth = std::min(growth, addresses.sparse_growth_limit(
+                                          source && prefix ? *source : destination, prefix));
+        }
         hold.reset();
         if (borrowed) {
             activation.emplace(addresses.prepare_activation(destination, growth, tx.lane, prefix));
@@ -578,6 +693,13 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     refresh_history_requirements(sequences[tx.lane].kv);
     refresh_state_views(sequences[tx.lane]);
     tx.reserved_state.reset();
+    if (kvmem_window_pages && requests[tx.lane].prefill && !tx.resume) {
+        initialize_kvmem(sequences[tx.lane], *requests[tx.lane].prefill,
+                         tx.source_kvmem_features.get(), tx.source_canonical_retrieval);
+    }
+    if (kvmem_window_pages && tx.resume) {
+        restore_kvmem_resume(sequences[tx.lane], *tx.resume->impl_);
+    }
     out.private_points      = std::move(tx.carried_points);
     out.retired_checkpoints = std::move(tx.retired_points);
     out.sequence            = sequence_handle(tx.lane);

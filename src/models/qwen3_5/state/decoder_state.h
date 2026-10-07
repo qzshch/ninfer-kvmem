@@ -22,6 +22,8 @@ struct DecoderStateSpec {
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
+    // Zero retains the dense capacity invariant; sparse rows may omit logical history pages.
+    std::uint32_t kvmem_window_pages        = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
 };
 

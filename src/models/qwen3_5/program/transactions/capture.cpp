@@ -57,6 +57,15 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
         }
         ticket->points.emplace_back(*point, role);
     }
+    if (kvmem_window_pages) {
+        const auto descriptors = 2ULL * ((frontier + 127U) / 128U) *
+                                 (sizeof(RetrievalBlockMeta) + sizeof(std::shared_ptr<void>));
+        ticket->kvmem_metadata = host_context_arena->charge_metadata(
+            std::max<std::size_t>(descriptors, kvmem_lanes_[lane].index.descriptor_bytes()) +
+            kvmem_lanes_[lane].key_sums.bytes() + kvmem_window_pages * sizeof(std::uint32_t) +
+            sizeof(KvmemPrefixFeatures));
+        if (!ticket->kvmem_metadata) { return false; }
+    }
     auto destination = state_store->reserve_destination();
     if (!destination && host_context_arena) {
         ticket->host = host_context_arena->allocate(state_images->host_layout().image_bytes);
@@ -115,7 +124,9 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
                                   .reserved = true};
     }
     const auto cursor =
-        request.lifecycle == Lifecycle::Replaying ? request.replay_cursor : request.prefill->cursor;
+        request.lifecycle == Lifecycle::Replaying
+            ? request.replay_cursor
+            : request.prefill->query_replay_cursor.value_or(request.prefill->cursor);
     while (request.next_capture < request.capture_groups.size()) {
         const auto frontier = request.capture_groups[request.next_capture].frontier;
         if (frontier <= cursor) {
@@ -175,7 +186,8 @@ void ProgramImpl::skip_capture(SequenceHandle handle) {
     request.capture_pending = false;
     ++request.next_capture;
     if (request.lifecycle != Lifecycle::Replaying && request.prefill &&
-        request.prefill->cursor == request.prefill->prompt_tokens) {
+        request.prefill->query_replay_cursor.value_or(request.prefill->cursor) ==
+            request.prefill->prompt_tokens) {
         request.prefill.reset();
     }
 }
@@ -208,6 +220,7 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
     tx.kind           = ContextOperationKind::Capture;
     tx.lane           = lane;
     tx.epoch          = lane_epochs[lane];
+    tx.kvmem_metadata = std::move(ticket->kvmem_metadata);
     tx.capture_points = std::move(ticket->points);
     tx.reuse_frontier = frontier;
     tx.backend_frontier =
@@ -305,9 +318,11 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
         tx.binding_history->owner = this;
         tx.reserved_kv.reset();
     }
+    const auto kvmem_features = capture_kvmem_features(state, std::move(tx.kvmem_metadata));
     for (const auto& [handle, role] : tx.capture_points) {
         state_store->retain_checkpoint_reference(source_state);
         checkpoints[handle.index].value = CheckpointState{
+            .kvmem_features = kvmem_features,
             .kv    = role == runtime::CheckpointRole::SharedPrefix ? tx.binding_history : state.kv,
             .role  = role,
             .state = source_state,

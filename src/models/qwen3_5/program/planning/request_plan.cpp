@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_set>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -199,8 +201,10 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
         if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
             throw std::logic_error("prefill demand requires a prefill cursor");
         }
-        const auto& staged      = *request.prefill;
-        demand.main_frontier    = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk);
+        const auto& staged = *request.prefill;
+        demand.main_frontier =
+            std::min(staged.prompt_tokens,
+                     staged.query_replay_cursor.value_or(staged.cursor) + prefill_chunk);
         demand.backend_frontier = backend_kv_cache() ? demand.main_frontier : 0;
         if (speculative_backend == SpeculativeBackend::Mtp &&
             demand.main_frontier == staged.prompt_tokens && staged.initial_mtp_extent != 0) {
@@ -256,6 +260,21 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
     std::array<UnitDemand, kMaximumConcurrency> coverage{};
     std::array<std::uint32_t, kMaximumConcurrency> old_main{}, old_backend{};
     std::array<bool, kMaximumConcurrency> seen{};
+    std::array<std::optional<std::uint32_t>, kMaximumConcurrency> replay_rewinds{};
+    const auto growth = [&](const KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
+                            std::uint32_t lane, std::uint32_t target) {
+        return replay_rewinds[lane]
+                   ? addresses.replay_growth_pages_for_tokens(address, *replay_rewinds[lane], target)
+                   : addresses.growth_pages_for_tokens(address, target);
+    };
+    const auto reserve = [&](KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
+                             std::uint32_t lane, std::uint32_t pages) {
+        if (replay_rewinds[lane]) {
+            addresses.reserve_replay_growth(address, *replay_rewinds[lane], pages);
+        } else {
+            addresses.reserve_growth(address, pages);
+        }
+    };
     std::uint64_t main_needed = 0, backend_needed = 0;
     for (std::size_t index = 0; index < units.size(); ++index) {
         const auto& unit = units[index];
@@ -267,6 +286,11 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         seen[lane]        = true;
         auto& request     = requests[lane];
         const auto& state = active_sequence(lane);
+        if (kvmem_window_pages && unit.kind == ExecutionUnitKind::Prefill && request.prefill &&
+            request.prefill->query_replay_cursor &&
+            *request.prefill->query_replay_cursor == kvmem_lanes_[lane].query_begin) {
+            replay_rewinds[lane] = kvmem_lanes_[lane].query_begin;
+        }
         demands[lane]     = next_unit(state, request, unit.kind, unit.tokens);
         coverage[lane]    = request.recovery ? request.recovery->coverage : demands[lane];
         if (demands[lane].main_frontier > coverage[lane].main_frontier ||
@@ -281,15 +305,108 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
             }
             continue;
         }
-        const auto main = text_kv_addresses->growth_pages_for_tokens(state.kv->text,
-                                                                     coverage[lane].main_frontier);
+        const auto main = growth(*text_kv_addresses, state.kv->text, lane,
+                                 coverage[lane].main_frontier);
         old_main[lane]  = text_kv_addresses->reserved_growth_pages(state.kv->text);
         main_needed += main > old_main[lane] ? main - old_main[lane] : 0;
         if (state.kv->backend) {
-            const auto backend = backend_kv_addresses->growth_pages_for_tokens(
-                *state.kv->backend, coverage[lane].backend_frontier);
+            const auto backend = growth(*backend_kv_addresses, *state.kv->backend, lane,
+                                        coverage[lane].backend_frontier);
             old_backend[lane] = backend_kv_addresses->reserved_growth_pages(*state.kv->backend);
             backend_needed += backend > old_backend[lane] ? backend - old_backend[lane] : 0;
+        }
+    }
+    if (kvmem_window_pages) {
+        std::size_t host_needed = 0, metadata_needed = 0;
+        std::unordered_set<std::size_t> seen_host;
+        for (const auto& unit : units) {
+            const auto lane       = ContractAccess::lane(unit.sequence).value;
+            const auto& state     = active_sequence(lane);
+            const auto& request   = requests[lane];
+            const auto& sparse    = kvmem_lanes_[lane];
+            const bool prefilling = request.lifecycle == Lifecycle::Prefilling ||
+                                    request.lifecycle == Lifecycle::Replaying;
+            const bool retrieved =
+                request.lifecycle == Lifecycle::Replaying ||
+                (request.prefill && (request.prefill->query_replay_cursor.has_value() ||
+                                     request.prefill->canonical_retrieval));
+            // The last probe unit also selects and places a different working set.
+            // Query scores are not available until that unit executes, so reserve
+            // the worst-case backup of its current unbacked residents before
+            // granting the permit. Rolling-window demand alone misses this burst.
+            const bool retrieval_boundary =
+                unit.kind == ExecutionUnitKind::Prefill && request.prefill && !retrieved &&
+                sparse.query_begin < sparse.query_end &&
+                demands[lane].main_frontier == request.prefill->prompt_tokens &&
+                kv_pages_for_frontier(demands[lane].main_frontier) > kvmem_window_pages;
+            const auto selected_history =
+                retrieved ? std::span<const std::uint32_t>(sparse.retrieved_pages)
+                          : std::span<const std::uint32_t>{};
+            const auto scan = [&](const KVAddressSpaceStore& addresses,
+                                  const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
+                                  std::uint32_t valid, std::uint32_t budget, std::size_t stride,
+                                  bool backend) {
+                auto mapped = addresses.mapped_pages(address);
+                if (request.prefill && request.prefill->query_replay_cursor &&
+                    *request.prefill->query_replay_cursor == sparse.query_begin) {
+                    mapped = std::min(mapped, kv_pages_for_frontier(sparse.query_begin));
+                    valid  = std::min(valid, sparse.query_begin);
+                }
+                const auto committed = std::min(mapped, kv_pages_for_frontier(valid));
+                if (!retrieval_boundary && committed <= budget && mapped <= budget) { return; }
+                auto chosen =
+                    prefilling
+                        ? (!sparse.media_groups.empty()
+                               ? media_window_page_set(committed, budget, selected_history,
+                                                       sparse.media_groups)
+                           : retrieved ? decode_window_page_set(committed, budget, selected_history)
+                                       : prefill_window_page_set(committed, 2U, budget - 2U))
+                        : media_window_page_set(mapped, budget, sparse.retrieved_pages,
+                                                sparse.media_groups);
+                if (prefilling) { append_prefill_growth_pages(chosen, committed, mapped); }
+                for (std::uint32_t index = 0; index < mapped; ++index) {
+                    if (!retrieval_boundary &&
+                        std::binary_search(chosen.begin(), chosen.end(), index)) { continue; }
+                    const auto page = addresses.logical_page(address, index);
+                    const bool writes_tail = retrieval_boundary && index >= valid / kPagedKVPageSize;
+                    if (pages.device_resident(page) &&
+                        (!pages.host_replica_current(page) || writes_tail) &&
+                        seen_host.insert(pages.descriptor_index(page) * 2ULL + backend).second) {
+                        host_needed += stride;
+                    }
+                }
+                if (retrieval_boundary) {
+                    const auto target = kv_pages_for_frontier(backend ? demands[lane].backend_frontier
+                                                                     : demands[lane].main_frontier);
+                    if (target > mapped) {
+                        host_needed += static_cast<std::size_t>(target - mapped) * stride;
+                    }
+                }
+            };
+            scan(*text_kv_addresses, *text_kv_pages, state.kv->text, state.text_kv_valid,
+                 kvmem_window_pages, text_host_kv_page_stride, false);
+            if (state.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
+                scan(*backend_kv_addresses, *backend_kv_pages, *state.kv->backend,
+                     state.mtp_kv_valid, kvmem_window_pages + (draft_window + 63U) / 64U,
+                     backend_host_kv_page_stride, true);
+            }
+            if (unit.kind == ExecutionUnitKind::Prefill && !retrieved) {
+                const auto blocks = (prefill_chunk + 127U) / 128U + 1U;
+                metadata_needed += blocks * (static_cast<std::size_t>(sparse.index.layers()) *
+                                                 sparse.index.kv_heads() * sparse.index.head_dim() *
+                                                 sizeof(float) +
+                                             512U);
+            }
+        }
+        const auto free     = host_context_arena->free_bytes();
+        const auto resident = host_context_arena->resident_free_bytes();
+        if (host_needed + metadata_needed > free || metadata_needed > resident) {
+            return {.reserved = false,
+                    .shortage = {.host_bytes = std::max(
+                                     host_needed + metadata_needed > free
+                                         ? host_needed + metadata_needed - free
+                                         : 0,
+                                     metadata_needed > resident ? metadata_needed - resident : 0)}};
         }
     }
     const auto main_available = text_kv_pages->physical_pool().available_pages();
@@ -311,13 +428,12 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
             if (requests[lane].permit) { continue; }
             auto& state = active_sequence(lane);
             added[lane] = true;
-            text_kv_addresses->reserve_growth(state.kv->text,
-                                              text_kv_addresses->growth_pages_for_tokens(
-                                                  state.kv->text, coverage[lane].main_frontier));
+            reserve(*text_kv_addresses, state.kv->text, lane,
+                    growth(*text_kv_addresses, state.kv->text, lane, coverage[lane].main_frontier));
             if (state.kv->backend) {
-                backend_kv_addresses->reserve_growth(
-                    *state.kv->backend, backend_kv_addresses->growth_pages_for_tokens(
-                                            *state.kv->backend, coverage[lane].backend_frontier));
+                reserve(*backend_kv_addresses, *state.kv->backend, lane,
+                        growth(*backend_kv_addresses, *state.kv->backend, lane,
+                               coverage[lane].backend_frontier));
             }
             requests[lane].permit = demands[lane];
         }
@@ -325,9 +441,9 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             if (!added[lane]) { continue; }
             auto& state = active_sequence(lane);
-            text_kv_addresses->reserve_growth(state.kv->text, old_main[lane]);
+            reserve(*text_kv_addresses, state.kv->text, lane, old_main[lane]);
             if (state.kv->backend) {
-                backend_kv_addresses->reserve_growth(*state.kv->backend, old_backend[lane]);
+                reserve(*backend_kv_addresses, *state.kv->backend, lane, old_backend[lane]);
             }
             requests[lane].permit.reset();
         }

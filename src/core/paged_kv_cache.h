@@ -19,6 +19,10 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// Nonresident historical pages are invisible to attention and are never dereferenced.
+// Every append destination is materialized before an execution unit writes it.
+inline constexpr std::int32_t kPagedKVPageHole = -1;
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -261,7 +265,7 @@ private:
     template <bool ToHost>
     TransferWork copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                  std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                 cudaStream_t stream) const;
+                                 cudaStream_t stream, bool file_submission = false) const;
 
     struct HostTransferPlane {
         std::size_t host_offset    = 0;
@@ -374,6 +378,7 @@ class KVExecutionTablePool {
 public:
     KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
                          const DeviceKVPagePool& pages);
+    ~KVExecutionTablePool();
 
     KVExecutionTablePool(const KVExecutionTablePool&)            = delete;
     KVExecutionTablePool& operator=(const KVExecutionTablePool&) = delete;
@@ -391,6 +396,9 @@ public:
     void publish_repeated(KVExecutionRowHandle row, DeviceKVPageHandle page, std::uint32_t count,
                           cudaStream_t stream);
 
+    void publish_holes(KVExecutionRowHandle row, std::uint32_t logical_begin, std::uint32_t count,
+                       cudaStream_t stream);
+
     [[nodiscard]] Tensor row(KVExecutionRowHandle handle) const;
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
@@ -400,6 +408,7 @@ private:
 
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
+    void prepare_shadow(KVExecutionRowHandle row);
     void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
                          std::span<const std::int32_t> indices, cudaStream_t stream);
 
@@ -407,6 +416,7 @@ private:
     const DeviceKVPagePool* pages_ = nullptr;
     Tensor block_tables_;
     PinnedHostBuffer host_shadow_;
+    std::vector<cudaEvent_t> shadow_upload_done_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
 };

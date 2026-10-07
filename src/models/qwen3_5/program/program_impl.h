@@ -1,5 +1,8 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "models/qwen3_5/program/retrieval/media_window.h"
+#include "models/qwen3_5/program/retrieval/diagnostics.h"
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
@@ -138,6 +141,30 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
 };
 
+struct KvmemLaneState {
+    Tensor query_sum;
+    Tensor key_sums;
+    Tensor query_key_checkpoint;
+    Tensor query_tail_hidden;
+    RetrievalIndex index;
+    std::uint32_t capture_begin = 0;
+    std::uint32_t query_begin   = 0;
+    std::uint32_t query_end     = 0;
+    bool query_checkpoint_valid = false;
+    std::vector<float> query;
+    std::vector<std::uint32_t> query_count;
+    std::vector<std::uint32_t> retrieved_pages;
+    std::vector<MediaPageGroup> media_groups;
+};
+
+struct KvmemPrefixFeatures {
+    std::uint32_t key_frontier = 0;
+    RetrievalIndex index;
+    std::shared_ptr<HostResidentCharge> metadata_charge;
+    std::vector<float> key_sums;
+    std::vector<std::uint32_t> retrieved_pages;
+};
+
 struct SequenceState {
     std::shared_ptr<KVHistory> kv;
     ActiveStateBinding state;
@@ -160,6 +187,7 @@ struct SequenceState {
 };
 
 struct CaptureReservation {
+    std::shared_ptr<HostResidentCharge> kvmem_metadata;
     ProgramImpl* owner = nullptr;
     std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
     StateImageHandle state;
@@ -192,6 +220,7 @@ struct RequestControl {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
         std::unique_ptr<execution::VisionPrefillSession> vision;
+        std::optional<std::uint32_t> query_replay_cursor;
         std::uint32_t base               = 0;
         std::uint32_t cursor             = 0;
         std::uint32_t prompt_tokens      = 0;
@@ -199,6 +228,7 @@ struct RequestControl {
         double elapsed_seconds           = 0.0;
         double retired_vision_seconds    = 0.0;
         bool prepare_mtp                 = false;
+        bool canonical_retrieval         = false;
         PrefixReusePath reuse            = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
@@ -208,6 +238,7 @@ struct RequestControl {
 };
 
 struct CheckpointState {
+    std::shared_ptr<const KvmemPrefixFeatures> kvmem_features;
     std::shared_ptr<KVHistory> kv;
     runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
     StateImageHandle state;
@@ -231,6 +262,10 @@ struct ResumeStateImpl {
     std::optional<CheckpointHandle> snapshot;
     SequenceState sequence;
     RequestControl control;
+    std::optional<KvmemLaneState> kvmem;
+    std::vector<float> kvmem_query_sums;
+    std::shared_ptr<const KvmemPrefixFeatures> kvmem_features;
+    std::optional<HostContextAllocation> kvmem_query_host;
     std::uint32_t frontier = 0;
     ~ResumeStateImpl();
 };
@@ -310,6 +345,8 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
+    // Thread-safe byte-worker counters only; no model state or CUDA operations.
+    [[nodiscard]] FileCacheStats file_cache_stats() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
@@ -320,6 +357,7 @@ public:
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
+    const std::uint32_t kvmem_window_pages;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
@@ -336,7 +374,35 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
+    std::optional<LinearAttentionStatePool> kvmem_query_checkpoint_;
+    std::optional<CyclicKVCache> kvmem_draft_checkpoint_;
+    std::uint32_t kvmem_capture_slots_ = 0;
+    [[nodiscard]] std::vector<std::uint32_t>
+    kvmem_restore_pages(const KVAddressSpaceStore&, KVAddressSpaceHandle, std::uint32_t,
+                        const PreparedPromptData&, std::span<const std::uint32_t> = {}) const;
+    [[nodiscard]] bool kvmem_same_prompt_source(const CheckpointState&,
+                                                const PreparedPromptData&) const;
+    void initialize_kvmem(SequenceState&, RequestControl::Prefill&, const KvmemPrefixFeatures*,
+                          bool = false);
+    void roll_sparse_prefill_window(SequenceState&, std::uint32_t, std::uint32_t, std::uint32_t,
+                                    bool = false);
+    void roll_sparse_decode_window(SequenceState&);
+    void record_kvmem_placement(SequenceState&, KvmemPlacementPhase, bool,
+                                const KVAddressSpaceStore::KVPlacementCounts&);
+    void consume_kvmem_chunk_capture(SequenceState&, std::uint32_t, std::uint32_t);
+    void finalize_kvmem_query(SequenceState&, std::uint32_t);
+    void apply_kvmem_retrieval_placement(SequenceState&);
+    void copy_kvmem_query_state(SequenceState&, bool);
+    void rewind_kvmem_query_probe(SequenceState&, RequestControl::Prefill&);
+    void copy_kvmem_query_host(const SequenceState&, HostContextAllocation&, bool);
+    void restore_kvmem_resume(SequenceState&, ResumeStateImpl&);
+    std::uint32_t advance_kvmem_query_replay(SequenceState&, RequestControl::Prefill&,
+                                             runtime::ExecutionTimingRecorder&, std::uint32_t = 0);
+    [[nodiscard]] std::shared_ptr<const KvmemPrefixFeatures>
+    capture_kvmem_features(const SequenceState&, std::shared_ptr<HostResidentCharge> charge = {});
+
     std::unique_ptr<HostContextArena> host_context_arena;
+    std::vector<KvmemLaneState> kvmem_lanes_;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
@@ -406,6 +472,7 @@ public:
     };
 
     struct ContextTransaction {
+        std::shared_ptr<HostResidentCharge> kvmem_metadata;
         ContextOperationKind kind = ContextOperationKind::Bind;
         std::uint32_t lane        = 0;
         std::uint64_t epoch       = 0;
@@ -421,6 +488,8 @@ public:
         std::optional<ResumeState> paused;
         std::optional<StateImageTransfer> state_transfer;
         std::vector<KVTransfer> kv_transfers;
+        std::uint32_t restoring_alias_lanes = 0;
+        std::vector<std::pair<LogicalKVPageStore*, LogicalKVPageHandle>> binding_source_pins;
         std::optional<KVPrefixForkReservation> text_fork;
         std::optional<KVPrefixForkReservation> backend_fork;
         std::optional<KVActivationReservation> text_activation;
@@ -442,17 +511,19 @@ public:
         std::vector<runtime::ContextTransferRequirement> transfers;
         std::vector<runtime::ContextTransferObservation> observations;
         runtime::ContextOperationCounts operations;
-        bool submitted             = false;
-        bool preserve_state_device = true;
-        bool consume_source        = false;
-        bool take_private          = false;
-        bool split_state           = false;
-        bool backup_state          = false;
-        bool adopted               = false;
-        bool borrow_text           = false;
-        bool borrow_backend        = false;
-        bool borrow_state          = false;
-        bool source_tail_hidden    = false;
+        bool submitted                  = false;
+        bool preserve_state_device      = true;
+        bool consume_source             = false;
+        bool take_private               = false;
+        bool split_state                = false;
+        bool backup_state               = false;
+        bool adopted                    = false;
+        bool borrow_text                = false;
+        bool borrow_backend             = false;
+        bool borrow_state               = false;
+        bool source_tail_hidden         = false;
+        bool source_canonical_retrieval = false;
+        std::shared_ptr<const KvmemPrefixFeatures> source_kvmem_features;
     };
 
     std::optional<ContextTransaction> context_transaction_;
@@ -471,8 +542,10 @@ public:
     [[nodiscard]] CheckpointState& checkpoint(CheckpointHandle);
     [[nodiscard]] const CheckpointState& checkpoint(CheckpointHandle) const;
     [[nodiscard]] std::optional<CheckpointHandle> reserve_checkpoint();
-    [[nodiscard]] std::optional<CheckpointHandle> detach_checkpoint(SequenceState&);
+    [[nodiscard]] std::optional<CheckpointHandle>
+    detach_checkpoint(SequenceState&, std::shared_ptr<const KvmemPrefixFeatures> features = {});
     void abort_context() noexcept;
+    void release_binding_source_pins(ContextTransaction&);
     void enqueue_context_transfers(ContextTransaction&);
     void enqueue_state_backup(ContextTransaction&);
     void copy_local_for_context(ContextTransaction&, std::int32_t source, std::int32_t destination);

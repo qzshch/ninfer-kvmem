@@ -57,8 +57,8 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
-        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
-                                   sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+        CUDA_CHECK(cudaMemcpyAsync(state.host_egress.sampled_tokens.data(), sampled.data,
+                                   static_cast<std::size_t>(batch_size) * sizeof(TokenId), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
     };
 }

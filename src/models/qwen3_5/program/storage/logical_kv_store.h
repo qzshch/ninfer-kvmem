@@ -291,7 +291,16 @@ public:
             page.destination_pinned || page.source_pins != 0 ||
             page.host_replica->content_epoch != page.content_epoch ||
             page.host_replica->committed_columns != page.committed_columns) {
-            throw std::logic_error("logical KV Device restore is not reservable");
+            throw std::logic_error(
+                "logical KV Device restore is not reservable: device=" +
+                std::to_string(bool(page.device_replica)) +
+                " pending=" + std::to_string(bool(page.pending_device_replica)) +
+                " host=" + std::to_string(bool(page.host_replica)) +
+                " destination=" + std::to_string(page.destination_pinned) +
+                " source_pins=" + std::to_string(page.source_pins) + " current=" +
+                std::to_string(page.host_replica &&
+                               page.host_replica->content_epoch == page.content_epoch &&
+                               page.host_replica->committed_columns == page.committed_columns));
         }
         page.pending_device_replica.emplace(physical_->materialize_one(reservation));
         page.destination_pinned = true;
@@ -320,6 +329,25 @@ public:
         page.destination_pinned = false;
     }
 
+    [[nodiscard]] bool device_payload_ready(LogicalKVPageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const auto& page = pages_[handle.index_];
+        return page.device_replica && !page.pending_device_replica && !page.destination_pinned;
+    }
+
+    // A stopped sparse address may release its historical replica. The address store
+    // proves no other active execution row selects it; its complete Host copy survives.
+    [[nodiscard]] bool drop_device_replica_within_active(LogicalKVPageHandle handle) noexcept {
+        if (!valid(handle)) { return false; }
+        auto& page = pages_[handle.index_];
+        if (!device_payload_ready(handle) || !host_replica_current(handle) ||
+            page.source_pins != 0 || page.references == 0 || page.writer_references > 1) {
+            return false;
+        }
+        page.device_replica.reset();
+        return true;
+    }
+
     [[nodiscard]] bool drop_device_replica(LogicalKVPageHandle handle) noexcept {
         if (!can_drop_device_replica(handle)) { return false; }
         Page& page = pages_[handle.index_];
@@ -340,6 +368,20 @@ public:
         return page.device_replica && host_replica_current(handle) &&
                !page.pending_device_replica && page.writer_references == 0 &&
                page.active_references == 0 && page.source_pins == 0 && !page.destination_pinned;
+    }
+
+    // Placement may need transient destinations although admitted append growth is already
+    // reserved. Retire only redundant, immutable inactive replicas, preserving every logical
+    // reference and current Host payload. Pending bindings retain their explicit source pins.
+    [[nodiscard]] std::uint32_t reclaim_inactive_device_replicas(std::uint32_t limit) noexcept {
+        std::uint32_t reclaimed = 0;
+        for (std::uint32_t index = 0; index < pages_.size() && reclaimed < limit; ++index) {
+            const auto& page = pages_[index];
+            if (!page.occupied) { continue; }
+            const LogicalKVPageHandle handle(this, index, page.generation);
+            if (drop_device_replica(handle)) { ++reclaimed; }
+        }
+        return reclaimed;
     }
 
     void retain_active_reference(LogicalKVPageHandle handle) {
@@ -447,13 +489,14 @@ public:
         }
     }
 
-    [[nodiscard]] bool can_destructive_truncate(LogicalKVPageHandle handle,
-                                                std::uint32_t columns) const noexcept {
+    [[nodiscard]] bool can_destructive_truncate(LogicalKVPageHandle handle, std::uint32_t columns,
+                                                bool host_will_be_released = false) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
         return columns <= page.committed_columns && columns >= page.protected_columns &&
                page.references == 1 && page.writer_references == 1 && page.source_pins == 0 &&
-               !page.destination_pinned && !page.host_replica && page.device_replica.has_value();
+               !page.destination_pinned && (!page.host_replica || host_will_be_released) &&
+               page.device_replica.has_value();
     }
 
     [[nodiscard]] bool can_destructive_truncate_inactive(LogicalKVPageHandle handle,

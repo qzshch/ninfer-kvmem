@@ -121,7 +121,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-context-mib N] "
+           "[--device-state-slots N] [--host-context-mib N] [--kvmem-window-pages N] "
+           "[--kv-file-dir PATH] [--hicache-ram-mib N] [--hicache-state-mib N] "
+           "[--hicache-prefetch] [--hicache-write-through] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -155,6 +157,12 @@ std::string serve_usage_text(const char* argv0) {
            "8192 MiB plus eight native StateImages\n"
            "       --device-state-slots is extra capacity beyond active lanes; "
            "--host-context-mib bounds shared Host State/KV and in-flight storage in MiB\n"
+           "--kvmem-window-pages enables a per-lane sparse working set (64 tokens/page)\n"
+           "       --kv-file-dir enables instance-local disk KV with optional bounded RAM hot "
+           "cache\n"
+           "       --hicache-state-mib bounds resident StateImages and retrieval metadata (disk "
+           "mode)\n"
+           "       --hicache-prefetch and --hicache-write-through are optional I/O policies\n"
            "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
@@ -259,6 +267,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--device-state-slots") {
             options.context_cache.device_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
+        } else if (arg == "--kvmem-window-pages") {
+            options.kvmem_window_pages = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-window-pages"), "kvmem-window-pages"));
+        } else if (arg == "--kv-file-dir") {
+            options.context_cache.kv_file_directory = require_value("--kv-file-dir");
+            if (options.context_cache.kv_file_directory.empty()) {
+                throw std::invalid_argument("--kv-file-dir cannot be empty");
+            }
+        } else if (arg == "--hicache-ram-mib") {
+            options.context_cache.hicache_ram_capacity_bytes =
+                parse_host_context_mib(require_value("--hicache-ram-mib"));
+        } else if (arg == "--hicache-state-mib") {
+            options.context_cache.hicache_state_capacity_bytes =
+                parse_host_context_mib(require_value("--hicache-state-mib"));
+        } else if (arg == "--hicache-prefetch") {
+            options.context_cache.hicache_prefetch = true;
+        } else if (arg == "--hicache-write-through") {
+            options.context_cache.hicache_write_through = true;
         } else if (arg == "--host-context-mib") {
             options.context_cache.host_capacity_bytes =
                 parse_host_context_mib(require_value("--host-context-mib"));
@@ -351,11 +377,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     options.context_cache.enabled = options.allow_prefix_reuse;
+    if (options.context_cache.kv_file_directory.empty() &&
+        (options.context_cache.hicache_ram_capacity_bytes ||
+         options.context_cache.hicache_prefetch || options.context_cache.hicache_write_through)) {
+        throw std::invalid_argument("HiCache RAM/prefetch/write-through requires --kv-file-dir");
+    }
+    if (!options.context_cache.kv_file_directory.empty() &&
+        !options.context_cache.hicache_state_capacity_bytes) {
+        throw std::invalid_argument("--hicache-state-mib must be positive in disk mode");
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (!options.kvmem_window_pages && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

@@ -336,6 +336,87 @@ Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
                 {"host_to_device_bytes", stats.host_to_device_bytes}};
 }
 
+Json kvmem_placement_json(const ninfer::KvmemPlacementStats& stats) {
+    return Json{{"calls", stats.calls},
+                {"no_copy_calls", stats.no_copy_calls},
+                {"demoted_pages", stats.demoted_pages},
+                {"promoted_pages", stats.promoted_pages},
+                {"d2h_pages", stats.d2h_pages},
+                {"d2h_bytes", stats.d2h_bytes},
+                {"h2d_bytes", stats.h2d_bytes},
+                {"d2h_submit_wait_ns", stats.d2h_submit_wait_ns},
+                {"h2d_submit_wait_ns", stats.h2d_submit_wait_ns},
+                {"publication_wait_ns", stats.publication_wait_ns},
+                {"total_host_wall_ns", stats.total_host_wall_ns}};
+}
+
+Json kvmem_json(const ninfer::KvmemDiagnostics& diagnostics) {
+    if (!diagnostics.enabled) { return nullptr; }
+    Json placement = Json::object();
+    constexpr std::array<const char*, 4> phases{"prefill", "retrieval", "replay", "decode"};
+    for (std::size_t phase = 0; phase < phases.size(); ++phase) {
+        placement[phases[phase]] =
+            Json{{"main", kvmem_placement_json(diagnostics.placement[phase][0])},
+                 {"backend", kvmem_placement_json(diagnostics.placement[phase][1])}};
+    }
+    return Json{{"timing_basis", "host_observed_wall_and_existing_waits"},
+                {"placement", std::move(placement)},
+                {"key_capture", Json{{"calls", diagnostics.key_capture_calls},
+                                     {"d2h_bytes", diagnostics.key_capture_d2h_bytes},
+                                     {"submit_wait_ns", diagnostics.key_capture_submit_wait_ns},
+                                     {"host_wall_ns", diagnostics.key_capture_host_wall_ns}}},
+                {"query_capture", Json{{"calls", diagnostics.query_capture_calls},
+                                       {"d2h_bytes", diagnostics.query_capture_d2h_bytes},
+                                       {"submit_wait_ns", diagnostics.query_capture_submit_wait_ns},
+                                       {"host_wall_ns", diagnostics.query_capture_host_wall_ns}}},
+                {"selection", Json{{"calls", diagnostics.selection_calls},
+                                   {"scored_blocks", diagnostics.scored_blocks},
+                                   {"host_wall_ns", diagnostics.selection_host_wall_ns}}},
+                {"replay",
+                 Json{{"tokens", diagnostics.replay_tokens},
+                      {"units", diagnostics.replay_units},
+                      {"step_host_wall_ns", diagnostics.replay_step_host_wall_ns},
+                      {"execution_host_ns", diagnostics.replay_execution_host_ns},
+                      {"execution_device_wait_ns", diagnostics.replay_execution_device_wait_ns}}}};
+}
+
+Json file_cache_json(const ninfer::FileCacheStats& stats) {
+    return Json{{"read_bytes", stats.read_bytes},
+                {"written_bytes", stats.written_bytes},
+                {"read_ns", stats.read_ns},
+                {"write_ns", stats.write_ns},
+                {"staging_wait_ns", stats.staging_wait_ns},
+                {"reads", stats.reads},
+                {"writes", stats.writes},
+                {"pinned_bytes", stats.pinned_bytes},
+                {"integrity_bytes", stats.integrity_bytes},
+                {"pending_reads", stats.pending_reads},
+                {"pending_writes", stats.pending_writes},
+                {"ram_capacity_bytes", stats.ram_capacity_bytes},
+                {"ram_resident_bytes", stats.ram_resident_bytes},
+                {"ram_dirty_bytes", stats.ram_dirty_bytes},
+                {"ram_hit_bytes", stats.ram_hit_bytes},
+                {"ram_miss_bytes", stats.ram_miss_bytes},
+                {"disk_read_bytes", stats.disk_read_bytes},
+                {"disk_written_bytes", stats.disk_written_bytes},
+                {"disk_read_ns", stats.disk_read_ns},
+                {"disk_write_ns", stats.disk_write_ns},
+                {"disk_pwrite_ns", stats.disk_pwrite_ns},
+                {"disk_sync_ns", stats.disk_sync_ns},
+                {"disk_sync_calls", stats.disk_sync_calls},
+                {"disk_high_water_bytes", stats.disk_high_water_bytes},
+                {"filesystem_pending_bytes", stats.filesystem_pending_bytes},
+                {"filesystem_write_budget_bytes", stats.filesystem_write_budget_bytes},
+                {"ram_evictions", stats.ram_evictions},
+                {"prefetch_bytes", stats.prefetch_bytes},
+                {"prefetch_hit_bytes", stats.prefetch_hit_bytes},
+                {"prefetch_wasted_bytes", stats.prefetch_wasted_bytes},
+                {"prefetch_dropped_jobs", stats.prefetch_dropped_jobs},
+                {"pending_prefetches", stats.pending_prefetches},
+                {"pending_writebacks", stats.pending_writebacks},
+                {"pending_callbacks", stats.pending_callbacks}};
+}
+
 double nanoseconds_to_seconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-9;
 }
@@ -555,6 +636,9 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
+    record["hicache"]                        = file_cache_json(memory.file_cache);
+    record["hicache"]["host_resident_bytes"] = memory.host_context_resident_bytes;
+    record["hicache"]["host_metadata_bytes"] = memory.host_context_metadata_bytes;
     return record.dump();
 }
 
@@ -630,6 +714,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         outcome.metrics.first_output_timing
             ? first_output_timing_json(*outcome.metrics.first_output_timing)
             : Json(nullptr);
+    record["kvmem"]       = kvmem_json(outcome.metrics.kvmem);
     record["speculative"] = speculative_json(outcome.metrics);
     record["generation"]  = Json{{"engine_request_id", outcome.metrics.engine_request_id},
                                  {"scheduling", scheduling_json(outcome.metrics.scheduling)}};
@@ -666,12 +751,44 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     const ninfer::RuntimeHostWorkStats host =
         host_work_delta(previous.host_work, current.host_work);
     const std::uint64_t active_host = host_active_ns(host);
+    record["hicache"]                        = file_cache_json(current.file_cache);
+    record["hicache"]["host_resident_bytes"] = current.host_context_resident_bytes;
+    record["hicache"]["host_metadata_bytes"] = current.host_context_metadata_bytes;
     record["interval_seconds"]      = report.interval_seconds;
     record["final_interval"]        = report.final_interval;
     record["tokens"]                = Json{{"computed_prefill", report.computed_prefill_tokens},
                                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    record["lanes"] = Json::array();
+    for (std::uint32_t lane = 0; lane < std::min(current.lane_count, kMaximumConcurrency); ++lane) {
+        const auto& now = current.lanes[lane];
+        const auto& before = previous.lanes[lane];
+        const auto delta = [](std::uint64_t a, std::uint64_t b) { return a >= b ? a - b : 0; };
+        const auto computed = delta(now.computed_prefill_tokens, before.computed_prefill_tokens);
+        const auto decoded = delta(now.committed_decode_tokens, before.committed_decode_tokens);
+        const char* state = "idle";
+        switch (now.state) {
+        case RuntimeLaneState::Idle: break;
+        case RuntimeLaneState::Binding: state = "binding"; break;
+        case RuntimeLaneState::Prefill: state = "prefill"; break;
+        case RuntimeLaneState::Decode: state = "decode_ready"; break;
+        case RuntimeLaneState::Replay: state = "replay"; break;
+        case RuntimeLaneState::CapturePending: state = "capture_pending"; break;
+        case RuntimeLaneState::TerminalPending: state = "terminal_pending"; break;
+        }
+        record["lanes"].push_back(Json{
+            {"lane_id", lane}, {"state", state},
+            {"engine_request_id", now.engine_request_id ? Json(now.engine_request_id) : Json(nullptr)},
+            {"tokens", Json{{"computed_prefill", computed}, {"committed_decode", decoded}}},
+            {"generated_tokens", delta(now.generated_tokens, before.generated_tokens)},
+            {"replayed_tokens", delta(now.replayed_tokens, before.replayed_tokens)},
+            {"decode_rounds", delta(now.decode_rounds, before.decode_rounds)},
+            {"prefill_units", delta(now.prefill_units, before.prefill_units)},
+            {"throughput_tokens_per_second",
+             Json{{"prefill", report.interval_seconds > 0 ? computed / report.interval_seconds : 0},
+                  {"decode", report.interval_seconds > 0 ? decoded / report.interval_seconds : 0}}}});
+    }
     record["scheduler"]  = Json{{"running", current.running_requests},
                                 {"prefilling", current.prefilling_requests},
                                 {"decode_ready", current.decode_ready_requests},

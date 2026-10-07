@@ -28,6 +28,7 @@ struct RoundStateSpec {
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
 // once per round; only its exact-B prefixes are consumed by the model schedule.
+// Egress copies only the initialized exact-B sampled-token prefix.
 struct OrdinaryDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> tokens{};
     std::array<std::int32_t, kMaximumConcurrency> cache_positions{};

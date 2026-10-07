@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/retrieval/window_capacity.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -134,6 +135,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
+                     .kvmem_window_pages        = plan.kvmem_window_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
     qwen3_5::StateImageSpec state_image_spec{
@@ -163,6 +165,17 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
+    if (plan.kvmem_window_pages != 0) {
+        auto query_state           = state_image_spec.linear;
+        query_state.slot_count     = dimension(plan.max_concurrency);
+        out.kvmem_query_checkpoint = plan_linear_attention_state_pool(builder, query_state);
+        if (state_image_spec.dflash_local) {
+            const auto& local = *state_image_spec.dflash_local;
+            out.kvmem_draft_checkpoint =
+                plan_cyclic_kv_cache(builder, local.layers, local.capacity, local.kv_heads,
+                                     local.head_dim, dimension(plan.max_concurrency));
+        }
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder,
@@ -243,6 +256,26 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
+    if (plan.kvmem_window_pages != 0) {
+        const auto layers   = static_cast<std::uint64_t>(config.full_attention_layers);
+        const auto slots    = static_cast<std::uint64_t>((effective_prefill_chunk + 127) / 128 + 1);
+        out.kvmem_query_sum = add_tensor(
+            builder, DType::FP32,
+            {dimension(layers * config.attention->query_width()), dimension(plan.max_concurrency)},
+            "KVMem per-lane query sums");
+        out.kvmem_key_sums = add_tensor(builder, DType::FP32,
+                                        {dimension(layers * slots * config.attention->key_width()),
+                                         dimension(plan.max_concurrency)},
+                                        "KVMem per-lane key sums");
+        out.kvmem_query_key_checkpoint =
+            add_tensor(builder, DType::FP32,
+                       {dimension(layers * slots * config.attention->key_width()),
+                        dimension(plan.max_concurrency)},
+                       "KVMem per-lane query-boundary key sums");
+        out.kvmem_query_tail_hidden = add_tensor(
+            builder, DType::BF16, {dimension(config.hidden_size), dimension(plan.max_concurrency)},
+            "KVMem per-lane query-boundary continuation hidden");
+    }
     if (plan.causal_scoring) {
         out.score_hidden =
             add_tensor(builder, DType::BF16,
@@ -753,8 +786,37 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    if (options.kvmem_window_pages &&
+        (options.kvmem_window_pages < 8 ||
+         options.kvmem_window_pages > page_count(options.max_context) ||
+         options.max_concurrency > 4 || options.purpose == EnginePurpose::CausalScoring ||
+         options.speculative.backend == SpeculativeBackend::DFlash)) {
+        throw std::invalid_argument("KVMem requires an 8+ page window within max_context, at most "
+                                    "four lanes, and a compatible backend");
+    }
+    if (options.kvmem_window_pages && options.context_cache.host_capacity_bytes == 0) {
+        throw std::invalid_argument("KVMem requires nonzero Host context backing");
+    }
+    const auto& cache = options.context_cache;
+    if ((cache.hicache_ram_capacity_bytes || cache.hicache_prefetch ||
+         cache.hicache_write_through) &&
+        cache.kv_file_directory.empty()) {
+        throw std::invalid_argument("HiCache hot RAM and prefetch require kv_file_directory");
+    }
+    if (!cache.kv_file_directory.empty() &&
+        (!cache.hicache_state_capacity_bytes ||
+         (cache.host_capacity_bytes &&
+          (!*cache.host_capacity_bytes ||
+           cache.hicache_ram_capacity_bytes > *cache.host_capacity_bytes)))) {
+        throw std::invalid_argument(
+            "HiCache requires bounded State RAM and adequate logical Host capacity");
+    }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    const std::uint32_t minimum_pages =
+        options.kvmem_window_pages
+            ? kvmem_pool_page_budget(options.max_context, options.prefill_chunk,
+                                     options.kvmem_window_pages, options.max_concurrency)
+            : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
@@ -762,7 +824,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        if (!options.kvmem_window_pages &&
+            options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
@@ -821,6 +884,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
+    impl->kvmem_window_pages   = inputs.kvmem_window_pages;
     impl->prefill_chunk        = inputs.prefill_chunk;
     impl->draft_window         = inputs.draft_window;
     impl->speculative_backend  = inputs.speculative_backend;
@@ -895,6 +959,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters           = &parameters,
         .capacity             = options.max_context,
         .max_concurrency      = options.max_concurrency,
+        .kvmem_window_pages   = options.kvmem_window_pages,
         .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
         .draft_window         = options.speculative.draft_tokens,
         .speculative_backend  = options.speculative.backend,
@@ -908,7 +973,11 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache        = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    const std::uint32_t minimum_pages =
+        inputs.kvmem_window_pages
+            ? kvmem_pool_page_budget(inputs.capacity, inputs.prefill_chunk,
+                                     inputs.kvmem_window_pages, inputs.max_concurrency)
+            : std::max(logical_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {

@@ -7,9 +7,16 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
+std::optional<CheckpointHandle>
+ProgramImpl::detach_checkpoint(SequenceState& state,
+                               std::shared_ptr<const KvmemPrefixFeatures> features) {
     const auto frontier = state.text_kv_valid;
     if (!frontier || !state.kv) { return std::nullopt; }
+    if (kvmem_window_pages && !features) {
+        try {
+            features = capture_kvmem_features(state);
+        } catch (const std::bad_alloc&) { return std::nullopt; }
+    }
     auto backing     = std::make_shared<PreparedCaptureBacking>();
     backing->digests = state.prefix_digests;
     backing->digests.truncate(frontier);
@@ -42,7 +49,8 @@ std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& st
         backend_kv_addresses->deactivate(*state.kv->backend);
     }
     checkpoints[handle->index].value =
-        CheckpointState{.kv                = state.kv,
+        CheckpointState{.kvmem_features    = std::move(features),
+                        .kv                = state.kv,
                         .state             = state.state.read,
                         .identity          = std::move(backing),
                         .key               = {state.prefix_digests.at(frontier), frontier,
@@ -118,9 +126,34 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
         control.lifecycle != Lifecycle::Replaying) {
         throw std::logic_error("pause requires a committed boundary");
     }
+    // Normalize the unpublished probe before snapshotting. Replaying the entire
+    // sparse prefix from a root would recompute its KV under a different selection,
+    // even though the saved query GDN state itself can be recovered exactly.
+    if (save_snapshot && kvmem_window_pages && control.prefill &&
+        control.prefill->query_replay_cursor &&
+        *control.prefill->query_replay_cursor == kvmem_lanes_[lane].query_begin &&
+        state.text_kv_valid > *control.prefill->query_replay_cursor) {
+        rewind_kvmem_query_probe(state, *control.prefill);
+    }
     timing.begin_wait();
     device.synchronize();
     timing.end_wait();
+    std::shared_ptr<const KvmemPrefixFeatures> saved_features;
+    if (kvmem_window_pages) {
+        try {
+            saved_features = capture_kvmem_features(state);
+        } catch (const std::bad_alloc&) { return false; }
+    }
+    std::optional<HostContextAllocation> query_host;
+    if (kvmem_window_pages && control.lifecycle == Lifecycle::Prefilling &&
+        kvmem_lanes_[lane].query_checkpoint_valid) {
+        if (!host_context_arena) { return false; }
+        query_host = host_context_arena->allocate(state_images->host_layout().image_bytes +
+                                                  kvmem_lanes_[lane].query_key_checkpoint.bytes());
+        if (!query_host) { return false; }
+        copy_kvmem_query_host(state, *query_host, false);
+        query_host->publish();
+    }
     control.capture_reservation.reset();
     if (control.capture_pending) { skip_capture(handle); }
     control.recovery.reset();
@@ -154,9 +187,20 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
         control.prefill->vision.reset();
     }
     if (control.replay) { control.replay->vision.reset(); }
-    auto saved      = std::make_unique<ResumeStateImpl>();
-    saved->owner    = this;
-    saved->frontier = control.lifecycle == Lifecycle::Prefilling  ? control.prefill->cursor
+    auto saved   = std::make_unique<ResumeStateImpl>();
+    saved->owner = this;
+    if (kvmem_window_pages) {
+        saved->kvmem            = kvmem_lanes_[lane];
+        saved->kvmem_features   = saved_features;
+        saved->kvmem_query_host = std::move(query_host);
+        saved->kvmem_query_sums.resize(kvmem_lanes_[lane].query_sum.bytes() / sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(
+            saved->kvmem_query_sums.data(), kvmem_lanes_[lane].query_sum.data,
+            kvmem_lanes_[lane].query_sum.bytes(), cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    }
+    saved->frontier = control.lifecycle == Lifecycle::Prefilling
+                          ? control.prefill->query_replay_cursor.value_or(control.prefill->cursor)
                       : control.lifecycle == Lifecycle::Replaying ? control.replay_target
                                                                   : state.execution_frontier;
     if (control.lifecycle == Lifecycle::Replaying) {
@@ -171,7 +215,9 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
             }
         }
     }
-    if (save_snapshot && saved->frontier) { saved->snapshot = detach_checkpoint(state); }
+    if (save_snapshot && saved->frontier) {
+        saved->snapshot = detach_checkpoint(state, saved_features);
+    }
     if (!saved->snapshot) {
         release_sequence_kv(state);
         release_sequence_state(state);
@@ -213,6 +259,19 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
             !state_store->drop_device_replica(record.state)) {
             throw std::logic_error("paused state is still Device-pinned");
         }
+    }
+    if (kvmem_window_pages) {
+        // ResumeState owns the detached CPU features and query snapshot now. The
+        // vacated lane must not keep another reference to its old MeanK blocks:
+        // rebinding to a different lane otherwise retains Host quota after finish.
+        auto& sparse = kvmem_lanes_[tx.lane];
+        sparse.index.truncate_to(0);
+        sparse.query.clear();
+        sparse.query_count.clear();
+        sparse.retrieved_pages.clear();
+        sparse.media_groups.clear();
+        sparse.capture_begin = sparse.query_begin = sparse.query_end = 0;
+        sparse.query_checkpoint_valid                                = false;
     }
     requests[tx.lane]       = {};
     sequences[tx.lane]      = {};

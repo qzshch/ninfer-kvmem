@@ -366,6 +366,9 @@ struct ContextProgress {
 };
 
 struct PhysicalUsageSnapshot {
+    FileCacheStats file_cache;
+    std::size_t host_resident_bytes = 0;
+    std::size_t host_metadata_bytes = 0;
     runtime::ContextResourceUsage occupied;
     runtime::ContextResourceUsage capacity;
     std::size_t host_reserved_bytes      = 0;
@@ -463,6 +466,8 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
+    // Thread-safe byte-worker counters only; no model state or CUDA operations.
+    [[nodiscard]] FileCacheStats file_cache_stats() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

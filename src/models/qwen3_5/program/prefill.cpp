@@ -54,6 +54,9 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_kvmem_capture(execution.kvmem_q_sum, execution.kvmem_k_sum,
+                           execution.kvmem_capture_slots, execution.kvmem_query_begin,
+                           execution.kvmem_query_end);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -200,8 +203,14 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     require_unit(lane, ExecutionUnitKind::Prefill);
     auto& state = sequences[lane];
     prepare_capture_boundary(lane);
-    const auto permit = *requests[lane].permit;
-    ensure_sequence_kv_mapped(state, permit.main_frontier, permit.backend_frontier);
+    const auto permit  = *requests[lane].permit;
+    const auto& staged = *requests[lane].prefill;
+    const bool initial_query_rewind =
+        kvmem_window_pages && staged.query_replay_cursor &&
+        *staged.query_replay_cursor == kvmem_lanes_.at(lane).query_begin;
+    if (!initial_query_rewind) {
+        ensure_sequence_kv_mapped(state, permit.main_frontier, permit.backend_frontier);
+    }
     set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(state.kv->text));
     if (state.kv->backend) {
         set_device_i32(io.backend_kv_table_row,
@@ -500,6 +509,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
+        auto* sparse = kvmem_window_pages ? &kvmem_lanes_.at(sequence.lane) : nullptr;
+        const bool needs_query_replay =
+            sparse && staged.prompt_tokens > kvmem_window_pages * kPagedKVPageSize &&
+            sparse->query_begin != 0 && sparse->query_begin < sparse->query_end;
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -520,6 +533,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             dflash_prefill_host_ingress,
             sequence.rope_delta};
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
+        if (sparse) {
+            schedule_state.execution.kvmem_q_sum = static_cast<float*>(sparse->query_sum.data);
+            schedule_state.execution.kvmem_k_sum = static_cast<float*>(sparse->key_sums.data);
+            schedule_state.execution.kvmem_capture_slots = kvmem_capture_slots_;
+            schedule_state.execution.kvmem_query_begin   = sparse->query_begin;
+            schedule_state.execution.kvmem_query_end     = sparse->query_end;
+            // The long-query probe is unpublished; it must not update generated-token
+            // penalty history before replay samples the canonical Begin token.
+            if (needs_query_replay) { schedule_state.sampling = nullptr; }
+        }
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -549,7 +572,27 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.mtp_bridge = MtpBridgeMode::None;
         }
 
-        if (staged.cursor < staged.prompt_tokens) {
+        if (staged.query_replay_cursor) {
+            mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
+                                                    : workspace_plan.text_prefill);
+            const auto count = advance_kvmem_query_replay(sequence, staged, timing);
+            // The probe already advanced the admitted prompt suffix. This second
+            // execution is additional work, not a second logical prompt advance;
+            // its tokens and cost are recorded in timings.kvmem.replay_*.
+            if (*staged.query_replay_cursor < staged.prompt_tokens) {
+                timing.begin_wait();
+                device.synchronize();
+                timing.end_wait();
+                staged.elapsed_seconds +=
+                    std::chrono::duration<double>(Clock::now() - started).count();
+                return runtime::PrefillStepResult{.summary = summary,
+                                                  .processed_prompt_tokens =
+                                                      processed_prompt_tokens,
+                                                  .timing = timing.finish()};
+            }
+            timing.resume_submit();
+            copy_tail(sequence, prefill_hidden.slice(1, static_cast<std::int32_t>(count) - 1, 1));
+        } else if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
                 std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
@@ -578,7 +621,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
                 const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens;
                 const std::optional<std::uint32_t> capture_frontier =
-                    request.next_capture < request.capture_groups.size()
+                    request.next_capture < request.capture_groups.size() &&
+                            (!needs_query_replay ||
+                             request.capture_groups[request.next_capture].frontier <=
+                                 sparse->query_begin)
                         ? std::optional<std::uint32_t>(
                               request.capture_groups[request.next_capture].frontier)
                         : std::nullopt;
@@ -589,6 +635,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
+                }
+                if (needs_query_replay && !sparse->query_checkpoint_valid &&
+                    sparse->query_begin > staged.cursor &&
+                    (!split_frontier || sparse->query_begin < *split_frontier)) {
+                    split_frontier = sparse->query_begin;
                 }
                 execution::PrefillChunkResult result;
                 timing.pause();
@@ -621,9 +672,20 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 
+                if (sparse) {
+                    consume_kvmem_chunk_capture(sequence, staged.cursor - result.processed_tokens,
+                                                staged.cursor);
+                }
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+                if (needs_query_replay && staged.cursor == sparse->query_begin) {
+                    copy_tail(sequence,
+                              prefill_hidden.slice(
+                                  1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+                    copy_kvmem_query_state(sequence, false);
+                    sparse->query_checkpoint_valid = true;
+                }
                 copy_tail(sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
@@ -664,6 +726,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
+            }
+            if (sparse) {
+                finalize_kvmem_query(sequence, staged.prompt_tokens);
+                apply_kvmem_retrieval_placement(sequence);
+                if (needs_query_replay) {
+                    staged.query_replay_cursor = sparse->query_begin;
+                    timing.begin_wait();
+                    device.synchronize();
+                    timing.end_wait();
+                    staged.elapsed_seconds +=
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    return runtime::PrefillStepResult{.summary = summary,
+                                                      .processed_prompt_tokens =
+                                                          processed_prompt_tokens,
+                                                      .timing = timing.finish()};
+                }
             }
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(

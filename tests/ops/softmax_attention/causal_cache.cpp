@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -133,7 +134,7 @@ struct AttentionCase {
     float qk_amplitude = 0.25f;
 };
 
-enum class MappingPattern { Identity, Offset, Fragmented };
+enum class MappingPattern { Identity, Offset, Fragmented, Holed, SparseTail };
 
 const char* mapping_name(MappingPattern pattern) {
     switch (pattern) {
@@ -143,8 +144,23 @@ const char* mapping_name(MappingPattern pattern) {
         return "offset";
     case MappingPattern::Fragmented:
         return "fragmented";
+    case MappingPattern::Holed:
+        return "holed";
+    case MappingPattern::SparseTail:
+        return "sparse-tail";
     }
     return "unknown";
+}
+
+// Holed-pattern holes start at page 4 so every append-writing case (whose positions stay in
+// pages 0..2 in this suite) keeps writing materialized pages only; read-only cases see holes
+// from page 4 upward (4, 7, 10, ...).
+bool holed_page_is_hole(std::int32_t page) { return page >= 4 && page % 3 == 1; }
+
+bool block_table_position_is_hole(std::span<const std::int32_t> block_table,
+                                  std::int32_t position) {
+    const std::int32_t page = block_table[static_cast<std::size_t>(position / kPagedKVPageSize)];
+    return page == kPagedKVPageHole;
 }
 
 std::int32_t align_up_page(std::int32_t value) {
@@ -160,13 +176,16 @@ std::int32_t physical_page_count(std::int32_t logical_pages, MappingPattern patt
         return logical_pages + 2;
     case MappingPattern::Fragmented:
         return 2 * logical_pages + 1;
+    case MappingPattern::Holed:
+    case MappingPattern::SparseTail:
+        return 2 * logical_pages + 1;
     }
     return 0;
 }
 
 std::vector<std::int32_t> make_block_table(std::int32_t populated_pages, std::int32_t table_pages,
                                            MappingPattern pattern) {
-    std::vector<std::int32_t> table(static_cast<std::size_t>(table_pages), -1);
+    std::vector<std::int32_t> table(static_cast<std::size_t>(table_pages), kPagedKVPageHole);
     switch (pattern) {
     case MappingPattern::Identity:
         for (std::int32_t page = 0; page < populated_pages; ++page) { table[page] = page; }
@@ -177,8 +196,21 @@ std::vector<std::int32_t> make_block_table(std::int32_t populated_pages, std::in
     case MappingPattern::Fragmented:
         for (std::int32_t page = 0; page < populated_pages; ++page) { table[page] = 2 * page + 1; }
         break;
+    case MappingPattern::Holed:
+    case MappingPattern::SparseTail:
+        for (std::int32_t page = 0; page < populated_pages; ++page) {
+            const bool hole                       = pattern == MappingPattern::SparseTail
+                                                        ? page >= 2 && page + 20 < populated_pages
+                                                        : holed_page_is_hole(page);
+            table[static_cast<std::size_t>(page)] = hole ? kPagedKVPageHole : 2 * page + 1;
+        }
+        break;
     }
     return table;
+}
+
+std::vector<std::int32_t> make_block_table(std::int32_t pages, MappingPattern pattern) {
+    return make_block_table(pages, pages, pattern);
 }
 
 std::size_t q_index(const Geometry& geometry, std::int32_t head, std::int32_t d,
@@ -273,6 +305,7 @@ std::vector<T> scatter_paged(const std::vector<T>& logical, std::int32_t leading
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) continue;
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t source = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -294,6 +327,7 @@ void scatter_paged_into(const std::vector<T>& logical, std::int32_t leading_exte
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) continue;
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t source = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -316,6 +350,7 @@ std::vector<T> gather_paged(std::span<const T> physical, std::int32_t leading_ex
         for (std::int32_t position = 0; position < logical_capacity; ++position) {
             const std::int32_t page =
                 block_table[static_cast<std::size_t>(position) / kPagedKVPageSize];
+            if (page == kPagedKVPageHole) continue;
             for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
                 const std::size_t target = static_cast<std::size_t>(leading) +
                                            static_cast<std::size_t>(leading_extent) *
@@ -861,9 +896,13 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::span<const std::int32_t> block_table = {}) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
+    const auto key_is_hole = [&](int pos) {
+        return !block_table.empty() && block_table_position_is_hole(block_table, pos);
+    };
     const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
     const bool rotate_v = cache.storage == KvCacheStorage::Nvfp4Group16 ||
                           cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -903,7 +942,7 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
         [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
         [&](int d, int head, int pos) { return values[index(d, head, pos)]; },
-        [&](int token, int pos) { return pos <= positions[token]; },
+        [&](int token, int pos) { return pos <= positions[token] && !key_is_hole(pos); },
         [&](int d, int head, int token, double value) {
             output[q_index(geometry, head, d, token)] = value;
         },
@@ -1225,8 +1264,14 @@ public:
                 const std::int32_t linear =
                     static_cast<std::int32_t>(row) * (logical_capacity_ / kPagedKVPageSize) +
                     logical;
+                const bool hole =
+                    mapping == MappingPattern::SparseTail
+                        ? logical >= 2 && logical + 20 < logical_capacity_ / kPagedKVPageSize
+                        : mapping == MappingPattern::Holed && holed_page_is_hole(logical);
                 block_tables_host_[row * static_cast<std::size_t>(logical_pages_) + logical] =
-                    mapping == MappingPattern::Fragmented ? 2 * linear + 1 : linear;
+                    hole                                    ? kPagedKVPageHole
+                    : mapping == MappingPattern::Fragmented ? 2 * linear + 1
+                                                            : linear;
             }
         }
         block_tables_.copy_from_host(block_tables_host_.data(),
@@ -1610,6 +1655,48 @@ private:
     GuardedDeviceBuffer block_tables_;
 };
 
+void zero_hole_pages(HostCache& cache, std::span<const std::int32_t> block_table) {
+    const auto zero_plane = [&](auto& buffer, std::int32_t leading_extent) {
+        for (std::int32_t head = 0; head < cache.geometry.kv_heads; ++head) {
+            for (std::int32_t position = 0; position < cache.logical_capacity; ++position) {
+                if (!block_table_position_is_hole(block_table, position)) { continue; }
+                for (std::int32_t leading = 0; leading < leading_extent; ++leading) {
+                    const std::size_t index =
+                        static_cast<std::size_t>(leading) +
+                        static_cast<std::size_t>(leading_extent) *
+                            (static_cast<std::size_t>(position) +
+                             static_cast<std::size_t>(cache.logical_capacity) * head);
+                    buffer[index] = 0;
+                }
+            }
+        }
+    };
+    if (cache.storage == KvCacheStorage::BFloat16) {
+        zero_plane(cache.k_bf16, kHeadDim);
+        zero_plane(cache.v_fp16, kHeadDim);
+    } else if (cache.storage == KvCacheStorage::Int8Group64) {
+        zero_plane(cache.k_i8, kHeadDim);
+        zero_plane(cache.v_i8, kHeadDim);
+        zero_plane(cache.k_scale, kQuantGroups);
+        zero_plane(cache.v_scale, kQuantGroups);
+    } else if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        zero_plane(cache.k_fp8, kHeadDim);
+        zero_plane(cache.v_fp8, kHeadDim);
+        zero_plane(cache.k_scale, kFp8QuantGroups);
+        zero_plane(cache.v_scale, kFp8QuantGroups);
+    } else if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        zero_plane(cache.k_fp8, kHeadDim);
+        zero_plane(cache.v_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.k_scale, kFp8QuantGroups);
+        zero_plane(cache.v_nvfp4_scale, kNvfp4QuantGroups);
+    } else {
+        zero_plane(cache.k_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.v_nvfp4, kNvfp4CodeBytes);
+        zero_plane(cache.k_nvfp4_scale, kNvfp4QuantGroups);
+        zero_plane(cache.v_nvfp4_scale, kNvfp4QuantGroups);
+    }
+}
+
 int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
     int failures = 0;
     if (expected.storage == KvCacheStorage::BFloat16) {
@@ -1793,9 +1880,11 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
     HostCache expected = initial;
     append_cache(expected, k, v, positions);
+    const auto block_table =
+        make_block_table(expected.logical_capacity / kPagedKVPageSize, mapping);
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
-                        expected, select_query_columns(positions, 1, oracle_queries));
+                        expected, select_query_columns(positions, 1, oracle_queries), block_table);
     DeviceCache cache(initial, mapping, max_context);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1869,6 +1958,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
                                     reference, attention_criterion(storage));
+    zero_hole_pages(expected, block_table);
     failures += verify_cache(label, cache.snapshot(), expected);
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         DeviceCache standalone(initial, mapping, max_context);
@@ -1914,9 +2004,11 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
 
     const HostCache cache_host =
         make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
-    const std::vector<double> reference =
-        ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
-                        cache_host, select_query_columns(positions, 1, oracle_queries));
+    const auto block_table =
+        make_block_table(cache_host.logical_capacity / kPagedKVPageSize, mapping);
+    const std::vector<double> reference = ideal_attention(
+        select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries), cache_host,
+        select_query_columns(positions, 1, oracle_queries), block_table);
     DeviceCache cache(cache_host, mapping, max_context);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1948,11 +2040,26 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
         case_label("causal_softmax_attention_cached", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label,
-                                    bf16_bits_to_double(select_query_columns(
+    int failures     = verify_attention(label,
+                                        bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
-    failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
+                                        reference, attention_criterion(storage));
+    if (storage == KvCacheStorage::Fp8E4M3Row256 && test_case.tokens == 128 &&
+        !test_case.graph_replay) {
+        for (unsigned repetition = 0; repetition < 3; ++repetition) {
+            ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
+                                                 cache.view(), envelope, workspace, tout, execution);
+            CUDA_CHECK(cudaStreamSynchronize(execution.stream));
+            const auto again = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+            if (again != output_bits) {
+                std::cerr << label << ": repeated read-only FP8 attention changed output\n";
+                ++failures;
+            }
+        }
+    }
+    HostCache before = cache_host;
+    zero_hole_pages(before, block_table);
+    failures += verify_cache(label + " cache unchanged", cache.snapshot(), before);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
@@ -2118,8 +2225,11 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
                 auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
                 auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
                 append_cache(expected[lanes[b]], row_k, row_v, row_positions);
-                insert_request_columns(ideal_attention(row_q, expected[lanes[b]], row_positions),
-                                       q_column_elements, width, b, reference);
+                const auto oracle_table = make_block_table(
+                    expected[lanes[b]].logical_capacity / kPagedKVPageSize, test_case.mapping);
+                insert_request_columns(
+                    ideal_attention(row_q, expected[lanes[b]], row_positions, oracle_table),
+                    q_column_elements, width, b, reference);
             }
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
@@ -2716,6 +2826,25 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
 
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
+    // Independent dense-oracle masking, including empty split ranges and both
+    // grouped decode and tiled prompt routes. Every appended page stays resident.
+    const std::array<int, 4> sparse_append_queries{0, 31, 64, 127};
+    const std::array<int, 4> sparse_cached_queries{0, 63, 128, 256};
+    for (const auto& geometry : kGeometries) {
+        failures += run_a1_case(execution, geometry, storage, {128, 8192, 8320, 2701u, false, true},
+                                MappingPattern::SparseTail, sparse_append_queries);
+        failures += run_a3_case(execution, geometry, storage, {7, 8192, 8199, 2702u, false, true},
+                                MappingPattern::SparseTail);
+        failures += run_a3_case(execution, geometry, storage, {257, 8192, 16384, 2703u},
+                                MappingPattern::Holed, sparse_cached_queries);
+        failures += run_batch_case(
+            execution, geometry, storage,
+            {7, {8192, 8192}, {7, 3}, {1, 0}, MappingPattern::SparseTail, 2704u, true});
+        failures += run_batch_case(
+            execution, geometry, storage,
+            {7, {8192, 8192}, {0, 7}, {0, 1}, MappingPattern::SparseTail, 2705u, true});
+    }
+
     if (storage == KvCacheStorage::Nvfp4Group16) {
         failures += run_nvfp4_cases(execution);
         failures += run_quantized_batch_cases(execution, storage, 720u);
@@ -2758,6 +2887,19 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
     DeviceContext device;
     const auto execution = device.execution_view();
     int failures         = 0;
+    if (std::getenv("NINFER_FP8_RACE_REGRESSION")) {
+        const std::array<int, 3> rows{0, 63, 127};
+        for (unsigned repeat = 0; repeat < 2; ++repeat) {
+            failures += run_a3_case(execution, kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                                    {128, repeat ? 9875 : 129, 16384, 9873u + repeat},
+                                    MappingPattern::Fragmented, rows);
+        }
+        for (const auto context : {0, 1024, 8192, 9875}) {
+            failures += run_batch_case(execution, kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                {128, {context}, {128}, {1}, MappingPattern::Fragmented, 9921u}, 16384);
+        }
+        return failures;
+    }
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {

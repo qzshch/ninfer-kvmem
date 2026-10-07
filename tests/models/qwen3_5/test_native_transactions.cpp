@@ -10,7 +10,9 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -18,6 +20,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace {
 
@@ -1767,6 +1770,394 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
             "sampling-count fixture leaked typed resources");
 }
 
+void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters& parameters,
+                        EngineOptions options) {
+    if (options.speculative.backend == SpeculativeBackend::DFlash2) {
+        options.speculative.draft_tokens = 7;
+    }
+    options.max_context                                = 16384;
+    options.prefill_chunk                              = 128;
+    options.max_concurrency                            = 2;
+    options.kv_capacity                                = KvCapacityPolicy::explicit_capacity(12288);
+    options.kvmem_window_pages                         = 64;
+    options.context_cache.enabled                      = false;
+    options.context_cache.device_state_slots           = 0;
+    options.context_cache.host_capacity_bytes          = 4ULL << 30;
+    options.context_cache.hicache_ram_capacity_bytes   = 16ULL << 20;
+    options.context_cache.hicache_state_capacity_bytes = 1ULL << 30;
+    options.context_cache.kv_file_directory            = std::filesystem::temp_directory_path() /
+                                              ("ninfer-sparse-pause-" + std::to_string(getpid()));
+    if (std::getenv("NINFER_SPARSE_BASELINE_RAM")) {
+        options.context_cache.kv_file_directory.clear();
+        options.context_cache.hicache_ram_capacity_bytes = 0;
+        options.context_cache.hicache_state_capacity_bytes = 0;
+    }
+    if (std::getenv("NINFER_SPARSE_BASELINE_DENSE")) {
+        options.max_concurrency = 1;
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(16384);
+        options.kvmem_window_pages = 256;
+    }
+    if (std::getenv("NINFER_SPARSE_BASELINE_BF16")) {
+        options.kv_cache = KvCacheStorage::BFloat16;
+    }
+    if (const auto* chunk = std::getenv("NINFER_SPARSE_BASELINE_CHUNK")) {
+        options.prefill_chunk = static_cast<std::uint32_t>(std::stoul(chunk));
+    }
+    auto frontend = qwen::make_frontend(parameters.model.resources(),
+                                        {.vision_enabled = false, .max_context = 16384});
+    std::vector<TokenId> baseline;
+    std::vector<float> baseline_keys;
+    std::vector<float> baseline_query;
+    std::vector<std::uint32_t> baseline_selection;
+    std::vector<std::vector<std::byte>> baseline_step_keys;
+    std::vector<std::vector<std::byte>> baseline_step_hidden;
+    std::vector<std::vector<float>> baseline_step_scores;
+    // Pause both the unfinished query probe and the unpublished replay, including a
+    // partly executed replay. Rebind to another lane and compare actual greedy output
+    // and the partial Key accumulator with uninterrupted execution.
+    const std::array<unsigned, 5> phases{0, 0, 1, 2, 3};
+    for (unsigned repetition = 0; repetition < phases.size(); ++repetition) {
+        if (repetition == 2 && std::getenv("NINFER_SPARSE_BASELINE_ONLY")) { break; }
+        const auto phase = phases[repetition];
+        auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
+        auto plan    = qwen::detail::finalize_sequence_plan_impl(
+            std::move(planner), options.kvmem_window_pages == 256 ? 256 : 192);
+        qwen::detail::ProgramImpl program(parameters, *plan, device, {});
+        const auto empty = program.physical_usage();
+        auto prepared    = frontend.prepare_tokens(std::vector<TokenId>(10003, 198));
+        runtime::ResolvedExecutionOptions request;
+        request.requested_output_tokens = 4;
+        request.allow_prefix_reuse      = false;
+        request.sampling.temperature    = 0;
+        auto base =
+            program.plan_request(qwen::PreparedPromptAccess::take(std::move(prepared)), request);
+        const auto settle = [&]() {
+            for (unsigned i = 0; i < 8; ++i) {
+                device.synchronize();
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                auto progress = program.poll_context({});
+                if (progress.complete) { return progress; }
+            }
+            throw std::runtime_error("sparse pause transaction failed to settle");
+        };
+        const auto bind = [&](unsigned lane, qwen::ResumeState* resume) {
+            auto source = program.inspect_source(base, std::nullopt);
+            require(source &&
+                        static_cast<bool>(program.start_binding(
+                            base, {lane}, *source, resume, qwen::ExecutionUnitKind::Prefill, 0)),
+                    "sparse query pause could not bind");
+            auto progress = settle();
+            require(progress.published && progress.sequence, "sparse bind did not publish");
+            return *progress.sequence;
+        };
+        auto sequence = bind(0, nullptr);
+        unsigned lane = 0;
+        bool paused   = phase == 0;
+        std::vector<TokenId> output;
+        const auto read_tensor = [&](const Tensor& tensor) {
+            std::vector<std::byte> bytes(tensor.bytes());
+            CUDA_CHECK(cudaMemcpyAsync(bytes.data(), tensor.data, bytes.size(),
+                                       cudaMemcpyDeviceToHost, device.stream));
+            device.synchronize();
+            return bytes;
+        };
+        const auto read_query_checkpoint = [&](unsigned row) {
+            std::vector<std::byte> bytes;
+            const auto append = [&](const Tensor& tensor) {
+                const auto part = read_tensor(tensor);
+                bytes.insert(bytes.end(), part.begin(), part.end());
+            };
+            const auto& linear = *program.kvmem_query_checkpoint_;
+            for (std::uint32_t layer = 0; layer < linear.layer_count(); ++layer) {
+                append(linear.conv_slot(layer, row));
+                append(linear.recurrent_slot(layer, row));
+            }
+            if (program.kvmem_draft_checkpoint_) {
+                for (std::uint32_t layer = 0;
+                     layer < program.kvmem_draft_checkpoint_->layer_count(); ++layer) {
+                    const auto view = program.kvmem_draft_checkpoint_->layer_view(layer);
+                    append(view.k.slice(3, row, 1));
+                    append(view.v.slice(3, row, 1));
+                }
+            }
+            append(program.kvmem_lanes_[row].query_key_checkpoint);
+            append(program.kvmem_lanes_[row].query_tail_hidden);
+            return bytes;
+        };
+        bool query_pressure_refused = false;
+        bool complete_replay_window_checked = false;
+        bool replay_growth_pressure_refused = false;
+        for (unsigned i = 0; i < 260 && output.empty(); ++i) {
+            const bool replaying =
+                program.requests[lane].lifecycle == qwen::detail::Lifecycle::Replaying;
+            const std::array<qwen::ExecutionUnit, 1> unit{
+                {{sequence,
+                  replaying ? qwen::ExecutionUnitKind::Replay : qwen::ExecutionUnitKind::Prefill,
+                  0}}};
+            if (repetition == 0 && !replaying && !query_pressure_refused &&
+                program.requests[lane].prefill) {
+                const auto& staged = *program.requests[lane].prefill;
+                const auto& sparse = program.kvmem_lanes_[lane];
+                if (!staged.query_replay_cursor && !staged.canonical_retrieval &&
+                    sparse.query_begin < sparse.query_end &&
+                    staged.cursor + options.prefill_chunk >= staged.prompt_tokens) {
+                    // A foreign Host claim leaves enough for the ordinary rolling
+                    // chunk, but not the final query's unknown page permutation.
+                    // Admission must report pressure before any placement or GPU work.
+                    const auto room = 8ULL * program.text_host_kv_page_stride;
+                    const auto free = program.host_context_arena->free_bytes();
+                    require(free > room, "query pressure fixture has no foreign claim headroom");
+                    auto foreign = program.host_context_arena->allocate_cold(free - room);
+                    require(foreign.has_value(), "query pressure fixture could not crowd Host quota");
+                    const auto before = program.physical_usage();
+                    const auto frontier = program.active_sequence(lane).execution_frontier;
+                    const auto cursor = staged.cursor;
+                    const auto refused = program.reserve_units(unit);
+                    require(!refused && refused.shortage.host_bytes > 0,
+                            "final query permutation was admitted without Host backup capacity");
+                    require(program.physical_usage().occupied == before.occupied &&
+                                program.physical_usage().host_reserved_bytes == before.host_reserved_bytes &&
+                                program.active_sequence(lane).execution_frontier == frontier &&
+                                program.requests[lane].prefill->cursor == cursor,
+                            "refused query unit changed physical claims or execution frontier");
+                    foreign.reset();
+                    query_pressure_refused = true;
+                    std::cout << "ok final query Host pressure refused before execution\n";
+                }
+            }
+            if (repetition == 0 && !replaying && !replay_growth_pressure_refused &&
+                program.requests[lane].prefill && program.requests[lane].prefill->query_replay_cursor &&
+                *program.requests[lane].prefill->query_replay_cursor == program.kvmem_lanes_[lane].query_begin) {
+                auto& pool = program.text_kv_pages->physical_pool();
+                const auto available = pool.available_pages();
+                require(available > 0, "replay growth fixture has no foreign claim room");
+                auto foreign = pool.reserve(available);
+                require(foreign.has_value(), "replay growth fixture could not crowd Device quota");
+                const auto before = program.physical_usage();
+                const auto frontier = program.active_sequence(lane).execution_frontier;
+                const auto cursor = *program.requests[lane].prefill->query_replay_cursor;
+                const auto refused = program.reserve_units(unit);
+                require(!refused && refused.shortage.main_kv_pages > 0,
+                        "query replay growth was admitted from the probe extent");
+                require(program.physical_usage().occupied == before.occupied &&
+                            pool.reserved_pages() == available &&
+                            program.active_sequence(lane).execution_frontier == frontier &&
+                            *program.requests[lane].prefill->query_replay_cursor == cursor,
+                        "refused replay growth changed claims or rewound the probe");
+                foreign.reset();
+                replay_growth_pressure_refused = true;
+                std::cout << "ok query replay growth pressure refused before rewind\n";
+            }
+            require(static_cast<bool>(program.reserve_units(unit)),
+                    "sparse pause unit admission failed");
+            if (replaying) {
+                (void)program.advance_replay(sequence, nullptr);
+                continue;
+            }
+            const auto& before_staged = *program.requests[lane].prefill;
+            const bool first_query_replay = before_staged.query_replay_cursor &&
+                *before_staged.query_replay_cursor == program.kvmem_lanes_[lane].query_begin;
+            const auto replay_phase = static_cast<std::size_t>(ninfer::KvmemPlacementPhase::Replay);
+            const auto before_promotions = program.requests[lane].timings.kvmem.placement[replay_phase];
+            auto step = program.advance_prefill(sequence, nullptr);
+            if (first_query_replay) {
+                // Observe the actual canonical execution, rather than repeating
+                // the window helper. Placement must have covered its history in
+                // the previous probe unit before competing bindings can run.
+                const auto& after = program.requests[lane].timings.kvmem.placement[replay_phase];
+                require(after[0].promoted_pages == before_promotions[0].promoted_pages &&
+                            after[1].promoted_pages == before_promotions[1].promoted_pages,
+                        "first query replay needed unadmitted historical destinations");
+                complete_replay_window_checked = true;
+            }
+            if (std::getenv("NINFER_SPARSE_STEP_DIAGNOSTIC")) {
+                const auto observed_keys = read_tensor(program.kvmem_lanes_[lane].key_sums);
+                const auto observed_hidden = read_tensor(program.prefill_hidden.slice(1, 0, 1));
+                const auto& index = program.kvmem_lanes_[lane].index;
+                std::vector<float> scores(index.layers(), 0.0F);
+                std::vector<float> probe(index.layers() * index.kv_heads() * index.head_dim(), 1.0F);
+                std::vector<std::uint32_t> count(index.layers(), 0);
+                if (index.total_tokens() >= 128) {
+                    const auto block = index.total_tokens() / 128 - 1;
+                    for (unsigned layer = 0; layer < index.layers(); ++layer) {
+                        count[layer] = 1;
+                        (void)index.score(block, probe, count, scores[layer]);
+                        count[layer] = 0;
+                    }
+                }
+                if (repetition == 0) {
+                    baseline_step_keys.push_back(observed_keys);
+                    baseline_step_hidden.push_back(observed_hidden);
+                    baseline_step_scores.push_back(scores);
+                } else if (i < baseline_step_keys.size()) {
+                    if (observed_keys != baseline_step_keys[i] ||
+                        observed_hidden != baseline_step_hidden[i]) {
+                        const auto first = std::mismatch(observed_keys.begin(), observed_keys.end(),
+                                                         baseline_step_keys[i].begin()).first;
+                        const auto score = std::mismatch(scores.begin(), scores.end(),
+                                                          baseline_step_scores[i].begin()).first;
+                        std::cout << "step divergence repetition=" << repetition << " step=" << i
+                                  << " processed=" << step.processed_prompt_tokens
+                                  << " keys_equal=" << (observed_keys == baseline_step_keys[i])
+                                  << " hidden_equal=" << (observed_hidden == baseline_step_hidden[i])
+                                  << " first_key_byte=" << (first - observed_keys.begin())
+                                  << " first_mean_layer=" << (score - scores.begin())
+                                  << std::endl;
+                    }
+                }
+            }
+            if (step.capture_ready) { program.skip_capture(sequence); }
+            if (step.complete) {
+                require(step.pending && step.pending->tokens().size() == 1, "sparse Begin missing");
+                output.push_back(step.pending->tokens().front());
+                const std::array<runtime::CommitDecision, 1> accept{{{.accepted_tokens = 1}}};
+                (void)program.commit(std::move(*step.pending), accept, {}, nullptr);
+                break;
+            }
+            const auto& staged        = program.requests[lane].prefill;
+            const auto& sparse        = program.kvmem_lanes_[lane];
+            const bool probe_boundary = staged && sparse.query_checkpoint_valid &&
+                                        !staged->query_replay_cursor &&
+                                        staged->cursor < staged->prompt_tokens;
+            const bool replay_boundary = staged && staged->query_replay_cursor &&
+                                         *staged->query_replay_cursor == sparse.query_begin;
+            const bool partial_replay = staged && staged->query_replay_cursor &&
+                                        *staged->query_replay_cursor > sparse.query_begin &&
+                                        *staged->query_replay_cursor < staged->prompt_tokens;
+            if (!paused && ((phase == 1 && probe_boundary) || (phase == 2 && replay_boundary) ||
+                            (phase == 3 && partial_replay))) {
+                require(program.start_pause(sequence, true, nullptr), "sparse query pause failed");
+                auto saved = settle();
+                require(saved.paused.has_value(), "sparse query pause lost recovery ownership");
+                const auto query_checkpoint = read_query_checkpoint(lane);
+                const auto paused_keys = read_tensor(program.kvmem_lanes_[lane].key_sums);
+                sequence = bind(1, &*saved.paused);
+                saved.paused.reset();
+                lane   = 1;
+                paused = true;
+                require(read_query_checkpoint(lane) == query_checkpoint,
+                        "sparse pause did not restore exact private query checkpoint bytes");
+                require(read_tensor(program.kvmem_lanes_[lane].key_sums) == paused_keys,
+                        "sparse pause did not restore exact current Key ring bytes");
+            }
+        }
+        require(paused && output.size() == 1, "sparse pause boundary or Begin was not reached");
+        if (repetition == 0) {
+            require(replay_growth_pressure_refused, "query rewind growth boundary was not exercised");
+        }
+        require(complete_replay_window_checked,
+                "first canonical replay window was not exercised");
+        std::cout << "ok first canonical replay needs no new historical destinations\n";
+        if (repetition == 0 && options.kvmem_window_pages == 64) {
+            require(query_pressure_refused, "final query Host pressure boundary was not exercised");
+        }
+        std::vector<float> keys(program.kvmem_lanes_[lane].key_sums.bytes() / sizeof(float));
+        device.synchronize();
+        CUDA_CHECK(cudaMemcpy(keys.data(), program.kvmem_lanes_[lane].key_sums.data,
+                              keys.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        const auto query = program.kvmem_lanes_[lane].query;
+        const auto selection = program.kvmem_lanes_[lane].retrieved_pages;
+        for (unsigned i = 0; i < 3; ++i) {
+            const std::array<qwen::ExecutionUnit, 1> unit{
+                {{sequence, qwen::ExecutionUnitKind::Decode, 1}}};
+            require(static_cast<bool>(program.reserve_units(unit)),
+                    "sparse recovered decode admission failed");
+            const std::array<qwen::SequenceHandle, 1> members{sequence};
+            const std::array<runtime::RoundBudget, 1> budget{{{.generated_tokens_remaining = 1}}};
+            auto pending = program.decode(members, budget, nullptr);
+            const auto licensed = pending.row_counts().empty() ? 1 : pending.row_counts().front();
+            require(pending.row_count() == 1 && licensed == 1 &&
+                        pending.tokens().size() >= pending.row_stride(),
+                    "sparse recovered decode token missing");
+            output.push_back(pending.tokens().front());
+            const std::array<runtime::CommitDecision, 1> accept{
+                {{.accepted_tokens = 1, .terminal = i == 2}}};
+            (void)program.commit(std::move(pending), accept, {}, nullptr);
+        }
+        if (repetition == 0 && options.kvmem_window_pages == 64) {
+            // An inactive canonical donor must admit every page that its first
+            // replay reads, including the recent share absent from scored features.
+            // Check against the actual executed row, not another selection helper.
+            const auto& active = program.active_sequence(lane);
+            const auto& prompt = *program.requests[lane].base->prompt;
+            const auto check_restore = [&](auto& addresses, auto handle, std::uint32_t valid) {
+                device.synchronize();
+                addresses.deactivate(handle);
+                const auto restore = program.kvmem_restore_pages(addresses, handle, valid, prompt,
+                                                                 program.kvmem_lanes_[lane].retrieved_pages);
+                for (std::uint32_t page = 0; page < (valid + 63U) / 64U; ++page) {
+                    require(!addresses.page_in_device_working_set(handle, page) ||
+                                std::binary_search(restore.begin(), restore.end(), page),
+                            "canonical binding omitted a page required by its first replay");
+                }
+                addresses.activate(handle, 0, lane, device.stream);
+                device.synchronize();
+            };
+            check_restore(*program.text_kv_addresses, active.kv->text, active.text_kv_valid);
+            if (active.kv->backend && options.speculative.backend == SpeculativeBackend::Mtp) {
+                check_restore(*program.backend_kv_addresses, *active.kv->backend, active.mtp_kv_valid);
+            }
+            std::cout << "ok canonical restore includes the executed recent window\n";
+        }
+        require(program.finish(sequence).status == runtime::ConsumeStatus::Consumed,
+                "sparse pause finish failed");
+        const auto final = program.physical_usage();
+        require(final.occupied == empty.occupied && final.host_reserved_bytes == 0,
+                "sparse query pause retained resources");
+        if (repetition == 0) {
+            baseline      = output;
+            baseline_keys = keys;
+            baseline_query = query;
+            baseline_selection = selection;
+        } else {
+            require(output == baseline, "sparse query pause changed greedy tokens");
+            if (query != baseline_query) {
+                std::size_t differing = 0, largest = 0;
+                float maximum = 0;
+                for (std::size_t i = 0; i < query.size(); ++i) {
+                    if (query[i] != baseline_query[i]) { ++differing; }
+                    const auto delta = std::abs(query[i] - baseline_query[i]);
+                    if (delta > maximum) { maximum = delta; largest = i; }
+                }
+                std::cout << "Query mismatch phase=" << phase << " repetition=" << repetition
+                          << " differing=" << differing << " / " << query.size()
+                          << " max_abs=" << maximum << " index=" << largest
+                          << " expected=" << baseline_query[largest]
+                          << " actual=" << query[largest]
+                          << " selection_equal=" << (selection == baseline_selection)
+                          << " keys_equal=" << (keys == baseline_keys) << std::endl;
+            }
+            require(query == baseline_query,
+                    "sparse query pause changed the retrieval query");
+            require(selection == baseline_selection,
+                    "sparse query pause changed the retrieved history");
+            if (keys != baseline_keys) {
+                std::size_t differing = 0, largest = 0;
+                float maximum = 0;
+                for (std::size_t i = 0; i < keys.size(); ++i) {
+                    if (keys[i] != baseline_keys[i]) { ++differing; }
+                    const auto delta = std::abs(keys[i] - baseline_keys[i]);
+                    if (delta > maximum) {
+                        maximum = delta;
+                        largest = i;
+                    }
+                }
+                std::cout << "Key mismatch phase=" << phase << " differing=" << differing << " / "
+                          << keys.size() << " max_abs=" << maximum << " index=" << largest
+                          << " expected=" << baseline_keys[largest] << " actual=" << keys[largest]
+                          << std::endl;
+            }
+            require(keys == baseline_keys,
+                    "sparse query pause changed the partial Key accumulator");
+        }
+        std::cout << "ok sparse query pause phase=" << phase
+                  << " repetition=" << repetition << std::endl;
+    }
+    if (!options.context_cache.kv_file_directory.empty()) {
+        std::filesystem::remove(options.context_cache.kv_file_directory);
+    }
+}
+
 SpeculativeBackend selected_backend(std::string_view name) {
     if (name == "none") { return SpeculativeBackend::None; }
     if (name == "mtp") { return SpeculativeBackend::Mtp; }
@@ -1805,6 +2196,16 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
         options.context_cache.device_state_slots  = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+        if (const auto* sparse = std::getenv("NINFER_NATIVE_TRANSACTIONS_SPARSE");
+            sparse && std::string_view(sparse) == "1") {
+            const auto runs = std::getenv("NINFER_SPARSE_BASELINE_RUNS")
+                ? std::stoul(std::getenv("NINFER_SPARSE_BASELINE_RUNS")) : 1UL;
+            require(runs >= 1 && runs <= 16, "invalid sparse regression run count");
+            for (unsigned i = 0; i < runs; ++i) {
+                sparse_query_pause(device, parameters, options);
+            }
+            return 0;
+        }
         auto planner = qwen::make_sequence_planner(parameters, device, options);
         auto plan    = std::move(planner).finalize(16);
         auto program = qwen::create_program(parameters, std::move(plan), device, {});

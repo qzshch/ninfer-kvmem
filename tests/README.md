@@ -287,3 +287,50 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 `15 1 1 8 bf16 0 3`. Run GPU integration tests serially. The individual Op suites remain the
 numerical/state-transition oracle; the fixed Engine fixture does not define bit parity across
 arbitrary floating-point routes.
+
+## Sparse KVMem with hierarchical context storage
+
+The real fixture uses the public Engine with FP8 KV, a small rolling Device window, RAM hot
+storage, and disk cold storage. It checks cold/warm/changed-query reuse, shared forks, image
+continuations, cancellation during query replay, a surviving request, IO settlement, and
+terminal publication. DFlash2 uses seven drafts; MTP uses three. Run model fixtures serially.
+
+```bash
+cmake --build build -j --target ninfer_qwen3_5_kvmem_hicache_real_test \
+  ninfer_qwen3_5_native_transactions_test ninfer_qwen3_5_preemption_real_test
+NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
+  build/tests/ninfer_qwen3_5_kvmem_hicache_real_test
+build/tests/ninfer_qwen3_5_kvmem_hicache_real_test \
+  out/qwen3_8_27b_nvfp4_dflash2.ninfer 2 1 1 dflash2 4
+NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
+  NINFER_NATIVE_TRANSACTIONS_SPARSE=1 \
+  build/tests/ninfer_qwen3_5_native_transactions_test dflash2
+```
+
+The real-fixture arguments are artifact, lanes, prefetch, vision, backend (`none`, `mtp`,
+`dflash2`), and Host quota in GiB. Qualify DFlash2 at one, two, and three lanes with prefetch
+off/on; also qualify none and MTP at two lanes. The artifact must contain the selected backend
+and vision weights. Without an explicit artifact argument or `NINFER_TEST_ARTIFACT`, it skips
+with status 77. This small-window lifecycle fixture does not establish full-context capacity
+or production throughput.
+
+The sparse transaction opt-in checks unfinished query probing, the query replay boundary,
+partial replay, and cross-lane Snapshot recovery against uninterrupted execution. It compares
+the exact FP32 partial Key ring, greedy output, and settled physical resources. It supplements
+the ordinary Native transaction and resource-pressure preemption fixtures; it does not replace
+their dense execution coverage or the independent Op oracles.
+It also crowds the shared Host quota before the final query permutation. The unit
+must report Host pressure without changing its frontier or claims; after releasing
+the competing claim, generation and exact recovery must still complete.
+After canonical execution it also deactivates and checks the actual row's restore
+coverage: binding must include the recent window, not only scored history pages.
+This catches destinations that would otherwise be discovered during the first
+replay after a pressure restore has already entered a lane.
+
+The sparse transaction fixture also observes the first canonical replay and requires
+no new historical promotions: the preceding query placement must already cover that
+execution before another binding can consume the shared pool margin.
+
+Query-rewind admission is also tested with a foreign Device claim: refusal must not
+rewind the probe or change claims; the context-store test reserves before rewinding
+at full logical capacity and replays while another claim occupies all free pages.

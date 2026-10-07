@@ -6,11 +6,24 @@
 
 namespace ninfer {
 
+struct HostResidentStorage {
+    HostContextArena& owner;
+    PinnedHostBuffer buffer;
+
+    explicit HostResidentStorage(HostContextArena& arena, std::size_t bytes)
+        : owner(arena), buffer(bytes) {
+        owner.resident_bytes_ += bytes;
+    }
+
+    ~HostResidentStorage() { owner.resident_bytes_ -= buffer.size(); }
+};
+
 HostContextAllocation::~HostContextAllocation() { (void)release(); }
 
 HostContextAllocation::HostContextAllocation(HostContextAllocation&& other) noexcept
     : owner_(other.owner_), offset_(other.offset_), bytes_(other.bytes_),
-      reserved_(other.reserved_) {
+      reserved_(other.reserved_), resident_(std::move(other.resident_)),
+      resident_offset_(other.resident_offset_) {
     other.disarm();
 }
 
@@ -21,12 +34,16 @@ HostContextAllocation& HostContextAllocation::operator=(HostContextAllocation&& 
     offset_   = other.offset_;
     bytes_    = other.bytes_;
     reserved_ = other.reserved_;
+    resident_        = std::move(other.resident_);
+    resident_offset_ = other.resident_offset_;
     other.disarm();
     return *this;
 }
 
 std::byte* HostContextAllocation::data() const noexcept {
-    return valid() ? static_cast<std::byte*>(owner_->backing_->data()) + offset_ : nullptr;
+    if (!valid()) { return nullptr; }
+    if (resident_) { return static_cast<std::byte*>(resident_->buffer.data()) + resident_offset_; }
+    return owner_->backing_ ? static_cast<std::byte*>(owner_->backing_->data()) + offset_ : nullptr;
 }
 
 void HostContextAllocation::publish() noexcept {
@@ -47,10 +64,15 @@ void HostContextAllocation::disarm() noexcept {
     offset_   = 0;
     bytes_    = 0;
     reserved_ = false;
+    resident_.reset();
+    resident_offset_ = 0;
 }
 
-HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes)
-    : capacity_bytes_(capacity_bytes) {
+HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes,
+                                   std::optional<std::size_t> resident_capacity_bytes)
+    : lazy_resident_(resident_capacity_bytes.has_value()),
+      resident_capacity_bytes_(resident_capacity_bytes.value_or(capacity_bytes)),
+      capacity_bytes_(capacity_bytes) {
     if (minimum_allocation_bytes == 0 ||
         minimum_allocation_bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
         throw std::invalid_argument("Host context minimum allocation is invalid");
@@ -60,8 +82,25 @@ HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minim
     // At most N allocated extents separate N+1 free runs; releases and splits never allocate
     // metadata. The unused trailing bytes remain part of the charged physical backing.
     free_extents_.reserve(capacity_bytes_ / minimum_bytes_ + 1);
-    backing_.emplace(capacity_bytes_);
+    if (!lazy_resident_) { backing_.emplace(capacity_bytes_); }
     free_extents_.push_back({0, capacity_bytes_});
+}
+
+HostResidentCharge::~HostResidentCharge() {
+    if (charged_) { owner_.metadata_bytes_ -= bytes_; }
+}
+
+std::shared_ptr<HostResidentCharge> HostContextArena::charge_metadata(std::size_t bytes) noexcept {
+    if (!bytes || bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)) { return {}; }
+    const auto rounded = (bytes + alignment - 1) & ~(alignment - 1);
+    if (rounded > free_bytes() || rounded > resident_free_bytes()) { return {}; }
+    try {
+        auto charge = std::shared_ptr<HostResidentCharge>(new HostResidentCharge(*this, rounded));
+        metadata_bytes_ += rounded;
+        charge->charged_     = true;
+        peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes());
+        return charge;
+    } catch (...) { return {}; }
 }
 
 std::size_t HostContextArena::allocation_bytes(std::size_t bytes) const noexcept {
@@ -81,17 +120,55 @@ std::optional<std::size_t> HostContextArena::find_free_extent(std::size_t bytes)
 
 bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
-    return rounded != 0 && find_free_extent(rounded).has_value();
+    return rounded != 0 && rounded <= free_bytes() && rounded <= resident_free_bytes() &&
+           find_free_extent(rounded).has_value();
+}
+
+bool HostContextArena::can_allocate_cold(std::size_t bytes) const noexcept {
+    const auto rounded = allocation_bytes(bytes);
+    return lazy_resident_ && rounded != 0 && rounded <= free_bytes() &&
+           find_free_extent(rounded).has_value();
 }
 
 std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
+    return allocate_impl(bytes, true);
+}
+
+std::optional<HostContextAllocation> HostContextArena::allocate_cold(std::size_t bytes) noexcept {
+    return lazy_resident_ ? allocate_impl(bytes, false) : std::nullopt;
+}
+
+std::optional<HostContextAllocation> HostContextArena::allocate_impl(std::size_t bytes,
+                                                                     bool resident) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
-    if (rounded == 0) { return std::nullopt; }
-    const auto free_index = find_free_extent(rounded);
+    if (rounded == 0 || rounded > free_bytes() || (resident && rounded > resident_free_bytes())) {
+        return std::nullopt;
+    }
+    std::shared_ptr<HostResidentStorage> storage;
+    if (resident && lazy_resident_) {
+        try {
+            storage = std::make_shared<HostResidentStorage>(*this, rounded);
+        } catch (...) { return std::nullopt; }
+    }
+    std::optional<std::size_t> free_index;
+    const bool from_end = resident && lazy_resident_;
+    if (from_end) {
+        // State lives in independent pinned allocations, not in the cold file.
+        // Keep its logical reservations at the high end so cold positional IO
+        // does not grow a file across large, never-written StateImage holes.
+        for (std::size_t index = free_extents_.size(); index != 0; --index) {
+            if (free_extents_[index - 1].bytes >= rounded) {
+                free_index = index - 1;
+                break;
+            }
+        }
+    } else {
+        free_index = find_free_extent(rounded);
+    }
     if (!free_index) { return std::nullopt; }
     FreeExtent& free         = free_extents_[*free_index];
-    const std::size_t offset = free.offset;
-    free.offset += rounded;
+    const std::size_t offset = from_end ? free.offset + free.bytes - rounded : free.offset;
+    if (!from_end) { free.offset += rounded; }
     free.bytes -= rounded;
     if (free.bytes == 0) {
         free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));
@@ -100,7 +177,9 @@ std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t byte
     reserved_bytes_ += rounded;
     peak_occupied_bytes_ = std::max(peak_occupied_bytes_, occupied_bytes_);
     ++allocation_count_;
-    return HostContextAllocation(*this, offset, rounded);
+    HostContextAllocation result(*this, offset, rounded);
+    result.resident_ = std::move(storage);
+    return result;
 }
 
 std::pair<HostContextAllocation, HostContextAllocation>
@@ -115,6 +194,10 @@ HostContextArena::split(HostContextAllocation&& allocation, std::size_t byte_off
     HostContextAllocation left(*this, allocation.offset_, byte_offset, allocation.reserved_);
     HostContextAllocation right(*this, allocation.offset_ + byte_offset,
                                 allocation.bytes_ - byte_offset, allocation.reserved_);
+    left.resident_         = allocation.resident_;
+    right.resident_        = allocation.resident_;
+    left.resident_offset_  = allocation.resident_offset_;
+    right.resident_offset_ = allocation.resident_offset_ + byte_offset;
     allocation.disarm();
     ++allocation_count_;
     return {std::move(left), std::move(right)};

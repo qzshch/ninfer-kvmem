@@ -244,6 +244,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        if (paged_kv_page_is_hole(physical_page)) {
+            ninfer::ops::cp_commit();
+            return;
+        }
         if constexpr (TokenTile == 1 && Bc == 32) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
@@ -251,10 +255,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int valid_keys            = max(0, min(8, split_end - key));
                 const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
-                cp_async_zfill<16, Cache::cg>(&k_scale_s[key_l], &cache_k_scale[scale_offset],
-                                              valid_keys * static_cast<int>(sizeof(__half)));
-                cp_async_zfill<16, Cache::cg>(&v_scale_s[key_l], &cache_v_scale[scale_offset],
-                                              valid_keys * static_cast<int>(sizeof(__half)));
+                if (valid_keys == 8) {
+                    cp_async<16, Cache::cg>(&k_scale_s[key_l], &cache_k_scale[scale_offset]);
+                    cp_async<16, Cache::cg>(&v_scale_s[key_l], &cache_v_scale[scale_offset]);
+                } else {
+                    // A tail may have fewer than eight initialized scale elements.
+                    // Read only represented keys; do not issue a vector transaction
+                    // over the uncommitted part of the cache.
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        k_scale_s[key_l + i] = i < valid_keys ? cache_k_scale[scale_offset + i]
+                                                             : __float2half_rn(0.0F);
+                        v_scale_s[key_l + i] = i < valid_keys ? cache_v_scale[scale_offset + i]
+                                                             : __float2half_rn(0.0F);
+                    }
+                }
             }
         } else {
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
@@ -297,6 +312,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // All threads own the same page; absent tiles contribute no softmax mass.
+        if (paged_kv_page_is_hole(physical_page)) {
+            if (kb + 1 < key_blocks) {
+                physical_page = block_table[(k0 + Bc) >> kPagedKVPageShift];
+                issue_kv_tile(k0 + Bc, physical_page);
+            }
+            ninfer::ops::cp_wait<0>();
+            __syncthreads();
+            continue;
+        }
         if (warp < RowTiles) {
             // A final query tile can contain fewer complete MMA row fragments.
             if (!ParallelQueries || warp < live_row_tiles) {

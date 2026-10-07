@@ -237,8 +237,17 @@ public:
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
-        std::lock_guard lock(stats_mutex_);
-        return published_stats_;
+        RuntimeStats out;
+        {
+            std::lock_guard lock(stats_mutex_);
+            out = published_stats_;
+        }
+        // Idle byte work can finish after the last model publication. Read only
+        // its atomics; do not wake/lock execution or traverse mutable histories.
+        if constexpr (requires { instance_.program->file_cache_stats(); }) {
+            out.file_cache = instance_.program->file_cache_stats();
+        }
+        return out;
     }
 
     [[nodiscard]] bool is_available() const {
@@ -507,6 +516,9 @@ private:
                             std::uint32_t accepted_tokens) {
         if (accepted_tokens == 0) { return std::nullopt; }
         cumulative_stats_.generated_tokens += accepted_tokens;
+        if (request->lane) {
+            cumulative_stats_.lanes[request->lane->value].generated_tokens += accepted_tokens;
+        }
         const bool observe_wall =
             request->observation.phase_timings || request->observation.live_timings;
         const bool need_now         = !request->first_token || observe_wall;
@@ -1087,7 +1099,10 @@ private:
             ++cumulative_stats_.decode_rounds;
             cumulative_stats_.decode_row_rounds += row_count;
             for (std::size_t row = 0; row < row_count; ++row) {
+                auto& lane_stats = cumulative_stats_.lanes[lane_indices[row]];
+                ++lane_stats.decode_rounds;
                 if (!cancelled[row]) {
+                    lane_stats.committed_decode_tokens += decisions[row].accepted_tokens;
                     cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
                     slots_[lane_indices[row]]->committed_decode_tokens +=
                         decisions[row].accepted_tokens;
@@ -1230,6 +1245,11 @@ private:
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
         cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
+        if (request->lane) {
+            auto& lane_stats = cumulative_stats_.lanes[request->lane->value];
+            ++lane_stats.prefill_units;
+            lane_stats.computed_prefill_tokens += progress.processed_prompt_tokens;
+        }
         if (!request->admitted_begin) {
             throw std::logic_error("prefill progress has no committed admission summary");
         }
@@ -1950,6 +1970,7 @@ private:
         for (const std::uint32_t lane : membership.lane_span()) {
             ++slots_[lane]->host_timing.control_units;
             slots_[lane]->committed_decode_tokens += membership.row_stride;
+            cumulative_stats_.lanes[lane].committed_decode_tokens += membership.row_stride;
         }
         cumulative_stats_.committed_decode_tokens += membership.size * membership.row_stride;
 
@@ -2080,7 +2101,8 @@ private:
                 selected_control.row_stride = controls.row_stride;
                 for (std::size_t row = 0; row < controls.size; ++row) {
                     if (!runnable_units_[controls.lanes[row]] ||
-                        slots_[controls.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
+                        slots_[controls.lanes[row]]->cancelled.load(std::memory_order_acquire) ||
+                        instance_.program->context_blocks(controls.sequences[row])) {
                         continue;
                     }
                     selected_control.lanes[selected_control.size]       = controls.lanes[row];
@@ -2102,7 +2124,8 @@ private:
                     RoundMembership selected;
                     for (std::size_t row = 0; row < decode.size; ++row) {
                         if (!runnable_units_[decode.lanes[row]] ||
-                            slots_[decode.lanes[row]]->cancelled.load(std::memory_order_acquire)) {
+                            slots_[decode.lanes[row]]->cancelled.load(std::memory_order_acquire) ||
+                            instance_.program->context_blocks(decode.sequences[row])) {
                             continue;
                         }
                         if (std::find(controls.lane_span().begin(), controls.lane_span().end(),
@@ -2135,7 +2158,9 @@ private:
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (!runnable_units_[lane] ||
                         (prefill_slots[lane] &&
-                         prefill_slots[lane]->cancelled.load(std::memory_order_acquire))) {
+                         (prefill_slots[lane]->cancelled.load(std::memory_order_acquire) ||
+                          (prefill_slots[lane]->sequence &&
+                           instance_.program->context_blocks(*prefill_slots[lane]->sequence))))) {
                         prefill_slots[lane].reset();
                     }
                 }
@@ -2152,6 +2177,7 @@ private:
                         }
                         request->replayed_tokens += progress.processed_tokens;
                         cumulative_stats_.replayed_tokens += progress.processed_tokens;
+                        cumulative_stats_.lanes[*lane].replayed_tokens += progress.processed_tokens;
                         if (progress.capture_ready) {
                             reserve_active_capture(request, EngineRequestState::Replay);
                         }

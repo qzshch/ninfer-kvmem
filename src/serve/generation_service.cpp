@@ -260,6 +260,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
+    engine_options.kvmem_window_pages       = options_.kvmem_window_pages;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
@@ -454,6 +455,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 
+    outcome.metrics.kvmem           = result.timings.kvmem;
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =
         prepared.prepare_seconds +
