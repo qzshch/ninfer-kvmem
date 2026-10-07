@@ -188,15 +188,19 @@ Regex 按完整正文匹配，公共接口为 `OutputConstraint::regex(string)`�
 |---|---|
 | 基本类型 | object、array、string、integer、number、boolean、null；类型数组按各分支适用的断言展开 |
 | 对象 | properties、required、additionalProperties（boolean 或子 schema）；required 名称须在 properties 中声明；声明字段按确定顺序生成 |
-| 数组 | 同质 items、minItems、maxItems；基础合同不接收 tuple/prefixItems |
+| 数组 | 同质 items 或位置 prefixItems、尾部 items、minItems/maxItems；draft-07 的 items 数组与 additionalItems 归约到同一位置合同 |
 | 字符串 | minLength/maxLength 与 pattern 可同时使用，多个 pattern 取交集；format 暂不支持 |
-| 数值 | integer 的 minimum/maximum/exclusive bounds，使用 signed 64-bit 整数界限，exclusive bound 折算后也须在此范围；number 支持普通 JSON 数字，基础合同不接受其范围和 multipleOf |
+| 数值 | integer 和 number 支持 minimum/maximum/exclusive bounds；整数区间归约到 signed 64-bit，上下界可由小数折算；有界 number 使用 int64 整数及最多 17 位有效数字的有限 binary64 表示；multipleOf 暂不支持 |
 | 有限值 | const、enum；整数字面量限 signed 64-bit；按同级受支持断言筛选候选，包括类型、范围、字符串、对象/数组及逻辑组合 |
-| 组合 | anyOf 与共同断言分配后取并集；oneOf 要证明分支互斥；allOf 支持类型、范围、字符串、对象字段/required/additionalProperties、同质数组与本地引用的交集 |
+| 组合 | anyOf 与共同断言分配后取并集；oneOf 要证明分支互斥；allOf 支持类型、范围、字符串、对象字段/required/additionalProperties、数组逐位置及尾部规则、本地引用的交集 |
 | 引用 | 文档内 `$ref`、`$defs`/definitions，包括递归与 2020-12 的引用同级断言；不获取外部文档 |
 | 注释 | title、description、default、examples、`$comment`、readOnly/writeOnly、deprecated 等保留为描述信息，不作为采样断言 |
 
 检查只遍历 schema 位置，const/enum 中的业务对象保留为值。组合归约按节点与交集记忆化，递归仍表示为引用图。对象交集逐分支应用 properties 与 additionalProperties：一个分支的封闭对象不能被另一个分支新增的属性重新打开。Required 合并后若某字段不可能出现，整个对象分支不可满足。
+
+prefixItems 只约束已经出现的位置，长度由 minItems/maxItems 决定；items 只作用于同一 schema 对象的前缀之后。位置为 false 或交集不可满足时，数组可以在该位置前结束。只有最低长度要求跨过该位置时，数组分支才不可满足。逐位置交集保留每个分支原有的前缀长度及尾部规则。
+
+有界 number 同时约束生成的十进制值和协议解析、重新序列化后的值。编译器以十进制数位和指数比较区间，按可发布 binary64 值的舍入边界收紧浮点生成语言；整数保留精确 int64 路径。小数支持科学计数法，常见数量级也允许普通小数写法，最多 17 位有效数字。数学空区间返回不可满足；非空区间没有可发布值时返回不支持。Schema 中会被 JSON 解析舍入的数值断言或 const/enum 值在源输入阶段拒绝；注释字段及非 strict 工具不应用此限制。
 
 oneOf 在合并共同断言后，以类型域、有限值集合或共同必填 discriminator 的有限值证明分支互斥。类型域判定包含 integer 是 number 的子域；无法证明的组合返回不支持。
 

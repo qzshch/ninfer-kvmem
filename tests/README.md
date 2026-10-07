@@ -204,7 +204,9 @@ validate the completed argument value after recovery; `cancel` interrupts the pa
 `python3 tests/models/qwen3_5/test_tool_schema.py` checks the native Qwen grammar and decoder against
 `jsonschema` (dependencies in `tests/text/requirements.txt`), including string pattern/Unicode-length
 intersections. The JSON Schema oracle also covers finite-value filtering, reference/union siblings,
-closed-object and array intersections, and recursive conjunctions.
+closed-object and positional-array intersections, draft-07 tuples, recursive conjunctions,
+numeric endpoints and JSON publication rounding. HTTP parsing tests check schema-number precision
+before protocol adapters serialize the schema.
 
 `ninfer_qwen3_5_grammar_real_test [none|mtp|dflash|dflash2] [graph|eager] [concurrency] [vision]` uses
 `NINFER_TEST_DRAFT_TOKENS` to override the default draft count of three and

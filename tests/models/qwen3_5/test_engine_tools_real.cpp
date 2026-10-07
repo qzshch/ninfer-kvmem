@@ -210,6 +210,32 @@ void composed_output(ninfer::Engine& engine) {
 
 void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
     composed_output(engine);
+    const auto coordinates = Json::parse(R"({"type":"object","properties":{
+        "position":{"type":"array","prefixItems":[
+            {"type":"number","minimum":30,"maximum":31},
+            {"type":"number","minimum":-121,"maximum":-120}],"minItems":2,"items":false},
+        "confidence":{"type":"number","exclusiveMinimum":0.1,"maximum":0.2}},
+        "required":["position","confidence"],"additionalProperties":false})");
+    for (float temperature : {0.0f, 0.8f}) {
+        auto input = prompt(coordinates);
+        input.messages[0].parts[0].text =
+            "Call record once with position [30.5, -120.25] and confidence 0.15.";
+        auto options                           = request();
+        options.execution.sampling.temperature = temperature;
+        const auto result                      = engine.generate(engine.prepare(input), options);
+        require(result.finish_reason == ninfer::FinishReason::StopToken &&
+                    result.tool_calls.size() == 1,
+                "positional numeric tool call did not complete");
+        const auto value = Json::parse(result.tool_calls[0].arguments_json);
+        require(value["position"].size() == 2 && value["position"][0] >= 30 &&
+                    value["position"][0] <= 31 && value["position"][1] >= -121 &&
+                    value["position"][1] <= -120 && value["confidence"] > 0.1 &&
+                    value["confidence"] <= 0.2,
+                "published tuple/number arguments violate their schema");
+        if (speculative)
+            require(result.speculative.rounds > 0, "numeric tools bypassed speculation");
+        record("positional_numbers", result, coordinates);
+    }
     const auto schema = parameters();
     auto options      = request();
     ninfer::GenerationResult first;
@@ -307,11 +333,18 @@ void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
 }
 
 void pressure(ninfer::Engine& engine, bool snapshot, bool cancel) {
-    const Json schema{
-        {"type", "object"},
-        {"properties", {{"message", {{"type", "string"}, {"pattern", "^(ab cd ){180}$"}}}}},
-        {"required", {"message"}},
-        {"additionalProperties", false}};
+    const Json schema{{"type", "object"},
+                      {"properties",
+                       {{"message", {{"type", "string"}, {"pattern", "^(ab cd ){180}$"}}},
+                        {"position",
+                         {{"type", "array"},
+                          {"prefixItems",
+                           {{{"type", "integer"}, {"minimum", 1}, {"maximum", 3}},
+                            {{"type", "number"}, {"minimum", 0.1}, {"maximum", 0.2}}}},
+                          {"minItems", 2},
+                          {"items", false}}}}},
+                      {"required", {"message", "position"}},
+                      {"additionalProperties", false}};
     auto options                              = request();
     options.execution.requested_output_tokens = 650;
     options.execution.allow_prefix_reuse      = false;

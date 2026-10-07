@@ -18,6 +18,10 @@ JSON Pointers and carry typed errors with schema locations. String grammars cons
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
 String intersections combine patterns, Unicode length and tool-delimiter exclusion in one automaton.
 General schema conjunction reduction and source diagnostics belong to NInfer's text adapter.
+Positional arrays preserve optional prefix positions and impossible-position length caps.
+Bounded numbers use decimal interval compilation and the product JSON serializer's binary64
+round-trip boundaries, with a separate exact int64 path. The numeric adapter shares the
+repository's nlohmann JSON dependency for this contract.
 Regex and schema patterns share character/escape normalization with explicit full/search matching;
 regex hexadecimal escapes consume exactly two digits. Product constraints reject unsupported
 escapes and anchor positions before grammar conversion.

@@ -149,6 +149,12 @@ selected `text.format` in aggregate responses and SSE response objects.
 JSON output uses compact separators and declared property order. State the desired content in the
 prompt; the schema is not inserted into it. Only one output constraint may be supplied.
 
+Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
+`number` ranges. Bounded numbers use exact int64 integers or finite binary64-compatible decimal
+and scientific notation with up to 17 significant digits. Bounds must retain their value when the
+schema is parsed; numbers requiring greater precision receive `unsupported_json_schema`.
+These capabilities also apply to strict tool parameters.
+
 GBNF, choice and regex are available through the NInfer extension `structured_outputs`
 on Chat Completions, Responses and Anthropic Messages. Supply exactly one member:
 

@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/tool_contract.h"
 #include "text/json_schema.h"
+#include "text/json_input.h"
 
 #include <nlohmann/json.hpp>
 
@@ -196,13 +197,25 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons) {
     std::set<std::string> names;
     for (std::size_t i = 0; i < tool_jsons.size(); ++i) {
         try {
-            const Json declaration = Json::parse(tool_jsons[i]);
-            const auto& function   = declaration.at("function");
+            const auto parsed       = text::parse_json_numbers(tool_jsons[i]);
+            const auto& declaration = parsed.value;
+            const auto& function    = declaration.at("function");
             Contract::Tool tool;
             tool.name = function.at("name").get<std::string>();
             if (tool.name.empty() || !names.insert(tool.name).second)
                 fail("tool names must be nonempty and unique", "/" + std::to_string(i));
-            tool.strict       = function.value("strict", false);
+            tool.strict = function.value("strict", false);
+            if (tool.strict) {
+                if (const auto pointer =
+                        text::inexact_schema_number(parsed, "/function/parameters"))
+                    throw RequestError(
+                        RequestErrorKind::UnsupportedJsonSchema,
+                        "numeric schema value cannot be preserved by the JSON number "
+                        "representation",
+                        "/" + std::to_string(i) + "/parameters" +
+                            pointer->substr(std::string_view("/function/parameters").size()),
+                        RequestErrorSource::Tools);
+            }
             const Json schema = function.value(
                 "parameters", Json{{"type", "object"}, {"properties", Json::object()}});
             tool.schema_json       = schema.dump();
