@@ -617,6 +617,8 @@ std::string format_server_start_json(
              {"host_context_capacity_bytes", memory.host_context_capacity_bytes},
              {"host_context_occupied_bytes", memory.host_context_occupied_bytes},
              {"host_context_reserved_bytes", memory.host_context_reserved_bytes},
+             {"host_context_resident_bytes", memory.host_context_resident_bytes},
+             {"host_context_metadata_bytes", memory.host_context_metadata_bytes},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
     record["environment"] =
@@ -912,7 +914,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"host_kv_bytes", current.host_kv_occupied_bytes},
               {"host_context_occupied_bytes", current.host_context_occupied_bytes},
               {"host_context_peak_occupied_bytes", current.host_context_peak_occupied_bytes},
-              {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
+              {"host_context_reserved_bytes", current.host_context_reserved_bytes},
+              {"host_context_resident_bytes", current.host_context_resident_bytes},
+              {"host_context_metadata_bytes", current.host_context_metadata_bytes}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
     return record.dump();
