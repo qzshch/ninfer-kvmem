@@ -204,8 +204,11 @@ validate the completed argument value after recovery; `cancel` interrupts the pa
 `jsonschema` (dependencies in `tests/text/requirements.txt`).
 
 `ninfer_qwen3_5_grammar_real_test [none|mtp|dflash|dflash2] [graph|eager] [concurrency] [vision]` uses
-`NINFER_TEST_ARTIFACT` to check GBNF/JSON/schema content, sampling, thinking, continuation, prefix reuse
-and mixed batches. Set `NINFER_TEST_CONSTRAINT=grammar` or `json_schema` on the preemption test to
+`NINFER_TEST_DRAFT_TOKENS` to override the default draft count of three and
+`NINFER_TEST_ARTIFACT` to check GBNF/JSON/schema/choice/regex content, sampling, thinking, continuation, prefix reuse
+and mixed batches. `ninfer_regex_choice_test` checks literal-set prefix masks and regex edge cases;
+`python3 tests/text/test_regex_choice.py` compares regex membership with independent fullmatch semantics.
+Set `NINFER_TEST_CONSTRAINT=grammar` or `json_schema` on the preemption test to
 check matcher continuity through Snapshot/Replay and cancellation. `ninfer_grammar_test` and
 `ninfer_json_schema_test` cover CPU language semantics. `ninfer_json_schema_oracle_test` compares
 supported schemas with the independent Python `jsonschema` validator; install its dependency with

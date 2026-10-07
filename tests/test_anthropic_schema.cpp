@@ -777,8 +777,18 @@ int test_stream() {
 }
 
 int test_constrained_decoding() {
-    int failures               = 0;
-    auto body                  = base_request();
+    int failures = 0;
+    auto body    = base_request();
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        body["structured_outputs"] = value;
+        const auto request         = parse(body).generation;
+        const auto constraint =
+            to_request_options(request, {}, semantics(request), true).constraint;
+        failures += check(constraint == (value.contains("choice")
+                                             ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                             : ninfer::OutputConstraint::regex("[a-z]+")),
+                          "Anthropic choice/regex lost in Engine translation");
+    }
     body["structured_outputs"] = Json{{"grammar", "root ::= \"yes\""}};
     const auto request         = parse(body);
     failures +=

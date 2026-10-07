@@ -149,12 +149,29 @@ selected `text.format` in aggregate responses and SSE response objects.
 JSON output uses compact separators and declared property order. State the desired content in the
 prompt; the schema is not inserted into it. Only one output constraint may be supplied.
 
-GBNF constrained decoding is available through the NInfer extension `structured_outputs.grammar`
-on Chat Completions, Responses and Anthropic Messages:
+GBNF, choice and regex are available through the NInfer extension `structured_outputs`
+on Chat Completions, Responses and Anthropic Messages. Supply exactly one member:
 
 ```json
 {"structured_outputs": {"grammar": "root ::= \"yes\" | \"no\""}}
 ```
+
+```json
+{"structured_outputs": {"choice": ["positive", "neutral", "negative"]}}
+```
+
+```json
+{"structured_outputs": {"regex": "(BUG|TASK)-[0-9]{4}"}}
+```
+
+Choice returns one literal string, preserving case and whitespace. The list must be nonempty;
+duplicate entries have no extra weight, and an empty-string entry permits empty content.
+Regex matches the complete content. It supports character classes, groups, alternatives and
+repetition; `.` excludes line terminators, `\d`/`\w` use ASCII ranges, and `\s` includes Unicode
+whitespace. Empty regex permits only empty content. Anchors are supported at the ends of top-level
+alternatives. Lookaround, backreferences, word boundaries, Unicode properties, flags and unknown
+escapes return HTTP 400. See the [language contract](maintainer/constrained-decoding.md#41-gbnf--regex--choice).
+Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the request field in `param`.
 
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
 Unicode and repetition. All modes support streaming and all speculative backends. For assistant

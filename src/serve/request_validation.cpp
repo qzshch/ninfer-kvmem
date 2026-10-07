@@ -94,16 +94,38 @@ void parse_structured_outputs(const RequestJson& body, GenerationRequest& reques
     for (const char* alias :
          {"grammar", "guided_json", "guided_regex", "guided_choice", "guided_grammar"}) {
         if (body.contains(alias) && !body[alias].is_null())
-            bad_request("use standard JSON output formats or structured_outputs.grammar", alias);
+            bad_request("use standard JSON output formats or structured_outputs", alias);
     }
     if (body.contains("structured_outputs") && !body["structured_outputs"].is_null()) {
         const auto& value = body["structured_outputs"];
-        if (!value.is_object() || value.size() != 1 || !value.contains("grammar") ||
-            !value["grammar"].is_string() || value["grammar"].get_ref<const std::string&>().empty())
-            bad_request("structured_outputs requires one nonempty grammar string",
-                        "structured_outputs.grammar");
-        set_constraint(request, OutputConstraint::grammar(value["grammar"].get<std::string>()),
-                       "structured_outputs.grammar");
+        if (!value.is_object() || value.size() != 1)
+            bad_request("structured_outputs requires exactly one of grammar, regex or choice",
+                        "structured_outputs");
+        const auto& kind   = value.begin().key();
+        const auto& source = value.begin().value();
+        const auto param   = "structured_outputs." + kind;
+        if (kind == "choice") {
+            if (!source.is_array() || source.empty())
+                bad_request("choice requires a nonempty array of strings", param, "invalid_choice");
+            std::vector<std::string> choices;
+            choices.reserve(source.size());
+            for (std::size_t i = 0; i < source.size(); ++i) {
+                if (!source[i].is_string())
+                    bad_request("choice entries must be strings", param + "/" + std::to_string(i),
+                                "invalid_choice");
+                choices.push_back(source[i].get<std::string>());
+            }
+            set_constraint(request, OutputConstraint::choice(std::move(choices)), param);
+        } else if (kind == "regex") {
+            if (!source.is_string()) bad_request("regex must be a string", param, "invalid_regex");
+            set_constraint(request, OutputConstraint::regex(source.get<std::string>()), param);
+        } else if (kind == "grammar") {
+            if (!source.is_string() || source.get_ref<const std::string&>().empty())
+                bad_request("grammar must be a nonempty string", param, "invalid_grammar");
+            set_constraint(request, OutputConstraint::grammar(source.get<std::string>()), param);
+        } else {
+            bad_request("unknown structured_outputs option: " + kind, param);
+        }
     }
     if (request.constraint && (request.uses_tools() || !request.stop_strings.empty()))
         bad_request("output constraints cannot be combined with active tools or custom stops",

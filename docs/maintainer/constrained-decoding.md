@@ -1,6 +1,6 @@
 # Constrained decoding 设计
 
-本文定义 NInfer 约束解码的架构、功能语义与执行合同。当前已实现 GBNF、JSON object、JSON Schema 和工具约束，覆盖普通解码、MTP、DFlash、DFlash2。正文约束经 `RequestOptions::constraint`、CLI 和三个 HTTP 协议使用；工具声明属于 Prompt，调用策略属于 `RequestOptions::tool_choice`。regex/choice 的独立产品入口仍是后续设计。
+本文定义 NInfer 约束解码的架构、功能语义与执行合同。当前已实现 GBNF、JSON object、JSON Schema、choice、regex 和工具约束，覆盖普通解码、MTP、DFlash、DFlash2。正文约束经 `RequestOptions::constraint`、CLI 和三个 HTTP 协议使用；工具声明属于 Prompt，调用策略属于 `RequestOptions::tool_choice`。
 
 目标是让 GBNF、JSON、JSON Schema 和工具调用共用一套 token 约束机制，接入现有普通采样、MTP、DFlash、DFlash2、thinking、流式输出与抢占恢复。NInfer 保持单 GPU、固定 resident lanes、原生 C++/CUDA 执行。
 
@@ -100,7 +100,7 @@ GBNF 是直接的 grammar 输入，适合作为底层机制的最小完整使用
 - regex；
 - 有限字符串 choice。
 
-正文约束使用 `RequestOptions::constraint` 中的 `OutputConstraint`，以枚举区分 Grammar、JsonObject、JsonSchema，并拥有源文本。运行时不读取文件。CLI 的 grammar/schema 文件在输入准备时读取；HTTP 将字段内容直接转换为请求数据。
+正文约束使用 `RequestOptions::constraint` 中的 `OutputConstraint`，以枚举区分 Grammar、JsonObject、JsonSchema、Choice、Regex，并拥有源文本或字面量列表。运行时不读取文件。CLI 的 grammar/schema 文件在输入准备时读取；HTTP 将字段内容直接转换为请求数据。
 
 工具约束来自 owning 工具定义及工具策略：每个工具的 name、参数 schema、strict 标志，以及 auto/none/required/named、是否允许多个调用。它与模板收到的工具定义来自同一请求事实；执行不从渲染后的 prompt 文本反向提取 schema。
 
@@ -150,7 +150,7 @@ JSON 源以保序方式解析和序列化；声明的属性顺序是生成布局
 
 复用库的一套线程安全编译缓存。并发相同 key 的冷编译共享一个构建结果；缓存锁不覆盖不同 key 的整个编译过程。
 每模型最多两个冷编译同时运行，各自在 submit 调用线程执行，编译内部单线程；缓存命中不占用冷编译名额。
-GBNF、JSON object、JSON Schema 以种类、源文本和模型输出封装作为缓存键。校验、转换、封装和词表编译均在缓存 miss 的同一个受限构建内完成；命中不重新解析或转换。continuation bytes 仅用于初始化 matcher。
+GBNF、JSON object、JSON Schema、regex 以种类、源文本和模型输出封装作为缓存键；choice 使用规范化后的字面量集合。校验、转换、封装和词表编译均在缓存 miss 的同一个受限构建内完成；命中不重新解析或转换。continuation bytes 仅用于初始化 matcher。
 
 设计默认编译缓存预算为 256 MiB，配置为 Engine 启动选项 `grammar_cache_bytes`。该预算限制缓存保留的编译结果；请求正在使用的对象被逐出缓存后仍可存活，因此不是进程 RAM 的总硬上限。词表索引、活跃 matcher 和编译临时内存分别计量，不扣入 KV/GDN Host cache 配额。
 
@@ -168,7 +168,13 @@ GBNF 入口不暴露上游的 `TagDispatch`、`TokenTagDispatch`、`Regex`、`Su
 完整语言由规则正文定义，注解应与后续规则一致。它沿用上游的编译提示语义，不作为独立的正则前瞻约束。
 用户直接 grammar 可以引用普通可生成 token；EOS 与保留的模型控制 token 由外层完成/阶段规则拥有，不作为可见正文终结符。模型封装可以使用相应控制 token 的精确 ID。
 
-regex 按完整输出匹配，使用 vendor 明确支持的方言。choice 通过正确转义的字面量分支构造，支持多 token 选项和共享前缀。两者完成后与 GBNF 使用同一执行路线。
+Choice 通过字面量 grammar 分支构造，精确保留字符串的大小写、空白与 Unicode，支持多 token 选项和共享前缀。候选列表不能为空；允许空字符串，重复候选去重，候选顺序不参与权重。短候选若也是长候选的前缀，匹配短候选后既允许 EOS，也允许继续生成。公共接口为 `OutputConstraint::choice(vector<string>)`。
+
+Regex 按完整正文匹配，公共接口为 `OutputConstraint::regex(string)`；空表达式只允许空正文。支持字面量、Unicode 字符、字符类、分组、分支和 `*`、`+`、`?`、`{m,n}` 重复。贪婪/非贪婪写法描述相同的合法集合；不返回捕获值。字符类沿用 ECMAScript 语义：`\d`/`\w` 为 ASCII 范围，`\s` 包括 Unicode 空白，`.` 排除 `\n`、`\r`、U+2028、U+2029。支持 `\xNN`、`\uNNNN` 等转义；非 BMP 字符直接书写。输出只包含 Unicode scalar values。
+
+`^`/`$` 只接受在表达式或顶层分支两端；其他位置、反向引用、前后向断言、单词边界、Unicode 属性类、flags、surrogate escape 和未知转义返回请求错误。`regex_converter` 共享字符与转义规范化逻辑：regex 使用完整匹配，JSON Schema `pattern` 保留搜索匹配。非法候选或表达式分别使用 `InvalidChoice` / `InvalidRegex`；不可继续的生成前缀沿用 `ConstraintDeadEnd`。
+
+两者共用现有编译缓存和 matcher。Choice 的缓存身份按去重后的字面量集合构造，不依赖 token 切分；完整匹配和 JSON Schema 搜索使用不同的入口身份。运行时、采样和 speculative 后端继续消费同一 mask 合同。
 
 原始 grammar 不自动注入 prompt。约束负责候选空间，用户 prompt 负责任务和字段含义。
 
@@ -552,7 +558,7 @@ Runtime integrity 错误不被包装成用户 schema 错误。例如 row members
 | 入口 | 目标能力 |
 |---|---|
 | 公共 Engine Generation | 正文约束与工具策略；原始 token 输入也可使用直接 grammar |
-| CLI | `--grammar-file`、`--json-schema-file`、`--json-object`；文件在 CLI 侧读取，互斥选择正文约束 |
+| CLI | `--grammar-file`、`--json-schema-file`、`--json-object`、`--regex`、重复的 `--choice`；互斥选择正文约束 |
 | OpenAI Chat | `response_format` 的 json_object/json_schema；工具 strict 与 tool_choice |
 | OpenAI Responses | `text.format` 的 json_object/json_schema；工具 strict 与 tool_choice |
 | Anthropic Messages | `output_config.format` 的 JSON Schema；工具定义、strict 和 tool_choice 使用共同工具合同 |

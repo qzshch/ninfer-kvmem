@@ -72,7 +72,8 @@ ninfer_bench --weights <artifact.ninfer>
           [-n, --n-gen <list>]
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
-          [--concurrency <1..8>] [--grammar-file <path> | --json-schema-file <path> | --json-object]
+          [--concurrency <1..8>]
+          [--grammar-file <path> | --json-schema-file <path> | --json-object | --regex <pattern> | --choice <text> ...]
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
@@ -109,7 +110,7 @@ For a DFlash2 companion artifact:
 ```
 
 `--concurrency` submits that many prepared requests per repetition. `--grammar-file`,
-`--json-schema-file` and `--json-object` select mutually exclusive output constraints and enable
+`--json-schema-file`, `--json-object`, `--regex` and repeated `--choice` select mutually exclusive output constraints and enable
 normal text output and default EOS; a constrained request may finish before the output limit.
 `--mixed-constraints` applies the selected constraint to alternate requests and requires concurrency
 of at least two. Warmups use the same mixture and compile constraints before measured repetitions.
@@ -1154,9 +1155,9 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 17 records the public value objects directly:
+statistics. JSON schema version 18 records the public value objects directly:
 
-- `config`: constraint type, source/file and mixed-request selection, alongside execution settings;
+- `config`: constraint type, source/file, literal choices and mixed-request selection, alongside execution settings;
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;
 - `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,

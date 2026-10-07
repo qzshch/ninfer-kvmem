@@ -15,6 +15,9 @@ its miss factory covers validation, conversion and output framing within the col
 JSON adaptations preserve literal data in cache keys, reject unsupported unions, resolve local
 JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
+Regex and schema patterns share character/escape normalization with explicit full/search matching;
+regex hexadecimal escapes consume exactly two digits. Product constraints reject unsupported
+escapes and anchor positions before grammar conversion.
 The Qwen converter uses canonical tool framing, preserves raw-string assertions with delimiter
 exclusion, and emits argument numbers that the protocol JSON adapters can represent.
 

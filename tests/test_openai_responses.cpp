@@ -1096,6 +1096,18 @@ int test_constrained_decoding() {
               {"structured_outputs", {{"grammar", "root ::= \"yes\""}}}};
     const auto request = parse_openai_responses_create_request(body, limits());
     OpenAIResponsesStore store(8, 1024 * 1024);
+    for (const auto& value : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        auto changed                  = body;
+        changed["structured_outputs"] = value;
+        const auto parsed             = parse_openai_responses_create_request(changed, limits());
+        const auto selected =
+            resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+        failures +=
+            check(to_request_options(selected.generation, {}, {}, true).constraint ==
+                      (value.contains("choice") ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                                : ninfer::OutputConstraint::regex("[a-z]+")),
+                  "Responses choice/regex lost through prompt resolution");
+    }
     const auto resolved =
         resolve_openai_responses_prompt(request.prompt, store, std::nullopt, false);
     failures += check(to_request_options(resolved.generation, {}, {}, true).constraint->source ==

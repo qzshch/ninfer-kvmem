@@ -17,6 +17,8 @@ class Grammar;
 
 namespace ninfer::text {
 
+[[nodiscard]] RequestErrorKind constraint_error_kind(OutputConstraintKind kind);
+
 // One immutable vocabulary/compiler per model; one transactional matcher per request.
 class GrammarSession {
 public:

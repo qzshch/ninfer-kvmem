@@ -916,9 +916,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
             !caller_stop.include_model_defaults || caller_stop.publish_stop_token || output.raw ||
             output.preserve_special_tokens) {
             throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
-                               : constraint->kind == OutputConstraintKind::Grammar
-                                   ? RequestErrorKind::InvalidGrammar
-                                   : RequestErrorKind::InvalidJsonSchema,
+                                               : text::constraint_error_kind(constraint->kind),
                                "constraints require default EOS, text output, no custom stops, and "
                                "one output language");
         }
@@ -945,9 +943,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
             }
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument& error) {
             throw RequestError(tool_constraint ? RequestErrorKind::InvalidToolConstraint
-                               : constraint->kind == OutputConstraintKind::Grammar
-                                   ? RequestErrorKind::InvalidGrammar
-                                   : RequestErrorKind::InvalidJsonSchema,
+                                               : text::constraint_error_kind(constraint->kind),
                                error.what());
         }
     }
