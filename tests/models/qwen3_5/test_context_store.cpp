@@ -1558,7 +1558,62 @@ void test_sparse_offload_rollback(ninfer::DeviceContext& device) {
            "failed sparse offload remains cancellable without leaked source pins");
 }
 
-
+void test_sparse_corrupt_restore(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    const ninfer::KVPageGeometry geometry{
+        .page_tokens        = ninfer::kPagedKVPageSize,
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}};
+    const auto layout =
+        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+    const auto table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 16, .table_rows = 1});
+    ninfer::DeviceArena storage(builder.finish(256));
+    const ninfer::DeviceSpan backing{storage.base(), storage.capacity()};
+    ninfer::DeviceKVPagePool pool(backing, layout);
+    ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
+    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 8, host_layout.page_stride, 0);
+    const std::array layouts{host_layout};
+    ninfer::HostKVArena host(ledger, layouts, std::filesystem::temp_directory_path(),
+                             host_layout.page_stride * 2);
+    store::HostKVExtentStore extents(host, 8);
+    store::LogicalKVPageStore pages(pool, 16);
+    store::KVAddressSpaceStore addresses(pages, tables, 1, 16);
+    auto source = addresses.create_active(8, 0, device.stream);
+    addresses.ensure_mapped_to_tokens(*source, 512, device.stream);
+    addresses.commit_frontier(*source, 512);
+    device.synchronize();
+    const std::array keep{0U, 7U};
+    (void)addresses.apply_device_placement(*source, extents, keep, device.transfer_stream,
+                                           "fault-offload");
+    const auto replica = pages.host_replica(addresses.logical_page(*source, 3));
+    const auto view    = extents.view(replica.extent).subview(replica.page_offset, 1);
+    const int fd       = ::open(view.file_backing()->path().c_str(), O_RDWR);
+    if (fd < 0) { throw std::runtime_error("corruption fixture open failed"); }
+    const std::byte value{0xff};
+    const auto written = ::pwrite(fd, &value, 1, view.file_offset());
+    ::close(fd);
+    if (written != 1) { throw std::runtime_error("corruption fixture write failed"); }
+    addresses.reserve_growth(*source, 2);
+    const auto before = read_block_table(tables, 0, 8);
+    bool rejected     = false;
+    try {
+        const std::array incoming{0U, 3U, 7U};
+        (void)addresses.apply_device_placement(*source, extents, incoming, device.transfer_stream,
+                                               "fault-restore");
+    } catch (const std::runtime_error&) { rejected = true; }
+    expect(rejected && pool.allocated_pages() == 2 && pool.reserved_pages() == 2 &&
+               !pages.device_resident(addresses.logical_page(*source, 3)) &&
+               read_block_table(tables, 0, 8) == before,
+           "corrupt disk restore aborts unpublished destinations and preserves the granted "
+           "growth/table");
+    expect(addresses.release_after_deactivate(*source), "poisoned source teardown failed");
+    (void)extents.release_unreferenced();
+    expect(pages.occupied() == 0 && pool.allocated_pages() == 0 && pool.reserved_pages() == 0 &&
+               host.occupied_bytes() == 0,
+           "failed restore can retire every poisoned allocation without leaking leases");
+}
 
 void test_sparse_decoder_capacity() {
     ninfer::models::qwen3_5::DecoderStateSpec spec{.full_attention_layers     = 1,
@@ -1602,6 +1657,7 @@ int main() {
         test_replay_growth_at_logical_capacity(device);
         test_sparse_idle_replica_reclamation(device);
         test_sparse_offload_rollback(device);
+        test_sparse_corrupt_restore(device);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
         test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
         device.synchronize();

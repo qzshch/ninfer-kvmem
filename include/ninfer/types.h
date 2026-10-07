@@ -1,7 +1,5 @@
 #pragma once
 
-#include <array>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -124,7 +122,43 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
-
+struct FileCacheStats {
+    std::uint64_t read_bytes            = 0;
+    std::uint64_t written_bytes         = 0;
+    std::uint64_t read_ns               = 0;
+    std::uint64_t write_ns              = 0;
+    std::uint64_t staging_wait_ns       = 0;
+    std::uint64_t reads                 = 0;
+    std::uint64_t writes                = 0;
+    std::size_t pinned_bytes            = 0;
+    std::size_t integrity_bytes         = 0;
+    std::uint64_t pending_reads         = 0;
+    std::uint64_t pending_writes        = 0;
+    std::size_t ram_capacity_bytes      = 0;
+    std::uint64_t ram_resident_bytes    = 0;
+    std::uint64_t ram_dirty_bytes       = 0;
+    std::uint64_t ram_hit_bytes         = 0;
+    std::uint64_t ram_miss_bytes        = 0;
+    std::uint64_t disk_read_bytes       = 0;
+    std::uint64_t disk_written_bytes    = 0;
+    std::uint64_t disk_read_ns          = 0;
+    std::uint64_t disk_write_ns         = 0;
+    std::uint64_t disk_pwrite_ns        = 0;
+    std::uint64_t disk_sync_ns          = 0;
+    std::uint64_t disk_sync_calls       = 0;
+    std::uint64_t disk_high_water_bytes = 0;
+    // Conservative page-rounded charge for unsynced file writes (gauge).
+    std::uint64_t filesystem_pending_bytes = 0;
+    std::uint64_t filesystem_write_budget_bytes = 0;
+    std::uint64_t ram_evictions         = 0;
+    std::uint64_t prefetch_bytes        = 0;
+    std::uint64_t prefetch_hit_bytes    = 0;
+    std::uint64_t prefetch_wasted_bytes = 0;
+    std::uint64_t prefetch_dropped_jobs = 0;
+    std::uint64_t pending_prefetches    = 0;
+    std::uint64_t pending_writebacks    = 0;
+    std::uint64_t pending_callbacks     = 0;
+};
 
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
@@ -137,7 +171,13 @@ struct ContextCacheOptions {
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
-
+    // Instance-local KV L3; shares the Host extent ledger with upstream StateImages.
+    // With L3 enabled, pinned State backing grows lazily under this separate physical limit.
+    std::filesystem::path kv_file_directory;
+    std::size_t hicache_ram_capacity_bytes   = 0;
+    std::size_t hicache_state_capacity_bytes = 8ULL << 30;
+    bool hicache_prefetch                    = false;
+    bool hicache_write_through               = false;
 };
 
 struct ContextCostOptions {
@@ -913,6 +953,7 @@ struct MemorySummary {
     std::size_t kv_payload_bytes                  = 0;
     // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
     // State/KV occupancy below is a breakdown and must not be added to this ledger again.
+    FileCacheStats file_cache;
     std::size_t host_context_resident_bytes = 0;
     std::size_t host_context_metadata_bytes = 0;
     std::size_t host_context_capacity_bytes = 0;
@@ -972,6 +1013,7 @@ struct RuntimeLaneStats {
 struct RuntimeStats {
     std::uint32_t lane_count = 0;
     std::array<RuntimeLaneStats, kMaximumConcurrency> lanes{};
+    FileCacheStats file_cache;
     std::size_t host_context_resident_bytes = 0;
     std::size_t host_context_metadata_bytes = 0;
     RuntimeHostWorkStats host_work;

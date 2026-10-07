@@ -350,6 +350,7 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
     // Thread-safe byte-worker counters only; no model state or CUDA operations.
+    [[nodiscard]] FileCacheStats file_cache_stats() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

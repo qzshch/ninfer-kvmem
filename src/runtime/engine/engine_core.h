@@ -242,7 +242,11 @@ public:
             std::lock_guard lock(stats_mutex_);
             out = published_stats_;
         }
-
+        // Idle byte work can finish after the last model publication. Read only
+        // its atomics; do not wake/lock execution or traverse mutable histories.
+        if constexpr (requires { instance_.program->file_cache_stats(); }) {
+            out.file_cache = instance_.program->file_cache_stats();
+        }
         return out;
     }
 

@@ -798,7 +798,19 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("KVMem requires nonzero Host context backing");
     }
     const auto& cache = options.context_cache;
-
+    if ((cache.hicache_ram_capacity_bytes || cache.hicache_prefetch ||
+         cache.hicache_write_through) &&
+        cache.kv_file_directory.empty()) {
+        throw std::invalid_argument("HiCache hot RAM and prefetch require kv_file_directory");
+    }
+    if (!cache.kv_file_directory.empty() &&
+        (!cache.hicache_state_capacity_bytes ||
+         (cache.host_capacity_bytes &&
+          (!*cache.host_capacity_bytes ||
+           cache.hicache_ram_capacity_bytes > *cache.host_capacity_bytes)))) {
+        throw std::invalid_argument(
+            "HiCache requires bounded State RAM and adequate logical Host capacity");
+    }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages =
         options.kvmem_window_pages

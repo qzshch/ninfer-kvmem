@@ -104,8 +104,8 @@ ninfer_add_test(ninfer_qwen3_5_retrieval_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_retrieval.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
-ninfer_add_test(ninfer_qwen3_5_kvmem_real_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_real.cpp"
+ninfer_add_test(ninfer_qwen3_5_kvmem_hicache_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kvmem_hicache_real.cpp"
   LIBRARIES ninfer_engine ninfer_core)
-set_tests_properties(ninfer_qwen3_5_kvmem_real_test PROPERTIES
+set_tests_properties(ninfer_qwen3_5_kvmem_hicache_real_test PROPERTIES
   SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")

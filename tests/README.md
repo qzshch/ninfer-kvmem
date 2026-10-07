@@ -288,28 +288,28 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 numerical/state-transition oracle; the fixed Engine fixture does not define bit parity across
 arbitrary floating-point routes.
 
-## Sparse KVMem with Native Host storage
+## Sparse KVMem with hierarchical context storage
 
-The real fixture uses the public Engine with FP8 KV, a small rolling Device window and fixed
-pinned Native Host storage. It checks cold/warm/changed-query reuse, shared forks, image
-continuations, cancellation during query replay, a surviving request, Host reservation settlement, and
+The real fixture uses the public Engine with FP8 KV, a small rolling Device window, RAM hot
+storage, and disk cold storage. It checks cold/warm/changed-query reuse, shared forks, image
+continuations, cancellation during query replay, a surviving request, IO settlement, and
 terminal publication. DFlash2 uses seven drafts; MTP uses three. Run model fixtures serially.
 
 ```bash
-cmake --build build -j --target ninfer_qwen3_5_kvmem_real_test \
+cmake --build build -j --target ninfer_qwen3_5_kvmem_hicache_real_test \
   ninfer_qwen3_5_native_transactions_test ninfer_qwen3_5_preemption_real_test
 NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
-  build/tests/ninfer_qwen3_5_kvmem_real_test
-build/tests/ninfer_qwen3_5_kvmem_real_test \
-  out/qwen3_8_27b_nvfp4_dflash2.ninfer 2 1 dflash2 4
+  build/tests/ninfer_qwen3_5_kvmem_hicache_real_test
+build/tests/ninfer_qwen3_5_kvmem_hicache_real_test \
+  out/qwen3_8_27b_nvfp4_dflash2.ninfer 2 1 1 dflash2 4
 NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   NINFER_NATIVE_TRANSACTIONS_SPARSE=1 \
   build/tests/ninfer_qwen3_5_native_transactions_test dflash2
 ```
 
-The real-fixture arguments are artifact, lanes, vision, backend (`none`, `mtp`,
-`dflash2`), and Host quota in GiB. Qualify DFlash2 at one, two, and three lanes;
-also qualify none and MTP at two lanes. The artifact must contain the selected backend
+The real-fixture arguments are artifact, lanes, prefetch, vision, backend (`none`, `mtp`,
+`dflash2`), and Host quota in GiB. Qualify DFlash2 at one, two, and three lanes with prefetch
+off/on; also qualify none and MTP at two lanes. The artifact must contain the selected backend
 and vision weights. Without an explicit artifact argument or `NINFER_TEST_ARTIFACT`, it skips
 with status 77. This small-window lifecycle fixture does not establish full-context capacity
 or production throughput.

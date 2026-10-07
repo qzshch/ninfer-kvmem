@@ -127,9 +127,22 @@ See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-
 for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
-This fork adds an optional bounded KVMem working set on top of Native checkpoint
-ownership and fixed pinned Host storage. See [sparse Native context cache](
-docs/maintainer/sparse-native-context-cache.md) for capacities and recovery contracts.
+Two build lines are maintained: `codex/upstream-kvmem-native-20261008` is
+Native prefix caching + KVMem; `codex/upstream-kvmem-hicache-optional-20261008`
+adds optional hierarchical KV storage. This enhanced build uses the same Native
+checkpoint catalog. **HiCache is disabled by default.** Omitting `--kv-file-dir`
+uses fixed pinned Native Host storage. Explicitly enabling a directory selects
+file backing; RAM, prefetch and writeback are independent, bounded options.
+
+Measure Native prefix reuse first. HiCache does not improve prefix matching and
+can add staging, metadata, transfer or synchronization cost. Enable it only after
+comparing the same workload and reporting compute saved, resource use and total
+latency. No universal performance benefit is claimed.
+
+This fork adds an optional bounded KVMem working set and instance-local RAM/disk KV
+tiers on top of Native checkpoint ownership. See [hierarchical context cache](
+docs/maintainer/hierarchical-context-cache.md) for capacities, commands, IO policies,
+the sparse-attention quality boundary and telemetry semantics.
 
 ## Performance
 
@@ -266,7 +279,7 @@ capacities remain fixed for the process lifetime.
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Sparse KVMem and Native RAM history](docs/maintainer/sparse-native-context-cache.md)
+- [Sparse KVMem and RAM/disk Native history](docs/maintainer/hierarchical-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)

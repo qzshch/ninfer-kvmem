@@ -175,10 +175,21 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     GAUGE(device_backend_kv_occupied_pages, "device_backend_kv_used_pages",
           "Occupied speculative backend KV pages.");
     GAUGE(host_context_resident_bytes, "host_context_resident_bytes",
-          "Fixed pinned Host backing plus unique CPU retrieval metadata bytes.");
+          "Resident State and retrieval metadata bytes.");
     GAUGE(host_context_metadata_bytes, "host_context_metadata_bytes",
           "Unique CPU retrieval metadata bytes.");
-
+    gauge("hicache_ram_resident_bytes", stats.file_cache.ram_resident_bytes,
+          "RAM hot cache occupancy.");
+    gauge("hicache_ram_capacity_bytes", stats.file_cache.ram_capacity_bytes,
+          "RAM hot cache capacity.");
+    gauge("hicache_disk_read_bytes_total", stats.file_cache.disk_read_bytes,
+          "Cumulative physical disk read bytes.");
+    gauge("hicache_disk_written_bytes_total", stats.file_cache.disk_written_bytes,
+          "Cumulative physical disk write bytes.");
+    gauge("hicache_prefetch_hit_bytes_total", stats.file_cache.prefetch_hit_bytes,
+          "Cumulative useful prefetch bytes.");
+    gauge("hicache_pending_callbacks", stats.file_cache.pending_callbacks,
+          "File transfer callbacks retaining staging.");
     GAUGE(host_context_occupied_bytes, "host_context_used_bytes",
           "Occupied Host backing, including reservations.");
     GAUGE(host_context_reserved_bytes, "host_context_reserved_bytes",

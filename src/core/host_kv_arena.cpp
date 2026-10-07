@@ -91,7 +91,9 @@ HostKVAllocationView HostKVAllocationView::subview(std::uint32_t begin, std::uin
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+        handle_, data_ ? data_ + static_cast<std::size_t>(begin) * layout_->page_stride : nullptr,
+        layout_, count, file_,
+        file_offset_ + static_cast<std::size_t>(begin) * layout_->page_stride);
 }
 
 bool HostKVAllocationConstView::valid() const noexcept {
@@ -109,7 +111,9 @@ HostKVAllocationConstView HostKVAllocationConstView::subview(std::uint32_t begin
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
     return HostKVAllocationConstView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+        handle_, data_ ? data_ + static_cast<std::size_t>(begin) * layout_->page_stride : nullptr,
+        layout_, count, file_,
+        file_offset_ + static_cast<std::size_t>(begin) * layout_->page_stride);
 }
 
 HostKVAllocation::~HostKVAllocation() { (void)release(); }
@@ -160,7 +164,10 @@ void HostKVAllocation::disarm() noexcept {
 }
 
 HostKVArena::HostKVArena(HostContextArena& arena,
-                         std::span<const HostKVPageLayout> supported_layouts)
+                         std::span<const HostKVPageLayout> supported_layouts,
+                         const std::filesystem::path& file_directory,
+                         std::size_t staging_slot_bytes, std::size_t ram_capacity_bytes,
+                         bool prefetch, bool write_through)
     : arena_(&arena), layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
         const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
@@ -170,6 +177,19 @@ HostKVArena::HostKVArena(HostContextArena& arena,
         for (std::size_t previous = 0; previous < index; ++previous) {
             if (layouts_[previous] == layouts_[index]) {
                 throw std::invalid_argument("Host KV arena contains a duplicate page layout");
+            }
+        }
+    }
+    if ((ram_capacity_bytes || prefetch || write_through) && file_directory.empty()) {
+        throw std::invalid_argument("HiCache hot tier and prefetch require a file directory");
+    }
+    if (!file_directory.empty()) {
+        file_ = std::make_unique<FileKVBacking>(file_directory, arena_->capacity_bytes(),
+                                                staging_slot_bytes, ram_capacity_bytes, prefetch,
+                                                write_through);
+        for (const auto& layout : layouts_) {
+            if (layout.page_stride > file_->slot_bytes()) {
+                throw std::invalid_argument("HiCache staging cannot hold one complete KV page");
             }
         }
     }
@@ -216,7 +236,8 @@ bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pag
         layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
         return false;
     }
-    return arena_->can_allocate(layout.page_stride * static_cast<std::size_t>(pages));
+    const auto bytes = layout.page_stride * static_cast<std::size_t>(pages);
+    return file_ ? arena_->can_allocate_cold(bytes) : arena_->can_allocate(bytes);
 }
 
 std::uint32_t HostKVArena::max_allocatable_pages(const HostKVPageLayout& layout,
@@ -233,6 +254,10 @@ std::uint32_t HostKVArena::max_allocatable_pages(const HostKVPageLayout& layout,
     return lo;
 }
 
+void HostKVArena::check_io_errors() const {
+    if (file_) { file_->check_errors(); }
+}
+
 std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
                                                       std::uint32_t pages) noexcept {
     const std::optional<std::uint32_t> layout_index = find_layout(layout);
@@ -241,7 +266,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
         return std::nullopt;
     }
     const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
-    auto storage            = arena_->allocate(bytes);
+    auto storage            = file_ ? arena_->allocate_cold(bytes) : arena_->allocate(bytes);
     if (!storage) { return std::nullopt; }
     const std::uint32_t descriptor_index = take_descriptor();
     Descriptor& descriptor               = descriptors_[descriptor_index];
@@ -294,7 +319,8 @@ HostKVAllocationView HostKVArena::writable_view(HostKVAllocation& allocation) {
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationView(allocation.handle(), allocation_data(descriptor),
-                                &layouts_[descriptor.layout], descriptor.pages);
+                                &layouts_[descriptor.layout], descriptor.pages, file_.get(),
+                                descriptor.storage.offset());
 }
 
 HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) const {
@@ -303,7 +329,8 @@ HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) 
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationConstView(allocation.handle(), allocation_data(descriptor),
-                                     &layouts_[descriptor.layout], descriptor.pages);
+                                     &layouts_[descriptor.layout], descriptor.pages, file_.get(),
+                                     descriptor.storage.offset());
 }
 
 bool HostKVArena::valid_handle(HostKVAllocationHandle handle) const noexcept {
@@ -325,6 +352,7 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     Descriptor& descriptor = descriptors_[descriptor_index];
     if (!descriptor.active || descriptor.generation != generation) { return false; }
 
+    if (file_) { file_->invalidate(descriptor.storage.offset(), descriptor.storage.bytes()); }
     occupied_bytes_ -= descriptor.storage.bytes();
     (void)descriptor.storage.release();
     descriptor.active = false;

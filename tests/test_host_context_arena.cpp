@@ -90,24 +90,68 @@ void test_fragmentation_and_split() {
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
 }
+
+void test_tiered_resident_budget() {
+    ninfer::HostContextArena arena(4096, 256, 1024);
+    auto cold = arena.allocate_cold(2048);
+    expect(cold && !cold->data() && arena.occupied_bytes() == 2048 && arena.resident_bytes() == 0,
+           "cold KV charges the common extent ledger without pins");
+    auto state = arena.allocate(1024);
+    expect(state && state->data() && !arena.can_allocate(256) && arena.can_allocate_cold(256),
+           "cold capacity never satisfies resident State capacity");
+    std::memset(state->data(), 0x39, 1024);
+    auto pieces = arena.split(std::move(*state), 256);
+    (void)pieces.first.release();
+    expect(arena.resident_bytes() == 1024 && !arena.allocate(256) &&
+               pieces.second.data()[767] == std::byte{0x39},
+           "a split reader retains the complete physical backing charge");
+    (void)pieces.second.release();
+    expect(arena.resident_bytes() == 0 && arena.allocate(1024).has_value(),
+           "last resident reader returns physical capacity independently of cold KV");
+    cold.reset();
+    expect(arena.occupied_bytes() == 0 && arena.allocation_count() == 0,
+           "tiered cancellation releases both extent and physical ledgers");
+}
+
+void test_cold_file_address_growth() {
+    ninfer::HostContextArena arena(4096, 256, 2048);
+    auto state = arena.allocate(1024);
+    auto cold = arena.allocate_cold(1024);
+    auto other_state = arena.allocate(512);
+    auto other_cold = arena.allocate_cold(512);
+    expect(state && cold && other_state && other_cold &&
+               cold->offset() == 0 && other_cold->offset() == cold->bytes() &&
+               other_state->offset() >= other_cold->offset() + other_cold->bytes(),
+           "resident State must not create unwritten holes before growing cold KV payload");
+    state.reset(); other_state.reset(); cold.reset(); other_cold.reset();
+    expect(arena.occupied_bytes() == 0 && arena.resident_bytes() == 0 &&
+               arena.can_allocate_cold(4096),
+           "opposite-end allocations must coalesce under the same complete quota");
+}
+
 void test_metadata_charge() {
-    ninfer::HostContextArena arena(2048, 256);
+    ninfer::HostContextArena arena(2048, 256, 1024);
     auto metadata = arena.charge_metadata(257);
     expect(metadata && arena.metadata_bytes() == 512 && arena.occupied_bytes() == 512 &&
-               arena.resident_bytes() == 2560,
-           "external CPU metadata charges the Host quota and physical usage once");
+               arena.resident_bytes() == 512,
+           "metadata charges common and resident quotas once");
     auto alias = metadata;
     metadata.reset();
-    auto state = arena.allocate(1536);
-    expect(state && !arena.allocate(1) && !arena.charge_metadata(1),
-           "metadata aliases and pinned extents share the complete admission quota");
+    expect(arena.metadata_bytes() == 512 && !arena.charge_metadata(513),
+           "aliases retain their unique charge and cannot exceed the resident quota");
+    auto state = arena.allocate(512);
+    auto cold  = arena.allocate_cold(1024);
+    expect(state && cold && !arena.allocate_cold(256) && !arena.charge_metadata(1),
+           "cold extents and metadata share the common Host admission quota");
     alias.reset();
-    expect(arena.metadata_bytes() == 0 && arena.resident_bytes() == 2048 &&
-               arena.can_allocate(512), "last metadata alias returns its unique charge");
+    expect(arena.metadata_bytes() == 0 && static_cast<bool>(arena.charge_metadata(1)),
+           "last alias returns its charge and temporary leases return theirs");
+    expect(arena.resident_bytes() == 512, "temporary metadata leases return their charge");
     state.reset();
-    expect(arena.occupied_bytes() == 0 && arena.free_bytes() == 2048 &&
+    cold.reset();
+    expect(arena.occupied_bytes() == 0 && arena.resident_bytes() == 0 &&
                !arena.charge_metadata(std::numeric_limits<std::size_t>::max()),
-           "overflow and teardown leave the fixed backing reusable");
+           "metadata overflow and teardown leave reusable ledgers");
 }
 } // namespace
 
@@ -122,6 +166,8 @@ int main() {
     try {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
+        test_tiered_resident_budget();
+        test_cold_file_address_growth();
         test_metadata_charge();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

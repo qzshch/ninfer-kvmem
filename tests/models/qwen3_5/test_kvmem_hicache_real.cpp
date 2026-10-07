@@ -1,8 +1,10 @@
 #include "ninfer/engine.h"
 #include <iostream>
 #include <stdexcept>
+#include <filesystem>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #include <cstdlib>
 #include <chrono>
 #include <thread>
@@ -35,7 +37,7 @@ ninfer::PromptInput media_prompt() {
     image.kind               = ninfer::MessagePartKind::Media;
     image.media.kind         = ninfer::MediaKind::Image;
     image.media.media_type   = "image/x-portable-pixmap";
-    image.media.source_name  = "native-pattern.ppm";
+    image.media.source_name  = "tiered-pattern.ppm";
     const std::string header = "P6\n64 64\n255\n";
     image.media.bytes.assign(header.begin(), header.end());
     for (int i = 0; i < 64 * 64; ++i) {
@@ -48,7 +50,7 @@ ninfer::PromptInput media_prompt() {
                                         {.kind = ninfer::MessagePartKind::Text,
                                          .text = "Describe the pattern briefly."}}});
     input.options.enable_thinking   = false;
-    input.context_cache.session_key = "native-media";
+    input.context_cache.session_key = "tiered-media";
     return input;
 }
 } // namespace
@@ -59,6 +61,8 @@ int main(int argc, char** argv) {
         std::cout << "SKIP: explicit real model artifact required\n";
         return 77;
     }
+    const auto directory =
+        std::filesystem::temp_directory_path() / ("ninfer-tiered-real-" + std::to_string(getpid()));
     try {
         ninfer::EngineOptions o;
         o.artifact_path      = artifact;
@@ -70,13 +74,18 @@ int main(int argc, char** argv) {
         o.kv_cache    = ninfer::KvCacheStorage::Fp8E4M3Row256;
         // Explicitly configurable quota for guarded local runs; the coverage/input gates stay
         // fixed. The default retains the four-GiB qualification profile.
-        o.context_cache.host_capacity_bytes        = (argc > 5 ? std::stoull(argv[5]) : 4ULL) << 30;
+        o.context_cache.host_capacity_bytes        = (argc > 6 ? std::stoull(argv[6]) : 4ULL) << 30;
+        o.context_cache.kv_file_directory          = directory;
+        o.context_cache.hicache_ram_capacity_bytes = 16ULL << 20;
+        o.context_cache.hicache_state_capacity_bytes = 1ULL << 30;
+        o.context_cache.hicache_prefetch             = argc > 3 && std::stoi(argv[3]);
+        o.context_cache.hicache_write_through        = true;
         o.speculative.backend                        = ninfer::SpeculativeBackend::DFlash2;
         o.speculative.draft_tokens                   = 7;
         o.speculative.proposal_head                  = ninfer::ProposalHead::Optimized;
-        o.enable_vision                              = argc > 3 && std::stoi(argv[3]);
-        if (argc > 4) {
-            const std::string backend = argv[4];
+        o.enable_vision                              = argc > 4 && std::stoi(argv[4]);
+        if (argc > 5) {
+            const std::string backend = argv[5];
             require(backend == "none" || backend == "mtp" || backend == "dflash2",
                     "unsupported test backend");
             o.speculative.backend      = backend == "none"  ? ninfer::SpeculativeBackend::None
@@ -218,7 +227,11 @@ int main(int argc, char** argv) {
             const auto idle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             for (;;) {
                 const auto idle = engine.runtime_stats();
-                if (idle.running_requests == 0 && idle.materializing_requests == 0) {
+                if (idle.running_requests == 0 && idle.materializing_requests == 0 &&
+                    idle.file_cache.pending_prefetches == 0 &&
+                    idle.file_cache.pending_writebacks == 0 &&
+                    idle.file_cache.filesystem_pending_bytes == 0 &&
+                    idle.file_cache.pending_callbacks == 0) {
                     require(idle.host_context_reserved_bytes == 0 &&
                                 idle.host_context_metadata_bytes <=
                                     before_cancel.host_context_metadata_bytes,
@@ -235,10 +248,16 @@ int main(int argc, char** argv) {
                 if (std::chrono::steady_clock::now() >= idle_deadline) {
                     std::cerr << "cancel idle running=" << idle.running_requests
                               << " materializing=" << idle.materializing_requests
-                              << '\n';
+                              << " file read=" << idle.file_cache.pending_reads
+                              << " write=" << idle.file_cache.pending_writes
+                              << " prefetch=" << idle.file_cache.pending_prefetches
+                              << " writeback=" << idle.file_cache.pending_writebacks
+                              << " callbacks=" << idle.file_cache.pending_callbacks
+                              << " filesystem=" << idle.file_cache.filesystem_pending_bytes
+                              << " sync_calls=" << idle.file_cache.disk_sync_calls << '\n';
                 }
                 require(std::chrono::steady_clock::now() < idle_deadline,
-                        "cancelled probe did not retire execution resources");
+                        "cancelled probe did not retire IO and execution resources");
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
@@ -261,14 +280,18 @@ int main(int argc, char** argv) {
                     decoded == stats.committed_decode_tokens && rounds == stats.decode_row_rounds &&
                     replayed == stats.replayed_tokens,
                 "lane counters duplicated or lost aggregate work across reuse and branching");
-        require(memory.host_context_occupied_bytes <= *o.context_cache.host_capacity_bytes &&
-                    memory.host_context_reserved_bytes == 0,
-                "Native Host quota or pending reservations did not settle");
-        std::cout << "ok cold/warm/fork/Native RAM, reused=" << warm.reused_prompt_tokens
-                  << " host_bytes=" << memory.host_context_occupied_bytes << '\n';
+        require(memory.file_cache.disk_written_bytes > 0 && memory.file_cache.disk_read_bytes > 0,
+                "test did not exercise disk write/read");
+        require(
+            memory.host_context_resident_bytes <= o.context_cache.hicache_state_capacity_bytes &&
+                memory.file_cache.ram_resident_bytes <= o.context_cache.hicache_ram_capacity_bytes,
+            "resident tier exceeded its limit");
+        std::cout << "ok cold/warm/fork/disk, reused=" << warm.reused_prompt_tokens
+                  << " disk_read=" << memory.file_cache.disk_read_bytes << '\n';
     } catch (const std::exception& e) {
         std::cerr << "FAIL " << e.what() << '\n';
         return 1;
     }
+    std::filesystem::remove_all(directory);
     return 0;
 }
