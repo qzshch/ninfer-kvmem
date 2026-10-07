@@ -2071,7 +2071,7 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
                     const auto room = 8ULL * program.text_host_kv_page_stride;
                     const auto free = program.host_context_arena->free_bytes();
                     require(free > room, "query pressure fixture has no foreign claim headroom");
-                    auto foreign = program.host_context_arena->allocate_cold(free - room);
+                    auto foreign = program.host_context_arena->allocate(free - room);
                     require(foreign.has_value(), "query pressure fixture could not crowd Host quota");
                     const auto before = program.physical_usage();
                     const auto frontier = program.active_sequence(lane).execution_frontier;

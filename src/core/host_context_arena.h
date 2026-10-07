@@ -36,7 +36,6 @@ public:
 
 private:
     friend class HostContextArena;
-class HostResidentCharge;
 
     HostContextAllocation(HostContextArena& owner, std::size_t offset, std::size_t bytes,
                           bool reserved = true) noexcept
