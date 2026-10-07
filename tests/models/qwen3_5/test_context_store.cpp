@@ -1254,7 +1254,7 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
            "retiring the final history and views leaked KV storage");
 }
 
-void test_sparse_shared_history(ninfer::DeviceContext& device, bool file) {
+void test_sparse_shared_history(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     const ninfer::KVPageGeometry geometry{
         .page_tokens        = ninfer::kPagedKVPageSize,
@@ -1269,13 +1269,9 @@ void test_sparse_shared_history(ninfer::DeviceContext& device, bool file) {
     ninfer::DeviceKVPagePool pool(backing, pool_layout);
     ninfer::KVExecutionTablePool tables(backing, table_layout, pool);
     const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
-    ninfer::HostContextArena ledger(file ? 1ULL << 20 : host_layout.page_stride * 16,
-                                    host_layout.page_stride,
-                                    file ? std::optional<std::size_t>(0) : std::nullopt);
+    ninfer::HostContextArena ledger(host_layout.page_stride * 16, host_layout.page_stride);
     const std::array layouts{host_layout};
-    ninfer::HostKVArena host(
-        ledger, layouts, file ? std::filesystem::temp_directory_path() : std::filesystem::path{},
-        host_layout.page_stride * 2, file ? 1ULL << 20 : 0, file, file);
+    ninfer::HostKVArena host(ledger, layouts);
     store::HostKVExtentStore extents(host, 16);
     store::LogicalKVPageStore pages(pool, 26);
     store::KVAddressSpaceStore addresses(pages, tables, 4, 16);
@@ -1597,8 +1593,7 @@ int main() {
         test_kv_store(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
-        test_sparse_shared_history(device, false);
-        test_sparse_shared_history(device, true);
+        test_sparse_shared_history(device);
         test_replay_growth_at_logical_capacity(device);
         test_sparse_idle_replica_reclamation(device);
         test_sparse_offload_rollback(device);
