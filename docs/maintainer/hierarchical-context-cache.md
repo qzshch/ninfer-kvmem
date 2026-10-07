@@ -1,6 +1,7 @@
 # Sparse working sets and tiered Native history
 
-This extension is based on upstream NInfer 68c54356. Native checkpoint identity,
+This extension is based on upstream NInfer 68c54356, with the source-wait admission
+contract from 911d34db adapted to sparse physical working sets. Native checkpoint identity,
 StateImages, immutable source leases, persistent KV directories, private replay
 points and incremental execution permits remain authoritative. Storage tiers do
 not introduce another prefix catalog or another owner of model state.

@@ -930,6 +930,12 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
 and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.
 
+`generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`,
+`revoked_checkpoints`, and `fallback_reason`. Source waiting is a subset of initial queue time;
+selecting or retaining a checkpoint does not itself count as a cache hit. Revocations count retained
+checkpoint references removed under resource pressure. Fallback reasons are `none`, `source_invalid`,
+`source_revoked`, `cost_changed`, `capacity_limit`, and `isolated_capacity`.
+
 `request_scheduling` records `pause_started`, `paused`, `restore_started`, `restored`,
 `replay_complete`, `recovery_complete`, `snapshot_revoked`, and a `terminal` boundary for preempted
 requests. `preemption_index` identifies each pause cycle; `route` is `snapshot`, `replay`, or `null`

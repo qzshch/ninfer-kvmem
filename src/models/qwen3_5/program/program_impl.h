@@ -280,6 +280,7 @@ public:
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
+                   std::span<const CheckpointHandle> = {},
                    std::span<const CheckpointHandle> = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
@@ -292,6 +293,10 @@ public:
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
+    [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
+    [[nodiscard]] std::optional<runtime::ContextResourceUsage>
+        checkpoint_release_resources(std::span<const CheckpointHandle>,
+                                     runtime::ContextResourceUsage) const;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
@@ -306,10 +311,9 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle>) noexcept;
-    [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan&,
-                                                             runtime::LaneId,
-                                                             const SourceCandidate&, ResumeState*,
-                                                             ExecutionUnitKind, std::uint32_t);
+    [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
+                                                   const SourceCandidate&, ResumeState*,
+                                                   ExecutionUnitKind, std::uint32_t);
     [[nodiscard]] bool start_capture(SequenceHandle);
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
@@ -532,6 +536,9 @@ public:
     std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 
+    [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
+    [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
+                                          std::uint32_t mtp_extent) const;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;

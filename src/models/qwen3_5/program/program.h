@@ -161,12 +161,28 @@ struct SourceCandidate {
     std::uint32_t reused_tokens = 0;
     runtime::PrefillWork remaining_work;
     std::vector<runtime::ContextTransferRequirement> transfers;
-    bool consume_private = false;
-    bool move_state      = false;
-    bool move_history    = false;
-    bool split_state     = false;
-    bool backup_state    = false;
+    bool consume_source = false;
+    bool take_private   = false;
+    bool move_state     = false;
+    bool move_history   = false;
+    bool split_state    = false;
+    bool backup_state   = false;
+    // Compatible carry intent. Binding may consume the selected point if its State slot
+    // is necessary for execution and no preservation destination can be obtained.
     std::vector<CheckpointHandle> private_points;
+    // Authorized retirement, applied only after binding capacity has been checked.
+    std::vector<CheckpointHandle> retired_points;
+};
+
+struct BindingReservation {
+    bool reserved          = false;
+    bool source_valid      = true;
+    bool capacity_possible = true;
+    runtime::ContextResourceUsage shortage;
+    std::vector<CheckpointHandle> retired_points;
+    std::optional<CheckpointHandle> consumed_source;
+
+    explicit operator bool() const noexcept { return reserved; }
 };
 
 struct ContextDemotion {
@@ -390,8 +406,9 @@ public:
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                   bool consume_private                             = false,
-                   std::span<const CheckpointHandle> private_points = {}) const;
+                   bool consume_source                              = false,
+                   std::span<const CheckpointHandle> private_points = {},
+                   std::span<const CheckpointHandle> retired_points = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
@@ -420,7 +437,7 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
-    [[nodiscard]] runtime::ResourceReservation
+    [[nodiscard]] BindingReservation
     start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                   ResumeState* resume           = nullptr,
                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,

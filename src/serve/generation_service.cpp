@@ -471,6 +471,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.engine_timing               = result.engine_timing;
     outcome.metrics.first_output_timing         = std::move(result.first_output_timing);
     outcome.metrics.scheduling                  = result.scheduling;
+    outcome.metrics.admission                   = result.admission;
     outcome.metrics.engine_request_id           = result.engine_request_id;
     outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;

@@ -867,6 +867,24 @@ enum class PrefixReusePath : std::uint8_t {
     Checkpoint,
 };
 
+enum class AdmissionFallbackReason : std::uint8_t {
+    None,
+    SourceInvalid,
+    SourceRevoked,
+    CostChanged,
+    CapacityLimit,
+    IsolatedCapacity,
+};
+
+struct GenerationAdmissionStats {
+    std::uint32_t preferred_reused_tokens = 0;
+    // Subset of initial queue wait, not additional TTFT. Includes waiting for a lane
+    // after a useful source has been selected.
+    double source_wait_seconds              = 0.0;
+    std::uint32_t revoked_checkpoints       = 0;
+    AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -886,6 +904,7 @@ struct GenerationResult {
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     GenerationSchedulingStats scheduling;
+    GenerationAdmissionStats admission;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative;
     ThinkingBudgetStats thinking;
