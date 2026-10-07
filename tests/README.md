@@ -302,6 +302,8 @@ NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   build/tests/ninfer_qwen3_5_kvmem_real_test
 build/tests/ninfer_qwen3_5_kvmem_real_test \
   out/qwen3_8_27b_nvfp4_dflash2.ninfer 2 1 dflash2 4
+build/tests/ninfer_qwen3_5_kvmem_real_test \
+  out/qwen3_8_27b_nvfp4_dflash2.ninfer 3 1 dflash2 4
 NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   NINFER_NATIVE_TRANSACTIONS_SPARSE=1 \
   build/tests/ninfer_qwen3_5_native_transactions_test dflash2
@@ -313,6 +315,11 @@ also qualify none and MTP at two lanes. The artifact must contain the selected b
 and vision weights. Without an explicit artifact argument or `NINFER_TEST_ARTIFACT`, it skips
 with status 77. This small-window lifecycle fixture does not establish full-context capacity
 or production throughput.
+
+Keep the three-lane/four-GiB run: after retained shared and vision checkpoints,
+the final query probe must still obtain complete Host KV backing. This is a
+regression for an optional Host State capture taking capacity already quoted for
+required execution; increasing the quota alone does not qualify the fix.
 
 The sparse transaction opt-in checks unfinished query probing, the query replay boundary,
 partial replay, and cross-lane Snapshot recovery against uninterrupted execution. It compares

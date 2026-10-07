@@ -99,6 +99,20 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
             if (ticket->points.empty()) { return false; }
         }
     }
+    if (kvmem_window_pages) {
+        // A permit quotes the Host backing needed by required execution. Optional
+        // State/metadata allocations happen afterwards and share that arena.
+        // Requote every granted unit with the tentative capture still charged;
+        // failure destroys the ticket instead of invalidating an execution permit.
+        std::array<ExecutionUnit, kMaximumConcurrency> granted{};
+        std::size_t count = 0;
+        for (std::uint32_t index = 0; index < max_concurrency; ++index) {
+            if (const auto& permit = requests[index].permit) {
+                granted[count++] = {sequence_handle(index), permit->kind, permit->tokens};
+            }
+        }
+        if (count && !reserve_units(std::span(granted).first(count)).reserved) { return false; }
+    }
     request.capture_reservation = std::move(ticket);
     return true;
 }
