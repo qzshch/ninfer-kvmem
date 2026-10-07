@@ -890,26 +890,7 @@ int main() {
                       987654321ULL &&
                   sparse_done.at("kvmem").at("replay").at("tokens") == 513,
               "sparse copy and replay work lost their exact request scope");
-    throughput.current.file_cache.disk_read_bytes   = 42424242;
-    throughput.current.file_cache.disk_pwrite_ns = 101;
-    throughput.current.file_cache.disk_sync_ns = 202;
-    throughput.current.file_cache.disk_sync_calls = 3;
-    throughput.current.file_cache.disk_high_water_bytes = 4096;
-    throughput.current.file_cache.filesystem_pending_bytes = 2048;
-    throughput.current.file_cache.filesystem_write_budget_bytes = 67112960;
-    throughput.current.file_cache.pending_callbacks = 2;
-    throughput.current.host_context_metadata_bytes  = 256;
-    const auto tiered_json = Json::parse(format_throughput_json("server-test", 123, throughput));
-    failures += check(tiered_json.at("hicache").at("disk_read_bytes") == 42424242 &&
-                          tiered_json.at("hicache").at("pending_callbacks") == 2 &&
-                          tiered_json.at("hicache").at("host_metadata_bytes") == 256 &&
-                          tiered_json.at("hicache").at("disk_pwrite_ns") == 101 &&
-                          tiered_json.at("hicache").at("disk_sync_ns") == 202 &&
-                          tiered_json.at("hicache").at("disk_sync_calls") == 3 &&
-                          tiered_json.at("hicache").at("disk_high_water_bytes") == 4096 &&
-                          tiered_json.at("hicache").at("filesystem_pending_bytes") == 2048 &&
-                          tiered_json.at("hicache").at("filesystem_write_budget_bytes") == 67112960,
-                      "tiered gauges or lifetime counters were omitted from periodic telemetry");
+
 
     throughput.current.lane_count = 3;
     throughput.previous.lanes[0].computed_prefill_tokens = 100;

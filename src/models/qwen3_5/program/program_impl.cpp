@@ -141,17 +141,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (host_bytes) {
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);
-        host_context_arena = std::make_unique<HostContextArena>(
-            host_bytes, minimum_stride,
-            context_cache.kv_file_directory.empty()
-                ? std::nullopt
-                : std::optional<std::size_t>(context_cache.hicache_state_capacity_bytes));
+        host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
-        host_kv_arena = std::make_unique<HostKVArena>(
-            *host_context_arena, layouts, context_cache.kv_file_directory, 16ULL << 20,
-            context_cache.hicache_ram_capacity_bytes, context_cache.hicache_prefetch,
-            context_cache.hicache_write_through);
+        host_kv_arena = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
@@ -505,7 +498,6 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         };
     }
     const auto physical              = physical_usage();
-    out.file_cache                   = physical.file_cache;
     out.host_context_resident_bytes  = physical.host_resident_bytes;
     out.host_context_metadata_bytes  = physical.host_metadata_bytes;
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;

@@ -380,42 +380,7 @@ Json kvmem_json(const ninfer::KvmemDiagnostics& diagnostics) {
                       {"execution_device_wait_ns", diagnostics.replay_execution_device_wait_ns}}}};
 }
 
-Json file_cache_json(const ninfer::FileCacheStats& stats) {
-    return Json{{"read_bytes", stats.read_bytes},
-                {"written_bytes", stats.written_bytes},
-                {"read_ns", stats.read_ns},
-                {"write_ns", stats.write_ns},
-                {"staging_wait_ns", stats.staging_wait_ns},
-                {"reads", stats.reads},
-                {"writes", stats.writes},
-                {"pinned_bytes", stats.pinned_bytes},
-                {"integrity_bytes", stats.integrity_bytes},
-                {"pending_reads", stats.pending_reads},
-                {"pending_writes", stats.pending_writes},
-                {"ram_capacity_bytes", stats.ram_capacity_bytes},
-                {"ram_resident_bytes", stats.ram_resident_bytes},
-                {"ram_dirty_bytes", stats.ram_dirty_bytes},
-                {"ram_hit_bytes", stats.ram_hit_bytes},
-                {"ram_miss_bytes", stats.ram_miss_bytes},
-                {"disk_read_bytes", stats.disk_read_bytes},
-                {"disk_written_bytes", stats.disk_written_bytes},
-                {"disk_read_ns", stats.disk_read_ns},
-                {"disk_write_ns", stats.disk_write_ns},
-                {"disk_pwrite_ns", stats.disk_pwrite_ns},
-                {"disk_sync_ns", stats.disk_sync_ns},
-                {"disk_sync_calls", stats.disk_sync_calls},
-                {"disk_high_water_bytes", stats.disk_high_water_bytes},
-                {"filesystem_pending_bytes", stats.filesystem_pending_bytes},
-                {"filesystem_write_budget_bytes", stats.filesystem_write_budget_bytes},
-                {"ram_evictions", stats.ram_evictions},
-                {"prefetch_bytes", stats.prefetch_bytes},
-                {"prefetch_hit_bytes", stats.prefetch_hit_bytes},
-                {"prefetch_wasted_bytes", stats.prefetch_wasted_bytes},
-                {"prefetch_dropped_jobs", stats.prefetch_dropped_jobs},
-                {"pending_prefetches", stats.pending_prefetches},
-                {"pending_writebacks", stats.pending_writebacks},
-                {"pending_callbacks", stats.pending_callbacks}};
-}
+
 
 Json admission_json(const ninfer::GenerationAdmissionStats& stats) {
     const char* reason = nullptr;
@@ -665,9 +630,6 @@ std::string format_server_start_json(
              {"cuda_runtime_version", environment.cuda_runtime_version},
              {"cuda_driver_version", environment.cuda_driver_version}};
     record["argv"] = options.startup_argv;
-    record["hicache"]                        = file_cache_json(memory.file_cache);
-    record["hicache"]["host_resident_bytes"] = memory.host_context_resident_bytes;
-    record["hicache"]["host_metadata_bytes"] = memory.host_context_metadata_bytes;
     return record.dump();
 }
 
@@ -781,9 +743,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
     const ninfer::RuntimeHostWorkStats host =
         host_work_delta(previous.host_work, current.host_work);
     const std::uint64_t active_host = host_active_ns(host);
-    record["hicache"]                        = file_cache_json(current.file_cache);
-    record["hicache"]["host_resident_bytes"] = current.host_context_resident_bytes;
-    record["hicache"]["host_metadata_bytes"] = current.host_context_metadata_bytes;
     record["interval_seconds"]      = report.interval_seconds;
     record["final_interval"]        = report.final_interval;
     record["tokens"]                = Json{{"computed_prefill", report.computed_prefill_tokens},

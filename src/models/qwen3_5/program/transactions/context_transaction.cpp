@@ -147,7 +147,6 @@ ContextProgress ProgramImpl::poll_context(runtime::CancellationFlagView cancella
     // are already complete; an unready event yields without synchronizing or spinning.
     for (std::uint32_t phase = 0; phase < 2; ++phase) {
         if (tx.submitted && !context_completion_.ready()) { return out; }
-        if (host_kv_arena) { host_kv_arena->check_io_errors(); }
         for (const auto& transfer : tx.transfers) {
             tx.observations.push_back(context_transfer_observation(
                 transfer.resource, transfer.direction, transfer.work, transfer.page_count,

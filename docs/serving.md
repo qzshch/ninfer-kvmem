@@ -788,13 +788,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
-| `--host-context-mib N` | unified Host logical budget for StateImages, KV, retrieval metadata and in-flight destinations; pinned backing unless file KV is enabled | `8192 MiB + 8 native StateImages` |
+| `--host-context-mib N` | fixed pinned Host budget shared by StateImages, KV, retrieval metadata and in-flight destinations | `8192 MiB + 8 native StateImages` |
 | `--kvmem-window-pages N` | sparse per-lane Main KV working set; 64 tokens per page; zero preserves dense execution | `0` |
-| `--kv-file-dir DIR` | instance-private disk cold KV directory; requires nonzero Host budget | disabled |
-| `--hicache-ram-mib N` | RAM hot KV capacity in file mode | `0` |
-| `--hicache-state-mib N` | resident StateImage/retrieval metadata bound in file mode | `8192` |
-| `--hicache-prefetch` | bounded queued cold read hints; requires file KV and RAM hot capacity | off |
-| `--hicache-write-through` | idle asynchronous dirty hot-block writeback; requires file KV and RAM hot capacity | off |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--cors` | permissive browser CORS headers | off |
@@ -824,14 +819,9 @@ request fields override process flags, and `--greedy` finally forces temperature
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
 Host state and Main/Backend KV share one startup-fixed logical byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
-In file mode, KV uses bounded RAM hot blocks and private cold extents; StateImages remain pinned
-under the resident bound. Staging and general process memory require additional headroom.
-Cold KV alone cannot restore a prefix without its complete Native checkpoint and StateImage.
-Files are cleaned up when their owning Engine retires; they do not provide cross-process or
-restart-persistent prefix sharing. Sparse KVMem and tiered storage can be enabled together, or
-file storage can retain dense Native history independently. Sparse attention approximates dense
-full-history attention; byte-preserving tier copies do not establish quality equivalence.
-See [sparse working sets and tiered history](maintainer/hierarchical-context-cache.md) for
+Sparse attention approximates dense
+full-history attention; byte-preserving Host copies do not establish quality equivalence.
+See [sparse working sets and Native history](maintainer/sparse-native-context-cache.md) for
 capacity, publication, replay and counter semantics.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.

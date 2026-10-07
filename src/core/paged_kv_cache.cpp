@@ -672,22 +672,16 @@ template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                   std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                  cudaStream_t stream, bool file_submission) const {
+                                  cudaStream_t stream) const {
     TransferWork work;
-    const auto check = [file_submission](cudaError_t error) {
-        if (file_submission) {
-            FileKVBacking::check_cuda_submission(error);
-        } else {
-            CUDA_CHECK(error);
-        }
-    };
+
     const auto copy = [&](unsigned char* device_base, std::size_t device_pitch, auto* host_base,
                           std::size_t host_pitch, std::size_t width, std::size_t height) {
         if constexpr (ToHost) {
-            check(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width, height,
+            CUDA_CHECK(cudaMemcpy2DAsync(host_base, host_pitch, device_base, device_pitch, width, height,
                                     cudaMemcpyDeviceToHost, stream));
         } else {
-            check(cudaMemcpy2DAsync(device_base, device_pitch, host_base, host_pitch, width, height,
+            CUDA_CHECK(cudaMemcpy2DAsync(device_base, device_pitch, host_base, host_pitch, width, height,
                                     cudaMemcpyHostToDevice, stream));
         }
         ++work.copy_operations;
@@ -774,36 +768,7 @@ TransferWork DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> 
         throw std::invalid_argument("Paged KV D2H geometry or extent is inconsistent");
     }
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
-    const auto& host = destination.layout();
-    auto* file       = destination.file_backing();
-    if (!file) { return copy_host_pages<true>(source, destination.data(), stream); }
-    TransferWork work;
-    const auto chunk_pages = file->slot_bytes() / host.page_stride;
-    for (std::size_t begin = 0; begin < source.size(); begin += chunk_pages) {
-        const auto count = std::min(chunk_pages, source.size() - begin);
-        std::optional<FileKVBacking::Transfer> transfer;
-        try {
-            transfer = file->write(destination.file_offset() + begin * host.page_stride,
-                                   count * host.page_stride);
-            file->order_before(stream);
-            transfer->enqueue_before(file->stream());
-            const auto part = copy_host_pages<true>(source.subspan(begin, count), transfer->data(),
-                                                    file->stream(), true);
-            work.payload_bytes += part.payload_bytes;
-            work.copy_operations += part.copy_operations;
-            transfer->enqueue_after(file->stream());
-            file->order_after(stream);
-        } catch (...) {
-            if (transfer) transfer->abort();
-            if (cudaStreamSynchronize(file->stream()) != cudaSuccess) {
-                file->abort_after_failed_stream();
-            }
-            if (transfer) transfer->retire_after_drain();
-            file->drain();
-            throw;
-        }
-    }
-    return work;
+    return copy_host_pages<true>(source, destination.data(), stream);
 }
 
 TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
@@ -814,38 +779,7 @@ TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
-    const auto& host = source.layout();
-    auto* file       = source.file_backing();
-    if (!file) { return copy_host_pages<false>(destination, source.data(), stream); }
-    TransferWork work;
-    const auto chunk_pages = file->slot_bytes() / host.page_stride;
-    for (std::size_t begin = 0; begin < destination.size(); begin += chunk_pages) {
-        const auto count = std::min(chunk_pages, destination.size() - begin);
-        file->prefetch(source.file_offset() + begin * host.page_stride,
-                       (destination.size() - begin) * host.page_stride);
-        std::optional<FileKVBacking::Transfer> transfer;
-        try {
-            transfer = file->read(source.file_offset() + begin * host.page_stride,
-                                  count * host.page_stride);
-            file->order_before(stream);
-            transfer->enqueue_before(file->stream());
-            const auto part = copy_host_pages<false>(destination.subspan(begin, count),
-                                                     transfer->data(), file->stream(), true);
-            work.payload_bytes += part.payload_bytes;
-            work.copy_operations += part.copy_operations;
-            transfer->enqueue_after(file->stream());
-            file->order_after(stream);
-        } catch (...) {
-            if (transfer) transfer->abort();
-            if (cudaStreamSynchronize(file->stream()) != cudaSuccess) {
-                file->abort_after_failed_stream();
-            }
-            if (transfer) transfer->retire_after_drain();
-            file->drain();
-            throw;
-        }
-    }
-    return work;
+    return copy_host_pages<false>(destination, source.data(), stream);
 }
 
 std::vector<DeviceKVPageReservation>

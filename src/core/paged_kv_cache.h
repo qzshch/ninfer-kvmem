@@ -265,7 +265,7 @@ private:
     template <bool ToHost>
     TransferWork copy_host_pages(std::span<const DeviceKVPageHandle> pages,
                                  std::conditional_t<ToHost, std::byte*, const std::byte*> host,
-                                 cudaStream_t stream, bool file_submission = false) const;
+                                 cudaStream_t stream) const;
 
     struct HostTransferPlane {
         std::size_t host_offset    = 0;

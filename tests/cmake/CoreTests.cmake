@@ -69,13 +69,3 @@ ninfer_add_test(ninfer_jinja_test
 add_test(NAME ninfer_chat_templates_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
           $<TARGET_FILE:ninfer_jinja_test>)
-
-ninfer_add_test(ninfer_file_kv_cache_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_kv_cache.cpp"
-  LIBRARIES ninfer_core)
-set_tests_properties(ninfer_file_kv_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
-
-target_link_options(ninfer_file_kv_cache_test PRIVATE
-  "LINKER:--wrap=cudaLaunchHostFunc"
-  "LINKER:--wrap=cudaMemcpy2DAsync"
-  "LINKER:--wrap=cudaStreamSynchronize")

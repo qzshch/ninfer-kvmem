@@ -174,8 +174,7 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.prefilling_requests              = 0;
     snapshot.paused_requests                  = static_cast<std::uint32_t>(paused_.size());
     snapshot.replaying_requests               = 0;
-    if constexpr (requires { physical.file_cache; physical.host_resident_bytes; }) {
-        snapshot.file_cache = physical.file_cache;
+    if constexpr (requires { physical.host_resident_bytes; physical.host_metadata_bytes; }) {
         snapshot.host_context_resident_bytes = physical.host_resident_bytes;
         snapshot.host_context_metadata_bytes = physical.host_metadata_bytes;
     }

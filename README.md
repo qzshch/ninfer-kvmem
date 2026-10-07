@@ -127,10 +127,9 @@ See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-
 for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
-This fork adds an optional bounded KVMem working set and instance-local RAM/disk KV
-tiers on top of Native checkpoint ownership. See [hierarchical context cache](
-docs/maintainer/hierarchical-context-cache.md) for capacities, commands, IO policies,
-the sparse-attention quality boundary and telemetry semantics.
+This fork adds an optional bounded KVMem working set on top of Native checkpoint
+ownership and fixed pinned Host storage. See [sparse Native context cache](
+docs/maintainer/sparse-native-context-cache.md) for capacities and recovery contracts.
 
 ## Performance
 
@@ -267,7 +266,7 @@ capacities remain fixed for the process lifetime.
 - [Perplexity evaluation](docs/perplexity.md)
 - [Weight conversion and custom recipes](docs/weight-conversion.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Sparse KVMem and RAM/disk Native history](docs/maintainer/hierarchical-context-cache.md)
+- [Sparse KVMem and Native RAM history](docs/maintainer/sparse-native-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)

@@ -1953,15 +1953,6 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
     options.context_cache.enabled                      = false;
     options.context_cache.device_state_slots           = 0;
     options.context_cache.host_capacity_bytes          = 4ULL << 30;
-    options.context_cache.hicache_ram_capacity_bytes   = 16ULL << 20;
-    options.context_cache.hicache_state_capacity_bytes = 1ULL << 30;
-    options.context_cache.kv_file_directory            = std::filesystem::temp_directory_path() /
-                                              ("ninfer-sparse-pause-" + std::to_string(getpid()));
-    if (std::getenv("NINFER_SPARSE_BASELINE_RAM")) {
-        options.context_cache.kv_file_directory.clear();
-        options.context_cache.hicache_ram_capacity_bytes = 0;
-        options.context_cache.hicache_state_capacity_bytes = 0;
-    }
     if (std::getenv("NINFER_SPARSE_BASELINE_DENSE")) {
         options.max_concurrency = 1;
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(16384);
@@ -2344,9 +2335,7 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
         std::cout << "ok sparse query pause phase=" << phase
                   << " repetition=" << repetition << std::endl;
     }
-    if (!options.context_cache.kv_file_directory.empty()) {
-        std::filesystem::remove(options.context_cache.kv_file_directory);
-    }
+
 }
 
 SpeculativeBackend selected_backend(std::string_view name) {

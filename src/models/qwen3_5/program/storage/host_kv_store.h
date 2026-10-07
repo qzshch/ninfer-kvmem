@@ -154,7 +154,6 @@ public:
         return count ? prepare(pages, membership.first(count), pin_active_writers) : std::nullopt;
     }
 
-    void check_io_errors() const { arena_->check_io_errors(); }
 
     [[nodiscard]] HostKVAllocationView writable_view(HostKVExtentReservation& reservation) {
         validate(reservation);
@@ -848,7 +847,6 @@ KVAddressSpaceStore::apply_device_placement(KVAddressSpaceHandle handle,
                 if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                     throw std::runtime_error("KV device placement stage-out transfer failed");
                 }
-                host_kv_extents.check_io_errors();
             } catch (...) {
                 // Earlier extents may already be submitted. Keep every reservation
                 // and source pin alive until that stream is drained.
@@ -946,7 +944,6 @@ KVAddressSpaceStore::apply_device_placement(KVAddressSpaceHandle handle,
             if (cudaStreamSynchronize(transfer_stream) != cudaSuccess) {
                 throw std::runtime_error("KV device placement stage-in transfer failed");
             }
-            host_kv_extents.check_io_errors();
             counts.telemetry.h2d_submit_wait_ns = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(TraceClock::now() - copy_begin)
                     .count());

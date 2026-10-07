@@ -419,35 +419,12 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
-    const auto tiered = parse({"ninfer-serve",         "model.ninfer",
-                               "--max-context",        "262144",
-                               "--kv-capacity",        "auto",
-                               "--kvmem-window-pages", "576",
-                               "--max-concurrency",    "2",
-                               "--host-context-mib",   "32768",
-                               "--kv-file-dir",        "/var/tmp/ninfer-kv",
-                               "--hicache-ram-mib",    "4096",
-                               "--hicache-state-mib",  "2048",
-                               "--hicache-prefetch",   "--hicache-write-through"});
-    failures += check(tiered.kvmem_window_pages == 576 && tiered.max_concurrency == 2 &&
-                          tiered.context_cache.kv_file_directory == "/var/tmp/ninfer-kv" &&
-                          tiered.context_cache.hicache_ram_capacity_bytes == (4096ULL << 20) &&
-                          tiered.context_cache.hicache_state_capacity_bytes == (2048ULL << 20) &&
-                          tiered.context_cache.hicache_prefetch &&
-                          tiered.context_cache.hicache_write_through &&
-                          tiered.context_cache.host_capacity_bytes == (32768ULL << 20),
-                      "tiered options did not preserve separate logical, RAM and State limits");
-    for (const auto flag : {"--hicache-ram-mib", "--hicache-prefetch"}) {
-        bool rejected = false;
-        try {
-            if (std::string(flag) == "--hicache-prefetch") {
-                (void)parse({"ninfer-serve", "model.ninfer", flag});
-            } else {
-                (void)parse({"ninfer-serve", "model.ninfer", flag, "1"});
-            }
-        } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "RAM/prefetch without file backing was accepted");
-    }
+    const auto sparse = parse({"ninfer-serve", "model.ninfer", "--max-context", "262144",
+                               "--kv-capacity", "77824", "--kvmem-window-pages", "576",
+                               "--max-concurrency", "2", "--host-context-mib", "8192"});
+    failures += check(sparse.kvmem_window_pages == 576 && sparse.max_concurrency == 2 &&
+                          sparse.context_cache.host_capacity_bytes == (8192ULL << 20),
+                      "Native sparse options did not preserve logical context and Host quota");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
