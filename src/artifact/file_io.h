@@ -19,6 +19,8 @@ public:
     [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
 
     void read_exact(std::uint64_t offset, std::span<std::byte> destination) const;
+    // Serial preparation is required before concurrent read_direct calls.
+    void prepare_direct() const;
     [[nodiscard]] std::size_t read_direct(std::uint64_t offset,
                                           std::span<std::byte> destination) const;
 

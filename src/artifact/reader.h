@@ -41,6 +41,8 @@ public:
     [[nodiscard]] std::vector<std::byte> read_range(std::uint64_t offset,
                                                     std::uint64_t bytes) const;
     [[nodiscard]] std::vector<std::byte> read_object(ObjectHandle handle) const;
+    // Opens/validates continuation and direct fd on the caller before worker reads.
+    void prepare_direct(std::size_t file_index) const;
     [[nodiscard]] std::size_t read_direct(std::size_t file_index, std::uint64_t file_offset,
                                           std::span<std::byte> destination) const;
 

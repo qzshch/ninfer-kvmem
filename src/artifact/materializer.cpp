@@ -1,5 +1,6 @@
 #include "artifact/materializer.h"
 
+#include "artifact/bounded_prefetch.h"
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
@@ -11,8 +12,10 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 namespace ninfer::artifact {
@@ -20,6 +23,14 @@ namespace {
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaximumSlotCount = 4;
+
+std::size_t weight_read_threads() {
+    const auto* value = std::getenv("NINFER_WEIGHT_READ_THREADS");
+    if (!value || std::string_view(value) == "1") { return 1; }
+    if (std::string_view(value) == "2") { return 2; }
+    if (std::string_view(value) == "4") { return 4; }
+    throw ArtifactError("NINFER_WEIGHT_READ_THREADS must be 1, 2 or 4");
+}
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -45,6 +56,16 @@ public:
             check_cuda(cudaEventSynchronize(event), "wait for weight staging transfer");
             pending = false;
         }
+    }
+
+    // Only the uploading caller queries CUDA. Workers never reuse a pending slot.
+    bool try_wait() {
+        if (!pending) { return true; }
+        const auto status = cudaEventQuery(event);
+        if (status == cudaErrorNotReady) { return false; }
+        check_cuda(status, "query weight staging transfer");
+        pending = false;
+        return true;
     }
 
     PinnedHostBuffer buffer;
@@ -130,6 +151,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     if (plan.source != &reader || plan.object_count != reader.directory().objects.size()) {
         throw ArtifactError("materialization plan belongs to another load session");
     }
+    const auto requested_read_threads = weight_read_threads();
     const StartupObserver no_observer;
     const auto& observer = startup_observer ? *startup_observer : no_observer;
     std::uint64_t total  = 0;
@@ -242,46 +264,108 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     pin_phase.complete();
     TransferCompletion completion{device.transfer_stream};
-    std::size_t next_slot  = 0;
     std::size_t next_range = 0;
     std::uint64_t copied   = 0;
     const auto start       = std::chrono::steady_clock::now();
-    for (const auto& span : spans) {
-        for (auto source = span.begin; source < span.end; source += slot_bytes) {
-            auto& slot = *slots[next_slot++ % slot_count];
-            slot.wait();
-            const auto remaining = span.end - source;
+    // The consumer remains serial and preserves the original file/range upload order.
+    const auto upload = [&](Slot& slot, const detail::DirectReadBlock& block,
+                            std::size_t received) {
+        if (received < std::min<std::uint64_t>(block.request, block.remaining)) {
+            throw ArtifactError("direct read ended before the required payload");
+        }
+        out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
+        const auto chunk_end = checked_add(block.source, received, "read block end");
+        while (next_range < ranges.size() && ranges[next_range].file == block.file &&
+               ranges[next_range].begin < chunk_end) {
+            const auto& range = ranges[next_range];
+            const auto begin  = std::max(block.source, range.begin);
+            const auto end    = std::min(chunk_end, range.end);
+            if (begin < end) {
+                check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
+                                           static_cast<const std::byte*>(slot.buffer.data()) +
+                                               (begin - block.source),
+                                           static_cast<std::size_t>(end - begin),
+                                           cudaMemcpyHostToDevice, device.transfer_stream),
+                           "upload weight bytes");
+                copied = checked_add(copied, end - begin, "copied bytes");
+            }
+            if (range.end > chunk_end) { break; }
+            ++next_range;
+        }
+        check_cuda(cudaEventRecord(slot.event, device.transfer_stream),
+                   "record weight staging completion");
+        slot.pending = true;
+        phase.progress(copied, total);
+    };
+    const auto read_threads = std::min(requested_read_threads, slot_count);
+    if (read_threads == 1) {
+        // Default retains the original caller-thread read/wait/upload pipeline.
+        std::size_t next_slot = 0;
+        for (const auto& span : spans) {
+            for (auto source = span.begin; source < span.end; source += slot_bytes) {
+                auto& slot = *slots[next_slot++ % slot_count];
+                slot.wait();
+                const auto remaining = span.end - source;
+                const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
+                const auto received = reader.read_direct(
+                    span.file, source, {static_cast<std::byte*>(slot.buffer.data()), request});
+                upload(slot, {span.file, source, remaining, request}, received);
+            }
+        }
+    } else {
+        // Reader continuation files and O_DIRECT fds are lazy. Prepare all files on
+        // this caller before workers make read-only pread calls into distinct slots.
+        for (std::size_t i = 0; i < spans.size(); ++i) {
+            if (!i || spans[i - 1].file != spans[i].file) {
+                reader.prepare_direct(spans[i].file);
+            }
+        }
+        detail::BoundedPrefetch prefetch(
+            slot_count, read_threads, [&](std::size_t slot, const detail::DirectReadBlock& block) {
+                return reader.read_direct(
+                    block.file, block.source,
+                    {static_cast<std::byte*>(slots[slot]->buffer.data()), block.request});
+            });
+        std::size_t next_span = 0;
+        auto next_source     = spans.front().begin;
+        std::size_t scheduled = 0;
+        std::size_t consumed  = 0;
+        // At most one descriptor per existing pinned slot: no full-model job queue.
+        const auto schedule = [&](bool wait_for_slot) {
+            if (next_span == spans.size() || scheduled - consumed == slot_count) {
+                return false;
+            }
+            const auto slot_index = scheduled % slot_count;
+            auto& slot            = *slots[slot_index];
+            if (wait_for_slot) { slot.wait(); }
+            else if (!slot.try_wait()) { return false; }
+            const auto& span = spans[next_span];
+            const auto remaining = span.end - next_source;
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                 slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-            const auto received  = reader.read_direct(
-                span.file, source, {static_cast<std::byte*>(slot.buffer.data()), request});
-            if (received < std::min<std::uint64_t>(request, remaining)) {
-                throw ArtifactError("direct read ended before the required payload");
+            prefetch.submit(slot_index, {span.file, next_source, remaining, request});
+            ++scheduled;
+            next_source = checked_add(next_source, std::min<std::uint64_t>(slot_bytes, remaining),
+                                      "next direct block");
+            if (next_source == span.end) {
+                ++next_span;
+                if (next_span != spans.size()) { next_source = spans[next_span].begin; }
             }
-            out.stats_.read_bytes = checked_add(out.stats_.read_bytes, received, "read bytes");
-            const auto chunk_end  = checked_add(source, received, "read block end");
-            while (next_range < ranges.size() && ranges[next_range].file == span.file &&
-                   ranges[next_range].begin < chunk_end) {
-                const auto& range = ranges[next_range];
-                const auto begin  = std::max(source, range.begin);
-                const auto end    = std::min(chunk_end, range.end);
-                if (begin < end) {
-                    check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                               static_cast<const std::byte*>(slot.buffer.data()) +
-                                                   (begin - source),
-                                               static_cast<std::size_t>(end - begin),
-                                               cudaMemcpyHostToDevice, device.transfer_stream),
-                               "upload weight bytes");
-                    copied = checked_add(copied, end - begin, "copied bytes");
-                }
-                if (range.end > chunk_end) { break; }
-                ++next_range;
-            }
-            check_cuda(cudaEventRecord(slot.event, device.transfer_stream),
-                       "record weight staging completion");
-            slot.pending = true;
-            phase.progress(copied, total);
+            return true;
+        };
+        while (schedule(false)) {}
+        while (consumed < scheduled) {
+            const auto slot_index = consumed % slot_count;
+            const auto ready      = prefetch.take(slot_index);
+            upload(*slots[slot_index], ready.block, ready.received);
+            ++consumed;
+            while (schedule(false)) {}
+            // Keep consuming ready reads while an older upload is still pending;
+            // synchronize its event only when no more prefetched work can be consumed.
+            if (consumed == scheduled) { (void)schedule(true); }
         }
+        // prefetch joins before TransferCompletion, slots and the device arena unwind.
     }
     for (const auto& slot : slots) { slot->wait(); }
     completion.finish();

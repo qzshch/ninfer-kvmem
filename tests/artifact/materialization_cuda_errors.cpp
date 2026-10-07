@@ -6,11 +6,13 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 namespace {
 
-enum class Failure { None, EventCreation, EventRecord };
+enum class Failure { None, EventCreation, EventRecord, EventQuery };
 
 struct Trace {
     Failure failure                = Failure::None;
@@ -38,6 +40,7 @@ cudaError_t CUDARTAPI __real_cudaFree(void*);
 cudaError_t CUDARTAPI __real_cudaFreeHost(void*);
 cudaError_t CUDARTAPI __real_cudaEventCreateWithFlags(cudaEvent_t*, unsigned int);
 cudaError_t CUDARTAPI __real_cudaEventRecord(cudaEvent_t, cudaStream_t);
+cudaError_t CUDARTAPI __real_cudaEventQuery(cudaEvent_t);
 cudaError_t CUDARTAPI __real_cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind,
                                              cudaStream_t);
 cudaError_t CUDARTAPI __real_cudaStreamSynchronize(cudaStream_t);
@@ -85,6 +88,14 @@ cudaError_t CUDARTAPI __wrap_cudaEventRecord(cudaEvent_t event, cudaStream_t str
     return __real_cudaEventRecord(event, stream);
 }
 
+cudaError_t CUDARTAPI __wrap_cudaEventQuery(cudaEvent_t event) {
+    if (trace.failure == Failure::EventQuery && !trace.injected && trace.upload_pending) {
+        trace.injected = true;
+        return cudaErrorInvalidResourceHandle;
+    }
+    return __real_cudaEventQuery(event);
+}
+
 cudaError_t CUDARTAPI __wrap_cudaMemcpyAsync(void* destination, const void* source,
                                              std::size_t bytes, cudaMemcpyKind kind,
                                              cudaStream_t stream) {
@@ -104,6 +115,37 @@ cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
 }
 
 namespace ninfer::test {
+
+void materialization_large_cuda_errors(DeviceContext& device, const std::filesystem::path& path,
+                                      std::size_t bytes) {
+    using namespace artifact;
+    using namespace artifact_fixture;
+    const auto* threads = std::getenv("NINFER_WEIGHT_READ_THREADS");
+    const bool parallel = threads && (std::string_view(threads) == "2" ||
+                                     std::string_view(threads) == "4");
+    for (const auto failure : {Failure::EventCreation, Failure::EventRecord, Failure::EventQuery}) {
+        if (failure == Failure::EventQuery && !parallel) { continue; }
+        Reader reader(path);
+        Binder binder(reader);
+        (void)binder.parameter("large", {bytes / 2});
+        trace       = {.failure = failure};
+        bool caught = false;
+        try { (void)materialize(reader, std::move(binder).finish(), device); }
+        catch (const ArtifactError&) { caught = true; }
+        const auto result = std::exchange(trace, {});
+        require(result.injected && caught, "large staging CUDA error did not propagate");
+        require(result.host_allocations > 0 && result.device_allocations > 0 &&
+                    result.host_allocations == result.host_releases &&
+                    result.device_allocations == result.device_releases,
+                "large failed loading leaked pinned or device storage");
+        require(!result.upload_pending && !result.released_during_upload,
+                "large failed loading released storage before completing uploads");
+        if (failure != Failure::EventCreation) {
+            require(result.uploads > 0, "large failure never submitted a copy");
+            require(result.host_allocations == 4, "large failure did not allocate four slots");
+        }
+    }
+}
 
 void materialization_cuda_errors(DeviceContext& device) {
     using namespace artifact;

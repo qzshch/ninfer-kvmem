@@ -13,6 +13,8 @@
 
 namespace ninfer::test {
 void materialization_cuda_errors(DeviceContext& device);
+void materialization_large_cuda_errors(DeviceContext& device, const std::filesystem::path& path,
+                                      std::size_t bytes);
 }
 
 namespace {
@@ -190,6 +192,9 @@ void staging_reuse(DeviceContext& device) {
                    std::min(page.size(), bytes - offset));
     }
     file.close();
+    // Small fixtures use one slot even with env2/4. This fixture also exercises
+    // parallel-read cleanup while copies may be pending, then checks recovery bytes.
+    ninfer::test::materialization_large_cuda_errors(device, fixture.entry, bytes);
     Reader reader(fixture.entry);
     Binder binder(reader);
     (void)binder.parameter("large", {bytes / 2});

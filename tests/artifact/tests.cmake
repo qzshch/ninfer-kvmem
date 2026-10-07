@@ -1,3 +1,8 @@
+ninfer_add_test(ninfer_artifact_bounded_prefetch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bounded_prefetch.cpp"
+  LIBRARIES Threads::Threads)
+set_tests_properties(ninfer_artifact_bounded_prefetch_test PROPERTIES TIMEOUT 15)
+
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
@@ -13,6 +18,7 @@ target_link_options(ninfer_artifact_materialization_test PRIVATE
   "LINKER:--wrap=cudaFreeHost"
   "LINKER:--wrap=cudaEventCreateWithFlags"
   "LINKER:--wrap=cudaEventRecord"
+  "LINKER:--wrap=cudaEventQuery"
   "LINKER:--wrap=cudaMemcpyAsync"
   "LINKER:--wrap=cudaStreamSynchronize")
 

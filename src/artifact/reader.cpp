@@ -169,6 +169,10 @@ std::vector<std::byte> Reader::read_object(ObjectHandle handle) const {
     return read_range(object_offset(object), object_bytes(object));
 }
 
+void Reader::prepare_direct(std::size_t file_index) const {
+    impl_->file(file_index).prepare_direct();
+}
+
 std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offset,
                                 std::span<std::byte> destination) const {
     return impl_->file(file_index).read_direct(file_offset, destination);
