@@ -51,6 +51,35 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+## Optional hierarchical cache
+
+HiCache is disabled unless `--kv-file-dir` is supplied. Without it, this build uses
+the native fixed Host backing and prefix reuse. Enabling or disabling the tier is
+a startup choice and requires restarting the server.
+
+Add these options to use a bounded RAM KV hot cache and a cold file backing:
+
+```bash
+--kv-file-dir /path/to/cache \
+--host-context-mib 8192 \
+--hicache-ram-mib 512 \
+--hicache-state-mib 2048
+```
+
+`--host-context-mib` is the logical ledger shared by StateImages, KV and metadata.
+The hot cache and resident State budget bound different physical allocations;
+they are additional RAM consumers, not interchangeable with that logical quota.
+Zero hot RAM uses the cold path directly. Prefetch and write-through are also off
+unless `--hicache-prefetch` and `--hicache-write-through` are supplied. Prefetch
+requires a positive hot RAM budget.
+
+First measure native prefix reuse on the same workload. HiCache can save more
+prefill only when it retains a prefix that the native cache would recompute.
+Compare that avoided work with State restore, KV placement, worker/staging wait,
+checksumming and storage IO. A faster disk cannot improve an already complete
+native cache hit. Cold files belong to the current process; this is not persistent
+cross-instance prefix sharing.
+
 ## Endpoints
 
 | Method and path | Behavior |
