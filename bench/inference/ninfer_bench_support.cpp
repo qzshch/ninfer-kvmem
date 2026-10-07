@@ -1,4 +1,5 @@
 #include "ninfer_bench_support.h"
+#include "product/constraint_observation.h"
 #include "product/speculative_options.h"
 
 #include <algorithm>
@@ -869,6 +870,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
                 << (result.test.has_decode() ? std::to_string(decode_engine_tokens(result, rep))
                                              : "null")
                 << ",\n";
+            out << "          \"constraint\": "
+                << product::constraint_observation_json(rep.constraint).dump() << ",\n"
+                << "          \"constraint_draft_wait_exposed_seconds\": "
+                << number(rep.constraint_draft_wait_exposed_seconds) << ",\n";
             append_timings_json(out, rep.timings, "          ");
             out << ",\n";
             append_speculative_json(out, rep.speculative, "          ");

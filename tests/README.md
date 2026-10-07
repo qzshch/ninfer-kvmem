@@ -196,12 +196,15 @@ Public-HTTP latency and output gaps are measured separately by the
 
 `ninfer_qwen3_5_tools_real_test [none|mtp|dflash|dflash2] [graph|eager|basic|snapshot|replay|cancel] [concurrency]`
 uses `NINFER_TEST_ARTIFACT` for strict tools, thinking, raw continuation, mixed batches, and
-call/result prefix reuse. `basic` checks default constraints with open/complex schemas, continuation,
+call/result prefix reuse, and required-tool → JSON continuation with committed constraint observations.
+`basic` checks default constraints with open/complex schemas, continuation,
 streaming and mixed strict/basic/free rows. Snapshot/Replay modes force resource pressure and
 validate the completed argument value after recovery; `cancel` interrupts the paused request.
 `NINFER_TEST_TOOL_REPORT` appends schema/output/timing JSONL.
 `python3 tests/models/qwen3_5/test_tool_schema.py` checks the native Qwen grammar and decoder against
-`jsonschema` (dependencies in `tests/text/requirements.txt`).
+`jsonschema` (dependencies in `tests/text/requirements.txt`), including string pattern/Unicode-length
+intersections. The JSON Schema oracle also covers finite-value filtering, reference/union siblings,
+closed-object and array intersections, and recursive conjunctions.
 
 `ninfer_qwen3_5_grammar_real_test [none|mtp|dflash|dflash2] [graph|eager] [concurrency] [vision]` uses
 `NINFER_TEST_DRAFT_TOKENS` to override the default draft count of three and

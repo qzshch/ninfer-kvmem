@@ -1,8 +1,10 @@
 #include "models/qwen3_5/frontend/tool_contract.h"
+#include "text/json_schema.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -114,7 +116,11 @@ std::uint8_t value_type(const Json& value) {
     if (value.is_null()) return type_bit(SchemaType::Null);
     if (value.is_object()) return type_bit(SchemaType::Object);
     if (value.is_array()) return type_bit(SchemaType::Array);
-    return type_bit(value.is_number_integer() ? SchemaType::Integer : SchemaType::Number);
+    // JSON Schema classifies numbers by value: 1.0 belongs to the integer domain too.
+    const bool integer =
+        value.is_number_integer() ||
+        (value.is_number_float() && std::floor(value.get<double>()) == value.get<double>());
+    return type_bit(integer ? SchemaType::Integer : SchemaType::Number);
 }
 
 std::uint8_t domain(const Json& source, const Json& document, std::set<std::string> seen = {}) {
@@ -140,11 +146,13 @@ std::uint8_t domain(const Json& source, const Json& document, std::set<std::stri
         for (const auto& branch : node[key]) combined |= domain(branch, document, seen);
         types &= combined;
     }
+    if (node.contains("allOf"))
+        for (const auto& branch : node["allOf"]) types &= domain(branch, document, seen);
     return types;
 }
 
 void prepare_strict_parameters(Contract::Tool& tool) {
-    const Json document = Json::parse(tool.schema_json);
+    const Json document = Json::parse(text::prepare_json_schema(tool.schema_json));
     std::set<std::string> seen;
     const Json& root = resolve(document, document, seen);
     if (!root.is_object() || root.value("type", std::string("object")) != "object")
@@ -261,6 +269,13 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
             if (!tool.strict) continue;
             try {
                 prepare_strict_parameters(tool);
+            } catch (const RequestError& error) {
+                if (error.kind() == RequestErrorKind::InvalidToolConstraint ||
+                    error.source() == RequestErrorSource::Tools)
+                    throw;
+                throw RequestError(error.kind(), "tool '" + tool.name + "': " + error.what(),
+                                   parameter_path(tool) + error.pointer(),
+                                   RequestErrorSource::Tools);
             } catch (const Json::exception& error) {
                 fail("invalid parameters for tool '" + tool.name + "': " + error.what(),
                      parameter_path(tool));

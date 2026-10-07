@@ -1199,22 +1199,6 @@ Result<StringSpec, SchemaError> SchemaParser::ParseString(const picojson::object
             std::to_string(spec.max_length)
     );
   }
-  // A pattern or built-in format takes the whole GenerateString branch, so minLength/maxLength
-  // would be dropped silently (issue #749). Warn here rather than in GenerateString: the XML
-  // tool-calling converter overrides that method, but every converter goes through ParseString.
-  if (spec.min_length != 0 || spec.max_length != -1) {
-    const char* generative = nullptr;
-    if (spec.pattern.has_value()) {
-      generative = "pattern";
-    } else if (spec.format.has_value() && JSONSchemaConverter::IsBuiltinFormat(*spec.format)) {
-      generative = "format";
-    }
-    if (generative != nullptr) {
-      XGRAMMAR_LOG(WARNING) << generative
-                            << " combined with minLength/maxLength is not supported; ignoring "
-                               "minLength/maxLength";
-    }
-  }
   return ResultOk(std::move(spec));
 }
 
@@ -2383,176 +2367,7 @@ int32_t JSONSchemaConverter::ExcludingString(
     XGRAMMAR_CHECK(filtered.IsOk());
     fsm = std::move(filtered).Unwrap();
   }
-  // Do not emit paths that can never complete after exclusions. Otherwise a matcher
-  // could accept a forbidden alternative's prefix and reach an all-rejected mask later.
-  std::vector<std::vector<int>> predecessors(fsm.NumStates());
-  for (int state = 0; state < fsm.NumStates(); ++state) {
-    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-      predecessors[edge.target].push_back(state);
-    }
-  }
-  std::vector<bool> productive(fsm.NumStates(), false);
-  std::vector<int> worklist(fsm.GetEnds().begin(), fsm.GetEnds().end());
-  for (int state : worklist) productive[state] = true;
-  for (size_t index = 0; index < worklist.size(); ++index) {
-    for (int state : predecessors[worklist[index]]) {
-      if (!productive[state]) {
-        productive[state] = true;
-        worklist.push_back(state);
-      }
-    }
-  }
-  if (!productive[fsm.GetStart()]) {
-    return Unsatisfiable();
-  }
-
-  // Collapse UTF-8 paths into codepoint transitions before emitting character classes.
-  // Emitting individual continuation bytes as string literals would not round-trip through
-  // EBNF, whose escaped string literals represent Unicode codepoints rather than raw bytes.
-  struct CodepointRange {
-    int min, max, target;
-  };
-  using Ranges = std::vector<CodepointRange>;
-  auto merge_ranges = [](Ranges ranges) {
-    std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
-      return std::tie(a.target, a.min, a.max) < std::tie(b.target, b.min, b.max);
-    });
-    Ranges merged;
-    for (const auto& range : ranges) {
-      if (!merged.empty() && merged.back().target == range.target &&
-          range.min <= merged.back().max + 1) {
-        merged.back().max = std::max(merged.back().max, range.max);
-      } else {
-        merged.push_back(range);
-      }
-    }
-    return merged;
-  };
-  auto append_ranges = [](Ranges* ranges, int min, int max, int shift, const CodepointRange& suffix
-                       ) {
-    if (suffix.min == 0 && suffix.max == (1 << shift) - 1) {
-      ranges->push_back({min << shift, (max << shift) | suffix.max, suffix.target});
-    } else {
-      for (int prefix = min; prefix <= max; ++prefix) {
-        ranges->push_back(
-            {(prefix << shift) | suffix.min, (prefix << shift) | suffix.max, suffix.target}
-        );
-      }
-    }
-  };
-  // Memoize suffixes so wide Unicode classes do not enumerate every codepoint.
-  std::map<std::pair<int, int>, Ranges> suffix_cache;
-  std::function<const Ranges&(int, int)> suffix_ranges = [&](int state,
-                                                             int remaining) -> const Ranges& {
-    auto [it, inserted] = suffix_cache.emplace(std::make_pair(state, remaining), Ranges{});
-    if (!inserted) return it->second;
-    Ranges ranges;
-    if (remaining == 0) {
-      ranges.push_back({0, 0, state});
-    } else {
-      for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-        if (!productive[edge.target]) continue;
-        XGRAMMAR_CHECK(edge.IsCharRange());
-        int min = std::max(edge.min, 0x80), max = std::min(edge.max, 0xbf);
-        if (min > max) continue;
-        for (const auto& suffix : suffix_ranges(edge.target, remaining - 1)) {
-          append_ranges(&ranges, min & 0x3f, max & 0x3f, 6 * (remaining - 1), suffix);
-        }
-      }
-    }
-    it->second = merge_ranges(std::move(ranges));
-    return it->second;
-  };
-
-  std::vector<int32_t> rules(fsm.NumStates(), -1);
-  std::vector<int> pending{fsm.GetStart()};
-  // Share complete fallback branches across key prefixes to reuse their token masks.
-  // The key contains the target state followed by every codepoint interval.
-  std::map<std::vector<int32_t>, int32_t> shared_key_continuations;
-  rules[fsm.GetStart()] = builder_.AddEmptyRuleWithHint(rule_name + "_exclude");
-  for (size_t index = 0; index < pending.size(); ++index) {
-    int state = pending[index];
-    Ranges ranges;
-    for (const auto& edge : fsm.GetFsm().GetEdges(state)) {
-      if (!productive[edge.target]) continue;
-      XGRAMMAR_CHECK(edge.IsCharRange());
-      if (edge.min < 128) {
-        ranges.push_back({edge.min, std::min(edge.max, 127), edge.target});
-      }
-      const int leading_min[] = {0, 0xc2, 0xe0, 0xf0};
-      const int leading_max[] = {0, 0xdf, 0xef, 0xf4};
-      for (int remaining = 1; remaining <= 3; ++remaining) {
-        int min = std::max(edge.min, leading_min[remaining]);
-        int max = std::min(edge.max, leading_max[remaining]);
-        if (min > max) continue;
-        int mask = (1 << (6 - remaining)) - 1;
-        Ranges unicode_ranges;
-        for (const auto& suffix : suffix_ranges(edge.target, remaining)) {
-          append_ranges(&unicode_ranges, min & mask, max & mask, 6 * remaining, suffix);
-        }
-        // The byte FSM can contain non-canonical UTF-8 paths. Never turn an overlong
-        // encoding into a second transition for an ASCII character (bypassing exclusions).
-        const int codepoint_min[] = {0, 0x80, 0x800, 0x10000};
-        const int codepoint_max[] = {0, 0x7ff, 0xffff, 0x10ffff};
-        for (auto range : unicode_ranges) {
-          range.min = std::max(range.min, codepoint_min[remaining]);
-          range.max = std::min(range.max, codepoint_max[remaining]);
-          if (range.min <= range.max) {
-            // Raw tool strings and JSON strings contain Unicode scalar values.
-            if (range.min <= 0xd7ff)
-              ranges.push_back({range.min, std::min(range.max, 0xd7ff), range.target});
-            if (range.max >= 0xe000)
-              ranges.push_back({std::max(range.min, 0xe000), range.max, range.target});
-          }
-        }
-      }
-    }
-    std::map<int, std::vector<GrammarBuilder::CharacterClassElement>> transitions;
-    for (const auto& range : merge_ranges(std::move(ranges))) {
-      transitions[range.target].push_back({range.min, range.max});
-    }
-    std::vector<int32_t> choices;
-    // Keep the closing quote on the accepting body states. A nullable body rule
-    // would otherwise finish at every character and force token masks to speculate
-    // across its parent rules. The quote is appended AFTER the exclusion intersection:
-    // it is JSON syntax, not string content subject to excludes.
-    if (fsm.IsEndState(state)) {
-      choices.push_back(close_json_string ? ByteString("\"") : Empty());
-    }
-    for (const auto& [target, codepoints] : transitions) {
-      if (rules[target] == -1) {
-        rules[target] = builder_.AddEmptyRuleWithHint(rule_name + "_exclude");
-        pending.push_back(target);
-      }
-      bool single_ascii = codepoints.size() == 1 && codepoints[0].lower == codepoints[0].upper &&
-                          codepoints[0].upper <= 0x7f;
-      // Keep self-loops local for the compiler's speculative string-mask fast path.
-      if (!excluded_keys.empty() && !single_ascii && target != state) {
-        std::vector<int32_t> key{target};
-        key.reserve(1 + codepoints.size() * 2);
-        for (const auto& range : codepoints) {
-          key.push_back(range.lower);
-          key.push_back(range.upper);
-        }
-        auto [it, inserted] = shared_key_continuations.emplace(std::move(key), -1);
-        if (inserted) {
-          it->second = builder_.AddRuleWithHint(
-              rule_name + "_exclude_continuation",
-              Sequence({builder_.AddCharacterClass(codepoints), RuleRef(rules[target])})
-          );
-        }
-        choices.push_back(RuleRef(it->second));
-      } else {
-        choices.push_back(Sequence({builder_.AddCharacterClass(codepoints), RuleRef(rules[target])})
-        );
-      }
-    }
-    if (choices.empty()) {
-      choices.push_back(Unsatisfiable());
-    }
-    builder_.UpdateRuleBody(rules[state], Choice(choices));
-  }
-  return RuleRef(rules[fsm.GetStart()]);
+  return AddScalarStringFSM(builder_, fsm, rule_name, close_json_string, !excluded_keys.empty());
 }
 
 int32_t JSONSchemaConverter::GenerateInteger(
@@ -2682,6 +2497,15 @@ int32_t JSONSchemaConverter::GenerateNumber(const NumberSpec& spec, const std::s
 }
 
 int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::string& rule_name) {
+  if (!spec.extra_patterns.empty() ||
+      (spec.pattern && (spec.min_length != 0 || spec.max_length != -1))) {
+    auto patterns = spec.extra_patterns;
+    if (spec.pattern) patterns.insert(patterns.begin(), *spec.pattern);
+    return Sequence(
+        {ByteString("\""),
+         AddSubGrammar(StringConstraints(patterns, spec.min_length, spec.max_length, {}, true)),
+         ByteString("\"")});
+  }
   // Check for format
   if (spec.format.has_value()) {
     auto regex = JSONFormatToRegexPattern(*spec.format);
@@ -3537,8 +3361,20 @@ int32_t JSONSchemaConverter::GenerateAllOf(const AllOfSpec& spec, const std::str
   if (spec.schemas.size() == 1) {
     return GenerateFromSpec(spec.schemas[0], rule_name + "_case_0");
   }
-  XGRAMMAR_LOG(FATAL) << "allOf with multiple branches is not supported";
-  return GenerateFromSpec(SchemaSpec::Make(AnySpec{}, "", "any"), rule_name);
+  StringSpec joined;
+  for (const auto& schema : spec.schemas) {
+    const auto* str = std::get_if<StringSpec>(&schema->spec);
+    XGRAMMAR_CHECK(str) << "allOf must be normalized to supported conjunctions";
+    joined.min_length = std::max(joined.min_length, str->min_length);
+    if (str->max_length >= 0)
+      joined.max_length =
+          joined.max_length < 0 ? str->max_length : std::min(joined.max_length, str->max_length);
+    if (str->pattern) joined.extra_patterns.push_back(*str->pattern);
+    joined.extra_patterns.insert(joined.extra_patterns.end(), str->extra_patterns.begin(),
+                                 str->extra_patterns.end());
+  }
+  if (joined.max_length >= 0 && joined.min_length > joined.max_length) return Unsatisfiable();
+  return GenerateString(joined, rule_name);
 }
 
 int32_t JSONSchemaConverter::GenerateTypeArray(
@@ -3979,6 +3815,15 @@ int32_t XMLToolCallingConverter::GenerateString(
 ) {
   if (nested_object_level_ <= 1) {
     if (json_format_ == JSONFormat::kQwenXML) {
+      if (!spec.extra_patterns.empty() ||
+          (spec.pattern && (spec.min_length != 0 || spec.max_length != -1))) {
+        auto patterns = spec.extra_patterns;
+        if (spec.pattern) patterns.insert(patterns.begin(), *spec.pattern);
+        auto excluded = excludes_;
+        excluded.push_back("\n</parameter>");
+        return AddSubGrammar(
+            StringConstraints(patterns, spec.min_length, spec.max_length, excluded, false));
+      }
       std::string regex = spec.pattern ? SchemaStringPattern(*spec.pattern)
           : R"([^\uD800-\uDFFF])" + std::string("{") + std::to_string(spec.min_length) + "," +
               (spec.max_length < 0 ? "" : std::to_string(spec.max_length)) + "}";

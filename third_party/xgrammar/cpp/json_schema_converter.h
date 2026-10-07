@@ -53,6 +53,7 @@ struct NumberSpec {
 };
 
 struct StringSpec {
+  std::vector<std::string> extra_patterns;
   std::optional<std::string> pattern;
   std::optional<std::string> format;
   int min_length = 0;

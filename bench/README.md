@@ -1155,7 +1155,7 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 18 records the public value objects directly:
+statistics. JSON schema version 19 records the public value objects directly:
 
 - `config`: constraint type, source/file, literal choices and mixed-request selection, alongside execution settings;
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
@@ -1164,6 +1164,10 @@ statistics. JSON schema version 18 records the public value objects directly:
   planned context, KV storage, CUDA Graph allowance, and KV payload;
 - `repetition_wall_seconds`: each concurrent repetition's submit-to-completion interval;
 - each request sample's `timings`: prepare, Vision, prefill, decode, and total seconds;
+- each request sample's `constraint`: committed completion/branch, compilation cache access, CPU
+preparation/mask/matcher seconds, evaluated positions and mask upload bytes; `null` without a constraint;
+- `constraint_draft_wait_exposed_seconds`: the sample's exposure to draft-ready wait; shared batch
+exposure must not be summed across requests, and CPU constraint work must not be added to wall time;
 - each request sample's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, and per-position
 acceptance.
 

@@ -82,8 +82,9 @@ printf '%s\n' '{"type":"object","properties":{"answer":{"type":"integer"}},"requ
 
 GBNF supports recursive rules, Unicode character classes and repetition. All constraint modes work with
 ordinary decoding, MTP, DFlash and DFlash2. Thinking may precede the constrained answer; an output
-limit or cancellation can leave it incomplete. Constraints cannot be combined with active tools,
-custom stops or `--raw-output`. JSON uses compact separators and declared property order. Describe
+limit or cancellation can leave it incomplete. JSON modes can accompany tools supplied in messages:
+the answer is either JSON or a tool-call sequence. GBNF, choice and regex require no active tools.
+Constraints reject custom stops and `--raw-output`. JSON uses compact separators and declared property order. Describe
 the desired content in the prompt; the schema is not added to it automatically. See the
 [supported schema subset](maintainer/constrained-decoding.md#42-json-与-schema-的执行合同).
 

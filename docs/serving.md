@@ -176,11 +176,21 @@ Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the r
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
 Unicode and repetition. All modes support streaming and all speculative backends. For assistant
 continuation, the grammar covers the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
-output limits and cancellation can produce an incomplete answer. Active tools and custom stops
-cannot be combined with an output constraint; `tool_choice:"none"` is allowed. OpenAI errors use
+output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
+active tools; GBNF, choice and regex require no active tools or `tool_choice:"none"`.
+Output constraints reject custom stops. OpenAI errors use
 `invalid_grammar` for invalid grammars and `constraint_dead_end` for a reachable prefix without a
 legal next token. Anthropic reports these through its `invalid_request_error` envelope.
 The `grammar` and `guided_*` aliases are not accepted.
+
+Constrained responses include a NInfer `constraint` observation. `branch` is `undecided`, `content`,
+or `tools`; `complete` means the committed language can end, and `terminated` means it accepted EOS.
+A complete JSON value can therefore have `complete:true`, `terminated:false` and a length finish
+reason. The observation also includes `cache` (`hit`, `built`, `waited`), `mask_positions`,
+`mask_upload_bytes`, and `timings_seconds` for preparation, CPU mask work and matcher work.
+These times are parts of existing request time and can overlap GPU execution.
+Streaming sends the observation once: the Chat finish/usage chunk, the Responses terminal response
+object, or Anthropic `message_delta`. Unconstrained responses omit it.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -253,8 +263,15 @@ Top-level `tool_constraints:"auto"` opts into request-driven constraints: ordina
 `tool_choice:"auto"` then uses free generation. Strict tools, selection/count restrictions, and
 `tool_choice:"none"` still enforce their requirements. `tool_constraints:"basic"` is the default.
 
+With JSON object/schema output, `auto` permits either a JSON answer or a complete tool-call sequence.
+Required/named choices permit calls for that turn; after supplying the tool result, use `auto` for
+the final JSON answer. `none` permits only JSON. The JSON schema is validated on every turn.
+This combination enforces tool framing even with `tool_constraints:"auto"`; `strict` continues to
+control argument-value validation. Tool markers inside JSON strings remain ordinary string data.
+
 A function's `strict:true` also constrains its argument values against its schema. Its parameter
-root must resolve to a single `type:"object"` declaration with `additionalProperties:false`.
+root must reduce to a `type:"object"` schema with `additionalProperties:false`, including supported
+`allOf` and local-reference combinations.
 Properties are emitted in declaration order; optional properties may be omitted. Root
 const/enum/unions are not supported. Values use the supported JSON Schema subset described above.
 Top-level pure string parameters use raw text and preserve whitespace. Other values use JSON;
@@ -264,7 +281,7 @@ Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required
 Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
 representations. Unsupported schemas fail with HTTP 400 before generation.
 
-For `auto`, text can precede the first call. Required/named choices start directly with calls
+For `auto` without JSON output, text can precede the first call. Required/named choices start directly with calls
 (after thinking, if enabled). Once a constrained call starts, the suffix consists of complete calls
 and model EOS. Active tool constraints require model EOS and reject custom stop strings.
 For ordinary non-strict auto calls that need custom stops, select `tool_constraints:"auto"`.
@@ -972,6 +989,9 @@ curl http://127.0.0.1:8080/metrics
 | `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
 | `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
 | `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `ninfer_constraint_requests_total{outcome}`, `ninfer_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
+| `ninfer_constraint_{prepare,mask,matcher}_seconds_total`, `ninfer_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
+| `ninfer_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `ninfer_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
@@ -1022,6 +1042,10 @@ preserved for consumer validation, and a stable text-fallback reason. Fallback r
 `malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
 `trailing_content`. These counters contain no tool arguments or generated text.
 
+`request_done.constraint` carries the same constraint observation as the HTTP terminal result,
+or `null` for unconstrained requests. Preparation failures and execution errors use the existing
+rejection/error records rather than successful constraint outcomes.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
@@ -1063,6 +1087,9 @@ wait. The nested `decode` object reports the request's decode-class Host exposur
 round count; `units` reports its prefill/control unit counts. In a compact batch every participating
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
+`constraint_draft_wait_exposed_seconds` is the request's exposure to the batch's draft-ready wait,
+already included in `device_wait_exposed_seconds`. The `throughput.host_work.constraint_draft_wait_seconds`
+interval and Prometheus counter count each batch once.
 
 `request_done.first_output_timing` freezes observations immediately before Engine publishes its
 first nonempty output delta. It is `null` when no such output exists. This boundary differs from the

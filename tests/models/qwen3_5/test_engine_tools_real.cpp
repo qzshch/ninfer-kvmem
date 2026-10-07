@@ -165,7 +165,51 @@ void exercise_basic(ninfer::Engine& engine, unsigned concurrency, bool speculati
                  "passed\n";
 }
 
+void composed_output(ninfer::Engine& engine) {
+    const auto schema  = parameters();
+    auto input         = prompt(schema);
+    auto options       = request();
+    options.constraint = ninfer::OutputConstraint::json_schema(
+        R"({"type":"object","properties":{"answer":{"type":"string","enum":["ok <tool_call>","wrong"],"pattern":"^ok","maxLength":30}},"required":["answer"],"additionalProperties":false})");
+    auto first = engine
+                     .submit(engine.prepare(input), options, ninfer::OutputConsumerMode::Aggregate,
+                             {.phase_timings = true})
+                     .wait();
+    validate(first);
+    require(first.constraint && first.constraint->complete && first.constraint->terminated &&
+                first.constraint->branch == ninfer::ConstraintOutputBranch::Tools &&
+                first.constraint->timings_collected && first.constraint->mask_positions > 0 &&
+                first.constraint->mask_upload_bytes > 0,
+            "tool branch lost constraint state or work observations");
+    input.messages.push_back(
+        {.role       = ninfer::ChatRole::Assistant,
+         .tool_calls = {{"composed_call", "record", first.tool_calls[0].arguments_json}}});
+    input.messages.push_back({.role         = ninfer::ChatRole::Tool,
+                              .parts        = {{.kind = ninfer::MessagePartKind::Text,
+                                                .text = "Recorded. Give the final JSON answer."}},
+                              .tool_call_id = "composed_call"});
+    // Prefix fixes the legal output branch; correctness does not depend on a probabilistic
+    // decision to use another tool when both branches are available.
+    input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::Assistant,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "{\"answer\":"}}});
+    options.tool_choice.mode        = ninfer::ToolChoiceMode::Auto;
+    options.tool_choice.constraints = ninfer::ToolConstraintMode::Automatic;
+    Sink sink;
+    auto second = engine.generate(engine.prepare(input), options, &sink);
+    require(second.finish_reason == ninfer::FinishReason::StopToken && second.tool_calls.empty() &&
+                sink.content == second.content &&
+                Json::parse("{\"answer\":" + second.content)["answer"] == "ok <tool_call>" &&
+                second.constraint && second.constraint->terminated &&
+                second.constraint->branch == ninfer::ConstraintOutputBranch::Content,
+            "tool-result JSON continuation lost schema, literal marker or stream bytes");
+    std::cout << "tools + JSON: required call, result continuation, literal marker and "
+                 "observations passed\n";
+}
+
 void exercise(ninfer::Engine& engine, unsigned concurrency, bool speculative) {
+    composed_output(engine);
     const auto schema = parameters();
     auto options      = request();
     ninfer::GenerationResult first;

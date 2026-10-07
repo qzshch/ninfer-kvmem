@@ -1665,6 +1665,8 @@ public:
 
     void grammar_row_failure() {
         struct Masks final : runtime::TokenMaskProvider {
+            void uploaded(std::size_t, std::size_t) noexcept override {}
+
             bool constrained(std::size_t row) const noexcept override { return row == 0; }
 
             std::uint32_t fill(std::size_t, std::span<const TokenId> drafts,
