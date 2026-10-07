@@ -7,18 +7,18 @@ points and incremental execution permits remain authoritative. Storage tiers do
 not introduce another prefix catalog or another owner of model state.
 
 ## Optional enhancement, disabled by default
-+
-+The baseline build contains Native prefix caching plus KVMem. This enhanced build
-+adds storage tiers using the same prefix identity and checkpoint ownership.
-+Without `--kv-file-dir`, it uses Native fixed pinned Host backing. A directory
-+opts into file backing; `--hicache-ram-mib`, `--hicache-state-mib`, prefetch and
-+write-through further select bounded storage policies. None is a daily default.
-+Changing hardware or workload can reverse the compute-versus-transfer tradeoff.
-+Native prefix savings must be measured independently before attributing a gain
-+to the added storage tiers. A storage-tier comparison must report computed/reused
-+tokens, transfer bytes and waits, latency distributions and actual resource peaks.
-+
-+## Three representations, one logical history
+
+The baseline build contains Native prefix caching plus KVMem. This enhanced build
+adds storage tiers using the same prefix identity and checkpoint ownership.
+Without `--kv-file-dir`, it uses Native fixed pinned Host backing. A directory
+opts into file backing; `--hicache-ram-mib`, `--hicache-state-mib`, prefetch and
+write-through further select bounded storage policies. None is a daily default.
+Changing hardware or workload can reverse the compute-versus-transfer tradeoff.
+Native prefix savings must be measured independently before attributing a gain
+to the added storage tiers. A storage-tier comparison must report computed/reused
+tokens, transfer bytes and waits, latency distributions and actual resource peaks.
+
+## Three representations, one logical history
 
 * Device: KVMem's bounded per-lane Main KV working set. Missing logical pages are
   `kPagedKVPageHole` and are masked before attention loads; original positions and
