@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <optional>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -12,6 +13,11 @@ namespace ninfer {
 
 class HostContextArena;
 class HostResidentCharge;
+
+struct HostPageDemand {
+    std::size_t page_bytes = 0;
+    std::size_t pages = 0;
+};
 
 // A unique, immovable physical extent. Keeping this owner alive pins its bytes; views never
 // allocate or charge a second copy. Transfer destinations remain reserved until publication.
@@ -90,6 +96,10 @@ public:
     [[nodiscard]] std::shared_ptr<HostResidentCharge> charge_metadata(std::size_t bytes) noexcept;
 
     [[nodiscard]] bool can_allocate(std::size_t bytes) const noexcept;
+    // Quote complete pages across existing free extents without reserving or moving
+    // any bytes. KV placement can split its transfer into these contiguous runs.
+    [[nodiscard]] std::size_t page_allocation_shortage(
+        std::span<const HostPageDemand> demands, std::size_t metadata_bytes = 0) const;
     [[nodiscard]] std::optional<HostContextAllocation> allocate(std::size_t bytes) noexcept;
     [[nodiscard]] std::pair<HostContextAllocation, HostContextAllocation>
     split(HostContextAllocation&& allocation, std::size_t byte_offset);

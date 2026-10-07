@@ -334,6 +334,8 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
     }
     if (kvmem_window_pages) {
         std::size_t host_needed = 0, metadata_needed = 0;
+        std::array<HostPageDemand, 2 * kMaximumConcurrency> host_demands{};
+        std::size_t host_demand_count = 0;
         std::unordered_set<std::size_t> seen_host;
         for (const auto& unit : units) {
             const auto lane       = ContractAccess::lane(unit.sequence).value;
@@ -362,6 +364,7 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
                                   const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
                                   std::uint32_t valid, std::uint32_t budget, std::size_t stride,
                                   bool backend) {
+                const auto host_before = host_needed;
                 auto mapped = addresses.mapped_pages(address);
                 if (request.prefill && request.prefill->query_replay_cursor &&
                     *request.prefill->query_replay_cursor == sparse.query_begin) {
@@ -398,6 +401,9 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
                         host_needed += static_cast<std::size_t>(target - mapped) * stride;
                     }
                 }
+                if (host_needed > host_before) {
+                    host_demands[host_demand_count++] = {stride, (host_needed - host_before) / stride};
+                }
             };
             scan(*text_kv_addresses, *text_kv_pages, state.kv->text, state.text_kv_valid,
                  kvmem_window_pages, text_host_kv_page_stride, false);
@@ -414,14 +420,13 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
                                              512U);
             }
         }
-        const auto free     = host_context_arena->free_bytes();
         const auto resident = host_context_arena->resident_free_bytes();
-        if (host_needed + metadata_needed > free || metadata_needed > resident) {
+        const auto page_shortage = host_context_arena->page_allocation_shortage(
+            std::span(host_demands).first(host_demand_count), metadata_needed);
+        if (page_shortage || metadata_needed > resident) {
             return {.reserved = false,
                     .shortage = {.host_bytes = std::max(
-                                     host_needed + metadata_needed > free
-                                         ? host_needed + metadata_needed - free
-                                         : 0,
+                                     page_shortage,
                                      metadata_needed > resident ? metadata_needed - resident : 0)}};
         }
     }

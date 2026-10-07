@@ -101,6 +101,49 @@ bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     return rounded != 0 && rounded <= free_bytes() && find_free_extent(rounded).has_value();
 }
 
+std::size_t HostContextArena::page_allocation_shortage(
+    std::span<const HostPageDemand> demands, std::size_t metadata_bytes) const {
+    std::size_t total = 0;
+    for (const auto& demand : demands) {
+        if (!demand.pages) { continue; }
+        const auto stride = allocation_bytes(demand.page_bytes);
+        if (!stride || demand.pages > (std::numeric_limits<std::size_t>::max() - total) / stride) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        total += stride * demand.pages;
+    }
+    if (metadata_bytes > std::numeric_limits<std::size_t>::max() - total) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    if (total + metadata_bytes > free_bytes()) { return total + metadata_bytes - free_bytes(); }
+    if (!total || find_free_extent(total)) { return 0; }
+
+    // Match prepare_prefix: take the largest whole-page run that fits, then
+    // allocate from the first extent that can hold it. Neither metadata charges
+    // nor quote scratch alter the physical extent ledger.
+    auto available = free_extents_;
+    std::size_t remaining_bytes = total;
+    for (const auto& demand : demands) {
+        auto remaining = demand.pages;
+        if (!remaining) { continue; }
+        const auto stride = allocation_bytes(demand.page_bytes);
+        while (remaining) {
+            std::size_t run = 0;
+            for (const auto& extent : available) {
+                run = std::max(run, std::min(remaining, extent.bytes / stride));
+            }
+            if (!run) { return remaining_bytes; }
+            const auto bytes = run * stride;
+            auto extent = std::find_if(available.begin(), available.end(),
+                                      [bytes](const auto& e) { return e.bytes >= bytes; });
+            extent->bytes -= bytes;
+            remaining -= run;
+            remaining_bytes -= bytes;
+        }
+    }
+    return 0;
+}
+
 std::optional<HostContextAllocation> HostContextArena::allocate(std::size_t bytes) noexcept {
     const std::size_t rounded = allocation_bytes(bytes);
     if (rounded == 0 || rounded > free_bytes()) { return std::nullopt; }
