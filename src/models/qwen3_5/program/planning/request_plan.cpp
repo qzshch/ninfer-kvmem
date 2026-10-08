@@ -333,11 +333,23 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
         }
     }
     if (kvmem_window_pages) {
+        // Host backing is shared. Quote the union of existing permits and this
+        // proposal; a later lane cannot spend backing already needed by an
+        // earlier, still unexecuted unit.
+        std::array<ExecutionUnit, kMaximumConcurrency> host_units{};
+        std::size_t host_unit_count = 0;
+        for (const auto& unit : units) { host_units[host_unit_count++] = unit; }
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (seen[lane] || !requests[lane].permit) { continue; }
+            const auto& permit = *requests[lane].permit;
+            demands[lane] = permit;
+            host_units[host_unit_count++] = {sequence_handle(lane), permit.kind, permit.tokens};
+        }
         std::size_t host_needed = 0, metadata_needed = 0;
         std::array<HostPageDemand, 2 * kMaximumConcurrency> host_demands{};
         std::size_t host_demand_count = 0;
         std::unordered_set<std::size_t> seen_host;
-        for (const auto& unit : units) {
+        for (const auto& unit : std::span(host_units).first(host_unit_count)) {
             const auto lane       = ContractAccess::lane(unit.sequence).value;
             const auto& state     = active_sequence(lane);
             const auto& request   = requests[lane];

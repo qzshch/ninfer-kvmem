@@ -564,7 +564,8 @@ public:
     void prepare_binding(ContextTransaction&);
     void complete_binding(ContextTransaction&, ContextProgress&);
     void publish_capture(ContextTransaction&);
-    [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier);
+    [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
+                                                   runtime::ResourceReservation* execution = nullptr);
     void prepare_capture_boundary(std::uint32_t lane);
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);

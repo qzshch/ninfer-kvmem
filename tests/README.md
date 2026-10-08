@@ -290,6 +290,21 @@ arbitrary floating-point routes.
 
 ## Sparse KVMem with hierarchical context storage
 
+The same build also includes `ninfer_qwen3_5_kvmem_real_test` for Native Host
+storage with HiCache disabled. Run its long concurrent admission regression as:
+
+```bash
+cmake --build build -j --target ninfer_qwen3_5_kvmem_real_test
+build/tests/ninfer_qwen3_5_kvmem_real_test \
+  out/qwen3_8_27b_nvfp4_dflash2.ninfer 3 1 dflash2 4 pressure
+```
+
+The `pressure` mode exercises five independent 48K roots per lane, immediate warm
+repeats and appended turns, a 16K rolling window and no extra Device states. It
+allows cache misses under the four-GiB quota, but requires successful completion,
+identical cold/warm greedy outputs and resource retirement. Timings are functional
+diagnostics, not a throughput claim. The tiered fixture below qualifies HiCache on.
+
 The real fixture uses the public Engine with FP8 KV, a small rolling Device window, RAM hot
 storage, and disk cold storage. It checks cold/warm/changed-query reuse, shared forks, image
 continuations, cancellation during query replay, a surviving request, IO settlement, and
