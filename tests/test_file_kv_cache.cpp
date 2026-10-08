@@ -724,6 +724,45 @@ void cleanup_with_external_reader(ninfer::DeviceContext& context) {
     require(stated == 0 && info.st_size == 0 && !std::filesystem::exists(path),
             "scratch teardown retained payload extents through an external reader");
 }
+
+void repeated_fast_drain(ninfer::DeviceContext& context) {
+    // A flush with no disk work can finish between drain's predicate check and
+    // its condition-variable wait. Repeat both empty flushes and tiny hot writes
+    // without sleeps, checking that completion and exact bytes still settle.
+    ninfer::FileKVBacking store(std::filesystem::temp_directory_path(), 2ULL << 20,
+                                4096, 1ULL << 20, false, true);
+    ninfer::DeviceBuffer payload(256);
+    for (unsigned iteration = 0; iteration < 400; ++iteration) {
+        store.drain();
+        CUDA_CHECK(cudaMemsetAsync(payload.p, iteration & 255, payload.bytes, context.stream));
+        context.synchronize();
+        auto writing = store.write(0, payload.bytes);
+        writing.enqueue_before(store.stream());
+        CUDA_CHECK(cudaMemcpyAsync(writing.data(), payload.p, payload.bytes,
+                                   cudaMemcpyDeviceToHost, store.stream()));
+        writing.enqueue_after(store.stream());
+        CUDA_CHECK(cudaStreamSynchronize(store.stream()));
+        store.drain();
+        store.check_errors();
+        const auto stats = store.snapshot();
+        require(stats.pending_writebacks == 0 && stats.filesystem_pending_bytes == 0 &&
+                    stats.ram_dirty_bytes == 0,
+                "fast write-through drain retained unfinished work");
+    }
+    auto reading = store.read(0, payload.bytes);
+    reading.enqueue_before(store.stream());
+    CUDA_CHECK(cudaMemcpyAsync(payload.p, reading.data(), payload.bytes,
+                               cudaMemcpyHostToDevice, store.stream()));
+    reading.enqueue_after(store.stream());
+    CUDA_CHECK(cudaStreamSynchronize(store.stream()));
+    std::array<unsigned char, 256> observed{};
+    CUDA_CHECK(cudaMemcpy(observed.data(), payload.p, observed.size(), cudaMemcpyDeviceToHost));
+    require(std::all_of(observed.begin(), observed.end(), [](unsigned char value) {
+        return value == (399 & 255);
+    }), "fast drain changed the final payload");
+    store.drain();
+    std::cout << "repeated fast flush / write-through drain / exact bytes passed\n";
+}
 } // namespace
 
 int main() {
@@ -738,6 +777,7 @@ int main() {
         ninfer::DeviceContext context;
         partial_promotion_error_counters();
         cleanup_with_external_reader(context);
+        repeated_fast_drain(context);
         cross_job_writeback(context);
         large_fragmented_hot_eviction(context);
         hierarchical_cache(context, true);

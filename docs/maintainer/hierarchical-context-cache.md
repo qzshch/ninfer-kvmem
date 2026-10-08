@@ -100,6 +100,11 @@ Linux `sync_file_range`, then requests page-cache eviction. Adjacent ranges are
 coalesced. This does not flush metadata or the device write cache, and does not
 provide crash durability; that is outside this instance-local scratch contract. An idle
 50-ms boundary, explicit `drain()` or destruction also flushes a partial batch.
+Worker completion counters and drain notifications use the same mutex as the
+condition-variable predicate. Atomic telemetry alone is insufficient: publishing
+the last completion outside that mutex can lose the notification between a
+waiter's predicate check and sleep. Invalidation of dirty hot sectors follows
+the same notification protocol without nesting the hot and queue mutexes.
 This fixed budget is additional headroom beyond RAM hot capacity, StateImages and
 pinned staging; it does not grow with cold capacity. The currently read staging
 range temporarily adds clean file pages which are immediately advised away.

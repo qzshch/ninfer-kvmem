@@ -652,10 +652,17 @@ struct FileKVBacking::Impl {
                         flush_disk_batch();
                     }
                 } catch (...) { remember_error(); }
-                if (hint)
-                    --pending_prefetches;
-                else
-                    --pending_writebacks;
+                {
+                    // drain() tests these counters while holding mutex. Publish
+                    // completion under the same mutex so its predicate check and
+                    // wait cannot straddle the last notification. Atomic counters
+                    // alone do not prevent a lost condition-variable wakeup.
+                    std::lock_guard lock(mutex);
+                    if (hint)
+                        --pending_prefetches;
+                    else
+                        --pending_writebacks;
+                }
                 cv.notify_all();
                 continue;
             }
@@ -708,7 +715,12 @@ struct FileKVBacking::Impl {
                 state->cv.notify_all();
                 if (aborted) { state->finish(); }
             }
-            cv.notify_all();
+            {
+                // IO also changes the drain predicate (dirty/pending bytes).
+                // Serialize the notification with a waiter entering cv.wait.
+                std::lock_guard lock(mutex);
+                cv.notify_all();
+            }
         }
     }
 };
@@ -962,32 +974,37 @@ void FileKVBacking::invalidate(std::size_t offset, std::size_t bytes) noexcept {
         bytes > impl_->capacity - offset) {
         std::terminate();
     }
-    std::lock_guard lock(impl_->hot_mutex);
-    if (impl_->ram_capacity && bytes) {
-        for (auto block = offset / kHotBlock; block <= (offset + bytes - 1) / kHotBlock; ++block) {
-            ++impl_->block_epochs[block];
-            const int index = impl_->block_slots[block];
-            if (index < 0) continue;
-            auto& slot       = impl_->hot[index];
-            const auto begin = std::max(offset, block * kHotBlock);
-            const auto end   = std::min(offset + bytes, (block + 1) * kHotBlock);
-            for (auto p = begin; p < end; p += kSector) {
-                const auto s = (p % kHotBlock) / kSector;
-                if (slot.valid[s]) impl_->ram_resident_bytes -= kSector;
-                if (slot.prefetched[s]) impl_->prefetch_wasted_bytes += kSector;
-                if (impl_->written[p / kSector] == 2) impl_->ram_dirty_bytes -= kSector;
-                slot.valid[s] = slot.prefetched[s] = 0;
-            }
-            if (std::none_of(slot.valid.begin(), slot.valid.end(),
-                             [](std::uint8_t valid) { return valid != 0; })) {
-                impl_->unlink_hot(index);
-                impl_->block_slots[block] = -1;
-                slot.block                = std::numeric_limits<std::size_t>::max();
-                impl_->free_hot.push_back(index);
+    {
+        std::lock_guard lock(impl_->hot_mutex);
+        if (impl_->ram_capacity && bytes) {
+            for (auto block = offset / kHotBlock; block <= (offset + bytes - 1) / kHotBlock; ++block) {
+                ++impl_->block_epochs[block];
+                const int index = impl_->block_slots[block];
+                if (index < 0) continue;
+                auto& slot       = impl_->hot[index];
+                const auto begin = std::max(offset, block * kHotBlock);
+                const auto end   = std::min(offset + bytes, (block + 1) * kHotBlock);
+                for (auto p = begin; p < end; p += kSector) {
+                    const auto s = (p % kHotBlock) / kSector;
+                    if (slot.valid[s]) impl_->ram_resident_bytes -= kSector;
+                    if (slot.prefetched[s]) impl_->prefetch_wasted_bytes += kSector;
+                    if (impl_->written[p / kSector] == 2) impl_->ram_dirty_bytes -= kSector;
+                    slot.valid[s] = slot.prefetched[s] = 0;
+                }
+                if (std::none_of(slot.valid.begin(), slot.valid.end(),
+                                 [](std::uint8_t valid) { return valid != 0; })) {
+                    impl_->unlink_hot(index);
+                    impl_->block_slots[block] = -1;
+                    slot.block                = std::numeric_limits<std::size_t>::max();
+                    impl_->free_hot.push_back(index);
+                }
             }
         }
+        std::fill_n(impl_->written.begin() + offset / kSector, bytes / kSector, 0);
     }
-    std::fill_n(impl_->written.begin() + offset / kSector, bytes / kSector, 0);
+    // Invalidating the last dirty sector may satisfy a write-through drain.
+    // Its notification follows the same mutex protocol as worker completion.
+    std::lock_guard lock(impl_->mutex);
     impl_->cv.notify_all();
 }
 
@@ -999,7 +1016,8 @@ void FileKVBacking::drain() {
     impl_->flush_requested = true;
     impl_->cv.notify_all();
     impl_->cv.wait(lock, [&] {
-        return (impl_->error || impl_->filesystem_pending_bytes.load() == 0) &&
+        return (impl_->error || !impl_->flush_requested) &&
+               (impl_->error || impl_->filesystem_pending_bytes.load() == 0) &&
                impl_->pending_prefetches.load() == 0 && impl_->pending_writebacks.load() == 0 &&
                (!impl_->write_through || impl_->error || impl_->ram_dirty_bytes.load() == 0);
     });
