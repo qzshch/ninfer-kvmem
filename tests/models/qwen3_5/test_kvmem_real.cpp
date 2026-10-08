@@ -53,6 +53,73 @@ ninfer::PromptInput media_prompt() {
 }
 } // namespace
 
+namespace {
+void pressure_regression(ninfer::Engine& engine, unsigned lanes) {
+    auto options = request();
+    options.stop.include_model_defaults = true;
+    for (unsigned cycle = 0; cycle < 5; ++cycle) {
+        std::vector<ninfer::PromptInput> inputs;
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            const auto tag = "PAIR-" + std::to_string(lanes) + "-" + std::to_string(cycle) + "-" +
+                             std::to_string(lane);
+            std::string archive = "Public archive " + tag +
+                                  ". Follow the final instruction exactly.\n";
+            for (unsigned i = 0; i < 8000; ++i) { archive += " alpha beta gamma delta epsilon."; }
+            ninfer::PromptInput input;
+            input.options.enable_thinking = false;
+            input.messages.push_back({.role = ninfer::ChatRole::System,
+                                      .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                 .text = std::move(archive)}}});
+            input.messages.push_back({.role = ninfer::ChatRole::User,
+                                      .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                 .text = "Reply with exactly READY-" + tag + "."}}});
+            require(engine.count_tokens(input) > 48000, "pressure fixture lost its long context");
+            inputs.push_back(std::move(input));
+        }
+        const auto batch = [&](const auto& prompts) {
+            std::vector<ninfer::GenerationHandle> handles;
+            for (const auto& input : prompts) { handles.push_back(engine.submit(engine.prepare(input), options)); }
+            std::vector<ninfer::GenerationResult> results;
+            for (auto& handle : handles) {
+                results.push_back(handle.wait());
+                require(!results.back().generated_token_ids.empty(), "pressure generation produced no output");
+            }
+            return results;
+        };
+        std::cout << "pressure cold cycle=" << cycle << std::endl;
+        const auto cold = batch(inputs);
+        std::cout << "pressure warm cycle=" << cycle << std::endl;
+        const auto warm = batch(inputs);
+        for (unsigned lane = 0; lane < lanes; ++lane) {
+            require(cold[lane].generated_token_ids == warm[lane].generated_token_ids,
+                    "cache pressure changed greedy output");
+            inputs[lane].messages.push_back({.role = ninfer::ChatRole::Assistant,
+                                            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                       .text = cold[lane].content}}});
+            inputs[lane].messages.push_back({.role = ninfer::ChatRole::User,
+                                            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                                                       .text = "Reply with exactly TURN-PAIR-" +
+                                                               std::to_string(lanes) + "-" + std::to_string(cycle) +
+                                                               "-" + std::to_string(lane) + "."}}});
+        }
+        std::cout << "pressure append cycle=" << cycle << std::endl;
+        (void)batch(inputs);
+        require(engine.is_available(), "cache pressure poisoned Engine availability");
+        std::cout << "ok pressure cold/warm/append cycle=" << cycle << std::endl;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        const auto stats = engine.runtime_stats();
+        if (!stats.running_requests && !stats.materializing_requests) {
+            require(stats.host_context_reserved_bytes == 0, "pressure left pending Host reservations");
+            break;
+        }
+        require(std::chrono::steady_clock::now() < deadline, "pressure requests did not retire");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+} // namespace
+
 int main(int argc, char** argv) {
     const auto* artifact = argc > 1 ? argv[1] : std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -85,7 +152,20 @@ int main(int argc, char** argv) {
             o.speculative.draft_tokens = backend == "none" ? 0 : backend == "mtp" ? 3 : 7;
             if (backend == "none") { o.speculative.proposal_head = ninfer::ProposalHead::Full; }
         }
+        const bool pressure = argc > 6 && std::string(argv[6]) == "pressure";
+        if (argc > 6) { require(pressure, "unsupported real-test mode"); }
+        if (pressure) {
+            o.max_context = 65536;
+            o.prefill_chunk = 1024;
+            o.kvmem_window_pages = 256;
+            o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(o.max_concurrency * 18432);
+            o.context_cache.device_state_slots = 0;
+        }
         ninfer::Engine engine(o);
+        if (pressure) {
+            pressure_regression(engine, o.max_concurrency);
+            return 0;
+        }
         const auto unit =
             engine.tokenize_text("Reference record: alpha beta gamma delta epsilon.\n");
         std::vector<ninfer::TokenId> tokens;

@@ -304,13 +304,20 @@ build/tests/ninfer_qwen3_5_kvmem_real_test \
   out/qwen3_8_27b_nvfp4_dflash2.ninfer 2 1 dflash2 4
 build/tests/ninfer_qwen3_5_kvmem_real_test \
   out/qwen3_8_27b_nvfp4_dflash2.ninfer 3 1 dflash2 4
+build/tests/ninfer_qwen3_5_kvmem_real_test \
+  out/qwen3_8_27b_nvfp4_dflash2.ninfer 3 1 dflash2 4 pressure
 NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4_dflash2.ninfer \
   NINFER_NATIVE_TRANSACTIONS_SPARSE=1 \
   build/tests/ninfer_qwen3_5_native_transactions_test dflash2
 ```
 
 The real-fixture arguments are artifact, lanes, vision, backend (`none`, `mtp`,
-`dflash2`), and Host quota in GiB. Qualify DFlash2 at one, two, and three lanes;
+`dflash2`), Host quota in GiB, and optional `pressure` mode. That mode uses five
+independent 48K chat roots per lane with immediate warm repeats and appended turns,
+a 16K rolling window, no extra Device states and a 64K per-request ceiling. It
+requires completion, exact cold/warm greedy output and resource retirement; a
+capacity-driven prefix miss is allowed, an allocation exception is not. Its timings
+are not a throughput benchmark. Qualify DFlash2 at one, two, and three lanes;
 also qualify none and MTP at two lanes. The artifact must contain the selected backend
 and vision weights. Without an explicit artifact argument or `NINFER_TEST_ARTIFACT`, it skips
 with status 77. This small-window lifecycle fixture does not establish full-context capacity

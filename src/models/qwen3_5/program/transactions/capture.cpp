@@ -37,7 +37,8 @@ bool ProgramImpl::reclaim_capture_reservation(runtime::ContextResourceUsage shor
     return false;
 }
 
-bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier) {
+bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
+                                               runtime::ResourceReservation* execution) {
     auto& request = requests[lane];
     if (request.capture_reservation) { return request.capture_reservation->frontier == frontier; }
     if (request.next_capture >= request.capture_groups.size()) { return false; }
@@ -111,7 +112,13 @@ bool ProgramImpl::reserve_capture_destination(std::uint32_t lane, std::uint32_t 
                 granted[count++] = {sequence_handle(index), permit->kind, permit->tokens};
             }
         }
-        if (count && !reserve_units(std::span(granted).first(count)).reserved) { return false; }
+        if (count) {
+            const auto result = reserve_units(std::span(granted).first(count));
+            if (!result.reserved) {
+                if (execution) { *execution = result; }
+                return false;
+            }
+        }
     }
     request.capture_reservation = std::move(ticket);
     return true;
@@ -148,10 +155,19 @@ std::optional<CapturePreparation> ProgramImpl::prepare_capture(SequenceHandle ha
             continue;
         }
         if (frontier > request.permit->main_frontier) { return std::nullopt; }
-        if (reserve_capture_destination(lane, frontier)) {
+        runtime::ResourceReservation execution;
+        if (reserve_capture_destination(lane, frontier, &execution)) {
             return CapturePreparation{.frontier = frontier, .reserved = true};
         }
         CapturePreparation result{.frontier = frontier};
+        if (execution.shortage.host_bytes) {
+            // The failed tentative ticket has been released. Reclaim enough free
+            // Host backing to retry both that ticket and all licensed execution,
+            // rather than reporting a misleading State-slot shortage.
+            result.shortage = execution.shortage;
+            result.host_bytes = host_context_arena->free_bytes() + execution.shortage.host_bytes;
+            return result;
+        }
         if (state_store->device_occupied() == state_store->device_capacity()) {
             result.shortage.state_slots = 1;
             result.host_bytes           = state_images->host_layout().image_bytes;

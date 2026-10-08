@@ -1188,13 +1188,14 @@ private:
         context_owner_ = request;
     }
 
-    bool prepare_semantic_capture(const std::shared_ptr<Request>& request) {
+    bool prepare_semantic_capture(const std::shared_ptr<Request>& request, bool& touched_resources) {
         auto& decision = capture_decisions_[request->lane->value];
         if (decision && decision->sequence != *request->sequence) { decision.reset(); }
         if (instance_.program->capture_is_input(*request->sequence) && !decision) {
             (void)resources_.recycle_input(*instance_.program, request->continuation_owner);
         }
         while (const auto capture = instance_.program->prepare_capture(*request->sequence)) {
+            touched_resources = true;
             if (capture->reserved) {
                 decision.reset();
                 return true;
@@ -1926,7 +1927,7 @@ private:
             return slots_[a]->id < slots_[b]->id;
         });
         std::optional<std::uint32_t> blocked;
-        for (const auto lane : candidates) {
+        const auto reserve_lane = [&](std::uint32_t lane) {
             const auto request = slots_[lane];
             // Reclaiming for an earlier row may already have paused this candidate.
             if (!request || !request->sequence || request->capture_pending ||
@@ -1934,7 +1935,7 @@ private:
                 instance_.program->context_blocks(*request->sequence) ||
                 !(request->is_control_ready() || request->is_decode_ready() ||
                   request->is_prefilling() || request->is_replaying())) {
-                continue;
+                return;
             }
             const ExecutionUnit unit{
                 *request->sequence,
@@ -1977,12 +1978,29 @@ private:
                 }
                 break;
             }
+        };
+        for (const auto lane : candidates) { reserve_lane(lane); }
+        if (blocked && !instance_.program->has_context_transaction()) {
+            (void)pause_resident(*blocked);
+            blocked.reset();
+        }
+        bool capture_touched_resources = false;
+        if (prefill && runnable_units_[*prefill] &&
+            !prepare_semantic_capture(slots_[*prefill], capture_touched_resources)) {
+            runnable_units_[*prefill] = false;
+        }
+        if (capture_touched_resources) {
+            // Optional capture can reclaim/demote other checkpoints into Host
+            // after the first quote, even when saving is skipped or a transfer
+            // is still pending. Revalidate every otherwise runnable row.
+            for (const auto lane : candidates) {
+                if (!runnable_units_[lane]) { continue; }
+                runnable_units_[lane] = false;
+                reserve_lane(lane);
+            }
         }
         if (blocked && !instance_.program->has_context_transaction()) {
             (void)pause_resident(*blocked);
-        }
-        if (prefill && runnable_units_[*prefill] && !prepare_semantic_capture(slots_[*prefill])) {
-            runnable_units_[*prefill] = false;
         }
         // A pause may have selected an already licensed younger row. Its permit belongs
         // to Native cleanup, and it must not enter this cycle's compact execution batch.
@@ -2206,6 +2224,10 @@ private:
                     }
                     if (admission_decision_ || scheduler_.admission_scan_pending()) {
                         (void)try_admit_one(false);
+                        // An in-flight binding already owns its destination. Unrelated
+                        // lanes may still run, so revalidate even before that transfer
+                        // completes; shortages wait for the existing transaction.
+                        reserve_resident_units();
                     }
                 }
                 if (instance_.program->has_context_transaction()) {
