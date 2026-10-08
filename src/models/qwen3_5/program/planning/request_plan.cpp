@@ -134,8 +134,12 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         // isolation. This happens before admission and must not poison the Engine.
         const auto prompt_pages = (static_cast<std::uint64_t>(base->summary.prompt_tokens) +
                                    kPagedKVPageSize - 1U) / kPagedKVPageSize;
-        const auto device_pages = static_cast<std::uint64_t>(kvmem_window_pages) +
-                                  (prefill_chunk + kPagedKVPageSize - 1U) / kPagedKVPageSize + 16U;
+        // At the final probe, scored candidates are still unknown. The legal-unit
+        // quote must be able to back every page except the two mandatory sink
+        // pages, even though most rolling units only back the off-window history.
+        // Reject this isolated peak before binding; exclusivity alone cannot make
+        // an undersized Host pool sufficient (notably near-capacity vision input).
+        const auto device_pages = prompt_pages <= kvmem_window_pages ? prompt_pages : 2U;
         std::size_t minimum = 0;
         const auto require_host = [&](std::uint64_t count, std::size_t stride) {
             if (stride && count > (limit - minimum) / stride) {
@@ -148,11 +152,14 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         require_host(prompt_pages > device_pages ? prompt_pages - device_pages : 0,
                      text_host_kv_page_stride);
         if (backend_kv_pages) {
-            const auto backend_device_pages = device_pages + (draft_window + 63U) / 64U + 1U;
-            require_host(prompt_pages > backend_device_pages ? prompt_pages - backend_device_pages : 0,
+            require_host(prompt_pages > device_pages ? prompt_pages - device_pages : 0,
                          backend_host_kv_page_stride);
         }
-        require_host(base->summary.prompt_tokens / sparse.index.block_tokens(), mean_bytes);
+        const auto prompt_blocks = (static_cast<std::uint64_t>(base->summary.prompt_tokens) +
+                                    sparse.index.block_tokens() - 1U) /
+                                   sparse.index.block_tokens();
+        const auto quote_blocks = (prefill_chunk + 127U) / 128U + 1U;
+        require_host(prompt_blocks + quote_blocks, mean_bytes + 512U);
         std::size_t bytes = 0;
         const auto add = [&](std::uint64_t count, std::size_t stride) {
             const auto free = limit - bytes;
@@ -454,10 +461,14 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
                                                 sparse.media_groups);
                 if (prefilling) { append_prefill_growth_pages(chosen, committed, mapped); }
                 for (std::uint32_t index = 0; index < mapped; ++index) {
-                    if (!retrieval_boundary &&
-                        std::binary_search(chosen.begin(), chosen.end(), index)) { continue; }
                     const auto page = addresses.logical_page(address, index);
                     const bool writes_tail = retrieval_boundary && index >= valid / kPagedKVPageSize;
+                    // Both canonical selection and replay placement retain the
+                    // first two sink pages. They cannot be demoted by the unknown
+                    // scores; unlike a probe tail they are never rewritten here.
+                    if ((!retrieval_boundary &&
+                         std::binary_search(chosen.begin(), chosen.end(), index)) ||
+                        (retrieval_boundary && index < 2U && !writes_tail)) { continue; }
                     if (pages.device_resident(page) &&
                         (!pages.host_replica_current(page) || writes_tail) &&
                         seen_host.insert(pages.descriptor_index(page) * 2ULL + backend).second) {
