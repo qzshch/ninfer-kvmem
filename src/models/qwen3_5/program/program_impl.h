@@ -58,9 +58,29 @@ enum class MtpBridgeMode : std::uint8_t {
     AfterExactHit,
 };
 
+// Logical future Host entitlement, independent of physical allocations and cache aliases.
+// Only the Engine thread mutates it. A paused request keeps its charge; terminal/abort
+// destruction releases it even when the original lane or Program no longer exists.
+struct HostAdmissionBudget {
+    std::size_t claimed = 0;
+};
+
+class HostAdmissionClaim {
+public:
+    HostAdmissionClaim(std::shared_ptr<HostAdmissionBudget> budget, std::size_t bytes)
+        : budget_(std::move(budget)), bytes_(bytes) { budget_->claimed += bytes_; }
+    ~HostAdmissionClaim() { budget_->claimed -= bytes_; }
+    HostAdmissionClaim(const HostAdmissionClaim&) = delete;
+    HostAdmissionClaim& operator=(const HostAdmissionClaim&) = delete;
+private:
+    std::shared_ptr<HostAdmissionBudget> budget_;
+    std::size_t bytes_;
+};
+
 struct RequestBasePlanImpl {
     std::shared_ptr<const PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
+    std::size_t kvmem_host_entitlement_bytes = 0;
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
@@ -205,6 +225,7 @@ struct RequestControl {
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     std::shared_ptr<const RequestBasePlanImpl> base;
+    std::shared_ptr<HostAdmissionClaim> host_admission;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
     std::unique_ptr<CaptureReservation> capture_reservation;
@@ -405,6 +426,7 @@ public:
     capture_kvmem_features(const SequenceState&, std::shared_ptr<HostResidentCharge> charge = {});
 
     std::unique_ptr<HostContextArena> host_context_arena;
+    std::shared_ptr<HostAdmissionBudget> host_admission_budget;
     std::vector<KvmemLaneState> kvmem_lanes_;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;

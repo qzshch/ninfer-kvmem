@@ -112,6 +112,64 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->summary.effective_limit_reason = options.requested_output_tokens <= capacity_output
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
+    if (kvmem_window_pages && host_context_arena) {
+        // Incremental unit quotes cannot stop independently admitted long histories from
+        // exhausting Host space together, including the space needed to pause a victim.
+        // Charge their future KV coverage before admitting them. Include one chunk of
+        // transient growth, speculative tails, two recovery images and retrieval metadata.
+        const auto frontier = std::min<std::uint64_t>(
+            capacity, static_cast<std::uint64_t>(base->summary.prompt_tokens) +
+                          base->summary.effective_output_tokens + prefill_chunk + draft_window);
+        const auto pages = (frontier + kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        const auto& sparse = kvmem_lanes_.front();
+        const auto blocks = (frontier + sparse.index.block_tokens() - 1U) /
+                            sparse.index.block_tokens();
+        const auto mean_bytes = static_cast<std::size_t>(sparse.index.layers()) *
+                                sparse.index.kv_heads() * sparse.index.head_dim() * sizeof(float);
+        // Saturating at the configured Host capacity makes an oversized estimate exclusive.
+        // It does not promise that every isolated request fits: real page geometry and
+        // physical reclamation are still checked by binding/unit reservations.
+        const auto limit = host_context_arena->capacity_bytes();
+        // Reject a prompt whose obligatory off-window history cannot fit even in
+        // isolation. This happens before admission and must not poison the Engine.
+        const auto prompt_pages = (static_cast<std::uint64_t>(base->summary.prompt_tokens) +
+                                   kPagedKVPageSize - 1U) / kPagedKVPageSize;
+        const auto device_pages = static_cast<std::uint64_t>(kvmem_window_pages) +
+                                  (prefill_chunk + kPagedKVPageSize - 1U) / kPagedKVPageSize + 16U;
+        std::size_t minimum = 0;
+        const auto require_host = [&](std::uint64_t count, std::size_t stride) {
+            if (stride && count > (limit - minimum) / stride) {
+                throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                    "KVMem prompt history exceeds isolated Host context capacity; "
+                    "reduce input length or configure a larger Host pool");
+            }
+            minimum += count * stride;
+        };
+        require_host(prompt_pages > device_pages ? prompt_pages - device_pages : 0,
+                     text_host_kv_page_stride);
+        if (backend_kv_pages) {
+            const auto backend_device_pages = device_pages + (draft_window + 63U) / 64U + 1U;
+            require_host(prompt_pages > backend_device_pages ? prompt_pages - backend_device_pages : 0,
+                         backend_host_kv_page_stride);
+        }
+        require_host(base->summary.prompt_tokens / sparse.index.block_tokens(), mean_bytes);
+        std::size_t bytes = 0;
+        const auto add = [&](std::uint64_t count, std::size_t stride) {
+            const auto free = limit - bytes;
+            bytes += stride && count > free / stride ? free : count * stride;
+        };
+        // Startup reserves a Device working-set budget for every lane. Charge the
+        // future history that exceeds that budget, not the same pages in both
+        // Device and Host. Unit quotes still account for actual Host replicas,
+        // temporary growth, fragmentation and competing cache ownership.
+        const auto host_pages = pages > kvmem_window_pages ? pages - kvmem_window_pages : 0;
+        add(host_pages, text_host_kv_page_stride);
+        if (backend_kv_pages) { add(host_pages, backend_host_kv_page_stride); }
+        add(2, state_images->host_layout().image_bytes);
+        add(blocks, mean_bytes + 512U);
+        add(2, sparse.key_sums.bytes() + sparse.query_key_checkpoint.bytes());
+        base->kvmem_host_entitlement_bytes = bytes;
+    }
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
     base->summary.publish_continuation =

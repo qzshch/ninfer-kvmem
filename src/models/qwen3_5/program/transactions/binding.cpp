@@ -68,6 +68,12 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
         requests[lane].lifecycle != Lifecycle::Empty || !base.impl_) {
         throw std::logic_error("binding requires a free lane and context transaction slot");
     }
+    if (!resume && base.impl_->kvmem_host_entitlement_bytes) {
+        const auto available = host_context_arena->capacity_bytes() - host_admission_budget->claimed;
+        if (base.impl_->kvmem_host_entitlement_bytes > available) {
+            return {.capacity_possible = true, .admission_deferred = true};
+        }
+    }
     const bool own_snapshot = resume && resume->has_snapshot();
     const auto source       = own_snapshot ? resume->impl_->snapshot : candidate.checkpoint;
     if (source &&
@@ -351,6 +357,10 @@ BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runti
                               .retired_points = candidate.retired_points,
                               .consumed_source =
                                   transaction.consume_source ? source : std::nullopt};
+    if (!resume && base.impl_->kvmem_host_entitlement_bytes) {
+        request.host_admission = std::make_shared<HostAdmissionClaim>(
+            host_admission_budget, base.impl_->kvmem_host_entitlement_bytes);
+    }
     request.base      = base.impl_;
     request.lifecycle = Lifecycle::Prefilling;
     initialize_prefill(lane, transaction.reuse_frontier);

@@ -54,6 +54,97 @@ ninfer::PromptInput media_prompt() {
 } // namespace
 
 namespace {
+void host_rejection_regression(ninfer::Engine& engine) {
+    const auto small = engine.tokenize_text("Reference record: alpha beta gamma delta epsilon.\n");
+    const auto baseline = engine.generate(engine.prepare_tokens(small), request(false));
+    std::vector<ninfer::TokenId> large;
+    while (large.size() < 255003) { large.insert(large.end(), small.begin(), small.end()); }
+    large.resize(255003);
+    for (unsigned repetition = 0; repetition < 2; ++repetition) {
+        bool rejected = false;
+        try {
+            (void)engine.generate(engine.prepare_tokens(large), request(false));
+        } catch (const ninfer::RequestError& error) {
+            rejected = error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        }
+        require(rejected && engine.is_available(),
+                "isolated Host capacity rejection poisoned the Engine");
+        const auto survivor = engine.generate(engine.prepare_tokens(small), request(false));
+        require(survivor.generated_token_ids == baseline.generated_token_ids,
+                "Host capacity rejection changed subsequent greedy inference");
+    }
+    std::cout << "ok isolated Host rejection and repeated surviving inference" << std::endl;
+}
+
+void host_admission_regression(ninfer::Engine& engine, bool expiry) {
+    const auto unit = engine.tokenize_text("Reference record: alpha beta gamma delta epsilon.\n");
+    std::vector<ninfer::TokenId> tokens;
+    while (tokens.size() < 255003) { tokens.insert(tokens.end(), unit.begin(), unit.end()); }
+    tokens.resize(255003);
+    auto options = request(false);
+    if (expiry) {
+        auto active = engine.submit(engine.prepare_tokens(tokens), options);
+        auto queued = engine.submit(engine.prepare_tokens(tokens), options);
+        bool timed_out = false;
+        try { (void)queued.wait(); }
+        catch (const ninfer::RequestError& error) {
+            timed_out = error.kind() == ninfer::RequestErrorKind::QueueTimeout;
+            if (!timed_out) { throw; }
+        }
+        require(timed_out && engine.is_available(), "waiting deadline poisoned Engine availability");
+        require(active.wait().generated_token_ids.size() == 24,
+                "waiting timeout damaged the admitted request");
+        require(engine.generate(engine.prepare_tokens(unit), options).generated_token_ids.size() == 24 &&
+                    engine.is_available(), "waiting timeout leaked admission capacity");
+        std::cout << "ok waiting deadline, admitted survivor and subsequent short request" << std::endl;
+        return;
+    }
+    const auto baseline = engine.generate(engine.prepare_tokens(tokens), options);
+    require(baseline.generated_token_ids.size() == 24, "isolated near-capacity baseline failed");
+    std::cout << "ok isolated near-capacity baseline" << std::endl;
+    const auto wait_for_progress = [&](std::uint64_t before) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        for (;;) {
+            const auto stats = engine.runtime_stats();
+            require(engine.is_available(), "Host admission poisoned Engine availability");
+            if (stats.computed_prefill_tokens > before + 2048 && stats.waiting_requests) {
+                require(stats.running_requests == 1, "oversized Host claims were admitted together");
+                return;
+            }
+            require(std::chrono::steady_clock::now() < deadline, "Host admission made no progress");
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    };
+    auto before = engine.runtime_stats().computed_prefill_tokens;
+    auto active = engine.submit(engine.prepare_tokens(tokens), options);
+    auto queued = engine.submit(engine.prepare_tokens(tokens), options);
+    wait_for_progress(before);
+    queued = {}; // Cancelling a waiting request must not release the active request's claim.
+    require(active.wait().generated_token_ids == baseline.generated_token_ids,
+            "queued cancellation changed the surviving long request");
+    std::cout << "ok queued cancellation and admitted survivor" << std::endl;
+
+    before = engine.runtime_stats().computed_prefill_tokens;
+    active = engine.submit(engine.prepare_tokens(tokens), options);
+    queued = engine.submit(engine.prepare_tokens(tokens), options);
+    wait_for_progress(before);
+    const auto cancelled = active.wait(nullptr, ninfer::CancellationView([] { return true; }));
+    require(cancelled.finish_reason == ninfer::FinishReason::Cancelled,
+            "active long request was not cancelled");
+    require(queued.wait().generated_token_ids == baseline.generated_token_ids,
+            "cancelled Host entitlement did not unlock the queued request");
+    std::cout << "ok active cancellation and unlocked queued survivor" << std::endl;
+
+    active = engine.submit(engine.prepare_tokens(tokens), options);
+    queued = engine.submit(engine.prepare_tokens(tokens), options);
+    require(active.wait().generated_token_ids == baseline.generated_token_ids &&
+                queued.wait().generated_token_ids == baseline.generated_token_ids,
+            "two long requests lost exact output or terminal Host credit release");
+    require(engine.is_available(), "two long requests left Engine unavailable");
+    std::cout << "ok Host admission near-256K pair, waiting cancellation, active cancellation and reuse"
+              << std::endl;
+}
+
 void pressure_regression(ninfer::Engine& engine, unsigned lanes) {
     auto options = request();
     options.stop.include_model_defaults = true;
@@ -153,7 +244,10 @@ int main(int argc, char** argv) {
             if (backend == "none") { o.speculative.proposal_head = ninfer::ProposalHead::Full; }
         }
         const bool pressure = argc > 6 && std::string(argv[6]) == "pressure";
-        if (argc > 6) { require(pressure, "unsupported real-test mode"); }
+        const bool expiry = argc > 6 && std::string(argv[6]) == "admission-expiry";
+        const bool admission = expiry || (argc > 6 && std::string(argv[6]) == "admission");
+        const bool rejection = argc > 6 && std::string(argv[6]) == "admission-reject";
+        if (argc > 6) { require(pressure || admission || rejection, "unsupported real-test mode"); }
         if (pressure) {
             o.max_context = 65536;
             o.prefill_chunk = 1024;
@@ -161,7 +255,24 @@ int main(int argc, char** argv) {
             o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(o.max_concurrency * 18432);
             o.context_cache.device_state_slots = 0;
         }
+        if (admission || rejection) {
+            require(o.max_concurrency == (rejection ? 1U : 2U), "Host regression lane count");
+            o.max_context = 262144;
+            o.prefill_chunk = 1024;
+            o.kvmem_window_pages = 576;
+            o.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(o.max_concurrency * 38912);
+            o.context_cache.device_state_slots = 0;
+            o.pending_timeout_ms = expiry ? 1000 : 1800000;
+        }
         ninfer::Engine engine(o);
+        if (rejection) {
+            host_rejection_regression(engine);
+            return 0;
+        }
+        if (admission) {
+            host_admission_regression(engine, expiry);
+            return 0;
+        }
         if (pressure) {
             pressure_regression(engine, o.max_concurrency);
             return 0;

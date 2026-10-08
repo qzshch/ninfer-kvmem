@@ -142,6 +142,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
                                 StartupProgressUnit::Bytes, host_bytes);
         host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
+        host_admission_budget = std::make_shared<HostAdmissionBudget>();
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
         host_kv_arena = std::make_unique<HostKVArena>(*host_context_arena, layouts);

@@ -323,6 +323,16 @@ and vision weights. Without an explicit artifact argument or `NINFER_TEST_ARTIFA
 with status 77. This small-window lifecycle fixture does not establish full-context capacity
 or production throughput.
 
+The `admission` mode uses two lanes, 36K working sets, a 256K context ceiling and
+255003-token raw inputs. With Host8GiB it checks an isolated greedy oracle, queued
+and active cancellation, waiting-request progress and repeated pair completion.
+The `admission-expiry` mode additionally expects a one-second waiting deadline,
+then verifies the admitted survivor and another short request. These are capacity
+and lifetime regressions, not evidence that both large histories run simultaneously.
+For the request error boundary, run one lane with Host4GiB and `admission-reject`:
+two oversized inputs must raise `ContextLengthExceeded`, keep Engine availability,
+and preserve subsequent short-request greedy output.
+
 Keep the three-lane/four-GiB run: after retained shared and vision checkpoints,
 the final query probe must still obtain complete Host KV backing. This is a
 regression for an optional Host State capture taking capacity already quoted for
