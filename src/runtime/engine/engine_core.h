@@ -1647,7 +1647,24 @@ private:
                     if (request->admission_generation == admission_generation_) { continue; }
                     request->admission_generation = admission_generation_;
                 }
-                ensure_base_plan(request);
+                try {
+                    ensure_base_plan(request);
+                } catch (const RequestError& error) {
+                    // A fresh input can exceed the isolated model capacity before any
+                    // binding, source or transfer is owned. Reject only that request;
+                    // execution/restore failures still reach fail_all_locked.
+                    if (restoring || error.kind() != RequestErrorKind::ContextLengthExceeded) {
+                        throw;
+                    }
+                    const auto rejected = std::current_exception();
+                    {
+                        std::lock_guard lock(queue_mutex_);
+                        std::erase(pending_, request);
+                    }
+                    complete_error(request, rejected);
+                    request_admission_check();
+                    continue;
+                }
                 const auto retained = resources_.retained_source(request->id);
                 const auto revoked  = resources_.source_revocations(request->id);
                 if (!restoring && revoked > request->admission.revoked_checkpoints) {
@@ -1742,6 +1759,13 @@ private:
                     }
                     ++decision.current;
                     continue;
+                }
+                if (!reservation && reservation.admission_deferred) {
+                    // Reclaiming cache cannot release a live request entitlement. Wait for
+                    // terminal/cancel capacity notification without evicting useful prefixes.
+                    if (!own_snapshot) { retain_admission_source(request, choice, restoring); }
+                    deferred = true;
+                    break;
                 }
                 if (!reservation) {
                     shortage = reservation.shortage;

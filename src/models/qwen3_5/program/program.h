@@ -178,6 +178,7 @@ struct BindingReservation {
     bool reserved          = false;
     bool source_valid      = true;
     bool capacity_possible = true;
+    bool admission_deferred = false;
     runtime::ContextResourceUsage shortage;
     std::vector<CheckpointHandle> retired_points;
     std::optional<CheckpointHandle> consumed_source;

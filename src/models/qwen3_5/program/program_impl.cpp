@@ -146,6 +146,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             context_cache.kv_file_directory.empty()
                 ? std::nullopt
                 : std::optional<std::size_t>(context_cache.hicache_state_capacity_bytes));
+        host_admission_budget = std::make_shared<HostAdmissionBudget>();
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
         host_kv_arena = std::make_unique<HostKVArena>(
