@@ -20,7 +20,10 @@ using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 // This projection selects its own route, so the layout the quantizer writes below must be derived
 // from the same predicate; the two are read together at the call site for that reason.
-constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 1024; }
+// Keep the efficient small/medium cp.async schedules through T=512. Above
+// that anchor, partial prefill chunks benefit from the existing 256-token
+// TMA pipeline; waiting for T=1024 unnecessarily reuses the resident route.
+constexpr bool uses_tma(std::int32_t tokens) { return tokens > 512; }
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,

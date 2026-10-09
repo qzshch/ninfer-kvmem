@@ -117,9 +117,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{96, ops::LinearPolicy::AllowA4},
         Invocation{128, ops::LinearPolicy::AllowA4},
         Invocation{129, ops::LinearPolicy::AllowA4},
-        // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
-        // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
-        // single real token, which is the emptiest grid this route ever runs.
+        // Qualify both sides of the TMA floor and one-token tails of its 256-token tile.
+        Invocation{255, ops::LinearPolicy::AllowA4},
+        Invocation{256, ops::LinearPolicy::AllowA4},
+        Invocation{257, ops::LinearPolicy::AllowA4},
+        Invocation{511, ops::LinearPolicy::AllowA4},
+        Invocation{512, ops::LinearPolicy::AllowA4},
+        Invocation{513, ops::LinearPolicy::AllowA4},
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
