@@ -93,6 +93,7 @@ enum class StartupPhase : std::uint8_t {
     FrontendInitialize,
     ProgramInitialize,
     HostContextPin,
+    HostContextAllocate,
     CudaGraphPrepare,
     EngineFinalize,
 };
@@ -124,7 +125,7 @@ struct StartupObserver {
     std::function<void(const StartupEvent& event)> callback;
 };
 
-
+enum class HostContextMemory : std::uint8_t { Pinned, Pageable };
 
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
@@ -137,7 +138,9 @@ struct ContextCacheOptions {
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
-
+    // Pageable backing preserves bytes and ownership, but CUDA transfers may block the host.
+    // It avoids pinning the entire context pool on systems with a tight commit budget.
+    HostContextMemory host_memory = HostContextMemory::Pinned;
 };
 
 struct ContextCostOptions {

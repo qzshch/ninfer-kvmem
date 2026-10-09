@@ -74,6 +74,7 @@ int main() {
     engine_options.use_cuda_graph                    = options.use_cuda_graph;
     engine_options.context_cache.device_state_slots  = 2;
     engine_options.context_cache.host_capacity_bytes = 64ULL << 20;
+    engine_options.context_cache.host_memory         = ninfer::HostContextMemory::Pageable;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
@@ -207,7 +208,8 @@ int main() {
     failures += check(
         server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
-            server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
+            server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20) &&
+            server.at("engine").at("context_cache").at("host_memory") == "pageable",
         "resolved context-cache configuration missing");
     failures += check(server.at("server").at("default_preserve_thinking") == true,
                       "server preserve-thinking default missing");

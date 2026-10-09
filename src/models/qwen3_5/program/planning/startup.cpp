@@ -798,6 +798,10 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("KVMem requires nonzero Host context backing");
     }
     const auto& cache = options.context_cache;
+    if (cache.host_memory != HostContextMemory::Pinned &&
+        cache.host_memory != HostContextMemory::Pageable) {
+        throw std::invalid_argument("Host context memory kind is invalid");
+    }
 
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages =

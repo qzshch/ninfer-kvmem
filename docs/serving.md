@@ -789,6 +789,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | fixed pinned Host budget shared by StateImages, KV, retrieval metadata and in-flight destinations | `8192 MiB + 8 native StateImages` |
+| `--host-context-memory pinned\|pageable` | Host backing allocation; pageable preserves bytes but transfers may block the host | `pinned` |
 | `--kvmem-window-pages N` | sparse per-lane Main KV working set; 64 tokens per page; zero preserves dense execution | `0` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -819,6 +820,11 @@ request fields override process flags, and `--greedy` finally forces temperature
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
 Host state and Main/Backend KV share one startup-fixed logical byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
+`--host-context-memory pageable` uses a fixed aligned ordinary-memory backing instead of
+pinning the whole pool. It does not change context limits, admission quotes, stored bytes or
+transfer publication ordering. CUDA may stage these transfers and block the submitting thread;
+measure transfer and E2E cost before selecting this mode. Backing capacity/resident accounting
+reports allocated address capacity, not actual RSS for pageable memory. Pinned remains the default.
 Sparse attention approximates dense
 full-history attention; byte-preserving Host copies do not establish quality equivalence.
 See [sparse working sets and Native history](maintainer/sparse-native-context-cache.md) for

@@ -69,6 +69,7 @@ Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和�
 | `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
 | `context_cache.device_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
 | `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+| `context_cache.host_memory` | 默认 Pinned；Pageable 显式使用普通内存 backing，保留相同的所有权、额度和字节表示 |
 
 Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
 `C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时
@@ -78,6 +79,8 @@ Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界
 Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`。它是一个共享 backing，State 与
 KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，
 不减少占用。Host extent 的分裂、最后引用释放和合并由 allocator 管理。
+Pageable 模式不锁定整个池；CUDA 搬运可能经过驱动 staging 并阻塞 Host。目的发布仍必须等待
+传输完成，源和目的 owner 保留到同一退休边界。容量/allocated backing 统计在此模式下不是 RSS。
 
 KVMem 的执行许可还检查现有空闲 extent 是否能容纳所需的完整 KV 页。总空闲字节足够并不表示
 碎片可用；报价按页几何模拟分段写回，并同时扣除本 unit 新增的 CPU 检索元数据。发现缺口时先

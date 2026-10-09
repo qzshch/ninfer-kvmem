@@ -139,13 +139,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
     const auto address_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
     if (host_bytes) {
-        StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
+        StartupPhaseScope phase(startup_observer,
+                                context_cache.host_memory == HostContextMemory::Pinned
+                                    ? StartupPhase::HostContextPin
+                                    : StartupPhase::HostContextAllocate,
                                 StartupProgressUnit::Bytes, host_bytes);
-        host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
+        host_context_arena    = std::make_unique<HostContextArena>(host_bytes, minimum_stride,
+                                                                   context_cache.host_memory);
         host_admission_budget = std::make_shared<HostAdmissionBudget>();
         host_state_images =
             std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
-        host_kv_arena = std::make_unique<HostKVArena>(*host_context_arena, layouts);
+        host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
         const auto extents = checked_count(host_bytes / minimum_kv_stride);
         if (extents) {
             host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);

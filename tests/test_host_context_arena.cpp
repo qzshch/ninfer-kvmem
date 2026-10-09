@@ -75,8 +75,8 @@ void test_fragmentation_and_split() {
     expect(arena.free_bytes() == 1024 && !arena.can_allocate(512) && !arena.allocate(512),
            "actual contiguous extents, not total free bytes, govern availability");
     const std::array<ninfer::HostPageDemand, 2> mixed = {{{512, 1}, {256, 2}}};
-    expect(arena.page_allocation_shortage(mixed) == 1024 &&
-               arena.occupied_bytes() == 1024 && arena.reserved_bytes() == 0,
+    expect(arena.page_allocation_shortage(mixed) == 1024 && arena.occupied_bytes() == 1024 &&
+               arena.reserved_bytes() == 0,
            "complete-page quote rejects fragmented capacity without changing source ownership");
     const std::array<ninfer::HostPageDemand, 1> small = {{{256, 4}}};
     expect(arena.page_allocation_shortage(small) == 0,
@@ -101,6 +101,7 @@ void test_fragmentation_and_split() {
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
 }
+
 void test_metadata_charge() {
     ninfer::HostContextArena arena(2048, 256);
     auto metadata = arena.charge_metadata(257);
@@ -113,12 +114,46 @@ void test_metadata_charge() {
     expect(state && !arena.allocate(1) && !arena.charge_metadata(1),
            "metadata aliases and pinned extents share the complete admission quota");
     alias.reset();
-    expect(arena.metadata_bytes() == 0 && arena.resident_bytes() == 2048 &&
-               arena.can_allocate(512), "last metadata alias returns its unique charge");
+    expect(arena.metadata_bytes() == 0 && arena.resident_bytes() == 2048 && arena.can_allocate(512),
+           "last metadata alias returns its unique charge");
     state.reset();
     expect(arena.occupied_bytes() == 0 && arena.free_bytes() == 2048 &&
                !arena.charge_metadata(std::numeric_limits<std::size_t>::max()),
            "overflow and teardown leave the fixed backing reusable");
+}
+
+void test_transfer_and_reuse(ninfer::HostContextMemory memory) {
+    constexpr std::size_t count = (1U << 20) + 257;
+    ninfer::HostContextArena arena(count * 3, 256, memory);
+    auto source = arena.allocate(count);
+    auto target = arena.allocate(count);
+    expect(source && target, "Host transfer endpoints must both be reserved");
+    expect(reinterpret_cast<std::uintptr_t>(source->data()) % 256 == 0,
+           "pageable and pinned backing preserve complete-page alignment");
+    for (std::size_t i = 0; i < count; ++i) { source->data()[i] = std::byte((i * 17 + 3) & 255); }
+    source->publish();
+    ninfer::DeviceBuffer device(count);
+    cudaStream_t stream{};
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        throw std::runtime_error("test transfer stream creation failed");
+    }
+    const auto upload =
+        cudaMemcpyAsync(device.p, source->data(), count, cudaMemcpyHostToDevice, stream);
+    const auto download =
+        cudaMemcpyAsync(target->data(), device.p, count, cudaMemcpyDeviceToHost, stream);
+    const auto retired = cudaStreamSynchronize(stream);
+    (void)cudaStreamDestroy(stream);
+    expect(upload == cudaSuccess && download == cudaSuccess && retired == cudaSuccess,
+           "both Host memory modes support ordered CUDA transfers");
+    expect(target->reserved(), "transfer destination is unpublished until completion");
+    target->publish();
+    expect(std::memcmp(source->data(), target->data(), count) == 0,
+           "Host backing mode must not change copied KV/state bytes");
+    source.reset();
+    target.reset();
+    expect(arena.occupied_bytes() == 0 && arena.allocation_count() == 0 &&
+               arena.can_allocate(count * 2),
+           "retired transfer allocations return reusable capacity");
 }
 } // namespace
 
@@ -134,6 +169,8 @@ int main() {
         test_reserve_publish_and_rollback();
         test_fragmentation_and_split();
         test_metadata_charge();
+        test_transfer_and_reuse(ninfer::HostContextMemory::Pinned);
+        test_transfer_and_reuse(ninfer::HostContextMemory::Pageable);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

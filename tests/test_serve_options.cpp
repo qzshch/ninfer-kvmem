@@ -49,6 +49,22 @@ int main() {
                       "default KV capacity does not follow max context");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
+    failures += check(defaults.context_cache.host_memory == ninfer::HostContextMemory::Pinned,
+                      "default Host context memory is not pinned");
+    for (const auto memory : {"pinned", "pageable"}) {
+        const auto configured =
+            parse({"ninfer-serve", "model.ninfer", "--host-context-memory", memory});
+        failures +=
+            check(configured.context_cache.host_memory ==
+                      (std::string_view(memory) == "pinned" ? ninfer::HostContextMemory::Pinned
+                                                            : ninfer::HostContextMemory::Pageable),
+                  "explicit Host memory kind was lost");
+    }
+    bool invalid_host_memory = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-context-memory", "automatic"});
+    } catch (const std::invalid_argument&) { invalid_host_memory = true; }
+    failures += check(invalid_host_memory, "unknown Host memory kind was accepted");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&

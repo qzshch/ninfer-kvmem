@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <stdexcept>
 
 namespace ninfer {
@@ -26,7 +27,7 @@ HostContextAllocation& HostContextAllocation::operator=(HostContextAllocation&& 
 }
 
 std::byte* HostContextAllocation::data() const noexcept {
-    return valid() ? static_cast<std::byte*>(owner_->backing_->data()) + offset_ : nullptr;
+    return valid() ? owner_->backing_data() + offset_ : nullptr;
 }
 
 void HostContextAllocation::publish() noexcept {
@@ -49,8 +50,12 @@ void HostContextAllocation::disarm() noexcept {
     reserved_ = false;
 }
 
-HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes)
+HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes,
+                                   HostContextMemory memory)
     : capacity_bytes_(capacity_bytes) {
+    if (memory != HostContextMemory::Pinned && memory != HostContextMemory::Pageable) {
+        throw std::invalid_argument("Host context memory kind is invalid");
+    }
     if (minimum_allocation_bytes == 0 ||
         minimum_allocation_bytes > std::numeric_limits<std::size_t>::max() - (alignment - 1)) {
         throw std::invalid_argument("Host context minimum allocation is invalid");
@@ -60,8 +65,23 @@ HostContextArena::HostContextArena(std::size_t capacity_bytes, std::size_t minim
     // At most N allocated extents separate N+1 free runs; releases and splits never allocate
     // metadata. The unused trailing bytes remain part of the charged physical backing.
     free_extents_.reserve(capacity_bytes_ / minimum_bytes_ + 1);
-    backing_.emplace(capacity_bytes_);
+    if (memory == HostContextMemory::Pinned) {
+        backing_.emplace(capacity_bytes_);
+    } else {
+        pageable_backing_ =
+            static_cast<std::byte*>(::operator new(capacity_bytes_, std::align_val_t{alignment}));
+    }
     free_extents_.push_back({0, capacity_bytes_});
+}
+
+HostContextArena::~HostContextArena() {
+    ::operator delete(pageable_backing_, std::align_val_t{alignment});
+}
+
+std::byte* HostContextArena::backing_data() const noexcept {
+    return pageable_backing_ ? pageable_backing_
+           : backing_        ? static_cast<std::byte*>(backing_->data())
+                             : nullptr;
 }
 
 HostResidentCharge::~HostResidentCharge() {
@@ -101,8 +121,8 @@ bool HostContextArena::can_allocate(std::size_t bytes) const noexcept {
     return rounded != 0 && rounded <= free_bytes() && find_free_extent(rounded).has_value();
 }
 
-std::size_t HostContextArena::page_allocation_shortage(
-    std::span<const HostPageDemand> demands, std::size_t metadata_bytes) const {
+std::size_t HostContextArena::page_allocation_shortage(std::span<const HostPageDemand> demands,
+                                                       std::size_t metadata_bytes) const {
     std::size_t total = 0;
     for (const auto& demand : demands) {
         if (!demand.pages) { continue; }
@@ -121,7 +141,7 @@ std::size_t HostContextArena::page_allocation_shortage(
     // Match prepare_prefix: take the largest whole-page run that fits, then
     // allocate from the first extent that can hold it. Neither metadata charges
     // nor quote scratch alter the physical extent ledger.
-    auto available = free_extents_;
+    auto available              = free_extents_;
     std::size_t remaining_bytes = total;
     for (const auto& demand : demands) {
         auto remaining = demand.pages;
@@ -134,8 +154,8 @@ std::size_t HostContextArena::page_allocation_shortage(
             }
             if (!run) { return remaining_bytes; }
             const auto bytes = run * stride;
-            auto extent = std::find_if(available.begin(), available.end(),
-                                      [bytes](const auto& e) { return e.bytes >= bytes; });
+            auto extent      = std::find_if(available.begin(), available.end(),
+                                            [bytes](const auto& e) { return e.bytes >= bytes; });
             extent->bytes -= bytes;
             remaining -= run;
             remaining_bytes -= bytes;

@@ -590,10 +590,13 @@ std::string format_server_start_json(
                                    {"hardware_class", context_cost.hardware_class},
                                    {"prefill_signature", context_cost.prefill_signature},
                                    {"preset_path", context_cost.preset_path.string()}}},
-             {"context_cache", Json{{"enabled", cache.enabled},
-                                    {"device_state_slots", cache.device_state_slots.value()},
-                                    {"total_device_state_slots", total_device_state_slots},
-                                    {"host_capacity_bytes", cache.host_capacity_bytes.value()}}}};
+             {"context_cache",
+              Json{{"enabled", cache.enabled},
+                   {"device_state_slots", cache.device_state_slots.value()},
+                   {"total_device_state_slots", total_device_state_slots},
+                   {"host_capacity_bytes", cache.host_capacity_bytes.value()},
+                   {"host_memory",
+                    cache.host_memory == HostContextMemory::Pinned ? "pinned" : "pageable"}}}};
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "ninfer/types.h"
 
 #include <cstddef>
 #include <optional>
@@ -19,7 +20,7 @@ struct HostPageDemand {
     std::size_t pages = 0;
 };
 
-// A unique, immovable physical extent. Keeping this owner alive pins its bytes; views never
+// A unique, immovable backing extent. Keeping this owner alive retains its bytes; views never
 // allocate or charge a second copy. Transfer destinations remain reserved until publication.
 class HostContextAllocation {
 public:
@@ -55,7 +56,7 @@ private:
     bool reserved_           = false;
 };
 
-// One startup-fixed pinned backing shared by every optional Host context representation.
+// One startup-fixed backing shared by every optional Host context representation.
 // minimum_allocation_bytes is the smallest supported complete geometry, not a quota split.
 // It bounds metadata at startup; all allocations and split pieces must meet that minimum.
 // The arena must outlive its allocations and the typed pools that own them.
@@ -63,7 +64,9 @@ class HostContextArena {
 public:
     static constexpr std::size_t alignment = 256;
 
-    HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes);
+    HostContextArena(std::size_t capacity_bytes, std::size_t minimum_allocation_bytes,
+                     HostContextMemory memory = HostContextMemory::Pinned);
+    ~HostContextArena();
     HostContextArena(const HostContextArena&)            = delete;
     HostContextArena& operator=(const HostContextArena&) = delete;
     HostContextArena(HostContextArena&&)                 = delete;
@@ -89,7 +92,8 @@ public:
 
     [[nodiscard]] std::size_t allocation_count() const noexcept { return allocation_count_; }
 
-    // Fixed pinned backing plus independently owned CPU retrieval metadata.
+    // Fixed allocated backing plus independently owned CPU retrieval metadata. Pageable
+    // capacity is allocated address space, not a measurement of OS resident physical pages.
     [[nodiscard]] std::size_t resident_bytes() const noexcept { return capacity_bytes_ + metadata_bytes_; }
     [[nodiscard]] std::size_t metadata_bytes() const noexcept { return metadata_bytes_; }
     [[nodiscard]] std::size_t resident_free_bytes() const noexcept { return free_bytes(); }
@@ -119,7 +123,9 @@ private:
     void release(std::size_t offset, std::size_t bytes, bool reserved) noexcept;
 
     std::size_t metadata_bytes_ = 0;
+    [[nodiscard]] std::byte* backing_data() const noexcept;
     std::optional<PinnedHostBuffer> backing_;
+    std::byte* pageable_backing_ = nullptr;
     std::size_t capacity_bytes_      = 0;
     std::size_t minimum_bytes_       = 0;
     std::size_t occupied_bytes_      = 0;

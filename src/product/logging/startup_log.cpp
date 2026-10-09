@@ -64,6 +64,9 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
                 false};
     case StartupPhase::HostContextPin:
         return {"pinning host context", "host context pinned", PhaseVisibility::Info, true, false};
+    case StartupPhase::HostContextAllocate:
+        return {"allocating pageable host context", "pageable host context allocated",
+                PhaseVisibility::Info, false, false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:

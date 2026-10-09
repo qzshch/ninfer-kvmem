@@ -2376,6 +2376,13 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
         options.context_cache.device_state_slots  = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
+        if (const auto* host = std::getenv("NINFER_TEST_HOST_MEMORY"); host) {
+            require(std::string_view(host) == "pinned" || std::string_view(host) == "pageable",
+                    "invalid NINFER_TEST_HOST_MEMORY");
+            options.context_cache.host_memory = std::string_view(host) == "pageable"
+                                                    ? HostContextMemory::Pageable
+                                                    : HostContextMemory::Pinned;
+        }
         if (const auto* sparse = std::getenv("NINFER_NATIVE_TRANSACTIONS_SPARSE");
             sparse && std::string_view(sparse) == "1") {
             const auto runs = std::getenv("NINFER_SPARSE_BASELINE_RUNS")

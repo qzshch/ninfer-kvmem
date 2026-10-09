@@ -121,7 +121,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
-           "[--device-state-slots N] [--host-context-mib N] [--kvmem-window-pages N] "
+           "[--device-state-slots N] [--host-context-mib N] "
+           "[--host-context-memory pinned|pageable] [--kvmem-window-pages N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
@@ -158,6 +159,8 @@ std::string serve_usage_text(const char* argv0) {
            "--kvmem-window-pages enables a per-lane sparse working set (64 tokens/page)\n"
 
            "       --host-context-mib accepts decimal MiB values that resolve to whole bytes\n"
+           "       --host-context-memory defaults to pinned; pageable avoids full-pool pinning "
+           "but transfers may block the host\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -267,6 +270,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-context-mib") {
             options.context_cache.host_capacity_bytes =
                 parse_host_context_mib(require_value("--host-context-mib"));
+        } else if (arg == "--host-context-memory") {
+            const std::string_view memory = require_value("--host-context-memory");
+            if (memory == "pinned") {
+                options.context_cache.host_memory = HostContextMemory::Pinned;
+            } else if (memory == "pageable") {
+                options.context_cache.host_memory = HostContextMemory::Pageable;
+            } else {
+                throw std::invalid_argument("--host-context-memory must be pinned or pageable");
+            }
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
