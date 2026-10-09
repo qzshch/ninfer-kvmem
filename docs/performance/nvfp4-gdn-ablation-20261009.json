@@ -12140,5 +12140,1455 @@
       "equal": false,
       "first_difference": 2
     }
-  ]
+  ],
+  "root_cause_followup": {
+    "scope": "Root-cause followup; primary E2E timings remain the original 3-repeat unprofiled cohorts. New16 full-model requests diagnose output invariance; one NV whole trace and cold-L2 GDN NCU counters are diagnostic only. No semantic judge or formal quality equivalence claim.",
+    "nv_actual_prefill_chunks": {
+      "1024": 46,
+      "445": 1,
+      "508": 1,
+      "4": 2,
+      "503": 1,
+      "5": 1
+    },
+    "nv_changed_interval_chunks": 0,
+    "nv_trace_image_sha256": "3fb192aeea2ebf0c8c62fa200d57ff8550d5c0e6fd71967a868cf084438af051",
+    "gdn_hardware_cold_l2": {
+      "B0": [
+        {
+          "kernel": "void unnamed>::prepare_kernel<1>(Arguments, QkChunk *, ControlChunk *)",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "value": "19.392000",
+              "unit": "us"
+            },
+            "launch__registers_per_thread": {
+              "value": "48",
+              "unit": "register/thread"
+            },
+            "launch__shared_mem_per_block": {
+              "value": "12.800000",
+              "unit": "Kbyte/block"
+            },
+            "launch__shared_mem_per_block_static": {
+              "value": "11.776000",
+              "unit": "Kbyte/block"
+            },
+            "launch__shared_mem_per_block_dynamic": {
+              "value": "0.000000",
+              "unit": "Kbyte/block"
+            },
+            "launch__occupancy_limit_registers": {
+              "value": "5.000000",
+              "unit": "block"
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "value": "8.000000",
+              "unit": "block"
+            },
+            "launch__waves_per_multiprocessor": {
+              "value": "3.61",
+              "unit": ""
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "value": "74.533250",
+              "unit": "%"
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "46.303919",
+              "unit": "%"
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "5.307028",
+              "unit": "%"
+            },
+            "dram__bytes.sum.per_second": {
+              "value": "93.465347",
+              "unit": "Gbyte/s"
+            },
+            "lts__t_sector_hit_rate.pct": {
+              "value": "100.654184",
+              "unit": "%"
+            },
+            "smsp__warps_eligible.avg.per_cycle_active": {
+              "value": "0.970924",
+              "unit": "warp"
+            },
+            "smsp__issue_active.avg.pct_of_peak_sustained_active": {
+              "value": "44.517006",
+              "unit": "%"
+            },
+            "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+              "value": "10.244733",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+              "value": "1.475866",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio": {
+              "value": "1.509610",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+              "value": "1.163320",
+              "unit": "inst"
+            },
+            "derived__local_spilling_requests": {
+              "value": "0",
+              "unit": ""
+            },
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "value": "11.495849",
+              "unit": "%"
+            }
+          },
+          "grid": "(3072, 1, 1)",
+          "block": "(256, 1, 1)",
+          "sm_count": "170"
+        },
+        {
+          "kernel": "void unnamed>::chunk_recurrence_kernel<64>(Arguments, const QkChunk *, const ControlChunk *)",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "value": "90.560000",
+              "unit": "us"
+            },
+            "launch__registers_per_thread": {
+              "value": "128",
+              "unit": "register/thread"
+            },
+            "launch__shared_mem_per_block": {
+              "value": "62.976000",
+              "unit": "Kbyte/block"
+            },
+            "launch__shared_mem_per_block_static": {
+              "value": "0.000000",
+              "unit": "Kbyte/block"
+            },
+            "launch__shared_mem_per_block_dynamic": {
+              "value": "61.952000",
+              "unit": "Kbyte/block"
+            },
+            "launch__occupancy_limit_registers": {
+              "value": "2.000000",
+              "unit": "block"
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "value": "1.000000",
+              "unit": "block"
+            },
+            "launch__waves_per_multiprocessor": {
+              "value": "0.56",
+              "unit": ""
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "value": "16.657955",
+              "unit": "%"
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "33.747398",
+              "unit": "%"
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "0.062487",
+              "unit": "%"
+            },
+            "dram__bytes.sum.per_second": {
+              "value": "1.102473",
+              "unit": "Gbyte/s"
+            },
+            "lts__t_sector_hit_rate.pct": {
+              "value": "99.994077",
+              "unit": "%"
+            },
+            "smsp__warps_eligible.avg.per_cycle_active": {
+              "value": "0.276040",
+              "unit": "warp"
+            },
+            "smsp__issue_active.avg.pct_of_peak_sustained_active": {
+              "value": "21.807355",
+              "unit": "%"
+            },
+            "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+              "value": "0.942205",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+              "value": "0.737854",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio": {
+              "value": "2.041392",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+              "value": "1.340587",
+              "unit": "inst"
+            },
+            "derived__local_spilling_requests": {
+              "value": "0",
+              "unit": ""
+            },
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "value": "33.747398",
+              "unit": "%"
+            }
+          },
+          "grid": "(96, 1, 1)",
+          "block": "(256, 1, 1)",
+          "sm_count": "170"
+        }
+      ],
+      "B2": [
+        {
+          "kernel": "void unnamed>::chunk_recurrence_kernel<64, 1, 1>(Arguments, const QkChunk *, const ControlChunk *)",
+          "metrics": {
+            "gpu__time_duration.sum": {
+              "value": "130.496000",
+              "unit": "us"
+            },
+            "launch__registers_per_thread": {
+              "value": "128",
+              "unit": "register/thread"
+            },
+            "launch__shared_mem_per_block": {
+              "value": "92.672000",
+              "unit": "Kbyte/block"
+            },
+            "launch__shared_mem_per_block_static": {
+              "value": "0",
+              "unit": "byte/block"
+            },
+            "launch__shared_mem_per_block_dynamic": {
+              "value": "91.648000",
+              "unit": "Kbyte/block"
+            },
+            "launch__occupancy_limit_registers": {
+              "value": "1.000000",
+              "unit": "block"
+            },
+            "launch__occupancy_limit_shared_mem": {
+              "value": "1.000000",
+              "unit": "block"
+            },
+            "launch__waves_per_multiprocessor": {
+              "value": "0.56",
+              "unit": ""
+            },
+            "sm__warps_active.avg.pct_of_peak_sustained_active": {
+              "value": "32.922578",
+              "unit": "%"
+            },
+            "sm__throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "31.072560",
+              "unit": "%"
+            },
+            "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": {
+              "value": "0.066366",
+              "unit": "%"
+            },
+            "dram__bytes.sum.per_second": {
+              "value": "1.171162",
+              "unit": "Gbyte/s"
+            },
+            "lts__t_sector_hit_rate.pct": {
+              "value": "100.006109",
+              "unit": "%"
+            },
+            "smsp__warps_eligible.avg.per_cycle_active": {
+              "value": "0.413738",
+              "unit": "warp"
+            },
+            "smsp__issue_active.avg.pct_of_peak_sustained_active": {
+              "value": "28.822294",
+              "unit": "%"
+            },
+            "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+              "value": "2.701299",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+              "value": "1.933465",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio": {
+              "value": "1.755958",
+              "unit": "inst"
+            },
+            "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+              "value": "1.243849",
+              "unit": "inst"
+            },
+            "derived__local_spilling_requests": {
+              "value": "0",
+              "unit": ""
+            },
+            "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+              "value": "27.317714",
+              "unit": "%"
+            }
+          },
+          "grid": "(96, 1, 1)",
+          "block": "(512, 1, 1)",
+          "sm_count": "170"
+        }
+      ]
+    },
+    "gdn_numeric": {
+      "block-diagnostic": {
+        "summary": {
+          "cases": 16,
+          "stable_cases": 16,
+          "exact_cases": 4,
+          "max_out_diff_fraction": 0.005247305256386787,
+          "max_pair_out_rel_l2": 0.000357935,
+          "max_pair_state_rel_l2": 0.000308483,
+          "max_fused_oracle_out_rel_l2": 0.00438554,
+          "max_prepared_oracle_out_rel_l2": 0.00438552,
+          "max_fused_oracle_state_rel_l2": 0.00331621,
+          "max_prepared_oracle_state_rel_l2": 0.00331584
+        },
+        "rows": [
+          {
+            "tokens": 257,
+            "pattern": 0,
+            "out_elements": 1579008,
+            "out_diff": 17,
+            "state_diff": 379,
+            "first_out_token": 206,
+            "pair_out_rel_l2": 1.23741e-05,
+            "pair_state_rel_l2": 1.39598e-07,
+            "fused_oracle_out_rel_l2": 0.00357017,
+            "prepared_oracle_out_rel_l2": 0.00357018,
+            "fused_oracle_state_rel_l2": 0.00255172,
+            "prepared_oracle_state_rel_l2": 0.00255172,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 1,
+            "out_elements": 1579008,
+            "out_diff": 418,
+            "state_diff": 894,
+            "first_out_token": 15,
+            "pair_out_rel_l2": 7.20187e-05,
+            "pair_state_rel_l2": 3.66855e-05,
+            "fused_oracle_out_rel_l2": 0.0040224,
+            "prepared_oracle_out_rel_l2": 0.00402233,
+            "fused_oracle_state_rel_l2": 0.00296564,
+            "prepared_oracle_state_rel_l2": 0.00296569,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 5,
+            "out_elements": 1579008,
+            "out_diff": 31,
+            "state_diff": 5202,
+            "first_out_token": 70,
+            "pair_out_rel_l2": 1.31305e-05,
+            "pair_state_rel_l2": 2.62194e-07,
+            "fused_oracle_out_rel_l2": 0.00282176,
+            "prepared_oracle_out_rel_l2": 0.00282177,
+            "fused_oracle_state_rel_l2": 0.00015607,
+            "prepared_oracle_state_rel_l2": 0.000156066,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 9,
+            "out_elements": 1579008,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 257,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00297787,
+            "prepared_oracle_out_rel_l2": 0.00297787,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 0,
+            "out_elements": 3151872,
+            "out_diff": 163,
+            "state_diff": 601,
+            "first_out_token": 106,
+            "pair_out_rel_l2": 2.39261e-05,
+            "pair_state_rel_l2": 1.3304e-06,
+            "fused_oracle_out_rel_l2": 0.00359316,
+            "prepared_oracle_out_rel_l2": 0.00359316,
+            "fused_oracle_state_rel_l2": 0.0025638,
+            "prepared_oracle_state_rel_l2": 0.0025638,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 1,
+            "out_elements": 3151872,
+            "out_diff": 121,
+            "state_diff": 639,
+            "first_out_token": 126,
+            "pair_out_rel_l2": 2.92142e-05,
+            "pair_state_rel_l2": 2.17638e-05,
+            "fused_oracle_out_rel_l2": 0.00416538,
+            "prepared_oracle_out_rel_l2": 0.00416539,
+            "fused_oracle_state_rel_l2": 0.00317608,
+            "prepared_oracle_state_rel_l2": 0.00317607,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 5,
+            "out_elements": 3151872,
+            "out_diff": 141,
+            "state_diff": 8725,
+            "first_out_token": 66,
+            "pair_out_rel_l2": 1.93839e-05,
+            "pair_state_rel_l2": 3.06084e-07,
+            "fused_oracle_out_rel_l2": 0.00282694,
+            "prepared_oracle_out_rel_l2": 0.00282694,
+            "fused_oracle_state_rel_l2": 0.000158633,
+            "prepared_oracle_state_rel_l2": 0.000158626,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 9,
+            "out_elements": 3151872,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 513,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00298054,
+            "prepared_oracle_out_rel_l2": 0.00298054,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 0,
+            "out_elements": 6291456,
+            "out_diff": 195,
+            "state_diff": 630,
+            "first_out_token": 26,
+            "pair_out_rel_l2": 1.66645e-05,
+            "pair_state_rel_l2": 3.20999e-06,
+            "fused_oracle_out_rel_l2": 0.00358288,
+            "prepared_oracle_out_rel_l2": 0.00358289,
+            "fused_oracle_state_rel_l2": 0.00255967,
+            "prepared_oracle_state_rel_l2": 0.00255967,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 1,
+            "out_elements": 6291456,
+            "out_diff": 1605,
+            "state_diff": 2559,
+            "first_out_token": 267,
+            "pair_out_rel_l2": 6.88395e-05,
+            "pair_state_rel_l2": 6.96629e-05,
+            "fused_oracle_out_rel_l2": 0.00428374,
+            "prepared_oracle_out_rel_l2": 0.00428373,
+            "fused_oracle_state_rel_l2": 0.00329161,
+            "prepared_oracle_state_rel_l2": 0.00329162,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 5,
+            "out_elements": 6291456,
+            "out_diff": 501,
+            "state_diff": 20983,
+            "first_out_token": 92,
+            "pair_out_rel_l2": 2.57983e-05,
+            "pair_state_rel_l2": 4.95063e-07,
+            "fused_oracle_out_rel_l2": 0.00282627,
+            "prepared_oracle_out_rel_l2": 0.00282628,
+            "fused_oracle_state_rel_l2": 0.000162754,
+            "prepared_oracle_state_rel_l2": 0.000162763,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 9,
+            "out_elements": 6291456,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 1024,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00298009,
+            "prepared_oracle_out_rel_l2": 0.00298009,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 0,
+            "out_elements": 25171968,
+            "out_diff": 884,
+            "state_diff": 512,
+            "first_out_token": 33,
+            "pair_out_rel_l2": 1.95364e-05,
+            "pair_state_rel_l2": 1.30022e-05,
+            "fused_oracle_out_rel_l2": 0.00359606,
+            "prepared_oracle_out_rel_l2": 0.00359606,
+            "fused_oracle_state_rel_l2": 0.00256958,
+            "prepared_oracle_state_rel_l2": 0.00256959,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 1,
+            "out_elements": 25171968,
+            "out_diff": 132085,
+            "state_diff": 16790,
+            "first_out_token": 8,
+            "pair_out_rel_l2": 0.000357935,
+            "pair_state_rel_l2": 0.000308483,
+            "fused_oracle_out_rel_l2": 0.00438554,
+            "prepared_oracle_out_rel_l2": 0.00438552,
+            "fused_oracle_state_rel_l2": 0.00331621,
+            "prepared_oracle_state_rel_l2": 0.00331584,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 5,
+            "out_elements": 25171968,
+            "out_diff": 10209,
+            "state_diff": 86384,
+            "first_out_token": 168,
+            "pair_out_rel_l2": 5.66458e-05,
+            "pair_state_rel_l2": 9.78173e-07,
+            "fused_oracle_out_rel_l2": 0.0028264,
+            "prepared_oracle_out_rel_l2": 0.0028264,
+            "fused_oracle_state_rel_l2": 0.000220909,
+            "prepared_oracle_state_rel_l2": 0.000220914,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 9,
+            "out_elements": 25171968,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 4097,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00297996,
+            "prepared_oracle_out_rel_l2": 0.00297996,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          }
+        ]
+      },
+      "serial-inverse-diagnostic": {
+        "summary": {
+          "cases": 16,
+          "stable_cases": 16,
+          "exact_cases": 16,
+          "max_out_diff_fraction": 0.0,
+          "max_pair_out_rel_l2": 0,
+          "max_pair_state_rel_l2": 0,
+          "max_fused_oracle_out_rel_l2": 0.00438552,
+          "max_prepared_oracle_out_rel_l2": 0.00438552,
+          "max_fused_oracle_state_rel_l2": 0.00331584,
+          "max_prepared_oracle_state_rel_l2": 0.00331584
+        },
+        "rows": [
+          {
+            "tokens": 257,
+            "pattern": 0,
+            "out_elements": 1579008,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 257,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00357018,
+            "prepared_oracle_out_rel_l2": 0.00357018,
+            "fused_oracle_state_rel_l2": 0.00255172,
+            "prepared_oracle_state_rel_l2": 0.00255172,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 1,
+            "out_elements": 1579008,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 257,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00402233,
+            "prepared_oracle_out_rel_l2": 0.00402233,
+            "fused_oracle_state_rel_l2": 0.00296569,
+            "prepared_oracle_state_rel_l2": 0.00296569,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 5,
+            "out_elements": 1579008,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 257,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00282177,
+            "prepared_oracle_out_rel_l2": 0.00282177,
+            "fused_oracle_state_rel_l2": 0.000156066,
+            "prepared_oracle_state_rel_l2": 0.000156066,
+            "stable": true
+          },
+          {
+            "tokens": 257,
+            "pattern": 9,
+            "out_elements": 1579008,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 257,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00297787,
+            "prepared_oracle_out_rel_l2": 0.00297787,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 0,
+            "out_elements": 3151872,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 513,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00359316,
+            "prepared_oracle_out_rel_l2": 0.00359316,
+            "fused_oracle_state_rel_l2": 0.0025638,
+            "prepared_oracle_state_rel_l2": 0.0025638,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 1,
+            "out_elements": 3151872,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 513,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00416539,
+            "prepared_oracle_out_rel_l2": 0.00416539,
+            "fused_oracle_state_rel_l2": 0.00317607,
+            "prepared_oracle_state_rel_l2": 0.00317607,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 5,
+            "out_elements": 3151872,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 513,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00282694,
+            "prepared_oracle_out_rel_l2": 0.00282694,
+            "fused_oracle_state_rel_l2": 0.000158626,
+            "prepared_oracle_state_rel_l2": 0.000158626,
+            "stable": true
+          },
+          {
+            "tokens": 513,
+            "pattern": 9,
+            "out_elements": 3151872,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 513,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00298054,
+            "prepared_oracle_out_rel_l2": 0.00298054,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 0,
+            "out_elements": 6291456,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 1024,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00358289,
+            "prepared_oracle_out_rel_l2": 0.00358289,
+            "fused_oracle_state_rel_l2": 0.00255967,
+            "prepared_oracle_state_rel_l2": 0.00255967,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 1,
+            "out_elements": 6291456,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 1024,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00428373,
+            "prepared_oracle_out_rel_l2": 0.00428373,
+            "fused_oracle_state_rel_l2": 0.00329162,
+            "prepared_oracle_state_rel_l2": 0.00329162,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 5,
+            "out_elements": 6291456,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 1024,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00282628,
+            "prepared_oracle_out_rel_l2": 0.00282628,
+            "fused_oracle_state_rel_l2": 0.000162763,
+            "prepared_oracle_state_rel_l2": 0.000162763,
+            "stable": true
+          },
+          {
+            "tokens": 1024,
+            "pattern": 9,
+            "out_elements": 6291456,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 1024,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00298009,
+            "prepared_oracle_out_rel_l2": 0.00298009,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 0,
+            "out_elements": 25171968,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 4097,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00359606,
+            "prepared_oracle_out_rel_l2": 0.00359606,
+            "fused_oracle_state_rel_l2": 0.00256959,
+            "prepared_oracle_state_rel_l2": 0.00256959,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 1,
+            "out_elements": 25171968,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 4097,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00438552,
+            "prepared_oracle_out_rel_l2": 0.00438552,
+            "fused_oracle_state_rel_l2": 0.00331584,
+            "prepared_oracle_state_rel_l2": 0.00331584,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 5,
+            "out_elements": 25171968,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 4097,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.0028264,
+            "prepared_oracle_out_rel_l2": 0.0028264,
+            "fused_oracle_state_rel_l2": 0.000220914,
+            "prepared_oracle_state_rel_l2": 0.000220914,
+            "stable": true
+          },
+          {
+            "tokens": 4097,
+            "pattern": 9,
+            "out_elements": 25171968,
+            "out_diff": 0,
+            "state_diff": 0,
+            "first_out_token": 4097,
+            "pair_out_rel_l2": 0,
+            "pair_state_rel_l2": 0,
+            "fused_oracle_out_rel_l2": 0.00297996,
+            "prepared_oracle_out_rel_l2": 0.00297996,
+            "fused_oracle_state_rel_l2": 0,
+            "prepared_oracle_state_rel_l2": 0,
+            "stable": true
+          }
+        ]
+      },
+      "model": {
+        "B0": {
+          "self": {
+            "equal": true,
+            "first_difference": null,
+            "lengths": [
+              128,
+              128
+            ]
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            },
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            }
+          ],
+          "input_tokens": [
+            48061,
+            48061
+          ]
+        },
+        "B2-pipeline-wide": {
+          "self": {
+            "equal": true,
+            "first_difference": null,
+            "lengths": [
+              128,
+              128
+            ]
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            },
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            }
+          ],
+          "input_tokens": [
+            48061,
+            48061
+          ]
+        },
+        "B2": {
+          "self": {
+            "equal": true,
+            "first_difference": null,
+            "lengths": [
+              128,
+              128
+            ]
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            },
+            {
+              "equal": true,
+              "first_difference": null,
+              "lengths": [
+                128,
+                128
+              ]
+            }
+          ],
+          "input_tokens": [
+            48061,
+            48061
+          ]
+        }
+      }
+    },
+    "model_comparison": {
+      "none": {
+        "B0": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              128,
+              128
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            0
+          ]
+        },
+        "B2-pipeline-wide": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              128,
+              128
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            0
+          ]
+        },
+        "B2": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              128,
+              128
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                128,
+                128
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            0
+          ]
+        }
+      },
+      "none-cache": {
+        "B0": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              256,
+              256
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            48052
+          ]
+        },
+        "B2": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              256,
+              256
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 46,
+              "different_positions": 197
+            },
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 46,
+              "different_positions": 197
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            48052
+          ]
+        }
+      },
+      "dflash": {
+        "B0": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              256,
+              256
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            48052
+          ],
+          "to_none_cache": [
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 46,
+              "different_positions": 161
+            },
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 46,
+              "different_positions": 161
+            }
+          ]
+        },
+        "B2-pipeline-wide": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              256,
+              256
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            },
+            {
+              "equal": true,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": null,
+              "different_positions": 0
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            48052
+          ]
+        },
+        "B2": {
+          "self": {
+            "equal": true,
+            "lengths": [
+              256,
+              256
+            ],
+            "first_difference": null,
+            "different_positions": 0
+          },
+          "to_B0": [
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 5,
+              "different_positions": 247
+            },
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 5,
+              "different_positions": 247
+            }
+          ],
+          "cache_hit_tokens": [
+            0,
+            48052
+          ],
+          "to_none_cache": [
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 5,
+              "different_positions": 249
+            },
+            {
+              "equal": false,
+              "lengths": [
+                256,
+                256
+              ],
+              "first_difference": 5,
+              "different_positions": 249
+            }
+          ]
+        }
+      }
+    },
+    "variant_audit": {
+      "cuda_source_hash_differences": [],
+      "patch_section_differences": {
+        "src/ops/linear_attention/gated_delta_net/chunked/prepare.cuh": 68
+      },
+      "note": "Frozen original-inverse wide and final block-inverse model arms. Bench/tests/report-only changes excluded from inference attribution; inverse header content and shared scratch remain distinct."
+    },
+    "test_commits": {
+      "gdn_only": "d2eb6fa5",
+      "combined": "01cdfcc5"
+    },
+    "hicache": {
+      "native_base": "6af5de4e",
+      "optional_branch": "codex/upstream-kvmem-hicache-optional-20261008",
+      "optional_head": "0a306396",
+      "source_separated": true,
+      "runtime_enabled": false,
+      "persistent_state": false,
+      "cross_instance_shared_checkpoints": false
+    },
+    "daily_restore": {
+      "status": "healthy",
+      "binary_sha256": "3fb192aeea2ebf0c8c62fa200d57ff8550d5c0e6fd71967a868cf084438af051",
+      "health": {
+        "status": "ok"
+      },
+      "identity": {
+        "pid": 663,
+        "starttime": "535"
+      },
+      "sensor_state_restored": true
+    },
+    "resource_and_retirement": [
+      {
+        "arm": "B0",
+        "mode": "none",
+        "samples": 33,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 651,
+          "starttime": "510",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37013016576,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 18175500288,
+        "min_physical_available_bytes": 27461926912,
+        "min_gpu_free_mib": 5782.0,
+        "min_wsl_available_bytes": 30907506688,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B2-pipeline-wide",
+        "mode": "none",
+        "samples": 31,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 673,
+          "starttime": "553",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37014409216,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 18234085376,
+        "min_physical_available_bytes": 27536445440,
+        "min_gpu_free_mib": 5780.0,
+        "min_wsl_available_bytes": 30903062528,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B2",
+        "mode": "none",
+        "samples": 31,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 679,
+          "starttime": "552",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37008449536,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 17222189056,
+        "min_physical_available_bytes": 27138506752,
+        "min_gpu_free_mib": 5762.0,
+        "min_wsl_available_bytes": 30900097024,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B0",
+        "mode": "dflash",
+        "samples": 32,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 689,
+          "starttime": "546",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37011906560,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 15329517568,
+        "min_physical_available_bytes": 27352334336,
+        "min_gpu_free_mib": 3115.0,
+        "min_wsl_available_bytes": 30865854464,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B2-pipeline-wide",
+        "mode": "dflash",
+        "samples": 31,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 693,
+          "starttime": "646",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37012144128,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 16208642048,
+        "min_physical_available_bytes": 27700596736,
+        "min_gpu_free_mib": 3113.0,
+        "min_wsl_available_bytes": 30861737984,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B2",
+        "mode": "dflash",
+        "samples": 30,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 679,
+          "starttime": "557",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37011189760,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 16206761984,
+        "min_physical_available_bytes": 27652984832,
+        "min_gpu_free_mib": 3094.0,
+        "min_wsl_available_bytes": 30867197952,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B0",
+        "mode": "none-cache",
+        "samples": 30,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 684,
+          "starttime": "522",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37005062144,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 18763309056,
+        "min_physical_available_bytes": 27602341888,
+        "min_gpu_free_mib": 5692.0,
+        "min_wsl_available_bytes": 30891626496,
+        "max_wsl_swap_used_bytes": 0
+      },
+      {
+        "arm": "B2",
+        "mode": "none-cache",
+        "samples": 31,
+        "stop": {
+          "returncode": 0,
+          "reason": "requested_stop",
+          "pid": 689,
+          "starttime": "580",
+          "floor_evidence": null,
+          "after": {
+            "wsl_available_bytes": 37010243584,
+            "wsl_swap_used_bytes": 0
+          }
+        },
+        "min_commit_available_bytes": 18900914176,
+        "min_physical_available_bytes": 27668549632,
+        "min_gpu_free_mib": 5690.0,
+        "min_wsl_available_bytes": 30900371456,
+        "max_wsl_swap_used_bytes": 0
+      }
+    ],
+    "diagnostic_driver_repairs": [
+      "Initial NCU regex was parsed by WSL shell; switched to --exec and retained failures.",
+      "Collected separate post-L2-flush Graph counters; initial preflight warm-cache counters retained separately.",
+      "Per-mode model summary filename collision repaired and summaries reconstructed from preserved per-request, configuration and retirement records; original summaries retained.",
+      "Paused external probes after proving idle VM was repeatedly restarted; unchanged startup46GiB/runtime12GiB commit floors. Restored probes and daily service."
+    ],
+    "remaining_limits": [
+      "No first-divergence target-logit margin, layer-state or identical-page selection capture; no exclusive attribution to draft vs verifier vs sparse page selection.",
+      "No semantic quality evaluation; token inequality is not answer error rate.",
+      "GDN fusion remains slower and excluded from daily build; original-inverse exactness proven only on stated cases.",
+      "B0 none vs DFlash greedy outputs differ in cacheON/max256 control, beginning at zero-based position46.",
+      "128/cacheOFF and256/cacheON change two controls; no attribution to cache switch alone."
+    ]
+  }
 }
