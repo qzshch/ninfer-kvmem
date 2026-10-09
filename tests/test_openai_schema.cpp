@@ -858,11 +858,15 @@ int test_stream_observations() {
 
 int test_common_objects() {
     int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000, 2));
+    failures += check(models.at("data").at(0).at("max_concurrency") == 2,
+                      "model list reports configured execution lanes");
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000, 3));
+    failures += check(model.at("max_concurrency") == 3,
+                      "model object reports configured execution lanes");
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
     const Json error = Json::parse(make_error_body(

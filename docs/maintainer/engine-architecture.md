@@ -7,6 +7,8 @@
 ## 1. 产品执行模型
 
 Generation Engine 使用一张 GPU、一个常驻模型和启动时确定的 `max_concurrency=1..8`。
+服务的 `/v1/models` 与 `/v1/models/{id}` 同时报告 `max_model_len` 和 `max_concurrency`，
+供外部代理同步执行槽上限。该上限不保证任意长度的请求都能同时驻留；Host/KV 准入仍按实际资源报价。
 有界等待队列按提交顺序组织；resident 请求按有限执行单元增量取得资源，资源压力下可以暂停与恢复。
 每轮将具备执行许可的 decode-ready 请求组成一个紧凑批次，prefill 与 Replay 分块穿插执行。
 
