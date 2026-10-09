@@ -205,8 +205,10 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t kvmem_window_pages =
         0; // 64-token pages per lane; zero retains dense upstream behavior.
-    std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    std::uint32_t prefill_chunk = 1024;
+    // Pack independent text-prefill FFN columns. Stateful mixers remain lane-local.
+    bool prefill_pack_projections = false;
+    KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

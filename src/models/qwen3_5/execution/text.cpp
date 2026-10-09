@@ -1153,6 +1153,153 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+runtime::ExecutionTiming
+TextContext::prefill_projection_batch(std::span<const ProjectionPrefillRow> rows,
+                                      Tensor& normalized_hidden, CudaEventTimer& timer) {
+    if (rows.size() < 2 || rows.size() > kMaximumConcurrency || rows.front().context == nullptr) {
+        throw std::invalid_argument("packed prefill requires two to eight rows");
+    }
+    auto& first          = *rows.front().context;
+    auto& work           = first.work_;
+    auto& device         = first.ctx_;
+    const auto& config   = first.config_;
+    std::int32_t columns = 0;
+    std::array<std::int32_t, kMaximumConcurrency> offsets{};
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        const auto& input = rows[row];
+        if (!input.context || &input.context->work_ != &work || &input.context->ctx_ != &device ||
+            &input.context->parameters_ != &first.parameters_ || input.context->mtp_enabled() ||
+            input.ids.empty() || input.ids.size() > input.context->prefill_chunk_ ||
+            input.ids.size() >
+                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() - columns) ||
+            (input.sink != nullptr) != (rows.front().sink != nullptr)) {
+            throw std::invalid_argument("packed prefill row does not match its execution envelope");
+        }
+        offsets[row] = columns;
+        columns += static_cast<std::int32_t>(input.ids.size());
+    }
+    Tensor output = matrix_window(normalized_hidden, columns);
+    runtime::ExecutionTimingRecorder timing;
+    nvtx::ScopedRange batch_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                  static_cast<std::uint64_t>(columns));
+    work.reset();
+    timer.start();
+    Tensor features, saved_positions;
+    std::array<Tensor, kMaximumConcurrency> row_features{}, row_positions{};
+    std::array<DFlashFeatureSink, kMaximumConcurrency> sinks{};
+    if (rows.front().sink) {
+        features        = work.alloc(DType::BF16, {rows.front().sink->features->ne[0], columns});
+        saved_positions = work.alloc(DType::I32, {columns});
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            const auto count     = static_cast<std::int32_t>(rows[row].ids.size());
+            row_features[row]    = features.slice(1, offsets[row], count);
+            row_positions[row]   = saved_positions.slice(0, offsets[row], count);
+            sinks[row]           = *rows[row].sink;
+            sinks[row].features  = &row_features[row];
+            sinks[row].positions = &row_positions[row];
+        }
+    }
+    {
+        auto roots_scope = work.scope();
+        const auto roots = workspace::text_prefill_roots(work, config, columns, 1, 0);
+        Tensor residual  = roots.residual;
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            const auto& input = rows[row];
+            auto& card        = *input.context;
+            const auto count  = static_cast<std::int32_t>(input.ids.size());
+            Tensor ids        = roots.ids.slice(0, offsets[row], count);
+            Tensor positions  = roots.positions.slice(0, offsets[row], count);
+            Tensor rope       = roots.rope_positions.view({columns}).slice(0, offsets[row], count);
+            Tensor x          = residual.slice(1, offsets[row], count);
+            copy_i32(input.ids.data(), ids, device.stream);
+            ops::fill_i32_positions(positions, static_cast<std::int32_t>(card.text_kv_base_),
+                                    device.stream);
+            ops::fill_i32_positions(
+                rope, static_cast<std::int32_t>(card.text_kv_base_) + card.rope_delta_,
+                device.stream);
+            ops::embedding(ids, *card.embed_, x, device.stream);
+            if (input.sink) { sinks[row].begin(x); }
+        }
+        for (std::size_t layer = 0; layer < first.parameters_.text.layers.size(); ++layer) {
+            const auto& block = first.parameters_.text.layers[layer];
+            const bool full   = config.layer_types[layer] == MixerKind::FullAttention;
+            nvtx::ScopedRange layer_range(
+                full ? nvtx::Name::PrefillLayerFull : nvtx::Name::PrefillLayerGdn,
+                full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                auto& card       = *rows[row].context;
+                const auto count = static_cast<std::int32_t>(rows[row].ids.size());
+                Tensor x         = residual.slice(1, offsets[row], count);
+                Tensor positions = roots.positions.slice(0, offsets[row], count);
+                Tensor rope = roots.rope_positions.view({columns}).slice(0, offsets[row], count);
+                ScopedPositions cache_binding(card.active_cache_positions_, positions);
+                ScopedPositions rope_binding(card.active_rope_positions_, rope);
+                const auto visible = card.text_kv_base_ + static_cast<std::uint32_t>(count);
+                const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
+                ScopedEnvelope envelope_binding(card.active_causal_attention_envelope_, envelope);
+                ops::set_i32_scalar(card.io_.text_kv_table_row, rows[row].text_table_row,
+                                    device.stream);
+                auto mixer_scope   = work.scope();
+                const auto compact = dimension(config.compact_layer_indices[layer]);
+                if (full) {
+                    card.attn_mix(block, x, compact, Phase::Prefill);
+                } else {
+                    card.gdn_mix(block, x, compact, Phase::Prefill);
+                }
+            }
+            {
+                nvtx::ScopedRange ffn_range(nvtx::Name::PrefillPostMixer, nvtx::Category::PostMixer,
+                                            layer);
+                auto ffn_scope = work.scope();
+                const auto& dense = std::get<DenseParameters>(block.ffn);
+                if (dense.gate_up.weight.qtype == QType::NVFP4 &&
+                    dense.down.weight.qtype == QType::NVFP4) {
+                    first.mlp_tail(block, residual, Phase::Prefill,
+                                   first.next_projection_hints(static_cast<int>(layer)));
+                } else {
+                    // FP8 bulk kernels select split-K from aggregate T. Keep each lane's
+                    // original reduction schedule instead of changing FP32 association.
+                    for (std::size_t row = 0; row < rows.size(); ++row) {
+                        auto lane_scope = work.scope();
+                        Tensor x = residual.slice(1, offsets[row],
+                                                  static_cast<std::int32_t>(rows[row].ids.size()));
+                        rows[row].context->mlp_tail(
+                            block, x, Phase::Prefill,
+                            rows[row].context->next_projection_hints(static_cast<int>(layer)));
+                    }
+                }
+            }
+            for (std::size_t row = 0; row < rows.size(); ++row) {
+                if (!rows[row].sink) { continue; }
+                Tensor x = residual.slice(1, offsets[row],
+                                          static_cast<std::int32_t>(rows[row].ids.size()));
+                sinks[row].capture_layer(static_cast<int>(layer), x, device.stream);
+            }
+        }
+        ops::rmsnorm(residual, *first.final_norm_, config.rms_norm_eps, true, output,
+                     device.stream);
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            if (!rows[row].sink) { continue; }
+            Tensor positions = roots.positions.slice(
+                0, offsets[row], static_cast<std::int32_t>(rows[row].ids.size()));
+            sinks[row].capture_positions(positions, device.stream);
+        }
+    }
+    // Keep captured features and positions live until each lane's draft append retires.
+    for (std::size_t row = 0; row < rows.size(); ++row) {
+        if (!rows[row].sink) { continue; }
+        auto append_scope = work.scope();
+        sinks[row].consume_prefill_chunk(static_cast<std::int32_t>(rows[row].ids.size()), false);
+    }
+    timer.record_stop();
+    timing.begin_wait();
+    device.synchronize();
+    timing.end_wait();
+    timing.include({.gpu_elapsed_ns = static_cast<std::uint64_t>(
+                        static_cast<double>(timer.elapsed_ms()) * 1.0e6 + 0.5)});
+    return timing.finish();
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,

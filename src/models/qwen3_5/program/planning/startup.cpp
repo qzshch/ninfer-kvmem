@@ -254,7 +254,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .backend        = plan.speculative_backend,
                                          .causal_scoring = plan.causal_scoring});
     out.prefill_hidden =
-        add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
+        add_tensor(builder, DType::BF16,
+                   {dimension(config.hidden_size),
+                    checked_i32(static_cast<std::uint64_t>(effective_prefill_chunk) *
+                                    (plan.prefill_pack_projections ? plan.max_concurrency : 1U),
+                                "packed prefill hidden columns")},
                    "step prefill hidden");
     if (plan.kvmem_window_pages != 0) {
         const auto layers   = static_cast<std::uint64_t>(config.full_attention_layers);
@@ -484,6 +488,29 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     dimension(parameters.model.resources().public_token_count), 1, 1));
     }
     out.text_prefill = finish(text_prefill);
+    if (plan.prefill_pack_projections && plan.max_concurrency > 1 && !plan.features.mtp() &&
+        !plan.causal_scoring) {
+        const auto columns = checked_i32(static_cast<std::uint64_t>(chunk) * plan.max_concurrency,
+                                         "packed prefill columns");
+        WorkspaceLayoutBuilder packed;
+        (void)workspace::text_prefill_roots(packed, config, columns, 1, 0);
+        if (plan.features.masked_draft()) {
+            matrix(packed, DType::BF16,
+                   dimension(config.hidden_size *
+                             parameters.model.config().draft->target_layer_ids.size()),
+                   columns);
+            matrix(packed, DType::I32, 1, columns);
+        }
+        // Mixers execute one lane at a time; only the independent FFN sees all columns.
+        target_body(packed, 1, chunk, TextPhase::Prefill, GdnWorkspacePath::Prefill, 1, 1, chunk,
+                    text_envelope);
+        for (const auto& block : parameters.text.layers) {
+            auto stage = packed.scope();
+            (void)workspace::post_mixer_hidden(packed, config, columns);
+            scratch(packed, execution::ffn_workspace_bytes(block.ffn, 1, columns));
+        }
+        out.packed_prefill = finish(packed);
+    }
 
     if (plan.causal_scoring) {
         WorkspaceLayoutBuilder causal_score;
@@ -748,9 +775,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
+    if (plan.prefill_pack_projections && plan.features.masked_draft() && plan.max_concurrency > 1) {
+        const auto columns = checked_i32(static_cast<std::uint64_t>(chunk) * plan.max_concurrency,
+                                         "packed draft capture columns");
+        WorkspaceLayoutBuilder append;
+        matrix(append, DType::BF16,
+               dimension(config.hidden_size *
+                         parameters.model.config().draft->target_layer_ids.size()),
+               columns);
+        matrix(append, DType::I32, 1, columns);
+        (void)append.alloc_bytes(out.dflash_context);
+        out.packed_prefill = std::max(out.packed_prefill, finish(append));
+    }
     out.general_capacity =
-        std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+        std::max({out.text_prefill, out.packed_prefill, out.ordinary_round, out.mtp_prefill,
+                  out.mtp_round, out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
@@ -868,27 +907,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
-    auto impl                  = std::make_unique<SequencePlanImpl>();
-    impl->parameters           = inputs.parameters;
-    impl->capacity             = inputs.capacity;
-    impl->main_page_groups     = main_page_groups;
-    impl->kv_capacity          = static_cast<std::uint32_t>(checked_i32(
+    auto impl                      = std::make_unique<SequencePlanImpl>();
+    impl->parameters               = inputs.parameters;
+    impl->capacity                 = inputs.capacity;
+    impl->main_page_groups         = main_page_groups;
+    impl->kv_capacity              = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency      = inputs.max_concurrency;
-    impl->kvmem_window_pages   = inputs.kvmem_window_pages;
-    impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->draft_window         = inputs.draft_window;
-    impl->speculative_backend  = inputs.speculative_backend;
-    impl->proposal_head        = inputs.proposal_head;
-    impl->features             = inputs.features;
-    impl->use_cuda_graph       = inputs.use_cuda_graph;
-    impl->causal_scoring       = inputs.causal_scoring;
-    impl->device               = inputs.device;
-    impl->multiprocessor_count = inputs.multiprocessor_count;
-    impl->context_cache        = inputs.context_cache;
-    impl->kv_storage           = inputs.kv_storage;
-    impl->persistent           = persistent_layout(*impl);
+    impl->max_concurrency          = inputs.max_concurrency;
+    impl->kvmem_window_pages       = inputs.kvmem_window_pages;
+    impl->prefill_chunk            = inputs.prefill_chunk;
+    impl->prefill_pack_projections = inputs.prefill_pack_projections;
+    impl->draft_window             = inputs.draft_window;
+    impl->speculative_backend      = inputs.speculative_backend;
+    impl->proposal_head            = inputs.proposal_head;
+    impl->features                 = inputs.features;
+    impl->use_cuda_graph           = inputs.use_cuda_graph;
+    impl->causal_scoring           = inputs.causal_scoring;
+    impl->device                   = inputs.device;
+    impl->multiprocessor_count     = inputs.multiprocessor_count;
+    impl->context_cache            = inputs.context_cache;
+    impl->kv_storage               = inputs.kv_storage;
+    impl->persistent               = persistent_layout(*impl);
     if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
         impl->context_cache.host_capacity_bytes =
@@ -948,21 +988,22 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
     SequencePlanningInputs inputs{
-        .parameters           = &parameters,
-        .capacity             = options.max_context,
-        .max_concurrency      = options.max_concurrency,
-        .kvmem_window_pages   = options.kvmem_window_pages,
-        .prefill_chunk        = std::min(options.prefill_chunk, options.max_context),
-        .draft_window         = options.speculative.draft_tokens,
-        .speculative_backend  = options.speculative.backend,
-        .kv_storage           = options.kv_cache,
-        .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options),
-        .use_cuda_graph       = options.use_cuda_graph,
-        .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
-        .device               = options.device,
-        .multiprocessor_count = device.multiprocessor_count(),
-        .context_cache        = options.context_cache,
+        .parameters               = &parameters,
+        .capacity                 = options.max_context,
+        .max_concurrency          = options.max_concurrency,
+        .kvmem_window_pages       = options.kvmem_window_pages,
+        .prefill_chunk            = std::min(options.prefill_chunk, options.max_context),
+        .prefill_pack_projections = options.prefill_pack_projections,
+        .draft_window             = options.speculative.draft_tokens,
+        .speculative_backend      = options.speculative.backend,
+        .kv_storage               = options.kv_cache,
+        .proposal_head            = options.speculative.proposal_head,
+        .features                 = models::load_options(options),
+        .use_cuda_graph           = options.use_cuda_graph,
+        .causal_scoring           = options.purpose == EnginePurpose::CausalScoring,
+        .device                   = options.device,
+        .multiprocessor_count     = device.multiprocessor_count(),
+        .context_cache            = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages =

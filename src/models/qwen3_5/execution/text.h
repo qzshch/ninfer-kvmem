@@ -131,6 +131,18 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+
+    struct ProjectionPrefillRow {
+        TextContext* context = nullptr;
+        std::span<const int> ids;
+        DFlashFeatureSink* sink     = nullptr;
+        std::int32_t text_table_row = 0;
+    };
+
+    // One non-final, boundary-free chunk per row. No attention/GDN state is concatenated.
+    [[nodiscard]] static runtime::ExecutionTiming
+    prefill_projection_batch(std::span<const ProjectionPrefillRow> rows, Tensor& normalized_hidden,
+                             CudaEventTimer& timer);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);

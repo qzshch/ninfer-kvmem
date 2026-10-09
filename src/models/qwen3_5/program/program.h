@@ -175,9 +175,9 @@ struct SourceCandidate {
 };
 
 struct BindingReservation {
-    bool reserved          = false;
-    bool source_valid      = true;
-    bool capacity_possible = true;
+    bool reserved           = false;
+    bool source_valid       = true;
+    bool capacity_possible  = true;
     bool admission_deferred = false;
     runtime::ContextResourceUsage shortage;
     std::vector<CheckpointHandle> retired_points;
@@ -309,6 +309,12 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+};
+
+struct PrefillBatchProgress {
+    std::array<PrefillProgress, kMaximumConcurrency> rows;
+    std::size_t row_count = 0;
+    runtime::ExecutionTiming timing;
 };
 
 struct CommitRowResult {
@@ -464,6 +470,10 @@ public:
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    [[nodiscard]] std::uint32_t packable_prefill_tokens(SequenceHandle sequence) const;
+    [[nodiscard]] PrefillBatchProgress
+    advance_prefill_batch(std::span<const SequenceHandle> sequences,
+                          runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,

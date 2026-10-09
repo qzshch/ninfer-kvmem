@@ -68,9 +68,13 @@ struct HostAdmissionBudget {
 class HostAdmissionClaim {
 public:
     HostAdmissionClaim(std::shared_ptr<HostAdmissionBudget> budget, std::size_t bytes)
-        : budget_(std::move(budget)), bytes_(bytes) { budget_->claimed += bytes_; }
+        : budget_(std::move(budget)), bytes_(bytes) {
+        budget_->claimed += bytes_;
+    }
+
     ~HostAdmissionClaim() { budget_->claimed -= bytes_; }
-    HostAdmissionClaim(const HostAdmissionClaim&) = delete;
+
+    HostAdmissionClaim(const HostAdmissionClaim&)            = delete;
     HostAdmissionClaim& operator=(const HostAdmissionClaim&) = delete;
 private:
     std::shared_ptr<HostAdmissionBudget> budget_;
@@ -357,6 +361,9 @@ public:
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] std::uint32_t packable_prefill_tokens(SequenceHandle) const;
+    [[nodiscard]] PrefillBatchProgress advance_prefill_batch(std::span<const SequenceHandle>,
+                                                             runtime::ExecutionTiming*);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
@@ -383,6 +390,7 @@ public:
     const ContextCacheOptions context_cache;
     const std::uint32_t kvmem_window_pages;
     const std::uint32_t prefill_chunk;
+    const bool prefill_pack_projections;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
@@ -585,8 +593,9 @@ public:
     void prepare_binding(ContextTransaction&);
     void complete_binding(ContextTransaction&, ContextProgress&);
     void publish_capture(ContextTransaction&);
-    [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
-                                                   runtime::ResourceReservation* execution = nullptr);
+    [[nodiscard]] bool
+    reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier,
+                                runtime::ResourceReservation* execution = nullptr);
     void prepare_capture_boundary(std::uint32_t lane);
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);

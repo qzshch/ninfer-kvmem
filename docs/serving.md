@@ -790,6 +790,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--host-context-mib N` | fixed pinned Host budget shared by StateImages, KV, retrieval metadata and in-flight destinations | `8192 MiB + 8 native StateImages` |
 | `--host-context-memory pinned\|pageable` | Host backing allocation; pageable preserves bytes but transfers may block the host | `pinned` |
+| `--prefill-pack-projections` | experimental cross-lane dense FFN projection packing; stateful mixers remain lane-local | disabled |
 | `--kvmem-window-pages N` | sparse per-lane Main KV working set; 64 tokens per page; zero preserves dense execution | `0` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -825,6 +826,13 @@ pinning the whole pool. It does not change context limits, admission quotes, sto
 transfer publication ordering. CUDA may stage these transfers and block the submitting thread;
 measure transfer and E2E cost before selecting this mode. Backing capacity/resident accounting
 reports allocated address capacity, not actual RSS for pageable memory. Pinned remains the default.
+
+`--prefill-pack-projections` packs eligible nonfinal dense-FFN prefill chunks across two or more
+licensed lanes. Attention, GDN and each draft feature consumer keep their own state and positions.
+Final sampling, actual vision input, MTP, capture/rewrite and sparse-query replay boundaries use
+ordinary finite units. The packed GPU interval is measured once; per-request timing shares are
+attributed by processed token count, not independent lane hardware intervals. This option remains
+experimental and disabled by default pending numerical and lifecycle qualification.
 Sparse attention approximates dense
 full-history attention; byte-preserving Host copies do not establish quality equivalence.
 See [sparse working sets and Native history](maintainer/sparse-native-context-cache.md) for

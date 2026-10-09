@@ -28,11 +28,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), kvmem_window_pages(plan.kvmem_window_pages),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
-      proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      prefill_chunk(plan.prefill_chunk), prefill_pack_projections(plan.prefill_pack_projections),
+      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
+      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      causal_scoring(plan.causal_scoring), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
@@ -53,7 +53,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::DFlashDecodeIngress) +
                                                              sizeof(qwen3_5::DFlashDecodeEgress) +
-                                                             sizeof(qwen3_5::DFlashPrefillIngress))
+                                                             sizeof(qwen3_5::DFlashPrefillIngress) *
+                                                                 plan.max_concurrency)
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),

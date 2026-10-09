@@ -59,6 +59,7 @@ public:
                ContextMachineCostModel context_cost)
         : instance_(instance), device_(device), max_context_(options.max_context),
           max_concurrency_(options.max_concurrency),
+          prefill_pack_projections_(options.prefill_pack_projections),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -1188,7 +1189,8 @@ private:
         context_owner_ = request;
     }
 
-    bool prepare_semantic_capture(const std::shared_ptr<Request>& request, bool& touched_resources) {
+    bool prepare_semantic_capture(const std::shared_ptr<Request>& request,
+                                  bool& touched_resources) {
         auto& decision = capture_decisions_[request->lane->value];
         if (decision && decision->sequence != *request->sequence) { decision.reset(); }
         if (instance_.program->capture_is_input(*request->sequence) && !decision) {
@@ -1316,6 +1318,35 @@ private:
             record_execution_work(request->prefill_work, progress.timing);
         }
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        publish_runtime_stats();
+    }
+
+    void run_prefill_batch(std::span<const std::uint32_t> lanes,
+                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        std::array<SequenceHandle, kMaximumConcurrency> handles{};
+        std::array<std::shared_ptr<Request>, kMaximumConcurrency> owners{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            owners[row] = slots_[lanes[row]];
+            if (!owners[row] || !owners[row]->sequence || !owners[row]->is_prefilling() ||
+                owners[row]->capture_pending) {
+                throw std::logic_error("packed prefill lost its licensed membership");
+            }
+            handles[row] = *owners[row]->sequence;
+        }
+        ProgramCallScope call(*this);
+        auto progress = instance_.program->advance_prefill_batch(
+            std::span(handles).first(lanes.size()), &call.failed_timing());
+        call.finish(progress.timing);
+        if (progress.row_count != lanes.size()) {
+            throw std::logic_error("packed prefill lost a row");
+        }
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (!owners[row]->first_output_timing) {
+                record_execution_work(owners[row]->prefill_work, progress.rows[row].timing);
+            }
+            resolve_prefill_progress(owners[row], std::move(progress.rows[row]),
+                                     cancelled_at_unit_start);
+        }
         publish_runtime_stats();
     }
 
@@ -1940,8 +1971,12 @@ private:
                 instance_.program->context_blocks(*request->sequence)) {
                 continue;
             }
-            if (prefill == lane || (scope == ReservationScope::Round &&
-                                    (request->is_control_ready() || request->is_decode_ready()))) {
+            const bool packed_candidate =
+                prefill_pack_projections_ && !recovering && request->is_prefilling() &&
+                instance_.program->packable_prefill_tokens(*request->sequence) != 0;
+            if (prefill == lane || packed_candidate ||
+                (scope == ReservationScope::Round &&
+                 (request->is_control_ready() || request->is_decode_ready()))) {
                 candidates.push_back(lane);
             }
         }
@@ -2009,9 +2044,12 @@ private:
             blocked.reset();
         }
         bool capture_touched_resources = false;
-        if (prefill && runnable_units_[*prefill] &&
-            !prepare_semantic_capture(slots_[*prefill], capture_touched_resources)) {
-            runnable_units_[*prefill] = false;
+        for (const auto lane : candidates) {
+            if (runnable_units_[lane] &&
+                (slots_[lane]->is_prefilling() || slots_[lane]->is_replaying()) &&
+                !prepare_semantic_capture(slots_[lane], capture_touched_resources)) {
+                runnable_units_[lane] = false;
+            }
         }
         if (capture_touched_resources) {
             // Optional capture can reclaim/demote other checkpoints into Host
@@ -2352,7 +2390,30 @@ private:
                                                GenerationSchedulingTransition::ReplayComplete);
                         }
                     } else {
-                        run_prefill_step(*lane, snapshot_cancellations());
+                        std::array<std::uint32_t, kMaximumConcurrency> packed_lanes{};
+                        std::size_t packed_count = 0;
+                        if (prefill_pack_projections_ &&
+                            instance_.program->packable_prefill_tokens(*request->sequence) != 0) {
+                            for (std::uint32_t offset = 0; offset < max_concurrency_; ++offset) {
+                                const auto candidate = (*lane + offset) % max_concurrency_;
+                                const auto& owner    = prefill_slots[candidate];
+                                if (owner && owner->is_prefilling() && owner->sequence &&
+                                    instance_.program->packable_prefill_tokens(*owner->sequence) !=
+                                        0) {
+                                    packed_lanes[packed_count++] = candidate;
+                                }
+                            }
+                        }
+                        if (packed_count > 1) {
+                            run_prefill_batch(std::span(packed_lanes).first(packed_count),
+                                              snapshot_cancellations());
+                            for (const auto candidate :
+                                 std::span(packed_lanes).first(packed_count)) {
+                                update_recovery(slots_[candidate]);
+                            }
+                        } else {
+                            run_prefill_step(*lane, snapshot_cancellations());
+                        }
                     }
                     scheduler_.prefill_executed(*lane, max_concurrency_);
                     update_recovery(request);
@@ -2376,6 +2437,7 @@ private:
     DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    const bool prefill_pack_projections_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;

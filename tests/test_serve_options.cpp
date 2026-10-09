@@ -34,6 +34,12 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures +=
+        check(!defaults.prefill_pack_projections, "prefill packing is unexpectedly enabled");
+    const auto packed = parse(
+        {"ninfer-serve", "model.ninfer", "--max-concurrency", "2", "--prefill-pack-projections"});
+    failures += check(packed.prefill_pack_projections && packed.max_concurrency == 2,
+                      "explicit prefill packing was not preserved");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.context_cost_presets.empty(),

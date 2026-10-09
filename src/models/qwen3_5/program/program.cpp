@@ -260,6 +260,15 @@ PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTim
     return impl_->advance_prefill(h, t);
 }
 
+std::uint32_t Program::packable_prefill_tokens(SequenceHandle h) const {
+    return impl_->packable_prefill_tokens(h);
+}
+
+PrefillBatchProgress Program::advance_prefill_batch(std::span<const SequenceHandle> s,
+                                                    runtime::ExecutionTiming* t) {
+    return impl_->advance_prefill_batch(s, t);
+}
+
 ReplayProgress Program::advance_replay(SequenceHandle h, runtime::ExecutionTiming* t) {
     return impl_->advance_replay(h, t);
 }
@@ -289,8 +298,6 @@ FinishResult Program::finish(SequenceHandle s) noexcept { return impl_->finish(s
 AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); }
 
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
-
-
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 

@@ -221,6 +221,195 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     return progress;
 }
 
+std::uint32_t ProgramImpl::packable_prefill_tokens(SequenceHandle handle) const {
+    if (!valid_sequence(handle)) { throw std::logic_error("prefill packing has a stale lane"); }
+    const auto lane     = ContractAccess::lane(handle).value;
+    const auto& request = requests[lane];
+    if (!prefill_pack_projections || max_concurrency < 2 ||
+        speculative_backend == SpeculativeBackend::Mtp ||
+        request.lifecycle != Lifecycle::Prefilling || request.capture_pending || !request.prefill ||
+        context_blocks(handle) || pending_transaction_) {
+        return 0;
+    }
+    const auto& staged = *request.prefill;
+    if (staged.vision || staged.query_replay_cursor || staged.mtp_bridge != MtpBridgeMode::None ||
+        staged.cursor >= staged.prompt_tokens) {
+        return 0;
+    }
+    const auto count = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+    // Pack only columns already using the TMA NVFP4 route in ordinary execution.
+    // Aggregating smaller units can cross cp.async/TMA arithmetic boundaries, so those
+    // units keep their canonical route instead of relying on a rounding tolerance.
+    if (count <= 512) { return 0; }
+    const auto end   = staged.cursor + count;
+    // Begin sampling, rewrite/capture and sparse-query rewind remain ordinary finite units.
+    if (end == staged.prompt_tokens ||
+        (request.next_capture < request.capture_groups.size() &&
+         request.capture_groups[request.next_capture].frontier <= end)) {
+        return 0;
+    }
+    const auto split =
+        std::upper_bound(staged.prompt.identity.rewrite_execution_frontiers.begin(),
+                         staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
+    if (split != staged.prompt.identity.rewrite_execution_frontiers.end() && *split <= end) {
+        return 0;
+    }
+    if (kvmem_window_pages) {
+        const auto& sparse = kvmem_lanes_[lane];
+        if (!sparse.query_checkpoint_valid && sparse.query_begin != 0 &&
+            sparse.query_begin >= staged.cursor && sparse.query_begin <= end) {
+            return 0;
+        }
+    }
+    for (const auto& block : parameters.text.layers) {
+        if (!std::holds_alternative<execution::DenseParameters>(block.ffn)) { return 0; }
+    }
+    return count;
+}
+
+PrefillBatchProgress ProgramImpl::advance_prefill_batch(std::span<const SequenceHandle> handles,
+                                                        runtime::ExecutionTiming* failed_timing) {
+    if (handles.size() < 2 || handles.size() > max_concurrency) {
+        throw std::invalid_argument("prefill packing membership has an invalid size");
+    }
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{}, counts{};
+    std::array<bool, kMaximumConcurrency> seen{};
+    std::uint32_t columns = 0;
+    for (std::size_t row = 0; row < handles.size(); ++row) {
+        counts[row] = packable_prefill_tokens(handles[row]);
+        if (counts[row] == 0) {
+            throw std::logic_error("prefill packing crossed a semantic boundary");
+        }
+        lanes[row] = ContractAccess::lane(handles[row]).value;
+        if (seen[lanes[row]]) { throw std::logic_error("prefill packing repeated a lane"); }
+        seen[lanes[row]] = true;
+        require_unit(lanes[row], ExecutionUnitKind::Prefill);
+        columns += counts[row];
+    }
+    runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
+    const auto started = Clock::now();
+    std::vector<execution::PrefillContext> contexts;
+    contexts.reserve(handles.size());
+    std::array<std::unique_ptr<execution::TextContext>, kMaximumConcurrency> cards;
+    std::array<execution::DFlashFeatureSink, kMaximumConcurrency> sinks;
+    std::array<execution::TextContext::ProjectionPrefillRow, kMaximumConcurrency> inputs{};
+    try {
+        mark_workspace_usage(workspace_plan.packed_prefill);
+        for (std::size_t row = 0; row < handles.size(); ++row) {
+            const auto lane   = lanes[row];
+            auto& sequence    = sequences[lane];
+            auto& staged      = *requests[lane].prefill;
+            const auto permit = *requests[lane].permit;
+            if (permit.main_frontier < staged.cursor + counts[row]) {
+                throw std::logic_error("packed prefill exceeds its licensed frontier");
+            }
+            ensure_sequence_kv_mapped(sequence, permit.main_frontier, permit.backend_frontier);
+            const auto selectors = state_selectors(sequence);
+            contexts.push_back(execution::PrefillContext{
+                {device, parameters, work, state_images->linear(),
+                 replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+                 proposal_head},
+                text_kv_view(sequence),
+                mtp_kv_view(sequence),
+                decoder->text_kv,
+                decoder->mtp_cache(),
+                dflash ? &*dflash : nullptr,
+                staged.cursor,
+                nullptr,
+                nullptr,
+                selectors.source,
+                selectors.destination,
+                0,
+                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0,
+                dflash_prefill_host_ingress ? dflash_prefill_host_ingress + row : nullptr,
+                sequence.rope_delta});
+            auto& context = contexts.back();
+            if (kvmem_window_pages) {
+                auto& sparse                          = kvmem_lanes_[lane];
+                context.execution.kvmem_q_sum         = static_cast<float*>(sparse.query_sum.data);
+                context.execution.kvmem_k_sum         = static_cast<float*>(sparse.key_sums.data);
+                context.execution.kvmem_capture_slots = kvmem_capture_slots_;
+                context.execution.kvmem_query_begin   = sparse.query_begin;
+                context.execution.kvmem_query_end     = sparse.query_end;
+            }
+            cards[row] = std::make_unique<execution::TextContext>(
+                device, parameters, work, context.text_kv, state_images->linear(), io,
+                prefill_hidden, prefill_chunk, staged.cursor, context.mtp_kv, &decoder->text_kv,
+                decoder->mtp_cache());
+            execution::configure_text_card(*cards[row], context.execution, nullptr,
+                                           selectors.source, selectors.destination, 0);
+            cards[row]->set_rope_delta(sequence.rope_delta);
+            if (dflash) { sinks[row] = execution::make_dflash_prefill_sink(context); }
+            inputs[row] = {
+                cards[row].get(),
+                std::span<const int>(staged.prompt.token_ids).subspan(staged.cursor, counts[row]),
+                dflash ? &sinks[row] : nullptr, text_kv_addresses->bound_row(sequence.kv->text)};
+        }
+        timing.pause();
+        timing.include(execution::TextContext::prefill_projection_batch(
+            std::span(inputs).first(handles.size()), prefill_hidden, prefill_gpu_timer_));
+        timing.resume_post();
+        PrefillBatchProgress out;
+        out.row_count        = handles.size();
+        std::uint32_t offset = 0;
+        for (std::size_t row = 0; row < handles.size(); ++row) {
+            const auto lane  = lanes[row];
+            auto& sequence   = sequences[lane];
+            auto& staged     = *requests[lane].prefill;
+            const auto begin = staged.cursor;
+            staged.cursor += counts[row];
+            sequence.text_kv_valid = staged.cursor;
+            if (is_masked_draft_backend(speculative_backend)) {
+                sequence.dflash_context_frontier = staged.cursor;
+            }
+            commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+            if (kvmem_window_pages) { consume_kvmem_chunk_capture(sequence, begin, staged.cursor); }
+            settle_state_fork(sequence);
+            copy_tail(sequence, prefill_hidden.slice(
+                                    1, static_cast<std::int32_t>(offset + counts[row] - 1), 1));
+            sequence.tail_hidden_valid = true;
+            offset += counts[row];
+            out.rows[row].summary                 = {.prompt_tokens        = staged.prompt_tokens,
+                                                     .reused_prompt_tokens = staged.base,
+                                                     .prefix_reuse_path    = staged.reuse};
+            out.rows[row].processed_prompt_tokens = counts[row];
+            settle_unit(lane);
+        }
+        timing.begin_wait();
+        device.synchronize();
+        timing.end_wait();
+        const auto elapsed = std::chrono::duration<double>(Clock::now() - started).count();
+        for (const auto lane : std::span(lanes).first(handles.size())) {
+            requests[lane].prefill->elapsed_seconds += elapsed;
+        }
+        out.timing = timing.finish();
+        // Shared stream cost is attributed by token count, with exact totals (no double count).
+        auto remaining         = out.timing;
+        auto remaining_columns = columns;
+        for (std::size_t row = 0; row < handles.size(); ++row) {
+            auto& share       = out.rows[row].timing;
+            const auto divide = [&](std::uint64_t& value) {
+                const auto allocated = value / remaining_columns * counts[row] +
+                                       value % remaining_columns * counts[row] / remaining_columns;
+                value -= allocated;
+                return allocated;
+            };
+            share = {divide(remaining.submit_host_ns), divide(remaining.device_wait_ns),
+                     divide(remaining.post_host_ns), divide(remaining.gpu_elapsed_ns)};
+            remaining_columns -= counts[row];
+        }
+        return out;
+    } catch (...) {
+        timing.begin_wait();
+        try {
+            device.synchronize();
+        } catch (...) {}
+        timing.end_wait();
+        clear_execution_failure_lanes(std::span(lanes).first(handles.size()));
+        throw;
+    }
+}
+
 runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
