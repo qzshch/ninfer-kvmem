@@ -143,9 +143,17 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         std::size_t minimum = 0;
         const auto require_host = [&](std::uint64_t count, std::size_t stride) {
             if (stride && count > (limit - minimum) / stride) {
+                constexpr std::size_t mib = 1024U * 1024U;
+                const auto maximum = std::numeric_limits<std::size_t>::max();
+                const auto required = count > (maximum - minimum) / stride
+                                          ? maximum : minimum + count * stride;
                 throw RequestError(RequestErrorKind::ContextLengthExceeded,
                     "KVMem prompt history exceeds isolated Host context capacity; "
-                    "reduce input length or configure a larger Host pool");
+                    "prompt_tokens=" + std::to_string(base->summary.prompt_tokens) +
+                    ", host_capacity_mib=" + std::to_string(limit / mib) +
+                    ", required_at_least_mib=" +
+                    std::to_string(required / mib + static_cast<std::size_t>(required % mib != 0)) +
+                    "; reduce input length or configure a larger Host pool");
             }
             minimum += count * stride;
         };

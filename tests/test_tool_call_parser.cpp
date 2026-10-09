@@ -733,6 +733,36 @@ int test_incremental_embedded_parameter_markup() {
     return failures;
 }
 
+int test_dsh_incident_markup_is_not_repaired_into_executable_calls() {
+    const auto contract = output_contract_for(
+        "bash", Json{{"command", Json{{"type", "string"}}},
+                      {"description", Json{{"type", "string"}}}});
+    const std::vector<std::string> malformed = {
+        "<tool_call>\n=bash\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>\n<tool_call>\n<name>bash</name>\n"
+        "<parameter=description>Read docs</parameter>\n"
+        "<parameter=command>head -60 README.md\n</parameter>\n</function>\n</tool_call>",
+    };
+    int failures = 0;
+    for (const auto& text : malformed) {
+        for (std::size_t split = 0; split <= text.size(); ++split) {
+            fi::ToolCallOutputDecoder decoder(contract, 64);
+            std::string visible = decoder.feed(std::string_view(text).substr(0, split));
+            visible += decoder.feed(std::string_view(text).substr(split));
+            auto terminal = decoder.finish();
+            failures += check(visible + terminal.content == text && terminal.tool_calls.empty() &&
+                                  terminal.diagnostics.fallback_reason ==
+                                      ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                              "DSH malformed generation was rewritten or executed");
+        }
+    }
+    const auto empty = fi::parse_qwen_tool_call_output(tool_call("bash"), 64, *contract);
+    failures += check(empty.tool_calls.size() == 1 &&
+                          empty.tool_calls.front().arguments_json == "{}",
+                      "non-strict parsing invented missing bash arguments");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -756,6 +786,7 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_dsh_incident_markup_is_not_repaired_into_executable_calls();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
