@@ -165,7 +165,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
         cuda_check(cudaDeviceSynchronize(), "synchronize NVFP4 linear_add");
 
-        if (invocation.tokens == 128) {
+        if (invocation.tokens == 128 || invocation.tokens == 513 || invocation.tokens == 1025) {
             cudaStream_t stream;
             cudaGraph_t graph;
             cudaGraphExec_t executable;
