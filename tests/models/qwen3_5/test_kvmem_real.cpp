@@ -25,11 +25,19 @@ ninfer::RequestOptions request(bool reuse = true) {
 ninfer::PromptInput media_prompt() {
     ninfer::PromptInput input;
     std::string records;
+    std::string policy = "Use the following reference records as context. Answer the final question.";
+    for (unsigned i = 0; i < 80; ++i) {
+        policy += " Keep these instructions available throughout this conversation.";
+    }
     for (unsigned i = 0; i < 720; ++i) {
         records += "Reference record: alpha beta gamma delta epsilon.\n";
     }
     input.messages.push_back(
         {.role  = ninfer::ChatRole::System,
+         .parts = {{.kind = ninfer::MessagePartKind::Text,
+                    .text = std::move(policy)}}});
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::User,
          .parts = {{.kind = ninfer::MessagePartKind::Text, .text = std::move(records)}}});
     ninfer::MessagePart image;
     image.kind               = ninfer::MessagePartKind::Media;
@@ -229,6 +237,12 @@ int main(int argc, char** argv) {
         // Explicitly configurable quota for guarded local runs; the coverage/input gates stay
         // fixed. The default retains the four-GiB qualification profile.
         o.context_cache.host_capacity_bytes        = (argc > 5 ? std::stoull(argv[5]) : 4ULL) << 30;
+        if (const auto* memory = std::getenv("NINFER_TEST_HOST_MEMORY")) {
+            const std::string kind = memory;
+            require(kind == "pageable" || kind == "pinned", "unsupported test Host memory kind");
+            o.context_cache.host_memory = kind == "pageable" ? ninfer::HostContextMemory::Pageable
+                                                            : ninfer::HostContextMemory::Pinned;
+        }
         o.speculative.backend                        = ninfer::SpeculativeBackend::DFlash2;
         o.speculative.draft_tokens                   = 7;
         o.speculative.proposal_head                  = ninfer::ProposalHead::Optimized;
@@ -307,11 +321,28 @@ int main(int argc, char** argv) {
             std::cout << "ok raw branch, reused=" << result.reused_prompt_tokens << std::endl;
         }
         auto shared = media_prompt();
+        require(engine.tokenize_text(shared.messages.front().parts.front().text).size() > 128U,
+                "instruction fixture fits the old 128-token sink and cannot test retention");
         shared.messages.back().parts.erase(shared.messages.back().parts.begin());
         shared.messages.back().parts.back().text = "Continue record zero.";
         shared.context_cache.session_key.reset();
         shared.context_cache.allow_engine_automatic_shared_prefixes = false;
-        shared.context_cache.markers.push_back({.after_message_count = 1});
+        shared.context_cache.markers.push_back({.after_message_count = 2});
+        auto oversized_instructions = shared;
+        oversized_instructions.messages[0].parts[0].text +=
+            oversized_instructions.messages[1].parts[0].text;
+        oversized_instructions.messages.erase(oversized_instructions.messages.begin() + 1);
+        const auto oversized = engine.prepare(oversized_instructions);
+        require(oversized.summary().prompt_tokens > o.kvmem_window_pages * 64U,
+                "instruction rejection fixture did not exceed its working window");
+        bool rejected_instructions = false;
+        try { (void)engine.generate(engine.prepare(oversized_instructions), request()); }
+        catch (const ninfer::RequestError& error) {
+            rejected_instructions = error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        }
+        require(rejected_instructions && engine.is_available(),
+                "oversized instructions were truncated or poisoned Engine availability");
+        std::cout << "ok oversized instructions rejected before execution" << std::endl;
         const auto shared_seed  = engine.generate(engine.prepare(shared), request());
         const auto shared_stats = engine.runtime_stats();
         std::cout << "shared seed captures=" << shared_stats.active_captures_completed
@@ -343,6 +374,13 @@ int main(int argc, char** argv) {
             const auto warm_image = engine.generate(engine.prepare(input), request());
             std::cout << "vision warm reused=" << warm_image.reused_prompt_tokens
                       << " replay=" << warm_image.timings.kvmem.replay_tokens << std::endl;
+            if (warm_image.generated_token_ids != cold_image.generated_token_ids) {
+                std::cerr << "vision cold tokens=";
+                for (const auto id : cold_image.generated_token_ids) { std::cerr << id << ','; }
+                std::cerr << "\nvision warm tokens=";
+                for (const auto id : warm_image.generated_token_ids) { std::cerr << id << ','; }
+                std::cerr << '\n';
+            }
             require(cold_image.generated_token_ids.size() == 24 &&
                         warm_image.generated_token_ids == cold_image.generated_token_ids &&
                         warm_image.reused_prompt_tokens > 0,

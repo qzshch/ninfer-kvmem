@@ -35,16 +35,27 @@ ProgramImpl::kvmem_restore_pages(const KVAddressSpaceStore& addresses, KVAddress
             (&addresses == backend_kv_addresses.get() && speculative_backend == SpeculativeBackend::Mtp
                  ? (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize
                  : 0U);
-        selected = media_window_page_set(count, budget, canonical_selection,
-                                         media_page_groups(prompt.vision_items));
+        selected = context_window_page_set(count, budget, canonical_selection,
+                                           media_page_groups(prompt.vision_items),
+                                           prompt.instruction_spans);
     } else if (addresses.active(address) || frontier == prompt.token_ids.size()) {
         for (std::uint32_t p = 0; p < count; ++p) {
             if (addresses.page_in_device_working_set(address, p)) { selected.push_back(p); }
         }
+        if (!prompt.instruction_spans.empty()) {
+            const auto budget = kvmem_window_pages +
+                (&addresses == backend_kv_addresses.get() && speculative_backend == SpeculativeBackend::Mtp
+                     ? (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize : 0U);
+            selected = context_window_page_set(count, budget, selected,
+                                               media_page_groups(prompt.vision_items),
+                                               prompt.instruction_spans);
+        }
     } else {
         const auto groups = media_page_groups(prompt.vision_items);
-        selected = groups.empty() ? prefill_window_page_set(count, 2U, kvmem_window_pages - 2U)
-                                  : media_window_page_set(count, kvmem_window_pages, {}, groups);
+        selected = groups.empty() && prompt.instruction_spans.empty()
+                       ? prefill_window_page_set(count, 2U, kvmem_window_pages - 2U)
+                       : context_window_page_set(count, kvmem_window_pages, {}, groups,
+                                                 prompt.instruction_spans);
     }
     if (count && !std::binary_search(selected.begin(), selected.end(), count - 1U)) {
         selected.push_back(count - 1U);
@@ -88,6 +99,7 @@ void ProgramImpl::initialize_kvmem(SequenceState& sequence, RequestControl::Pref
                                         ? features->retrieved_pages
                                         : std::vector<std::uint32_t>{};
     sparse.media_groups           = media_page_groups(staged.prompt.vision_items);
+    sparse.instruction_spans      = staged.prompt.instruction_spans;
     sparse.query_checkpoint_valid = false;
     const auto query              = kvmem_query_span(staged.prompt_tokens, staged.base,
                                                      staged.prompt.retrieval_query, staged.prompt.vision_items);
@@ -152,8 +164,9 @@ void ProgramImpl::roll_sparse_prefill_window(SequenceState& sequence, std::uint3
         const auto mapped    = addresses.mapped_pages(address);
         const auto committed = std::min(mapped, (valid + kPagedKVPageSize - 1U) / kPagedKVPageSize);
         if (committed <= budget && mapped <= budget) { return; }
-        auto window = !sparse.media_groups.empty()
-                          ? media_window_page_set(committed, budget, selected, sparse.media_groups)
+        auto window = !sparse.media_groups.empty() || !sparse.instruction_spans.empty()
+                          ? context_window_page_set(committed, budget, selected, sparse.media_groups,
+                                                    sparse.instruction_spans)
                       : retrieved_history ? decode_window_page_set(committed, budget, selected)
                                           : prefill_window_page_set(committed, 2U, budget - 2U);
         append_prefill_growth_pages(window, committed, mapped);
@@ -177,7 +190,8 @@ void ProgramImpl::roll_sparse_decode_window(SequenceState& sequence) {
         const auto mapped = addresses.mapped_pages(address);
         if (mapped <= budget) { return; }
         auto selected =
-            media_window_page_set(mapped, budget, sparse.retrieved_pages, sparse.media_groups);
+            context_window_page_set(mapped, budget, sparse.retrieved_pages, sparse.media_groups,
+                                    sparse.instruction_spans);
         const auto counts = addresses.apply_device_placement(address, *host_kv_extents, selected,
                                                                device.transfer_stream, "decode");
         record_kvmem_placement(sequence, KvmemPlacementPhase::Decode, backend, counts);
@@ -606,7 +620,19 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         }
         media_budget = std::max(media_budget,
                                 sink_extent + (latest.begin < 2 ? 0 : latest.end - latest.begin));
-        pages = media_window_page_set(mapped, media_budget, pages, sparse.media_groups, false);
+        pages = context_window_page_set(mapped, media_budget, pages, sparse.media_groups, {}, false);
+    }
+    if (!sparse.instruction_spans.empty()) {
+        // Keep scored features within their usual share unless mandatory context
+        // is larger. Both the executing window and checkpoint restore apply this
+        // same instruction policy; recency is filled only in the executing set.
+        const auto required = context_window_page_set(mapped, kvmem_window_pages, {},
+                                                       sparse.media_groups, sparse.instruction_spans,
+                                                       false).size();
+        const auto budget = std::max(config.budget_blocks * 2U,
+                                     static_cast<std::uint32_t>(required));
+        pages = context_window_page_set(mapped, budget, pages, sparse.media_groups,
+                                         sparse.instruction_spans, false);
     }
     sparse.retrieved_pages           = pages;
     // The probe is unpublished. Place the complete first canonical replay window,
@@ -617,8 +643,9 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     // them. Scored features remain separate from the executing sink/recent window.
     const auto query_pages = (sparse.query_begin + kPagedKVPageSize - 1U) / kPagedKVPageSize;
     const auto replay_pages = sparse.query_checkpoint_valid ? query_pages : mapped;
-    pages = media_window_page_set(replay_pages, kvmem_window_pages,
-                                 sparse.retrieved_pages, sparse.media_groups);
+    pages = context_window_page_set(replay_pages, kvmem_window_pages,
+                                   sparse.retrieved_pages, sparse.media_groups,
+                                   sparse.instruction_spans);
     auto& diagnostics = requests[sequence.lane].timings.kvmem;
     ++diagnostics.selection_calls;
     diagnostics.scored_blocks += selection.scored_blocks;
@@ -631,6 +658,16 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
                      "KVMEM retrieval scored=%u selected=%zu promoted=%u demoted=%u lane=%u\n",
                      selection.scored_blocks, pages.size(), placement.promoted, placement.demoted,
                      sequence.lane);
+        std::uint32_t visible = 0, retained = 0;
+        for (const auto& span : sparse.instruction_spans) {
+            for (auto p = span.begin / kPagedKVPageSize;
+                 p < std::min(replay_pages, static_cast<std::uint32_t>((span.begin + span.count + 63U) / 64U)); ++p) {
+                ++visible;
+                retained += std::binary_search(pages.begin(), pages.end(), p);
+            }
+        }
+        std::fprintf(stderr, "KVMEM instructions lane=%u spans=%zu visible=%u retained=%u\n",
+                     sequence.lane, sparse.instruction_spans.size(), visible, retained);
     }
     if (sequence.kv->backend && speculative_backend == SpeculativeBackend::Mtp) {
         const auto backend_mapped = backend_kv_addresses->mapped_pages(*sequence.kv->backend);
@@ -638,8 +675,9 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
             sparse.query_checkpoint_valid ? query_pages : backend_mapped;
         const auto backend_budget =
             kvmem_window_pages + (draft_window + kPagedKVPageSize - 1U) / kPagedKVPageSize;
-        pages = media_window_page_set(backend_replay_pages, backend_budget,
-                                     sparse.retrieved_pages, sparse.media_groups);
+        pages = context_window_page_set(backend_replay_pages, backend_budget,
+                                       sparse.retrieved_pages, sparse.media_groups,
+                                       sparse.instruction_spans);
         const auto backend_placement = backend_kv_addresses->apply_device_placement(
             *sequence.kv->backend, *host_kv_extents, pages, device.transfer_stream, "retrieval");
         record_kvmem_placement(sequence, KvmemPlacementPhase::Retrieval, true, backend_placement);

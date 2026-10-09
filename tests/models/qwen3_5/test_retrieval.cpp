@@ -153,19 +153,19 @@ void test_media_windows() {
     const auto groups = r::media_page_groups(std::array{a, b, c});
     expect(groups.size() == 2 && groups[0].begin == 3 && groups[0].end == 7,
            "media sharing a physical page cannot be selected independently");
-    r::validate_media_window(groups, 10);
-    const auto selected = r::media_window_page_set(20, 8, std::array{4U}, groups);
+    r::validate_context_window(groups, 10);
+    const auto selected = r::context_window_page_set(20, 8, std::array{4U}, groups);
     expect(selected == std::vector<std::uint32_t>({0, 1, 3, 4, 5, 6, 10, 11}),
            "one scored page brings its full media group, with sink and latest image");
-    const auto tight = r::media_window_page_set(20, 6, std::array{4U}, groups);
+    const auto tight = r::context_window_page_set(20, 6, std::array{4U}, groups);
     expect(tight == std::vector<std::uint32_t>({0, 1, 10, 11, 18, 19}),
            "a group that does not fit is omitted as a whole");
-    const auto partial = r::media_window_page_set(5, 8, {}, groups);
+    const auto partial = r::context_window_page_set(5, 8, {}, groups);
     expect(partial == std::vector<std::uint32_t>({0, 1, 2, 3, 4}),
            "in-progress image maps no future pages and a fitting prefix stays dense");
     bool rejected = false;
     try {
-        r::validate_media_window(groups, 7);
+        r::validate_context_window(groups, 7);
     } catch (const ninfer::RequestError& error) {
         rejected = error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
     }
@@ -174,7 +174,7 @@ void test_media_windows() {
     for (std::uint32_t mapped = 0; mapped < 30; ++mapped) {
         for (std::uint32_t budget = 8; budget <= 16; ++budget) {
             const auto pages =
-                r::media_window_page_set(mapped, budget, std::array{4U, 11U}, groups);
+                r::context_window_page_set(mapped, budget, std::array{4U, 11U}, groups);
             expect(pages.size() <= budget && std::is_sorted(pages.begin(), pages.end()),
                    "media windows stay sorted and within capacity");
             for (const auto& group : groups) {
@@ -223,10 +223,69 @@ void test_prefill_lookahead_preserves_history() {
     expect(replay == std::vector<std::uint32_t>({0, 1, 8, 9, 36, 37, 38, 39, 40, 41, 42, 43}),
            "retrieved history is preserved while replay append pages stay writable");
     const std::array groups{r::MediaPageGroup{3, 7}, r::MediaPageGroup{10, 12}};
-    auto media = r::media_window_page_set(11, 8, {}, groups);
+    auto media = r::context_window_page_set(11, 8, {}, groups);
     r::append_prefill_growth_pages(media, 11, 14);
     expect(media == std::vector<std::uint32_t>({0, 1, 2, 7, 8, 9, 10, 11, 12, 13}),
            "media history remains atomic while its future continuation stays mapped");
+}
+
+void test_instruction_retention() {
+    using ninfer::models::qwen3_5::TokenSpan;
+    // Several pages of tool definitions, plus a late developer message. An
+    // independently enumerated membership oracle includes every intersecting
+    // page, even partial boundary pages, and never includes future KV.
+    const std::array spans{TokenSpan{70, 250}, TokenSpan{1300, 90}};
+    const std::array preferred{8U, 9U, 10U, 11U, 12U, 13U};
+    r::validate_context_window({}, 11, spans);
+    for (std::uint32_t mapped = 0; mapped < 45; ++mapped) {
+        for (std::uint32_t budget = 11; budget < 22; ++budget) {
+            const auto chosen = r::context_window_page_set(mapped, budget, preferred, {}, spans);
+            expect(chosen.size() <= budget && std::is_sorted(chosen.begin(), chosen.end()) &&
+                       std::adjacent_find(chosen.begin(), chosen.end()) == chosen.end(),
+                   "instruction window stays sorted, unique, and within capacity");
+            for (std::uint32_t p = 0; p < mapped; ++p) {
+                bool mandatory = p < 2 || p + 2 >= mapped;
+                for (const auto& span : spans) {
+                    mandatory |= p * 64 < span.begin + span.count && (p + 1) * 64 > span.begin;
+                }
+                if (mandatory) {
+                    expect(std::binary_search(chosen.begin(), chosen.end(), p),
+                           "all visible instructions and tail survive scored history");
+                }
+            }
+            expect(chosen.empty() || chosen.back() < mapped,
+                   "unmaterialized instruction pages are never loaded");
+            auto with_growth = chosen;
+            r::append_prefill_growth_pages(with_growth, mapped, mapped + 4);
+            expect(with_growth.size() == chosen.size() + 4 &&
+                       std::equal(chosen.begin(), chosen.end(), with_growth.begin()),
+                   "prefill lookahead preserves instruction-bearing history");
+        }
+    }
+    bool rejected = false;
+    try { r::validate_context_window({}, 8, spans); }
+    catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+    }
+    expect(rejected, "instructions too large for the window fail before admission");
+
+    // Instructions sharing a page with image KV pin the whole group. A different
+    // latest image also remains atomic, without double charging overlapping pages.
+    const std::array groups{r::MediaPageGroup{4, 8}, r::MediaPageGroup{15, 18}};
+    const std::array instruction{TokenSpan{64, 220}}; // page 4 intersects the image
+    r::validate_context_window(groups, 13, instruction);
+    const auto chosen = r::context_window_page_set(25, 13, preferred, groups, instruction);
+    expect(chosen == std::vector<std::uint32_t>({0, 1, 2, 3, 4, 5, 6, 7, 15, 16, 17, 23, 24}),
+           "shared instruction/media pages are pinned once, with latest media and tail");
+    rejected = false;
+    try { r::validate_context_window(groups, 12, instruction); }
+    catch (const ninfer::RequestError& error) {
+        rejected = error.kind() == ninfer::RequestErrorKind::MediaBudgetExceeded;
+    }
+    expect(rejected, "instruction plus latest-media capacity is checked before execution");
+    expect(r::context_window_page_set(30, 8, preferred, {}) ==
+               r::decode_window_page_set(30, 8, preferred),
+           "raw text without semantic instructions retains its existing policy");
 }
 
 } // namespace
@@ -254,7 +313,7 @@ void test_checkpoint_copy_on_write() {
 }
 
 void test_shared_metadata_budget() {
-    ninfer::HostContextArena arena(4096, 256, 1024);
+    ninfer::HostContextArena arena(4096, 256, ninfer::HostContextMemory::Pageable);
     {
         ninfer::models::qwen3_5::detail::RetrievalIndex live(128, 1, 1, 2);
         live.bind_metadata_arena(&arena);
@@ -281,6 +340,7 @@ int main() {
         test_window_helpers();
         test_media_windows();
         test_prefill_lookahead_preserves_history();
+        test_instruction_retention();
         test_checkpoint_copy_on_write();
         test_shared_metadata_budget();
     } catch (const std::exception& error) {

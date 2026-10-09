@@ -738,6 +738,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.retrieval_query     = processed.retrieval_query;
+        result.instruction_spans  = std::move(processed.instruction_spans);
         result.starts_in_reasoning = processed.starts_in_reasoning;
         result.token_types         = std::move(processed.token_types);
         result.positions           = std::move(processed.positions);
@@ -781,6 +782,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             throw_context_length_exceeded(impl_->max_context);
         }
         result.token_ids                   = std::move(encoded.input_ids);
+        result.instruction_spans           = std::move(encoded.instruction_spans);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);

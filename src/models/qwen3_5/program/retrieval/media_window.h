@@ -39,31 +39,62 @@ inline std::vector<MediaPageGroup> media_page_groups(std::span<const VisionItem>
     return groups;
 }
 
-inline void validate_media_window(std::span<const MediaPageGroup> groups, std::uint32_t budget) {
-    std::uint32_t sink_extent = 2;
+inline void validate_context_window(std::span<const MediaPageGroup> groups, std::uint32_t budget,
+                                    std::span<const TokenSpan> instructions = {}) {
+    if (groups.empty() && instructions.empty()) { return; }
+    std::uint32_t extent = 2;
+    for (const auto& span : instructions) {
+        extent = std::max(extent, static_cast<std::uint32_t>((span.begin + span.count + 63U) / 64U));
+    }
+    for (const auto& group : groups) { extent = std::max(extent, group.end); }
+    std::vector<std::uint8_t> pinned(extent, 0);
+    pinned[0] = pinned[1] = 1;
+    for (const auto& span : instructions) {
+        for (auto p = span.begin / 64U; p < (span.begin + span.count + 63U) / 64U; ++p) {
+            pinned[p] = 1;
+        }
+    }
+    // A boundary page can contain both instructions and media. Its complete
+    // media group must then stay resident with the instructions.
     for (const auto& group : groups) {
-        if (group.begin < 2) { sink_extent = std::max(sink_extent, group.end); }
+        if (std::any_of(pinned.begin() + group.begin, pinned.begin() + group.end,
+                        [](auto kept) { return kept != 0; })) {
+            std::fill(pinned.begin() + group.begin, pinned.begin() + group.end, 1);
+        }
+    }
+    const auto mandatory = static_cast<std::uint32_t>(
+        std::count(pinned.begin(), pinned.end(), std::uint8_t{1}));
+    if (mandatory + 2U > budget) {
+        throw RequestError(
+            instructions.empty() ? RequestErrorKind::MediaBudgetExceeded
+                                 : RequestErrorKind::ContextLengthExceeded,
+            "KVMem window cannot hold system/developer instructions plus sink and tail pages");
     }
     for (const auto& group : groups) {
-        // Two sink pages and two boundary/recent pages remain available. Reject at
-        // admission rather than silently cutting a media group midway through prefill.
-        const auto required = sink_extent + (group.begin < 2 ? 0 : group.end - group.begin) + 2;
-        if (required > budget) {
+        const auto extra = static_cast<std::uint32_t>(
+            std::count(pinned.begin() + group.begin, pinned.begin() + group.end, std::uint8_t{0}));
+        // Reject before admission rather than silently cutting mandatory context.
+        if (mandatory + extra + 2U > budget) {
             throw RequestError(
                 RequestErrorKind::MediaBudgetExceeded,
-                "KVMem window cannot hold a complete media group plus sink and tail pages");
+                "KVMem window cannot hold a complete media group plus instructions and tail pages");
         }
     }
 }
 
-// Latest visible media is mandatory; other media is selected as a whole or omitted.
+// System/developer instructions and latest visible media are mandatory; other
+// media is selected as a whole or omitted. Instruction-bearing requests also
+// reserve their two latest pages before spending the remainder on retrieval.
 // Only the materialized prefix of an in-progress item exists. No future KV is loaded.
-// Text-only requests retain the existing selection policy exactly.
-inline std::vector<std::uint32_t> media_window_page_set(std::uint32_t mapped, std::uint32_t budget,
+// Requests without semantic instruction ranges retain their existing policy.
+inline std::vector<std::uint32_t> context_window_page_set(std::uint32_t mapped, std::uint32_t budget,
                                                         std::span<const std::uint32_t> preferred,
                                                         std::span<const MediaPageGroup> groups,
+                                                        std::span<const TokenSpan> instructions = {},
                                                         bool fill_recent = true) {
-    if (groups.empty()) { return decode_window_page_set(mapped, budget, preferred); }
+    if (groups.empty() && instructions.empty()) {
+        return decode_window_page_set(mapped, budget, preferred);
+    }
     std::vector<std::uint8_t> kept(mapped, 0);
     std::uint32_t used = 0;
     const auto keep    = [&](std::uint32_t page) {
@@ -87,12 +118,23 @@ inline std::vector<std::uint32_t> media_window_page_set(std::uint32_t mapped, st
     for (std::uint32_t p = 0; p < std::min(mapped, 2U); ++p) {
         if (!keep(p)) { throw std::logic_error("KVMem media sink exceeds its admitted window"); }
     }
+    for (const auto& span : instructions) {
+        const auto end = std::min(mapped, static_cast<std::uint32_t>((span.begin + span.count + 63U) / 64U));
+        for (auto p = static_cast<std::uint32_t>(span.begin / 64U); p < end; ++p) {
+            if (!keep(p)) { throw std::logic_error("KVMem instructions exceed their admitted window"); }
+        }
+    }
     for (auto it = groups.rbegin(); it != groups.rend(); ++it) {
         if (it->begin < mapped) {
             if (!keep(it->begin)) {
                 throw std::logic_error("KVMem latest media exceeds its admitted window");
             }
             break;
+        }
+    }
+    if (!instructions.empty()) {
+        for (auto p = mapped > 2U ? mapped - 2U : 0U; p < mapped; ++p) {
+            if (!keep(p)) { throw std::logic_error("KVMem tail exceeds its admitted window"); }
         }
     }
     for (const auto p : preferred) { (void)keep(p); }

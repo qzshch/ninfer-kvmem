@@ -1945,7 +1945,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
 }
 
 void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters& parameters,
-                        EngineOptions options) {
+                        EngineOptions options, bool chat_instructions = false) {
     if (options.speculative.backend == SpeculativeBackend::DFlash2) {
         options.speculative.draft_tokens = 7;
     }
@@ -1991,12 +1991,32 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
         // restored working set still fits. This distinguishes temporary
         // competing claims from an intrinsically impossible binding.
         auto prepared = frontend.prepare_tokens(std::vector<TokenId>(13003, 198));
+        if (chat_instructions) {
+            PromptInput chat;
+            std::string policy = "Follow the system instructions throughout this conversation.";
+            for (unsigned i = 0; i < 80; ++i) {
+                policy += " Keep these instructions available throughout this conversation.";
+            }
+            std::string history;
+            for (unsigned i = 0; i < 13003; ++i) { history += "a "; }
+            chat.messages = {
+                {.role = ChatRole::System,
+                 .parts = {{.kind = MessagePartKind::Text, .text = std::move(policy)}}},
+                {.role = ChatRole::User,
+                 .parts = {{.kind = MessagePartKind::Text, .text = std::move(history)}}}};
+            prepared = frontend.prepare(std::move(chat));
+        }
         runtime::ResolvedExecutionOptions request;
         request.requested_output_tokens = 4;
         request.allow_prefix_reuse      = false;
         request.sampling.temperature    = 0;
-        auto base =
-            program.plan_request(qwen::PreparedPromptAccess::take(std::move(prepared)), request);
+        auto prompt = qwen::PreparedPromptAccess::take(std::move(prepared));
+        const auto instruction_spans = prompt.instruction_spans;
+        auto base = program.plan_request(std::move(prompt), request);
+        if (chat_instructions) {
+            require(!instruction_spans.empty() && instruction_spans.front().count > 128U,
+                    "sparse pause fixture cannot exercise instruction retention");
+        }
         const auto settle = [&]() {
             for (unsigned i = 0; i < 8; ++i) {
                 device.synchronize();
@@ -2232,6 +2252,17 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
                 saved.paused.reset();
                 lane   = 1;
                 paused = true;
+                if (chat_instructions) {
+                    const auto& restored = program.kvmem_lanes_[lane].instruction_spans;
+                    const auto& expected = instruction_spans;
+                    require(restored.size() == expected.size() &&
+                                std::equal(restored.begin(), restored.end(), expected.begin(),
+                                           [](const auto& a, const auto& b) {
+                                               return a.begin == b.begin && a.count == b.count;
+                                           }) &&
+                                program.kvmem_lanes_[0].instruction_spans.empty(),
+                            "sparse pause lost instruction ownership or left ranges on the old lane");
+                }
                 require(read_query_checkpoint(lane) == query_checkpoint,
                         "sparse pause did not restore exact private query checkpoint bytes");
                 require(read_tensor(program.kvmem_lanes_[lane].key_sums) == paused_keys,
@@ -2668,7 +2699,10 @@ int main(int argc, char** argv) {
                                   ? std::stoul(std::getenv("NINFER_SPARSE_BASELINE_RUNS"))
                                   : 1UL;
             require(runs >= 1 && runs <= 16, "invalid sparse regression run count");
-            for (unsigned i = 0; i < runs; ++i) { sparse_query_pause(device, parameters, options); }
+            for (unsigned i = 0; i < runs; ++i) {
+                sparse_query_pause(device, parameters, options);
+                sparse_query_pause(device, parameters, options, true);
+            }
             return 0;
         }
         auto planner = qwen::make_sequence_planner(parameters, device, options);

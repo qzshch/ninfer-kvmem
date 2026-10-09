@@ -116,6 +116,8 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<text::ByteSpan> retrieval_query;
+    // Complete rendered System/Developer blocks, including template-supplied tool definitions.
+    std::vector<text::ByteSpan> instruction_spans;
     std::vector<text::ByteSpan> literal_spans;
     bool starts_in_reasoning = false;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;

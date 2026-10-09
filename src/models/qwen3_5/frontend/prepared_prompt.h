@@ -141,6 +141,8 @@ struct PrepareStats {
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
     std::optional<TokenSpan> retrieval_query;
+    // Exact template instruction ranges retained by sparse KVMem execution.
+    std::vector<TokenSpan> instruction_spans;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;

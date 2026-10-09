@@ -270,6 +270,7 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
         sparse.query_count.clear();
         sparse.retrieved_pages.clear();
         sparse.media_groups.clear();
+        sparse.instruction_spans.clear();
         sparse.capture_begin = sparse.query_begin = sparse.query_end = 0;
         sparse.query_checkpoint_valid                                = false;
     }

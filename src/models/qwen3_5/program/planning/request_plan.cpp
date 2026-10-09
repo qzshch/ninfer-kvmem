@@ -93,6 +93,19 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     if (prompt.has_media() && !vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
+    std::uint32_t previous_instruction_end = 0;
+    for (const auto& span : prompt.instruction_spans) {
+        if (span.count == 0 || span.begin < previous_instruction_end ||
+            span.begin > prompt.token_ids.size() ||
+            span.count > prompt.token_ids.size() - span.begin) {
+            throw std::invalid_argument("prepared instruction spans are not sorted valid ranges");
+        }
+        previous_instruction_end = span.begin + span.count;
+    }
+    if (kvmem_window_pages) {
+        validate_context_window(media_page_groups(prompt.vision_items), kvmem_window_pages,
+                                 prompt.instruction_spans);
+    }
     validate_sampling(options.sampling);
     if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
         rewrite &&
@@ -460,13 +473,13 @@ runtime::ResourceReservation ProgramImpl::reserve_units(std::span<const Executio
                 if (!retrieval_boundary && committed <= budget && mapped <= budget) { return; }
                 auto chosen =
                     prefilling
-                        ? (!sparse.media_groups.empty()
-                               ? media_window_page_set(committed, budget, selected_history,
-                                                       sparse.media_groups)
+                        ? (!sparse.media_groups.empty() || !sparse.instruction_spans.empty()
+                               ? context_window_page_set(committed, budget, selected_history,
+                                                         sparse.media_groups, sparse.instruction_spans)
                            : retrieved ? decode_window_page_set(committed, budget, selected_history)
                                        : prefill_window_page_set(committed, 2U, budget - 2U))
-                        : media_window_page_set(mapped, budget, sparse.retrieved_pages,
-                                                sparse.media_groups);
+                        : context_window_page_set(mapped, budget, sparse.retrieved_pages,
+                                                  sparse.media_groups, sparse.instruction_spans);
                 if (prefilling) { append_prefill_growth_pages(chosen, committed, mapped); }
                 for (std::uint32_t index = 0; index < mapped; ++index) {
                     const auto page = addresses.logical_page(address, index);

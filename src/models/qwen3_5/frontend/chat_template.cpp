@@ -270,6 +270,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         layout = inspect_prompt_layout(output, media);
     }
     RenderedChat result;
+    for (const auto& block : layout.messages) {
+        if (instruction(block.role) && block.begin < block.end) {
+            result.instruction_spans.push_back({block.begin, block.end});
+        }
+    }
     result.starts_in_reasoning          = layout.starts_in_reasoning;
     result.media_placeholders           = layout.media_placeholders;
     result.rewrite_execution_boundaries = layout.execution_boundaries;

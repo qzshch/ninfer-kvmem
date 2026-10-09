@@ -586,6 +586,10 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         rendered.retrieval_query->end =
             map_boundary(rendered.retrieval_query->end, "retrieval query");
     }
+    for (auto& span : rendered.instruction_spans) {
+        span.begin = map_boundary(span.begin, "instruction range");
+        span.end = map_boundary(span.end, "instruction range");
+    }
     if (rendered.rewrite_checkpoint) {
         rendered.rewrite_checkpoint->offset =
             map_boundary(rendered.rewrite_checkpoint->offset, "rewrite checkpoint");
@@ -774,6 +778,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(rendered.retrieval_query->begin);
         byte_boundaries.push_back(rendered.retrieval_query->end);
     }
+    for (const auto& span : rendered.instruction_spans) {
+        byte_boundaries.push_back(span.begin);
+        byte_boundaries.push_back(span.end);
+    }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
@@ -869,6 +877,17 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         }
     }
 
+    for (std::size_t i = 0; i < rendered.instruction_spans.size(); ++i) {
+        const auto& begin = tokenized.boundaries.at(boundary_index++);
+        const auto& end = tokenized.boundaries.at(boundary_index++);
+        if (!begin.exact_frontier || !end.exact_frontier ||
+            *begin.exact_frontier >= *end.exact_frontier) {
+            throw std::logic_error("instruction range is not an exact nonempty token span");
+        }
+        encoded.instruction_spans.push_back(
+            {.begin = to_frontier(*begin.exact_frontier, "instruction begin"),
+             .count = to_frontier(*end.exact_frontier - *begin.exact_frontier, "instruction length")});
+    }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
     }
@@ -1096,6 +1115,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.starts_in_reasoning         = rendered.starts_in_reasoning;
     output.input_ids                   = std::move(encoded.input_ids);
     output.retrieval_query             = encoded.retrieval_query;
+    output.instruction_spans           = std::move(encoded.instruction_spans);
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
     output.message_boundaries          = std::move(encoded.message_boundaries);

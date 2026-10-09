@@ -179,6 +179,7 @@ struct KvmemLaneState {
     std::vector<std::uint32_t> query_count;
     std::vector<std::uint32_t> retrieved_pages;
     std::vector<MediaPageGroup> media_groups;
+    std::vector<TokenSpan> instruction_spans;
 };
 
 struct KvmemPrefixFeatures {

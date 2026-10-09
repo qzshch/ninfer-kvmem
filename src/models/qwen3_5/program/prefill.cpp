@@ -898,7 +898,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
 
                 finalized = result.finalized;
-                if (finalized || remaining == 0) { break; }
+                // Sparse placement is licensed at an execution-unit frontier. A
+                // rewrite may finish only part of the nominal chunk; return to
+                // scheduling before its suffix, just as query replay does. Otherwise
+                // a restored vision prefix can execute the suffix with a stale
+                // recency window that cold replay has already rolled. Rolling here
+                // inside the old permit would also miss the next Host backup quote.
+                if (finalized || remaining == 0 || sparse) { break; }
             }
 
             if (!finalized) {
