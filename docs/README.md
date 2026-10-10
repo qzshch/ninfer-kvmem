@@ -28,6 +28,7 @@ The executable `--help` output is the exact source for command-line option spell
 
 ## Repository-local guides
 
+- [NInfer + KVMem experiment results (2026-10-10)](performance/experiment-results-20261010.md)
 - [Benchmarks](../bench/README.md)
 - [Tests](../tests/README.md)
 - [Tools](../tools/README.md)
