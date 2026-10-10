@@ -270,8 +270,8 @@ GDN诊断测试已提交 `d2eb6fa5`（单独实验）及 `01cdfcc5`（组合实�
 
 ### HiCache隔离状态与“完整”的边界
 
-- Native+KVMem基线：`codex/upstream-kvmem-native-20261008`，`6af5de4e`；当前NV分支基于它。当前源码没有`FileKVBacking`实现、HiCache配置及分层缓存测试。
-- 可选增强：独立分支`codex/upstream-kvmem-hicache-optional-20261008`，`0a306396`，独立工作树`wt-upstream-kvmem-hicache-optional-20261008`；比Native多40个文件的变更，约3279行新增、183行删除。安装二进制也独立位于`runtime/upstream-hicache`。
+- Native+KVMem基线：`Native-KVMem-Baseline`，`6af5de4e`；本次NV实验分支基于它。该基线没有`FileKVBacking`实现、HiCache配置及分层缓存测试。
+- 可选增强：独立分支`HiCache`，`0a306396`，独立工作树`wt-upstream-kvmem-hicache-optional-20261008`；比Native多40个文件的变更，约3279行新增、183行删除。安装二进制也独立位于`runtime/upstream-hicache`。2026-10-10仅重命名公开分支，测试提交未改变；上文其他`codex/`名称是当时的本地实验分支记录。
 - 默认关闭；参数`--kv-file-dir`启用文件层，`--hicache-ram-mib/--hicache-state-mib`配置热层与状态RAM配额，预取/write-through另行选择。当前日常运行`runtime/upstream-native`，不只是“包含HiCache但不开开关”。
 - 已有单实例RAM/临时磁盘KV、校验、预取与生命周期功能；完整GDN/conv/DFlash StateImage仍在RAM，进程正常退休删除文件。没有重启恢复或跨实例完整检查点共享。
 - 实验性能仍有负收益：前次容量压力回访66.22s/29.17s，相对Native12.63s/12.03s；预取ON11.278s、OFF10.069s。保留这些原声明条件的记录，未把功能测试通过写成Prefill提速通过。

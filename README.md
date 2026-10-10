@@ -1,69 +1,71 @@
 # ninfer-kvmem
 
-**面向单卡长上下文、多请求与工具调用的 NInfer + KVMem 集成构筑，由 [qzshch](https://github.com/qzshch) 维护。**
+English | [简体中文](README.zh-CN.md)
 
-本项目以 [NInfer](https://github.com/Neroued/ninfer) 的 C++/CUDA 推理引擎为基础，将 [KVMem](https://github.com/kvmem/kvmem-llama.cpp) 的有界 GPU 工作集、Host 历史存储与查询检索机制接入原生执行和前缀缓存。重点是：在有限显存中使用较大的逻辑上下文，支持多 lane、DFlash2 与视觉共同运行，并持续验证真实 agent 请求中的缓存、工具和会话生命周期。
+**A NInfer + KVMem integration for single-GPU long-context inference, concurrent requests and agent workflows, maintained by [qzshch](https://github.com/qzshch).**
 
-`main` 是当前日常构筑的维护入口；旧 `master`、`feature/kvmem` 和实验分支保留历史用途。本页数据更新于 **2026-10-10**，对应已运行验证的代码 `7e9f4e13`。后续首页与文档、归属标注修改不代表新增性能优化。
+This project builds on [NInfer](https://github.com/Neroued/ninfer)'s C++/CUDA engine and integrates [KVMem](https://github.com/kvmem/kvmem-llama.cpp)'s bounded GPU working set, Host history and query-based retrieval with native execution and prefix reuse. The focus is large logical contexts within limited VRAM, multiple lanes, DFlash2 and vision running together, and regression checks based on real agent requests.
 
-## 本项目的核心改动
+`main` tracks the current daily build. Measurements below were recorded on **2026-10-10**, using qualified code `7e9f4e13`. Later documentation and attribution changes do not represent additional performance improvements.
 
-| 改动 | 实际作用 | 当前状态 |
+## Core changes
+
+| Change | Purpose | Current status |
 |---|---|---|
-| 多 lane KVMem | 每个执行 lane 使用独立的稀疏 GPU 窗口，逻辑历史存入共享、受配额管理的 Host 存储 | 日常使用 2 lane；每路 36K 窗口、256K 逻辑上限 |
-| 与 Native 前缀缓存结合 | 复用已有 KV 和完整继续执行状态，减少重复 Prefill；共享 prefix lease，避免再建立第二套缓存账本 | 冷/热、追加、分叉、取消、恢复与资源归还已验证 |
-| KVMem + DFlash2 + Vision | 将检索、投机验证、图像/视频状态接入同一原生执行路径 | DFlash2 草稿 7 + 图像/视频已实际推理验证；MTP3 也有跨窗口回归 |
-| 长历史指令与工具保留 | 保留 System/Developer、工具定义、必要媒体和尾部页；窗口不足时明确拒绝，不静默丢弃工具定义 | 原始 DSH 故障请求已受保护重放；修复 MTP 未提交 lookahead 页提前迁出问题 |
-| 可追踪的性能与容量 | JSONL 输出 per-lane Prefill/Decode、缓存、选页、搬运与 replay 数据 | 日常面板已验证收到双 lane 数据；可区分逻辑占用和 Host 固定 backing |
-| 模块化 KVMem | 检索、窗口及容量策略拆成可独立构建的 `kvmem_core`，由 NInfer adapter 对接 | 降低策略代码与 CUDA/模型/前端的耦合；是源码接口，不是动态插件 ABI |
-| 上游能力适配 | 吸收 NInfer 的结构化输出、严格工具约束；适配视频采样校验及 Responses 生命周期 | 支持 JSON/受支持 Schema、GBNF、choice/regex；不支持的 Schema 明确报错 |
+| Multi-lane KVMem | Give each execution lane an independent sparse GPU window while retaining logical history in quota-managed shared Host storage | Daily profile: 2 lanes, each with a 36K window and a 256K logical limit |
+| Native prefix reuse | Reuse KV and complete continuation state to reduce repeated prefill; share native prefix leases instead of maintaining another cache ledger | Cold/warm, append, fork, cancellation, recovery and resource retirement checked |
+| KVMem + DFlash2 + vision | Integrate retrieval, speculative verification and image/video state through the same native execution path | DFlash2 K7 and image/video inference checked; MTP3 also has cross-window regression coverage |
+| Long-history instructions and tools | Retain System/Developer instructions, tool definitions, required media and tail pages; reject an undersized window explicitly | Original DSH failure requests replayed in bounded smoke tests; premature migration of uncommitted MTP lookahead pages fixed |
+| Observable performance and capacity | Emit per-lane prefill/decode, prefix reuse, selection, transfers and replay metrics to JSONL | Daily dashboard receives both lanes; logical occupancy and fixed Host backing remain separate |
+| Modular KVMem core | Move retrieval, window and capacity policy into an independently buildable `kvmem_core`, connected through a NInfer adapter | Reduces coupling to CUDA, models and frontends; a source-level interface, not a dynamic plugin ABI |
+| Selected upstream integration | Adopt NInfer structured output and strict tool constraints; adapt video sampling validation and Responses lifecycle handling | JSON/supported schemas, GBNF, choice/regex supported; unsupported schemas fail explicitly |
 
-NInfer 提供模型数学、CUDA kernels、Graph、原生调度及协议基础；KVMem 提供工作集与检索设计。本项目维护它们在上述组合中的集成和修复，不把上游能力标为本项目原创。具体来源和适配边界见 [版本清单](backends/versions.json) 与 [后端集成说明](docs/maintainer/backend-integration.md)。
+NInfer supplies model mathematics, CUDA kernels, graphs, scheduling and protocol foundations. KVMem supplies the working-set and retrieval design. This project maintains their integration and fixes for the combinations above. Upstream capabilities retain their original attribution; see the [source version manifest](backends/versions.json) and [backend integration contract](docs/maintainer/backend-integration.md).
 
-## 当前日常配置
+## Current daily profile
 
-| 项目 | 配置 |
+| Item | Configuration |
 |---|---|
-| 验证平台 | RTX 5090 32 GiB、Linux/WSL2、CUDA 13.2.86、GCC 13.3 |
-| 实测模型 | Huihui Qwen3.8-27B NVFP4 `.ninfer`，附 DFlash2 companion 权重 |
-| 并发 / 逻辑上限 | 2 lane；每路 262,144 token |
-| GPU 工作窗口 | 每路 36,864 token，即 576 页 × 64 token |
-| 共享 Device KV 池 | 77,824 token，其中包含执行所需增长余量；不等于单路窗口 |
-| KV / 投机 / 视觉 | FP8 / DFlash2 草稿 7 / Vision 启用 |
-| Host / Prefill | 18 GiB pageable 共享 Host 配额 / chunk 1,024 |
-| 缓存 | NInfer Native 前缀复用；HiCache 关闭 |
+| Qualified platform | RTX 5090 32 GiB, Linux/WSL2, CUDA 13.2.86, GCC 13.3 |
+| Measured model | Huihui Qwen3.8-27B NVFP4 `.ninfer` with DFlash2 companion weights |
+| Concurrency / logical limit | 2 lanes; 262,144 tokens per lane |
+| GPU working window | 36,864 tokens per lane: 576 pages × 64 tokens |
+| Shared Device KV pool | 77,824 tokens, including execution growth slack; distinct from a lane's window |
+| KV / speculation / media | FP8 / DFlash2, 7 draft tokens / vision enabled |
+| Host / prefill | Shared 18 GiB pageable Host quota / 1,024-token chunks |
+| Prefix reuse | NInfer Native cache; HiCache disabled |
 
-36K 驻留窗口是 256K 逻辑上限的约 **14.1%**；显存还要容纳权重、State、Graph 与 workspace。这是上下文容量设计，不是“显存降低 85.9%”或“质量无损”的证明。Host 也是共享配额；配置两路 256K 上限，不等于已经证明两路完整 256K 实体历史同时达到峰值。资源压力可能触发缓存淘汰、暂停或 replay。
+A 36K resident window is about **14.1%** of the 256K logical limit. VRAM also holds weights, state, graphs and workspace. This is a capacity design, not evidence of an 85.9% VRAM reduction or lossless quality. The Host quota is shared; configuring two 256K limits does not qualify simultaneous full-history peaks. Resource pressure can trigger eviction, pause or replay.
 
-## 实测收益与边界
+## Measurements and limits
 
-最近一次比较采用 **A → B → B → A**：A 为冻结的上一日常构筑（`ae5134c7` + r2 遥测），B 为本页当前构筑。使用相同权重、配置、公开输入、seed，每请求实际发布 256 token，每版本两次重复。两者都配置为 2 lane；表中的单请求是只有一个活跃请求，**不是配置为 1 lane 的实验**。
+The latest comparison used **A → B → B → A**: A is the frozen previous daily build (`ae5134c7` + r2 telemetry), B is the qualified current build. Weights, configuration, public prompts and seed were held fixed. Each request published 256 tokens, with two repetitions per build. Both services were configured for 2 lanes; **single-request rows have one active request, not a service configured for one lane**.
 
-指标为 **整批实际输出 token ÷ 整批耗时，单位 tok/s**，包含 Prefill、排队、缓存搬运和 Decode。长输入约 54.6K，超过 36K GPU 窗口。下表给出重复范围：
+The metric is **actual output tokens for the batch ÷ batch wall time, in tok/s**, including prefill, queueing, cache transfers and decode. Long prompts contain approximately 54.6K tokens, exceeding the 36K GPU window. Ranges cover both repetitions:
 
-| 负载 | 基线冷态 A | 当前冷态 B | 基线热态 A | 当前热态 B |
+| Workload | Baseline A, cold | Current B, cold | Baseline A, warm | Current B, warm |
 |---|---:|---:|---:|---:|
-| 短单请求 | 159.1–167.2 | 160.6–167.2 | 72.5–133.2 | 133.2–141.3 |
-| 短双请求 | 201.0–214.1 | 203.5–212.8 | 138.3–268.6 | 260.0–275.3 |
-| 长单请求 | 23.4–24.1 | 24.0–24.7 | 48.0–72.8 | 66.1–70.6 |
-| 长双请求 | 17.2–19.9 | 24.0–24.4 | 83.4–103.1 | 102.4–105.0 |
+| Short, one request | 159.1–167.2 | 160.6–167.2 | 72.5–133.2 | 133.2–141.3 |
+| Short, two requests | 201.0–214.1 | 203.5–212.8 | 138.3–268.6 | 260.0–275.3 |
+| Long, one request | 23.4–24.1 | 24.0–24.7 | 48.0–72.8 | 66.1–70.6 |
+| Long, two requests | 17.2–19.9 | 24.0–24.4 | 83.4–103.1 | 102.4–105.0 |
 
-- **并发有收益，但不保证翻倍。** 当前短双请求冷态总吞吐为 203.5–212.8，短单为 160.6–167.2；负载、验证批次和 Prefill 都会影响结果。
-- **前缀命中能减少重复 Prefill。** 本轮长热态复用约 54,624 token；当前长双请求冷态 24.0–24.4，热态 102.4–105.0。这是该案例的整批吞吐差异，包含少算输入和恢复成本，不能当作纯 Decode 提速倍数。
-- **此次模块化没有证明普遍加速。** 冷短、冷长单请求基本重合；长双请求记录更好，但只有两次重复，热态又有明显波动，没有消融归因。短双冷态还复用了 29 token 公共前缀，并非严格零命中。
-- **质量验收仍有边界。** 四类单请求的重复和跨版本 token IDs 一致；双请求在基线自身重复中也有差异。动态并发逐 token 一致性、正式多轮语义质量及完整双256K峰值尚未证明。稀疏检索也不等于全历史 dense attention。
+- **Concurrency helps, but does not guarantee twice the throughput.** Current cold short requests reached 203.5–212.8 with two active requests and 160.6–167.2 with one. Workload, verification batches and prefill affect the result.
+- **Prefix hits reduce repeated prefill.** Warm long requests reused about 54,624 tokens. Current long two-request throughput was 24.0–24.4 cold and 102.4–105.0 warm. This is a batch-level difference, including less input computation and restoration costs, not a pure decode speedup ratio.
+- **Modularization has not established a general speedup.** Cold short and cold long single-request results overlap substantially. Long two-request measurements improved, but there are only two repetitions, warm results vary and no component ablation establishes causality. Cold short pairs also shared 29 cached tokens, so they were not strictly zero-hit runs.
+- **Quality qualification remains bounded.** Token IDs matched across builds and repetitions in all four single-request cases. Parallel baseline repetitions themselves differed. Dynamic-concurrency token determinism, formal multi-round semantic quality equivalence and full simultaneous two-256K peaks remain unqualified. Sparse retrieval is not full-history dense attention.
 
-完整方法、修复、负面结果和资格范围见 [2026-10-10 验证报告](docs/reports/2026-10-10-modular-kvmem-constraints.md)。没有将上游模型测评成绩作为本构筑的质量成绩，也没有把组件 microbenchmark 写成 E2E 提速。
+See the [2026-10-10 qualification report](docs/reports/2026-10-10-modular-kvmem-constraints.md) (Chinese) for methods, fixes, adverse findings and limits. Upstream model evaluation scores are not this build's scores; kernel microbenchmarks are not end-to-end gains.
 
-## 稳定性验证
+## Stability checks
 
-本轮通过：独立无 CUDA core 1/1、CPU/协议及独立 oracle 18/18、GPU 数学/Graph 4/4、真实模型配置 15/15，以及独立 Draft 2020-12 校验的 25 组实际工具参数。真实模型覆盖 none/MTP3/DFlash2 K7 的跨窗口冷/热约束、工具、snapshot/replay/cancel，以及视觉和 Native 事务。
+Completed checks: independent CPU-only core 1/1; CPU/protocol and independent oracles 18/18; GPU mathematics/graph oracles 4/4; real-model configurations 15/15; and 25 generated tool-argument sets validated independently with Draft 2020-12. Real-model coverage includes none/MTP3/DFlash2 K7 cross-window cold/warm constraints, tools, snapshot/replay/cancel, vision and Native transactions.
 
-日常全参数构筑还验证了 JSON Schema、strict tool、四帧视频、Responses 父响应删除后子响应续接，以及两条原始 DSH 故障请求并行流式重放。DSH 重放保留原输出上限，只做有界冒烟并取消，没有执行外部工具或生成完整长答案。私有提示词和 SSE 不上传。
+The full daily profile also passed JSON Schema, strict tools, four-frame video and Responses continuation after parent deletion. Two original DSH failure requests were replayed concurrently with their original output caps in bounded streaming smoke tests, then cancelled. These tests did not execute external tools or generate complete long answers. Private prompts and SSE payloads are not published.
 
-## 构建与启动
+## Build and run
 
-当前构筑支持 64 位 Linux/WSL2，针对 `sm_120a`，实测 GPU 为 RTX 5090。需要 CUDA、CMake ≥ 3.28、C++20 编译器、Ninja、pkg-config、FFmpeg 开发库及 libcurl ≥ 7.85。本项目本轮使用 CUDA 13.2.86；没有据此验证其他 GPU/系统。
+This build targets 64-bit Linux/WSL2 and `sm_120a`; the qualified GPU is the RTX 5090. Requirements: CUDA, CMake ≥ 3.28, a C++20 compiler, Ninja, pkg-config, FFmpeg development libraries and libcurl ≥ 7.85. This qualification used CUDA 13.2.86; other GPUs and operating systems were not qualified by these tests.
 
 ```bash
 git clone https://github.com/qzshch/ninfer-kvmem.git
@@ -72,9 +74,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-模型需另行准备为 v3 `.ninfer`，见 [权重转换](docs/weight-conversion.md)。启用 DFlash2 时，artifact 必须包含兼容的 companion 权重；普通 text-only 或只含 MTP 的文件不能直接启用 DFlash2。
+Prepare a v3 `.ninfer` model separately; see [weight conversion](docs/weight-conversion.md). DFlash2 requires compatible companion weights in the artifact. A text-only or MTP-only artifact cannot enable DFlash2 directly.
 
-下面是日常参数的**直接 HTTP 服务示例**，使用公开别名 `ninfer-kvmem`；按实际位置替换模型路径。18 GiB pageable Host 是本机已测配置，内存类型和配额应按硬件调整。
+The following **direct HTTP server example** uses the daily capacity settings and the public alias `ninfer-kvmem`. Substitute your actual model path. The 18 GiB pageable Host setting was tested on this machine; choose memory type and quota for your hardware.
 
 ```bash
 mkdir -p logs
@@ -93,32 +95,41 @@ NINFER_WEIGHT_READ_THREADS=2 ./build/apps/ninfer-serve \
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"ninfer-kvmem","messages":[{"role":"user","content":"用一句话解释前缀缓存。"}],"max_tokens":64}'
+  -d '{"model":"ninfer-kvmem","messages":[{"role":"user","content":"Explain prefix caching in one sentence."}],"max_tokens":64}'
 ```
 
-API、结构化输出及工具参数见 [Serving](docs/serving.md)；完整选项以可执行文件 `--help` 为准。
+See [serving](docs/serving.md) for APIs, structured outputs and tools. Executable `--help` is authoritative for option spelling and defaults.
 
-## 实验与文档
+## Branches and experiments
 
-HiCache RAM/磁盘扩展保留在 [`codex/upstream-kvmem-hicache-optional-20261008`](https://github.com/qzshch/ninfer-kvmem/tree/codex/upstream-kvmem-hicache-optional-20261008)，不属于当前 `main` 日常构筑。非 CP GDN recurrence 融合、跨 lane 投影打包和 NVFP4 数值舍入实验也没有作为默认优化启用。GDN 输出 RMSNorm + SiLU gating 已在原生产路径融合，与 recurrence 实验不同。
-
-- [文档入口](docs/README.md)：CLI、Serving、权重转换、测试和维护说明。
-- [本构筑实测报告](docs/reports/2026-10-10-modular-kvmem-constraints.md)：资格、ABBA 与未解决边界。
-- [KVMem / Native 缓存契约](docs/maintainer/sparse-native-context-cache.md)：选页、搬运、指令保留、Host 配额和恢复。
-- [后端模块化与更新方法](docs/maintainer/backend-integration.md)、[上游版本清单](backends/versions.json)。
-
-继承的模型卡与通用指南记录上游能力；本构筑的性能与默认配置以本页及本项目报告为准。
-
-## 上游归属与开源许可
-
-本项目的 NInfer 衍生代码和项目自有改动沿用 **[Apache License 2.0](LICENSE)**。保留原有版权、第三方许可证与 NOTICE；改动来源由 Git 历史、[NOTICE](NOTICE) 和 [上游及许可说明](docs/upstream-and-licenses.md) 记录。
-
-| 来源 | 归属及许可 |
+| Branch | Purpose |
 |---|---|
-| [NInfer](https://github.com/Neroued/ninfer) | Neroued 与 NInfer contributors；[Apache-2.0](https://github.com/Neroued/ninfer/blob/81c8ce093b2c1646a87566a8e59d807fcf0ec95c/LICENSE)。模型执行、CUDA 与协议基础来自上游 |
-| [KVMem](https://github.com/kvmem/kvmem-llama.cpp) / [KVMem-qw3](https://github.com/kvmem/kvmem-qw3) | KVMem 作者与 contributors；固定版本移植仓的 [README 许可声明](https://github.com/kvmem/kvmem-llama.cpp/blob/d9ae944b39f55f77f5434edb96b9fb037217a0a4/README.md#license) 说明按 Apache-2.0 处理。该版本未单独提供根 LICENSE；不将 llama.cpp 的 MIT 泛化为整个 KVMem 的许可 |
-| [XGrammar](third_party/xgrammar/README.ninfer.md) | Apache-2.0，保留其 [LICENSE](third_party/xgrammar/LICENSE) 和 [NOTICE](third_party/xgrammar/NOTICE) |
-| 其他 vendored 依赖及模板 | 保留各自的许可证；例如 llama-jinja、cpp-httplib、spdlog、nlohmann JSON 的 MIT，详见 [许可清单](docs/upstream-and-licenses.md#第三方组件) |
-| 模型与草稿权重 | 独立分发，须分别遵守原模型、消融模型、量化及 companion 权重的 model card/许可；源码许可不替代权重许可 |
+| [`main`](https://github.com/qzshch/ninfer-kvmem/tree/main) | Current daily build and ongoing maintenance |
+| [`HiCache`](https://github.com/qzshch/ninfer-kvmem/tree/HiCache) | Optional RAM/disk cache experiment; separate from the daily build |
+| [`Native-KVMem-Baseline`](https://github.com/qzshch/ninfer-kvmem/tree/Native-KVMem-Baseline) | Historical 2026-10-08 Native + KVMem comparison baseline |
+| [`Modular-Integration`](https://github.com/qzshch/ninfer-kvmem/tree/Modular-Integration) | Historical 2026-10-10 modular/constraint integration snapshot, already included in `main` |
 
-KVMem 的研究设计请引用 [KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer GPU](https://arxiv.org/abs/2609.04852)，Di Chai、Leye Wang、Zeshen Su、Zhiguo Xia、Zhihang Yu，2026。本项目是独立集成与维护构筑，不代表上游官方发行或背书。
+HiCache is not part of the current daily build. Non-CP GDN recurrence fusion, cross-lane projection packing and NVFP4 rounding experiments are also not enabled as default optimizations. Output RMSNorm + SiLU gating is already fused in the production GDN path; it is distinct from the recurrence experiment. Older `master`, `feature/kvmem` and PR branches retain their historical or review roles.
+
+Documentation:
+
+- [Guide index](docs/README.md): CLI, serving, conversion, tests and maintenance.
+- [Current qualification report](docs/reports/2026-10-10-modular-kvmem-constraints.md) (Chinese).
+- [KVMem / Native cache contract](docs/maintainer/sparse-native-context-cache.md): selection, transfers, instruction retention, Host quotas and recovery.
+- [Backend integration and update method](docs/maintainer/backend-integration.md), [upstream source versions](backends/versions.json).
+
+Inherited model cards and general guides describe upstream artifacts and interfaces. This README and project-specific reports describe this build's measurements and defaults.
+
+## Attribution and licenses
+
+NInfer-derived code and project-owned modifications use **[Apache License 2.0](LICENSE)**. Original copyright notices, third-party licenses and notices are retained. Changes and provenance are recorded in Git history, [NOTICE](NOTICE) and the [source and license notes](docs/upstream-and-licenses.md) (Chinese).
+
+| Source | Attribution and terms |
+|---|---|
+| [NInfer](https://github.com/Neroued/ninfer) | Neroued and NInfer contributors; [Apache-2.0](https://github.com/Neroued/ninfer/blob/81c8ce093b2c1646a87566a8e59d807fcf0ec95c/LICENSE). Model execution, CUDA and protocol foundations come from upstream |
+| [KVMem](https://github.com/kvmem/kvmem-llama.cpp) / [KVMem-qw3](https://github.com/kvmem/kvmem-qw3) | KVMem authors and contributors. The pinned port's [README license statement](https://github.com/kvmem/kvmem-llama.cpp/blob/d9ae944b39f55f77f5434edb96b9fb037217a0a4/README.md#license) declares Apache-2.0 treatment; that revision has no standalone root LICENSE. llama.cpp's MIT terms are not a blanket license for all KVMem code |
+| [XGrammar](third_party/xgrammar/README.ninfer.md) | Apache-2.0; its [LICENSE](third_party/xgrammar/LICENSE) and [NOTICE](third_party/xgrammar/NOTICE) are retained |
+| Other vendored dependencies and templates | Retain their own terms, including MIT for llama-jinja, cpp-httplib, spdlog and nlohmann JSON; see the [component list](docs/upstream-and-licenses.md#第三方组件) |
+| Models and draft weights | Distributed separately; follow each original, abliterated, quantized and companion model's model card and license. The source license does not replace weight licenses |
+
+For the KVMem research design, cite [KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer GPU](https://arxiv.org/abs/2609.04852), Di Chai, Leye Wang, Zeshen Su, Zhiguo Xia and Zhihang Yu, 2026. This is an independently maintained integration, not an official upstream release or endorsement.

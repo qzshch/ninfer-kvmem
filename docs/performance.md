@@ -1,7 +1,7 @@
 # Single-GPU serving performance
 
 For **ninfer-kvmem** measurements, start with the [current build report](reports/2026-10-10-modular-kvmem-constraints.md)
-and [project README](../README.md#实测收益与边界). The model benchmark and evaluation entries
+and [project README](../README.md#measurements-and-limits). The model benchmark and evaluation entries
 below are inherited NInfer records; they are not measurements or quality scores for this local build.
 
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.

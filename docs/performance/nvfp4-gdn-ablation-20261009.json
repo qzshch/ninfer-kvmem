@@ -13388,7 +13388,7 @@
     },
     "hicache": {
       "native_base": "6af5de4e",
-      "optional_branch": "codex/upstream-kvmem-hicache-optional-20261008",
+      "optional_branch": "HiCache",
       "optional_head": "0a306396",
       "source_separated": true,
       "runtime_enabled": false,
