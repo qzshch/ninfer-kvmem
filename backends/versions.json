@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "review_date": "2026-10-10",
+  "local_starting_point": "ae5134c784a6785fe4d58a26e9a1f7c87e59cd0d",
   "ninfer": {
     "repository": "https://github.com/Neroued/ninfer",
     "baseline": "68c54356fd490ab329bd1475d48957f886bb7dd1",
@@ -21,6 +23,10 @@
       "dormant_graph_6f1bf82a": "native prebuilt batch Graph families; covered by reactivation checks"
     },
     "excluded": "llama.cpp disk session GC and wholesale ninfer-all adapter replacement"
+  },
+  "local_fixes": {
+    "mtp_uncommitted_lookahead": "retain unpublished growth pages on Device until execution-unit settlement; never weaken checkpoint protection",
+    "constrained_prefill": "ordinary mask-aware path when optional projection packing is enabled"
   },
   "optional": {
     "hicache": "separate experimental branch; not enabled by this build",

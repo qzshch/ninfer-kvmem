@@ -56,6 +56,7 @@ other references own narrower contracts:
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [Sparse working sets and Native history](maintainer/sparse-native-context-cache.md) | per-lane KVMem placement, Native prefix identity, fixed pinned Host KV, recovery and observability |
 | [Backend integration](maintainer/backend-integration.md) | portable KVMem core, native adapter ownership, fixed upstream references and update qualification |
+| [2026-10-10 integration qualification](reports/2026-10-10-modular-kvmem-constraints.md) | modular core, upstream constraints, MTP lookahead fix, native qualification and ABBA results |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
