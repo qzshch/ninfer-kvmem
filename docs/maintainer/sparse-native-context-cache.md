@@ -1,5 +1,9 @@
 # Sparse KVMem and Native context cache
 
+Retrieval and retention policy live in the independently buildable `kvmem_core`.
+The [backend integration contract](backend-integration.md) separates portable
+algorithms from Native placement, checkpoint and CUDA ownership.
+
 This extension uses upstream NInfer 68c54356 and adapts the source-wait admission
 contract from 911d34db to sparse physical working sets. Native owns checkpoint
 identity, StateImages, immutable source leases, persistent KV directories and

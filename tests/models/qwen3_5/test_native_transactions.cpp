@@ -2191,7 +2191,7 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
             const auto replay_phase = static_cast<std::size_t>(ninfer::KvmemPlacementPhase::Replay);
             const auto before_promotions =
                 program.requests[lane].timings.kvmem.placement[replay_phase];
-            auto step = program.advance_prefill(sequence, nullptr);
+            auto step = program.advance_prefill(sequence, nullptr, nullptr);
             if (first_query_replay) {
                 // Observe the actual canonical execution, rather than repeating
                 // the window helper. Placement must have covered its history in
@@ -2332,7 +2332,7 @@ void sparse_query_pause(DeviceContext& device, const qwen::execution::Parameters
                     "sparse recovered decode admission failed");
             const std::array<qwen::SequenceHandle, 1> members{sequence};
             const std::array<runtime::RoundBudget, 1> budget{{{.generated_tokens_remaining = 1}}};
-            auto pending        = program.decode(members, budget, nullptr);
+            auto pending        = program.decode(members, budget, nullptr, nullptr);
             const auto licensed = pending.row_counts().empty() ? 1 : pending.row_counts().front();
             require(pending.row_count() == 1 && licensed == 1 &&
                         pending.tokens().size() >= pending.row_stride(),
@@ -2583,7 +2583,7 @@ void packed_prefill_regression(DeviceContext& device, const qwen::execution::Par
                         {{handles[lane], qwen::ExecutionUnitKind::Prefill}}};
                     require(static_cast<bool>(program.reserve_units(unit)),
                             "ordinary fallback lost its permit");
-                    auto progress = program.advance_prefill(handles[lane], nullptr);
+                    auto progress = program.advance_prefill(handles[lane], nullptr, nullptr);
                     processed[lane] += progress.processed_prompt_tokens;
                     if (!progress.complete) { continue; }
                     require(progress.pending && processed[lane] == lengths[lane],
