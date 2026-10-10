@@ -420,7 +420,8 @@ int main(int argc, char** argv) {
         else
             require(backend == "none", "unknown backend");
         if (backend != "none") {
-            options.speculative.draft_tokens  = 3;
+            const auto draft_tokens = std::getenv("NINFER_TEST_DRAFT_TOKENS");
+            options.speculative.draft_tokens = draft_tokens ? std::stoul(draft_tokens) : 3;
             options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
         }
         ninfer::Engine engine(options);

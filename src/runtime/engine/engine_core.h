@@ -2026,7 +2026,8 @@ private:
                 continue;
             }
             const bool packed_candidate =
-                prefill_pack_projections_ && !recovering && request->is_prefilling() &&
+                prefill_pack_projections_ && !recovering && !request->output.constrained() &&
+                request->is_prefilling() &&
                 instance_.program->packable_prefill_tokens(*request->sequence) != 0;
             if (prefill == lane || packed_candidate ||
                 (scope == ReservationScope::Round &&
@@ -2455,11 +2456,13 @@ private:
                         std::array<std::uint32_t, kMaximumConcurrency> packed_lanes{};
                         std::size_t packed_count = 0;
                         if (prefill_pack_projections_ &&
+                            !request->output.constrained() &&
                             instance_.program->packable_prefill_tokens(*request->sequence) != 0) {
                             for (std::uint32_t offset = 0; offset < max_concurrency_; ++offset) {
                                 const auto candidate = (*lane + offset) % max_concurrency_;
                                 const auto& owner    = prefill_slots[candidate];
                                 if (owner && owner->is_prefilling() && owner->sequence &&
+                                    !owner->output.constrained() &&
                                     instance_.program->packable_prefill_tokens(*owner->sequence) !=
                                         0) {
                                     packed_lanes[packed_count++] = candidate;
