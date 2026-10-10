@@ -1340,7 +1340,13 @@ private:
         if (progress.row_count != lanes.size()) {
             throw std::logic_error("packed prefill lost a row");
         }
+        ++cumulative_stats_.packed_prefill_batches;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto computed = progress.rows[row].processed_prompt_tokens;
+            cumulative_stats_.packed_prefill_tokens += computed;
+            auto& lane_stats = cumulative_stats_.lanes[lanes[row]];
+            ++lane_stats.packed_prefill_units;
+            lane_stats.packed_prefill_tokens += computed;
             if (!owners[row]->first_output_timing) {
                 record_execution_work(owners[row]->prefill_work, progress.rows[row].timing);
             }

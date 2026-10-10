@@ -700,6 +700,17 @@ int main() {
     throughput.committed_decode_tokens                  = 40;
     throughput.decode_rounds                            = 10;
     throughput.decode_row_rounds                        = 18;
+    throughput.previous.packed_prefill_batches = 1;
+    throughput.current.packed_prefill_batches = 3;
+    throughput.previous.packed_prefill_tokens = 96;
+    throughput.current.packed_prefill_tokens = 156;
+    throughput.current.lane_count = 2;
+    for (std::size_t lane = 0; lane < 2; ++lane) {
+        throughput.previous.lanes[lane].packed_prefill_units = 1;
+        throughput.current.lanes[lane].packed_prefill_units = 3;
+        throughput.previous.lanes[lane].packed_prefill_tokens = 48;
+        throughput.current.lanes[lane].packed_prefill_tokens = lane == 0 ? 96 : 60;
+    }
     throughput.previous.root_selections                 = 2;
     throughput.previous.checkpoint_selections           = 3;
     throughput.previous.preemptions                     = 8;
@@ -793,6 +804,23 @@ int main() {
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
+    failures += check(
+        throughput_json.at("prefill_packing") == Json{{"batches", 2}, {"tokens", 60}} &&
+        throughput_json.at("lanes")[0].at("packed_prefill_tokens") == 48 &&
+        throughput_json.at("lanes")[1].at("packed_prefill_tokens") == 12 &&
+        throughput_json.at("lanes")[0].at("packed_prefill_units") == 2,
+        "packing interval counters must conserve tokens across participating lanes");
+    ThroughputReport reset_packing = throughput;
+    reset_packing.current.packed_prefill_batches = 0;
+    reset_packing.current.packed_prefill_tokens = 0;
+    reset_packing.current.lanes[0].packed_prefill_units = 0;
+    reset_packing.current.lanes[0].packed_prefill_tokens = 0;
+    const auto reset_packing_json =
+        Json::parse(format_throughput_json("serve-test", 5001, reset_packing));
+    failures += check(
+        reset_packing_json.at("prefill_packing") == Json{{"batches", 0}, {"tokens", 0}} &&
+        reset_packing_json.at("lanes")[0].at("packed_prefill_tokens") == 0,
+        "reset packing counters must not wrap to a fabricated positive throughput");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
     failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&

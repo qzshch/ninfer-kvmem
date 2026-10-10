@@ -25,11 +25,15 @@ int main() {
     RuntimeStats baseline;
     baseline.generated_tokens         = 4;
     baseline.speculative_draft_tokens = 3;
+    baseline.packed_prefill_batches = 2;
+    baseline.packed_prefill_tokens = 1024;
     Metrics metrics;
     metrics.configure("custom\"model\\name\nline", options, memory, baseline);
     RuntimeStats running = baseline;
     running.generated_tokens += 5;
     running.speculative_draft_tokens += 6;
+    running.packed_prefill_batches += 3;
+    running.packed_prefill_tokens += 2048;
     running.speculative_accepted_tokens = 3;
     running.running_requests            = 1;
     running.host_context_occupied_bytes = 4096;
@@ -40,6 +44,9 @@ int main() {
           "live generated count must exclude startup warmup");
     check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
+    check(live.find("ninfer_prefill_packed_batches_total 3\n") != std::string::npos &&
+              live.find("ninfer_prefill_packed_tokens_total 2048\n") != std::string::npos,
+          "live packing counters must exclude warmup and remain visible before retirement");
     check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
               live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");

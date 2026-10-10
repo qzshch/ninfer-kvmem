@@ -970,6 +970,8 @@ struct RuntimeLaneStats {
     std::uint64_t replayed_tokens = 0;
     std::uint64_t decode_rounds = 0;
     std::uint64_t prefill_units = 0;
+    std::uint64_t packed_prefill_units = 0;
+    std::uint64_t packed_prefill_tokens = 0;
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
@@ -992,6 +994,9 @@ struct RuntimeStats {
     // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;
+    // Actual cross-lane projection batches, and initial tokens evaluated within them.
+    std::uint64_t packed_prefill_batches = 0;
+    std::uint64_t packed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.

@@ -755,6 +755,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                            {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =
         Json{{"prefill", prefill_rate}, {"decode", decode_rate}};
+    record["prefill_packing"] = Json{
+        {"batches", monotonic_delta(previous.packed_prefill_batches, current.packed_prefill_batches)},
+        {"tokens", monotonic_delta(previous.packed_prefill_tokens, current.packed_prefill_tokens)}};
     record["lanes"] = Json::array();
     for (std::uint32_t lane = 0; lane < std::min(current.lane_count, kMaximumConcurrency); ++lane) {
         const auto& now = current.lanes[lane];
@@ -780,6 +783,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
             {"replayed_tokens", delta(now.replayed_tokens, before.replayed_tokens)},
             {"decode_rounds", delta(now.decode_rounds, before.decode_rounds)},
             {"prefill_units", delta(now.prefill_units, before.prefill_units)},
+            {"packed_prefill_units", delta(now.packed_prefill_units, before.packed_prefill_units)},
+            {"packed_prefill_tokens", delta(now.packed_prefill_tokens, before.packed_prefill_tokens)},
             {"throughput_tokens_per_second",
              Json{{"prefill", report.interval_seconds > 0 ? computed / report.interval_seconds : 0},
                   {"decode", report.interval_seconds > 0 ? decoded / report.interval_seconds : 0}}}});

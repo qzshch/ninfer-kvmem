@@ -141,6 +141,10 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             "Input tokens supplied by exact checkpoints.");
     COUNTER(computed_prefill_tokens, "prefill_tokens_total",
             "Initial input tokens actually computed, excluding Replay.");
+    COUNTER(packed_prefill_batches, "prefill_packed_batches_total",
+            "Cross-lane projection batch executions.");
+    COUNTER(packed_prefill_tokens, "prefill_packed_tokens_total",
+            "Initial input tokens computed in cross-lane projection batches.");
     COUNTER(generated_tokens, "generation_tokens_total",
             "Committed output tokens, including first and control tokens.");
     COUNTER(committed_decode_tokens, "decode_tokens_total",
