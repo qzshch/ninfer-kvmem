@@ -1,8 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
-#include "models/qwen3_5/frontend/prepared_prompt.h"
-#include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "kvmem/types.h"
+#include "kvmem/block_retrieval.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -11,36 +10,16 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace kvmem {
 
 struct MediaPageGroup {
     std::uint32_t begin = 0;
     std::uint32_t end   = 0;
 };
 
-// Include the predecessor consumed by the MTP embedding bridge. Items sharing a
-// physical page form one indivisible group, including intervening video timestamps.
-inline std::vector<MediaPageGroup> media_page_groups(std::span<const VisionItem> items) {
-    std::vector<MediaPageGroup> groups;
-    for (const auto& item : items) {
-        if (item.token_spans.empty()) {
-            throw std::invalid_argument("media item has no token span");
-        }
-        const auto first = item.token_spans.front().begin;
-        const auto& last = item.token_spans.back();
-        const MediaPageGroup group{static_cast<std::uint32_t>((first == 0 ? 0 : first - 1) / 64),
-                                   static_cast<std::uint32_t>((last.begin + last.count + 63) / 64)};
-        if (!groups.empty() && group.begin < groups.back().end) {
-            groups.back().end = std::max(groups.back().end, group.end);
-        } else {
-            groups.push_back(group);
-        }
-    }
-    return groups;
-}
-
+template<class Range = TokenRange>
 inline void validate_context_window(std::span<const MediaPageGroup> groups, std::uint32_t budget,
-                                    std::span<const TokenSpan> instructions = {}) {
+                                    std::span<const Range> instructions = {}) {
     if (groups.empty() && instructions.empty()) { return; }
     std::uint32_t extent = 2;
     for (const auto& span : instructions) {
@@ -65,9 +44,7 @@ inline void validate_context_window(std::span<const MediaPageGroup> groups, std:
     const auto mandatory = static_cast<std::uint32_t>(
         std::count(pinned.begin(), pinned.end(), std::uint8_t{1}));
     if (mandatory + 2U > budget) {
-        throw RequestError(
-            instructions.empty() ? RequestErrorKind::MediaBudgetExceeded
-                                 : RequestErrorKind::ContextLengthExceeded,
+        throw WindowCapacityError(!instructions.empty(),
             "KVMem window cannot hold system/developer instructions plus sink and tail pages");
     }
     for (const auto& group : groups) {
@@ -75,8 +52,7 @@ inline void validate_context_window(std::span<const MediaPageGroup> groups, std:
             std::count(pinned.begin() + group.begin, pinned.begin() + group.end, std::uint8_t{0}));
         // Reject before admission rather than silently cutting mandatory context.
         if (mandatory + extra + 2U > budget) {
-            throw RequestError(
-                RequestErrorKind::MediaBudgetExceeded,
+            throw WindowCapacityError(false,
                 "KVMem window cannot hold a complete media group plus instructions and tail pages");
         }
     }
@@ -87,10 +63,11 @@ inline void validate_context_window(std::span<const MediaPageGroup> groups, std:
 // reserve their two latest pages before spending the remainder on retrieval.
 // Only the materialized prefix of an in-progress item exists. No future KV is loaded.
 // Requests without semantic instruction ranges retain their existing policy.
+template<class Range = TokenRange>
 inline std::vector<std::uint32_t> context_window_page_set(std::uint32_t mapped, std::uint32_t budget,
                                                         std::span<const std::uint32_t> preferred,
                                                         std::span<const MediaPageGroup> groups,
-                                                        std::span<const TokenSpan> instructions = {},
+                                                        std::span<const Range> instructions = {},
                                                         bool fill_recent = true) {
     if (groups.empty() && instructions.empty()) {
         return decode_window_page_set(mapped, budget, preferred);
@@ -149,4 +126,4 @@ inline std::vector<std::uint32_t> context_window_page_set(std::uint32_t mapped, 
     return pages;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace kvmem

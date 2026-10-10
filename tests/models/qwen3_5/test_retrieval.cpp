@@ -1,6 +1,4 @@
-#include "models/qwen3_5/program/retrieval/block_retrieval.h"
-#include "models/qwen3_5/program/retrieval/media_window.h"
-#include "models/qwen3_5/program/retrieval/query_span.h"
+#include "models/qwen3_5/program/retrieval/adapter.h"
 
 #include <array>
 #include <cmath>
@@ -316,7 +314,7 @@ void test_shared_metadata_budget() {
     ninfer::HostContextArena arena(4096, 256, ninfer::HostContextMemory::Pageable);
     {
         ninfer::models::qwen3_5::detail::RetrievalIndex live(128, 1, 1, 2);
-        live.bind_metadata_arena(&arena);
+        live.bind_metadata_budget(ninfer::models::qwen3_5::detail::retrieval_metadata_budget(&arena));
         (void)live.append(128);
         live.write_block_mean(0, 0, std::array{1.0F, 0.0F});
         auto saved = live;

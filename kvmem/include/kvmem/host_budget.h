@@ -6,7 +6,7 @@
 #include <optional>
 #include <span>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace kvmem {
 
 // Scratch belongs to the admission boundary, never to a numerical KV operation.
 // Logical descriptors identify a Host replica exactly once even when many active
@@ -45,4 +45,4 @@ sparse_host_budget_occupancy(std::size_t actual_bytes, std::size_t claimed_activ
     return additional <= capacity && used <= capacity - additional;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace kvmem

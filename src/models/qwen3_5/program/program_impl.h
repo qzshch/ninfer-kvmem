@@ -1,7 +1,6 @@
 #pragma once
 #include "models/qwen3_5/program/internal.h"
-#include "models/qwen3_5/program/retrieval/block_retrieval.h"
-#include "models/qwen3_5/program/retrieval/media_window.h"
+#include "models/qwen3_5/program/retrieval/adapter.h"
 #include "models/qwen3_5/program/retrieval/diagnostics.h"
 
 #include "core/arena.h"

@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "ninfer": {
+    "repository": "https://github.com/Neroued/ninfer",
+    "baseline": "68c54356fd490ab329bd1475d48957f886bb7dd1",
+    "reviewed_head": "81c8ce093b2c1646a87566a8e59d807fcf0ec95c",
+    "imports": ["7e2973ee", "08902f73", "eb6696ae", "41e50d0d", "8ffa3131", "2734a56e", "81c8ce09"],
+    "adapted_cache_source_wait": "911d34db688241a5b67db63d9cd714eb5eedfaed",
+    "excluded": "BF16/Q8 shape tuning outside the requested structured-output import"
+  },
+  "kvmem": {
+    "repository": "https://github.com/kvmem/kvmem-llama.cpp",
+    "reviewed_master": "d9ae944b39f55f77f5434edb96b9fb037217a0a4",
+    "reviewed_multi_backend": "ae48ec008e77f15aa8518cb85ca35a138f2db8de",
+    "mechanisms": {
+      "portable_core_and_backend_ownership": "adapted with independently buildable kvmem_core and an explicit NInfer bridge",
+      "gdn_output_norm_and_gating_bc6b4e08": "already present in production gated_rmsnorm",
+      "responses_system_developer_c8bfbc18": "preserve both inputs using NInfer native roles; do not port llama.cpp turn reordering",
+      "video_fps_0b1ab5d5": "validate requested sampling before decode; retain existing native video processing",
+      "shared_conversations_8f2418a4": "native shared prefix catalog and request-owned leases",
+      "dormant_graph_6f1bf82a": "native prebuilt batch Graph families; covered by reactivation checks"
+    },
+    "excluded": "llama.cpp disk session GC and wholesale ninfer-all adapter replacement"
+  },
+  "optional": {
+    "hicache": "separate experimental branch; not enabled by this build",
+    "non_cp_gdn_fusion": false,
+    "prefill_projection_packing": false,
+    "nvfp4_rounding_experiment": false
+  }
+}

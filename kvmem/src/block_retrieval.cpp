@@ -1,11 +1,11 @@
-#include "models/qwen3_5/program/retrieval/block_retrieval.h"
+#include "kvmem/block_retrieval.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace kvmem {
 
 namespace {
 
@@ -76,9 +76,9 @@ void RetrievalIndex::write_block_mean(std::uint32_t block_id, std::uint32_t laye
     auto& storage = mean_k_[block_id];
     if (!storage || !storage.unique()) {
         const auto count = static_cast<std::size_t>(layers_) * head_stride();
-        std::shared_ptr<HostResidentCharge> charge;
-        if (metadata_arena_) {
-            charge = metadata_arena_->charge_metadata(count * sizeof(float) + sizeof(MeanBlock));
+        std::shared_ptr<void> charge;
+        if (metadata_budget_.claim) {
+            charge = metadata_budget_.claim(metadata_budget_.owner, count * sizeof(float) + sizeof(MeanBlock));
             if (!charge) { throw std::bad_alloc(); }
         }
         auto next    = std::make_shared<MeanBlock>();
@@ -210,4 +210,4 @@ BlockSelection select_blocks(const RetrievalIndex& index, std::span<const float>
     return selection;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace kvmem

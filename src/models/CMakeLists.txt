@@ -6,7 +6,7 @@ target_link_libraries(ninfer_model_loading PUBLIC ninfer_artifact ninfer_text ni
 add_library(ninfer_model_runtime STATIC)
 ninfer_internal_includes(ninfer_model_runtime)
 target_link_libraries(ninfer_model_runtime
-  PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support
+  PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support kvmem_core
   PRIVATE ninfer_media_decode ninfer_jinja ninfer_grammar ninfer_xgrammar)
 target_include_directories(ninfer_model_runtime PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)

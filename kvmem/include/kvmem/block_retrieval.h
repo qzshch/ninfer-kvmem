@@ -13,13 +13,21 @@
 //     query head; GQA groups map onto KV heads by summation before scoring.
 
 #include <cstdint>
-#include "core/host_context_arena.h"
+#include <cstddef>
 #include <algorithm>
 #include <span>
 #include <memory>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace kvmem {
+
+// A backend supplies one shared RAII charge for an independently owned block.
+// The owner must outlive the index and every checkpoint; null means refusal.
+// No allocator, CUDA type, model or frontend crosses this boundary.
+struct MetadataBudget {
+    void* owner = nullptr;
+    std::shared_ptr<void> (*claim)(void*, std::size_t) = nullptr;
+};
 
 struct RetrievalBlockMeta {
     std::uint32_t block_id  = 0;     // dense append order
@@ -37,7 +45,7 @@ public:
     RetrievalIndex(std::uint32_t block_tokens, std::uint32_t layers, std::uint32_t kv_heads,
                    std::uint32_t head_dim);
 
-    void bind_metadata_arena(HostContextArena* arena) noexcept { metadata_arena_ = arena; }
+    void bind_metadata_budget(MetadataBudget budget) noexcept { metadata_budget_ = budget; }
 
     [[nodiscard]] std::size_t descriptor_bytes() const noexcept {
         return blocks_.capacity() * sizeof(RetrievalBlockMeta) +
@@ -93,11 +101,11 @@ private:
     // Checkpoints share completed blocks; publishing another layer detaches the
     // block so restoring or extending one lane cannot mutate another checkpoint.
     struct MeanBlock {
-        std::shared_ptr<HostResidentCharge> charge;
+        std::shared_ptr<void> charge;
         std::vector<float> values;
     };
 
-    HostContextArena* metadata_arena_ = nullptr;
+    MetadataBudget metadata_budget_;
     std::vector<std::shared_ptr<MeanBlock>> mean_k_;
 };
 
@@ -194,4 +202,4 @@ inline std::vector<std::uint32_t> decode_window_page_set(std::uint32_t mapped, s
     return pages;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace kvmem

@@ -4,7 +4,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
-#include "models/qwen3_5/program/retrieval/window_capacity.h"
+#include "models/qwen3_5/program/retrieval/adapter.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
@@ -179,7 +179,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 
     if (kvmem_window_pages) {
         for (auto& lane : kvmem_lanes_) {
-            lane.index.bind_metadata_arena(host_context_arena.get());
+            lane.index.bind_metadata_budget(retrieval_metadata_budget(host_context_arena.get()));
         }
         const auto budget = kvmem_lane_page_budget(capacity, prefill_chunk, kvmem_window_pages);
         text_kv_addresses->set_sparse_activation_budget(budget);

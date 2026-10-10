@@ -5,7 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
-#include "models/qwen3_5/program/retrieval/window_capacity.h"
+#include "models/qwen3_5/program/retrieval/adapter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"

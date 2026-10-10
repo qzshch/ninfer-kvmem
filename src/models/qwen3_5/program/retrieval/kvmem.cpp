@@ -1,7 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/execution_context.h"
-#include "models/qwen3_5/program/retrieval/query_span.h"
-#include "models/qwen3_5/program/retrieval/window_capacity.h"
+#include "models/qwen3_5/program/retrieval/adapter.h"
 #include "core/device.h"
 #include <cmath>
 #include <cstdio>
