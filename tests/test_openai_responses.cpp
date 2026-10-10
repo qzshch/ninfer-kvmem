@@ -1159,8 +1159,38 @@ int test_constrained_decoding() {
 
 } // namespace
 
+int test_late_system_developer_and_instructions() {
+    const Json body = {{"model", "qwen3.8-27b"}, {"input", Json::array({
+        Json{{"role", "user"}, {"content", "first query"}},
+        Json{{"role", "system"}, {"content", "late system"}},
+        Json{{"role", "developer"}, {"content", Json::array({
+            Json{{"type", "input_text"}, {"text", "late developer"}}})}},
+        Json{{"role", "user"}, {"content", "second query"}}})},
+        {"instructions", "request instructions"}};
+    const auto request = parse_openai_responses_create_request(body, limits());
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const auto resolved = resolve_openai_responses_prompt(request.prompt, store, "resp_roles", true);
+    const auto& messages = resolved.generation.messages;
+    int failures = 0;
+    failures += check(messages.size() == 5 &&
+        messages[0].content[0].text == "request instructions" &&
+        messages[1].content[0].text == "first query" &&
+        messages[2].role == ninfer::ChatRole::System && messages[2].content[0].text == "late system" &&
+        messages[3].role == ninfer::ChatRole::Developer && messages[3].content[0].text == "late developer" &&
+        messages[4].content[0].text == "second query", "all instruction sources preserve their native order");
+    auto invalid = body;
+    invalid["input"][2]["content"] = Json::array({Json{{"type", "input_image"},
+        {"image_url", "data:image/png;base64,AAAA"}}});
+    bool rejected = false;
+    try { (void)parse_openai_responses_create_request(invalid, limits()); }
+    catch (const ApiException&) { rejected = true; }
+    failures += check(rejected, "non-text developer input must not be silently discarded");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_late_system_developer_and_instructions();
     failures += test_constrained_decoding();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();

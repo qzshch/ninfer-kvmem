@@ -80,6 +80,11 @@ int test_lru_and_delete() {
     const std::shared_ptr<const StoredOpenAIResponse> fork = store.get("resp_3");
     failures += check(fork && flatten_openai_response_context(fork->context).size() == 2,
                       "descendant context survives parent response deletion");
+    const auto held = store.get("resp_3");
+    failures += check(store.erase("resp_3") && store.size() == 0 && store.bytes() == 0,
+                      "deleting the last public response returns the store quota");
+    failures += check(held && flatten_openai_response_context(held->context).size() == 2,
+                      "in-flight parent lease survives deletion of every public entry");
     return failures;
 }
 
