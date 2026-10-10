@@ -452,12 +452,17 @@ int count_frames(std::span<const std::uint8_t> input, const Policy& policy) {
 
 std::vector<int> sample_indices(int total, double source_fps, double target_fps, int min_frames,
                                 int max_frames) {
-    if (total <= 0 || source_fps <= 0.0 || target_fps <= 0.0 || min_frames <= 0 ||
+    if (total <= 0 || !std::isfinite(source_fps) || source_fps <= 0.0 ||
+        !std::isfinite(target_fps) || target_fps <= 0.0 || min_frames <= 0 ||
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
     }
-    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
-    count     = std::min({std::max(count, min_frames), max_frames, total});
+    // Bound in floating point before narrowing: even a finite requested FPS can
+    // overflow the token/frame count. Preserve truncation for ordinary inputs.
+    const double requested = static_cast<double>(total) / source_fps * target_fps;
+    const int ceiling = std::min(max_frames, total);
+    const int count = requested >= ceiling ? ceiling
+        : std::min(std::max(static_cast<int>(requested), min_frames), ceiling);
     std::vector<int> indices(static_cast<std::size_t>(count));
     if (count == 1) {
         indices[0] = 0;
@@ -481,6 +486,10 @@ struct VideoPlan {
 
 VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& policy,
                           double target_fps, int min_frames, int max_frames) {
+    if (!std::isfinite(target_fps) || target_fps <= 0.0 || min_frames <= 0 ||
+        max_frames < min_frames) {
+        throw_invalid_media("video sampling requires finite positive FPS and valid frame limits");
+    }
     Decoder probe(bytes, policy.max_decoded_pixels);
     VideoPlan plan;
     plan.fps          = fps_of(probe.stream());

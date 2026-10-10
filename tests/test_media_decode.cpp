@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -136,11 +137,32 @@ void test_issue_20_unaligned_jpeg() {
     }
 }
 
+void test_video_sampling_validation() {
+    const auto encoded = decode_base64(issue_20_jpeg_base64);
+    for (double fps : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                       std::numeric_limits<double>::quiet_NaN()}) {
+        for (bool inspect : {false, true}) {
+            bool rejected = false;
+            try {
+                if (inspect) (void)ninfer::media::decode::inspect_video(encoded, {}, fps, 1, 16);
+                else (void)ninfer::media::decode::decode_video(encoded, {}, fps, 1, 16);
+            } catch (const ninfer::media::decode::Error& e) {
+                rejected = e.kind() == ninfer::media::decode::ErrorKind::InvalidInput;
+            }
+            if (!rejected) throw std::runtime_error("invalid FPS must fail as an input error");
+        }
+    }
+    const auto huge = ninfer::media::decode::inspect_video(
+        encoded, {}, std::numeric_limits<double>::max(), 1, 16);
+    if (huge.sampled_frames != 1) throw std::runtime_error("huge finite FPS must respect frame bounds");
+}
+
 } // namespace
 
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_video_sampling_validation();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {
