@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_output.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"

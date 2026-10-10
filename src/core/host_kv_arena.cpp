@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "core/host_kv_arena.h"
 
 #include "core/dtype.h"

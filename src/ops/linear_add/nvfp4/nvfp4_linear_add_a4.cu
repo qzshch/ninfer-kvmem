@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 

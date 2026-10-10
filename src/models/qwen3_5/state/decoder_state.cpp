@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "models/qwen3_5/state/decoder_state.h"
 
 #include <algorithm>

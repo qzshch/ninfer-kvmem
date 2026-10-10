@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #pragma once
 
 // Product-side adapter from one protocol-neutral generation request to the public Engine. Wire

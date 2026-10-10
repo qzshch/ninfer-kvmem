@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 set(ninfer_op_tests
   add_bias
   gelu

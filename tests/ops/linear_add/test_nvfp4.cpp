@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device.h"

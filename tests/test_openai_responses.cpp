@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 // Host-only contract tests for the OpenAI Responses adapter. These tests keep request parsing,
 // previous_response_id state reconstruction, output encoding, and SSE sequencing independent of
 // an Engine instance.

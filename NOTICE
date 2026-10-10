@@ -1,0 +1,37 @@
+ninfer-kvmem
+Maintained by qzshch: https://github.com/qzshch/ninfer-kvmem
+
+This distribution contains NInfer-derived code and local modifications for
+KVMem working sets, Native prefix reuse, concurrency, speculative/vision
+integration, instruction retention, lifecycle fixes, telemetry and modular
+backend integration. Git history records individual upstream and local changes.
+File-level distribution modification notices do not replace upstream authorship.
+
+NInfer
+Upstream project: https://github.com/Neroued/ninfer
+Neroued and NInfer contributors
+License: Apache License 2.0 (see LICENSE)
+Reviewed source: 81c8ce093b2c1646a87566a8e59d807fcf0ec95c
+
+KVMem
+Upstream projects: https://github.com/kvmem/kvmem-llama.cpp
+                   https://github.com/kvmem/kvmem-qw3
+Research authors: Di Chai, Leye Wang, Zeshen Su, Zhiguo Xia, Zhihang Yu
+Paper: https://arxiv.org/abs/2609.04852
+Reviewed port source: d9ae944b39f55f77f5434edb96b9fb037217a0a4
+The port README declares Apache-2.0 treatment; that revision contains no
+standalone root LICENSE. The existing Apache-2.0 text is retained in LICENSE.
+Local NInfer integration does not bundle the llama.cpp runtime or relabel its
+separate MIT-licensed components as Apache-only.
+
+XGrammar
+Copyright (c) 2024 by XGrammar Contributors
+License and notice: third_party/xgrammar/LICENSE, third_party/xgrammar/NOTICE
+The original notice is retained with its source distribution.
+
+Other bundled dependencies retain their own copyright and license files.
+See docs/upstream-and-licenses.md for the source and license locations.
+Model and companion weights are separately distributed under their own terms.
+
+This file records attribution and does not modify any license terms or imply
+endorsement by upstream projects.

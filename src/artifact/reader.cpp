@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "artifact/reader.h"
 
 #include "artifact/file_io.h"

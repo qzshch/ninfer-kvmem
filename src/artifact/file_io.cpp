@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "artifact/file_io.h"
 
 #include "artifact/framing.h"

@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "product/logging/startup_log.h"
 
 #include "product/logging/logging.h"

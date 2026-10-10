@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #pragma once
 #include "ops/softmax_attention/dense/causal_cache/k8v4/operands.h"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"

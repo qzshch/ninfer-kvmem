@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "serve/operational_log.h"
 #include "serve/request_log.h"
 

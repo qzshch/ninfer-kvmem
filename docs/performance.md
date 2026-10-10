@@ -1,5 +1,9 @@
 # Single-GPU serving performance
 
+For **ninfer-kvmem** measurements, start with the [current build report](reports/2026-10-10-modular-kvmem-constraints.md)
+and [project README](../README.md#实测收益与边界). The model benchmark and evaluation entries
+below are inherited NInfer records; they are not measurements or quality scores for this local build.
+
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
 Choose a model below for its detailed results, run conditions, output limitations, and reproduction
 commands. These are recorded measurements; a model/backend being supported does not
@@ -46,7 +50,7 @@ and [Qwen3.8 completion outcomes](performance/qwen3.8-27b.md#completion-outcomes
 - [Serving benchmark runners](../tools/bench/README.md#serving-corpus-benchmark): usage and local report files.
 - [Engine and Op benchmarks](../bench/README.md): their separate measurement scopes and commands.
 - [Capability evaluation](../eval/README.md): evaluation workflow; published scores live in the
-  [model cards](README.md#model-artifacts), with a [README summary](../README.md#evaluation).
+  [model cards](README.md#model-artifacts). These remain upstream artifact scores.
 - [Perplexity](perplexity.md): offline causal-scoring measurement and comparison rules.
 
 Model pages are the detailed result authority. README and model-card performance tables are

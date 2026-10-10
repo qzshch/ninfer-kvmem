@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include <charconv>
 #include "serve/generation_service.h"
 

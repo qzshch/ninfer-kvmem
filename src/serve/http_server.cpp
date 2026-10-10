@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "serve/http_server.h"
 
 #include "serve/anthropic_messages.h"

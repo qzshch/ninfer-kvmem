@@ -1,299 +1,124 @@
-# NInfer
+# ninfer-kvmem
 
-> Selected checkpoints. Maximum single-GPU inference performance.
+**面向单卡长上下文、多请求与工具调用的 NInfer + KVMem 集成构筑，由 [qzshch](https://github.com/qzshch) 维护。**
 
-NInfer is a from-scratch C++/CUDA inference engine for Qwen3.5 Dense and MoE architectures on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
-resident model, and one to eight execution lanes fixed at startup.
+本项目以 [NInfer](https://github.com/Neroued/ninfer) 的 C++/CUDA 推理引擎为基础，将 [KVMem](https://github.com/kvmem/kvmem-llama.cpp) 的有界 GPU 工作集、Host 历史存储与查询检索机制接入原生执行和前缀缓存。重点是：在有限显存中使用较大的逻辑上下文，支持多 lane、DFlash2 与视觉共同运行，并持续验证真实 agent 请求中的缓存、工具和会话生命周期。
 
-Five official artifacts are available. The quick-start commands use Qwen3.8-27B NVFP4.
+`main` 是当前日常构筑的维护入口；旧 `master`、`feature/kvmem` 和实验分支保留历史用途。本页数据更新于 **2026-10-10**，对应已运行验证的代码 `7e9f4e13`。后续首页与文档、归属标注修改不代表新增性能优化。
 
-| Model | Weights | Artifact | Download and model card |
-|---|---|---|---|
-| Qwen3.6-27B | `groupwise-int` | `qwen3_6_27b.ninfer` | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
-| Qwen3.6-27B | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
-| Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
-| Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
-| Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+## 本项目的核心改动
 
-Each v3 `.ninfer` artifact carries model configuration, encoded weights, logical bindings and
-frontend resources. Runtime execution uses those facts with the implemented model and Op
-capabilities. You can also [convert your own weights](docs/weight-conversion.md), reuse an official
-recipe or choose another supported mixture of formats.
+| 改动 | 实际作用 | 当前状态 |
+|---|---|---|
+| 多 lane KVMem | 每个执行 lane 使用独立的稀疏 GPU 窗口，逻辑历史存入共享、受配额管理的 Host 存储 | 日常使用 2 lane；每路 36K 窗口、256K 逻辑上限 |
+| 与 Native 前缀缓存结合 | 复用已有 KV 和完整继续执行状态，减少重复 Prefill；共享 prefix lease，避免再建立第二套缓存账本 | 冷/热、追加、分叉、取消、恢复与资源归还已验证 |
+| KVMem + DFlash2 + Vision | 将检索、投机验证、图像/视频状态接入同一原生执行路径 | DFlash2 草稿 7 + 图像/视频已实际推理验证；MTP3 也有跨窗口回归 |
+| 长历史指令与工具保留 | 保留 System/Developer、工具定义、必要媒体和尾部页；窗口不足时明确拒绝，不静默丢弃工具定义 | 原始 DSH 故障请求已受保护重放；修复 MTP 未提交 lookahead 页提前迁出问题 |
+| 可追踪的性能与容量 | JSONL 输出 per-lane Prefill/Decode、缓存、选页、搬运与 replay 数据 | 日常面板已验证收到双 lane 数据；可区分逻辑占用和 Host 固定 backing |
+| 模块化 KVMem | 检索、窗口及容量策略拆成可独立构建的 `kvmem_core`，由 NInfer adapter 对接 | 降低策略代码与 CUDA/模型/前端的耦合；是源码接口，不是动态插件 ABI |
+| 上游能力适配 | 吸收 NInfer 的结构化输出、严格工具约束；适配视频采样校验及 Responses 生命周期 | 支持 JSON/受支持 Schema、GBNF、choice/regex；不支持的 Schema 明确报错 |
 
-The current engine requires v3 artifacts. Existing official v2 downloads can be
-[upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
-the weights again.
+NInfer 提供模型数学、CUDA kernels、Graph、原生调度及协议基础；KVMem 提供工作集与检索设计。本项目维护它们在上述组合中的集成和修复，不把上游能力标为本项目原创。具体来源和适配边界见 [版本清单](backends/versions.json) 与 [后端集成说明](docs/maintainer/backend-integration.md)。
 
-## Quick start
+## 当前日常配置
 
-NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, a CUDA toolkit supporting `sm_120a`,
-CMake 3.28 or newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
-(`libavformat`, `libavcodec`, `libavutil`, and `libswscale`), and `libcurl >= 7.85`.
-CUDA 13.1 is the validated development toolkit; CMake does not impose a CUDA version floor.
-The build rejects CUDA architectures other than `sm_120a`.
+| 项目 | 配置 |
+|---|---|
+| 验证平台 | RTX 5090 32 GiB、Linux/WSL2、CUDA 13.2.86、GCC 13.3 |
+| 实测模型 | Huihui Qwen3.8-27B NVFP4 `.ninfer`，附 DFlash2 companion 权重 |
+| 并发 / 逻辑上限 | 2 lane；每路 262,144 token |
+| GPU 工作窗口 | 每路 36,864 token，即 576 页 × 64 token |
+| 共享 Device KV 池 | 77,824 token，其中包含执行所需增长余量；不等于单路窗口 |
+| KV / 投机 / 视觉 | FP8 / DFlash2 草稿 7 / Vision 启用 |
+| Host / Prefill | 18 GiB pageable 共享 Host 配额 / chunk 1,024 |
+| 缓存 | NInfer Native 前缀复用；HiCache 关闭 |
 
-Build the product binaries:
+36K 驻留窗口是 256K 逻辑上限的约 **14.1%**；显存还要容纳权重、State、Graph 与 workspace。这是上下文容量设计，不是“显存降低 85.9%”或“质量无损”的证明。Host 也是共享配额；配置两路 256K 上限，不等于已经证明两路完整 256K 实体历史同时达到峰值。资源压力可能触发缓存淘汰、暂停或 replay。
+
+## 实测收益与边界
+
+最近一次比较采用 **A → B → B → A**：A 为冻结的上一日常构筑（`ae5134c7` + r2 遥测），B 为本页当前构筑。使用相同权重、配置、公开输入、seed，每请求实际发布 256 token，每版本两次重复。两者都配置为 2 lane；表中的单请求是只有一个活跃请求，**不是配置为 1 lane 的实验**。
+
+指标为 **整批实际输出 token ÷ 整批耗时，单位 tok/s**，包含 Prefill、排队、缓存搬运和 Decode。长输入约 54.6K，超过 36K GPU 窗口。下表给出重复范围：
+
+| 负载 | 基线冷态 A | 当前冷态 B | 基线热态 A | 当前热态 B |
+|---|---:|---:|---:|---:|
+| 短单请求 | 159.1–167.2 | 160.6–167.2 | 72.5–133.2 | 133.2–141.3 |
+| 短双请求 | 201.0–214.1 | 203.5–212.8 | 138.3–268.6 | 260.0–275.3 |
+| 长单请求 | 23.4–24.1 | 24.0–24.7 | 48.0–72.8 | 66.1–70.6 |
+| 长双请求 | 17.2–19.9 | 24.0–24.4 | 83.4–103.1 | 102.4–105.0 |
+
+- **并发有收益，但不保证翻倍。** 当前短双请求冷态总吞吐为 203.5–212.8，短单为 160.6–167.2；负载、验证批次和 Prefill 都会影响结果。
+- **前缀命中能减少重复 Prefill。** 本轮长热态复用约 54,624 token；当前长双请求冷态 24.0–24.4，热态 102.4–105.0。这是该案例的整批吞吐差异，包含少算输入和恢复成本，不能当作纯 Decode 提速倍数。
+- **此次模块化没有证明普遍加速。** 冷短、冷长单请求基本重合；长双请求记录更好，但只有两次重复，热态又有明显波动，没有消融归因。短双冷态还复用了 29 token 公共前缀，并非严格零命中。
+- **质量验收仍有边界。** 四类单请求的重复和跨版本 token IDs 一致；双请求在基线自身重复中也有差异。动态并发逐 token 一致性、正式多轮语义质量及完整双256K峰值尚未证明。稀疏检索也不等于全历史 dense attention。
+
+完整方法、修复、负面结果和资格范围见 [2026-10-10 验证报告](docs/reports/2026-10-10-modular-kvmem-constraints.md)。没有将上游模型测评成绩作为本构筑的质量成绩，也没有把组件 microbenchmark 写成 E2E 提速。
+
+## 稳定性验证
+
+本轮通过：独立无 CUDA core 1/1、CPU/协议及独立 oracle 18/18、GPU 数学/Graph 4/4、真实模型配置 15/15，以及独立 Draft 2020-12 校验的 25 组实际工具参数。真实模型覆盖 none/MTP3/DFlash2 K7 的跨窗口冷/热约束、工具、snapshot/replay/cancel，以及视觉和 Native 事务。
+
+日常全参数构筑还验证了 JSON Schema、strict tool、四帧视频、Responses 父响应删除后子响应续接，以及两条原始 DSH 故障请求并行流式重放。DSH 重放保留原输出上限，只做有界冒烟并取消，没有执行外部工具或生成完整长答案。私有提示词和 SSE 不上传。
+
+## 构建与启动
+
+当前构筑支持 64 位 Linux/WSL2，针对 `sm_120a`，实测 GPU 为 RTX 5090。需要 CUDA、CMake ≥ 3.28、C++20 编译器、Ninja、pkg-config、FFmpeg 开发库及 libcurl ≥ 7.85。本项目本轮使用 CUDA 13.2.86；没有据此验证其他 GPU/系统。
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
-
+git clone https://github.com/qzshch/ninfer-kvmem.git
+cd ninfer-kvmem
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
-the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
-Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
-Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
-See [build organization and configuration](docs/maintainer/build-system.md) for details.
+模型需另行准备为 v3 `.ninfer`，见 [权重转换](docs/weight-conversion.md)。启用 DFlash2 时，artifact 必须包含兼容的 companion 权重；普通 text-only 或只含 MTP 的文件不能直接启用 DFlash2。
 
-There is no install target or packaged binary distribution; run NInfer from its source build tree.
-Python tools run independently of CMake; the standalone HBM probe has its own
-[build command](tools/README.md#standalone-hbm-probe).
-
-Download the artifact used by this example with the Hugging Face CLI:
+下面是日常参数的**直接 HTTP 服务示例**，使用公开别名 `ninfer-kvmem`；按实际位置替换模型路径。18 GiB pageable Host 是本机已测配置，内存类型和配额应按硬件调整。
 
 ```bash
-hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
-  qwen3_8_27b_nvfp4.ninfer \
-  --local-dir models
+mkdir -p logs
+NINFER_WEIGHT_READ_THREADS=2 ./build/apps/ninfer-serve \
+  models/qwen3_8_27b_huihui_abliterated_nvfp4_dflash2.ninfer \
+  --host 0.0.0.0 --port 8080 --model-id ninfer-kvmem \
+  --max-context 262144 --kv-dtype fp8 --kv-capacity 77824 \
+  --kvmem-window-pages 576 --max-concurrency 2 \
+  --host-context-mib 18432 --host-context-memory pageable \
+  --prefill-chunk 1024 --device-state-slots 0 \
+  --spec dflash2 --draft-tokens 7 --lm-head-draft --vision \
+  --log-stats-interval-ms 1000 --pending-timeout-ms 1800000 \
+  --request-log-jsonl logs/ninfer.jsonl
 ```
-
-Start a long-running text/agent server with two execution lanes and prefix caching:
-
-```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --max-context 240000 \
-  --kv-capacity 240000 \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
-  --preserve-thinking
-```
-
-Each request has a 240,000-token logical ceiling. A shared 240,000-token Device KV pool serves
-resident requests and retained prefixes. Requests acquire KV pages as execution advances; under
-pressure, the scheduler can pause a request and resume it later. The profile provides two extra
-Device StateImages and the default shared pinned Host budget: 8 GiB plus eight model StateImages,
-used for retained state, KV and pause snapshots.
-
-Send an OpenAI-style request:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{
-    "model": "qwen3.8-27b",
-    "messages": [{"role": "user", "content": "Reply with one short sentence."}],
-    "max_tokens": 64
-  }'
+  -d '{"model":"ninfer-kvmem","messages":[{"role":"user","content":"用一句话解释前缀缓存。"}],"max_tokens":64}'
 ```
 
-Run a one-shot CLI request with a 32,768-token allocation:
+API、结构化输出及工具参数见 [Serving](docs/serving.md)；完整选项以可执行文件 `--help` 为准。
 
-```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
-  --prompt "Explain prefill and decode, then give a concise conclusion." \
-  --max-context 32768 \
-  --max-new 8192 \
-  --kv-dtype fp8 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft
-```
+## 实验与文档
 
-Answer content is written to stdout. Human-readable startup/runtime diagnostics and the CLI-owned
-reasoning, timing, throughput, memory, and speculative-decoding report are written to stderr;
-reasoning and the result report remain unprefixed product output. On a terminal, weight
-materialization uses one transient progress line followed by a compact Engine-ready summary.
-Redirected stderr receives persistent readable progress without terminal control sequences. Use
-`--log-level debug` for complete startup detail. Option and local input errors remain direct command
-diagnostics. Use `--messages FILE` and `--vision` for structured image/video input; see the
-[CLI guide](docs/cli.md) and [committed examples](examples/cli/).
+HiCache RAM/磁盘扩展保留在 [`codex/upstream-kvmem-hicache-optional-20261008`](https://github.com/qzshch/ninfer-kvmem/tree/codex/upstream-kvmem-hicache-optional-20261008)，不属于当前 `main` 日常构筑。非 CP GDN recurrence 融合、跨 lane 投影打包和 NVFP4 数值舍入实验也没有作为默认优化启用。GDN 输出 RMSNorm + SiLU gating 已在原生产路径融合，与 recurrence 实验不同。
 
-## Resource-aware long-context reuse
+- [文档入口](docs/README.md)：CLI、Serving、权重转换、测试和维护说明。
+- [本构筑实测报告](docs/reports/2026-10-10-modular-kvmem-constraints.md)：资格、ABBA 与未解决边界。
+- [KVMem / Native 缓存契约](docs/maintainer/sparse-native-context-cache.md)：选页、搬运、指令保留、Host 配额和恢复。
+- [后端模块化与更新方法](docs/maintainer/backend-integration.md)、[上游版本清单](backends/versions.json)。
 
-A reusable checkpoint combines KV with the complete continuation state at an exact token frontier.
-The engine retains completed conversation endpoints and stable input boundaries for multi-turn and
-agent reuse. Inactive checkpoints share Device and pinned Host capacity; pressure reclaims retained
-resources before pausing resident requests. Paused requests resume from a snapshot or rebuild their
-state by replaying already committed tokens.
+继承的模型卡与通用指南记录上游能力；本构筑的性能与默认配置以本页及本项目报告为准。
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
-reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
+## 上游归属与开源许可
 
-This fork adds an optional bounded KVMem working set on top of Native checkpoint
-ownership and fixed pinned Host storage. See [sparse Native context cache](
-docs/maintainer/sparse-native-context-cache.md) for capacities and recovery contracts.
+本项目的 NInfer 衍生代码和项目自有改动沿用 **[Apache License 2.0](LICENSE)**。保留原有版权、第三方许可证与 NOTICE；改动来源由 Git 历史、[NOTICE](NOTICE) 和 [上游及许可说明](docs/upstream-and-licenses.md) 记录。
 
-## Performance
+| 来源 | 归属及许可 |
+|---|---|
+| [NInfer](https://github.com/Neroued/ninfer) | Neroued 与 NInfer contributors；[Apache-2.0](https://github.com/Neroued/ninfer/blob/81c8ce093b2c1646a87566a8e59d807fcf0ec95c/LICENSE)。模型执行、CUDA 与协议基础来自上游 |
+| [KVMem](https://github.com/kvmem/kvmem-llama.cpp) / [KVMem-qw3](https://github.com/kvmem/kvmem-qw3) | KVMem 作者与 contributors；固定版本移植仓的 [README 许可声明](https://github.com/kvmem/kvmem-llama.cpp/blob/d9ae944b39f55f77f5434edb96b9fb037217a0a4/README.md#license) 说明按 Apache-2.0 处理。该版本未单独提供根 LICENSE；不将 llama.cpp 的 MIT 泛化为整个 KVMem 的许可 |
+| [XGrammar](third_party/xgrammar/README.ninfer.md) | Apache-2.0，保留其 [LICENSE](third_party/xgrammar/LICENSE) 和 [NOTICE](third_party/xgrammar/NOTICE) |
+| 其他 vendored 依赖及模板 | 保留各自的许可证；例如 llama-jinja、cpp-httplib、spdlog、nlohmann JSON 的 MIT，详见 [许可清单](docs/upstream-and-licenses.md#第三方组件) |
+| 模型与草稿权重 | 独立分发，须分别遵守原模型、消融模型、量化及 companion 权重的 model card/许可；源码许可不替代权重许可 |
 
-Published measurements use an RTX 5090. The [performance index](docs/performance.md) links to
-per-model run records and the [measurement rules](docs/performance/methodology.md). The tables
-below are excerpts from those detailed results. Qwen3.8 uses FP8 E4M3 row-256 KV;
-Qwen3.6 uses INT8 group-64 KV.
-
-### Concurrent MTP3 decode
-
-Saturated decode used CUDA Graphs, MTP3, and one 8,192-token generation per active
-request. Throughput uses aggregate committed decode tokens from complete intervals whose actual
-decode batch equaled the configured concurrency. Acceptance covers the complete request wave;
-these rates are steady decode (tok/s).
-
-| Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept |
-|---|---:|---:|---:|---:|
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#decode-saturation) `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#decode-saturation) `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% |
-| [Qwen3.6-35B-A3B](docs/performance/qwen3.6-35b-a3b.md#decode-saturation) `groupwise-int` | 642.5 / 68.6% | 907.2 / 66.3% | 1,213.5 / 69.6% | 1,380.7 / 68.0% |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `groupwise-int` | 136.5 / 44.4% | 253.3 / 45.2% | 398.1 / 46.1% | 582.4 / 46.4% |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `nvfp4` | 147.7 / 46.2% | 291.0 / 48.7% | 522.2 / 45.8% | 922.4 / 46.1% |
-
-### Single-request serving
-
-The serial serving corpus used CUDA Graphs, a 1,024-token prefill chunk, and five
-fixed seeds after warm-up. The table keeps one short-prefill, one extreme-prefill, and one
-structured-output MTP3 point for each published profile; the full context and scenario matrices are
-linked from each model below.
-
-| Model profile | 7,680-token prefill | 260,096-token prefill | Structured MTP3 decode |
-|---|---:|---:|---:|
-| [Qwen3.6-35B-A3B](docs/performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) `groupwise-int` | 17,705.4 tok/s | 5,247.0 tok/s | 779.6 tok/s |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,331.9 tok/s | 2,139.4 tok/s | 214.7 tok/s |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 12,819.1 tok/s | 4,016.4 tok/s | 231.7 tok/s |
-
-## Evaluation
-
-Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
-enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
-
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
-|---|---:|---:|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
-| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
-
-The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8 rows used temperature
-1.0 and presence penalty 0.0. Multimodal evaluation used `--vision` and an 81,920-token context
-limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 252,928 tokens to
-fit the RTX 5090 after weights. Each score is one sample per problem; model cards contain the
-correct/total counts and evaluation notes.
-
-## Startup notes
-
-GPU residency is fixed at process startup. `--spec` selects speculative decoding residency, and
-`--vision` independently selects Vision residency. Qwen3.6-35B-A3B DFlash can be combined with
-Vision; it accelerates generated-text decode after multimodal prefill, not Vision encode itself.
-
-## Docker
-
-Build the runtime image on a host with the NVIDIA Container Toolkit:
-
-```bash
-docker build --tag ninfer:local .
-```
-
-Mount the downloaded model and run the same example server profile:
-
-```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer-serve /models/qwen3_8_27b_nvfp4.ninfer \
-  --host 0.0.0.0 \
-  --max-context 240000 \
-  --kv-capacity 240000 \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
-  --preserve-thinking
-```
-
-## Capabilities and limits
-
-The official artifacts provide the following capabilities, with optional components enabled at startup:
-
-- text generation with thinking and non-thinking prompt modes;
-- image, multi-image, video, and mixed multimodal messages;
-- chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
-- MTP speculative decoding with draft windows from one to five;
-- BF16, INT8, FP8, NVFP4, and K8V4 KV storage;
-- offline causal-perplexity scoring;
-- private and shared exact-prefix reuse with Device/Host State and KV retention;
-- model-aware sampling defaults and explicit sampler overrides;
-- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
-  tools, local response state, token counting, and usage accounting.
-
-The 35B-A3B target additionally supports DFlash with draft windows from one to fifteen for Text and
-image/video Vision prompts. Qwen3.8-27B artifacts with the DFlash2 companion weights support
-`--spec dflash2 --draft-tokens 7` for the same Text/Vision Engine path, with draft counts 1..15
-and either full or optimized proposal heads.
-
-The product boundary remains intentionally small:
-
-- one RTX 5090 and one resident model per Engine;
-- one to eight resident execution lanes with bounded FIFO ingress;
-- resource-pressure preemption with snapshot or token-replay recovery;
-- no priority/QoS, weight offload, multi-GPU, or distributed serving;
-- one shared startup-fixed KV pool across active requests and retained prefixes;
-- model architectures and format/shape combinations use explicitly implemented native paths;
-- parsed tool calls are returned to the client; NInfer does not execute tools;
-- the in-tree C++ headers are not distributed as an installed SDK.
-
-`--max-context` is each sequence's logical limit. `--kv-capacity` sizes the shared Main Text KV pool
-used by active requests and retained prefixes; `auto` resolves the largest legal capacity at
-startup from the memory remaining after weights while keeping 1 GiB of sizing headroom. Explicit
-capacities remain fixed for the process lifetime.
-
-## Documentation
-
-- [Documentation index](docs/README.md)
-- [CLI](docs/cli.md)
-- [HTTP serving](docs/serving.md)
-- [Performance](docs/performance.md)
-- [Perplexity evaluation](docs/perplexity.md)
-- [Weight conversion and custom recipes](docs/weight-conversion.md)
-- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Sparse KVMem and Native RAM history](docs/maintainer/sparse-native-context-cache.md)
-- [Serve TTFT benchmark](tools/bench/ttft/)
-- [CLI examples](examples/cli/)
-- [Contributing](CONTRIBUTING.md)
-
-Run the relevant `--help` for the exact current option contract.
-
-## Support
-
-NInfer is a personal project that I develop out of interest. If you find it useful and would like
-to support its continued development, you can [support the project on Ko-fi](https://ko-fi.com/neroued).
-
-Support is entirely voluntary. It is not a purchase or investment and does not come with financial
-returns, promised services or features, or a role in project decisions. The project's direction,
-priorities, technical choices, and release schedule remain independently determined by the
-maintainer.
-
-## License
-
-NInfer is licensed under the [Apache License 2.0](LICENSE).
-
-The published artifacts are derived from
-[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
-[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
-also uses the fixed packed weights from
-[rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
-[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
-repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
-under `third_party/`.
+KVMem 的研究设计请引用 [KVMem: Virtualizing Million-Token Agent Workspaces on a Consumer GPU](https://arxiv.org/abs/2609.04852)，Di Chai、Leye Wang、Zeshen Su、Zhiguo Xia、Zhihang Yu，2026。本项目是独立集成与维护构筑，不代表上游官方发行或背书。

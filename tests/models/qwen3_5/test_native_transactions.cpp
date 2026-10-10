@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/ffn.h"

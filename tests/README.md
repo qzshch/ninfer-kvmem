@@ -384,3 +384,5 @@ execution before another binding can consume the shared pool margin.
 Query-rewind admission is also tested with a foreign Device claim: refusal must not
 rewind the probe or change claims; the context-store test reserves before rewinding
 at full logical capacity and replays while another claim occupies all free pages.
+
+<!-- Modified in the ninfer-kvmem distribution; see NOTICE and Git history. -->

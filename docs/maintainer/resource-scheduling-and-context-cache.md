@@ -517,3 +517,5 @@ Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到
 - [EngineCore](../../src/runtime/engine/engine_core.h)：事务编排、生命周期与发布。
 - [Program](../../src/models/qwen3_5/program/program.h)：模型恢复与资源操作合同。
 - [Native 源码组织](../../src/models/qwen3_5/program_sources.cmake)：规划、存储、绑定和各事务实现。
+
+<!-- Modified in the ninfer-kvmem distribution; see NOTICE and Git history. -->

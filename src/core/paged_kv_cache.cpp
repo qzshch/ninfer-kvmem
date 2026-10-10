@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "core/paged_kv_cache.h"
 
 #include "core/device.h"

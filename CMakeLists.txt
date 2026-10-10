@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 cmake_minimum_required(VERSION 3.28)
 
 # The current implementation is compiled only for sm_120a. Set and validate the

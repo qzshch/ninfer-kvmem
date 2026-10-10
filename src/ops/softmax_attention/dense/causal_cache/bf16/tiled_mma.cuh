@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #pragma once
 
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"

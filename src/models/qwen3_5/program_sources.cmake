@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/retrieval/kvmem.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"

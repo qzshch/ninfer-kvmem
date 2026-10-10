@@ -339,3 +339,5 @@ continuation 或 checkpoint。
 
 公共 C++ 接口服务仓库内应用；NInfer 不安装或导出 C++ SDK。V3 `.ninfer` 是唯一 C++ 产品 artifact，
 CLI、server 和 inference benchmark 均通过公共 Engine，converter 不提供 Python model-inference 路径。
+
+<!-- Modified in the ninfer-kvmem distribution; see NOTICE and Git history. -->

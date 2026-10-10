@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 ninfer_add_test(ninfer_artifact_bounded_prefetch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bounded_prefetch.cpp"
   LIBRARIES Threads::Threads)

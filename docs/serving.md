@@ -1225,3 +1225,5 @@ responses. NInfer does not execute tools or enforce tool-argument schemas throug
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+<!-- Modified in the ninfer-kvmem distribution; see NOTICE and Git history. -->

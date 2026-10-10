@@ -1,7 +1,12 @@
-# NInfer documentation
+# ninfer-kvmem documentation
 
-Start with the [project README](../README.md) to build NInfer, download a published artifact, and
-run the CLI or HTTP server.
+Start with the [project README](../README.md) for this build's configuration, measured results,
+build command and HTTP server example. Inherited guides document the NInfer engine interfaces;
+upstream benchmark/model-card results are not this build's measurements.
+
+See [upstream sources and licenses](upstream-and-licenses.md) for attribution and redistribution
+details, and the [integration qualification report](reports/2026-10-10-modular-kvmem-constraints.md)
+for the current native KVMem build's evidence and limits.
 
 ## User guides
 
@@ -67,3 +72,5 @@ Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
 fields, parameter expansion and native supported domains are maintained by the code linked from
 these references.
+
+<!-- Modified in the ninfer-kvmem distribution; see NOTICE and Git history. -->

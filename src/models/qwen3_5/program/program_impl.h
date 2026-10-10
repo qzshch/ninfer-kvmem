@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/retrieval/adapter.h"

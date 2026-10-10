@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "artifact/materializer.h"
 
 #include "artifact/bounded_prefetch.h"

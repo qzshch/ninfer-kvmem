@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #pragma once
 
 // Optional full-precision JSONL measurement log. Human operational rendering is owned separately

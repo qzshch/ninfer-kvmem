@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/span_accumulate/span_accumulate.cu"
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"

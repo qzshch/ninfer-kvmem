@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "serve/request_log.h"
 #include "product/constraint_observation.h"
 #include "product/logging/pretty_format.h"

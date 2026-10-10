@@ -1,9 +1,10 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+The supported architecture is `sm_120a`; upstream validates CUDA 13.1, while this build's
+2026-10-10 qualification uses CUDA 13.2.86.
 Product commands and prerequisites are in the
-[README](../../README.md#quick-start); test and measurement workflows live in
+[README](../../README.md#构建与启动); test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
 
 ## Configuration

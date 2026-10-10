@@ -1,3 +1,4 @@
+// Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 #include "serve/openai_responses_store.h"
 
 #include <nlohmann/json.hpp>

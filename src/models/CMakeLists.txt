@@ -1,3 +1,4 @@
+# Modified in the ninfer-kvmem distribution; see NOTICE and Git history.
 # Immutable loading and mutable execution have separate compile owners.
 add_library(ninfer_model_loading STATIC registry.cpp)
 ninfer_internal_includes(ninfer_model_loading)
