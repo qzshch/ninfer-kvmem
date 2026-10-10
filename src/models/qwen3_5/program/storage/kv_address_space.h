@@ -840,7 +840,20 @@ public:
         if (frontier == address.committed_frontier && target == address.page_count) { return; }
         for (std::uint32_t page = target; page < address.page_count; ++page) {
             if (!pages_->can_dematerialize(membership(address, page))) {
-                throw std::logic_error("KV truncate would partially release a protected page");
+                const auto logical = membership(address, page);
+                throw std::logic_error(
+                    "KV truncate would partially release a protected page: frontier=" +
+                    std::to_string(frontier) + " committed=" +
+                    std::to_string(address.committed_frontier) + " checkpoint=" +
+                    std::to_string(address.checkpoint_frontier) + " page=" +
+                    std::to_string(page) + " columns=" +
+                    std::to_string(pages_->committed_columns(logical)) + " references=" +
+                    std::to_string(pages_->address_references(logical)) + " active=" +
+                    std::to_string(pages_->active_address_references(logical)) + " writers=" +
+                    std::to_string(pages_->writer_references(logical)) + " pins=" +
+                    std::to_string(pages_->source_pins(logical)) + " host=" +
+                    std::to_string(pages_->host_resident(logical)) + " device=" +
+                    std::to_string(pages_->device_resident(logical)));
             }
         }
         if (target != 0) {

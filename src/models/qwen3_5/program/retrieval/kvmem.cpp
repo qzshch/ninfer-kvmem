@@ -645,6 +645,8 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
     pages = context_window_page_set(replay_pages, kvmem_window_pages,
                                    sparse.retrieved_pages, sparse.media_groups,
                                    sparse.instruction_spans);
+    append_prefill_growth_pages(
+        pages, (sequence.text_kv_valid + kPagedKVPageSize - 1U) / kPagedKVPageSize, mapped);
     auto& diagnostics = requests[sequence.lane].timings.kvmem;
     ++diagnostics.selection_calls;
     diagnostics.scored_blocks += selection.scored_blocks;
@@ -677,6 +679,12 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         pages = context_window_page_set(backend_replay_pages, backend_budget,
                                        sparse.retrieved_pages, sparse.media_groups,
                                        sparse.instruction_spans);
+        // Uncommitted MTP lookahead belongs to this unit, not retained history.
+        // Keep it on Device until normal settlement can retire it. Offloading
+        // an empty page to Host prevents destructive_truncate from returning it.
+        append_prefill_growth_pages(
+            pages, (sequence.mtp_kv_valid + kPagedKVPageSize - 1U) / kPagedKVPageSize,
+            backend_mapped);
         const auto backend_placement = backend_kv_addresses->apply_device_placement(
             *sequence.kv->backend, *host_kv_extents, pages, device.transfer_stream, "retrieval");
         record_kvmem_placement(sequence, KvmemPlacementPhase::Retrieval, true, backend_placement);

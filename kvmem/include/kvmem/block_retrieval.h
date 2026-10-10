@@ -161,7 +161,12 @@ inline std::vector<std::uint32_t> prefill_window_page_set(std::uint32_t mapped_p
 inline void append_prefill_growth_pages(std::vector<std::uint32_t>& pages,
                                         std::uint32_t committed_pages, std::uint32_t mapped_pages) {
     for (std::uint32_t page = committed_pages; page < mapped_pages; ++page) {
-        pages.push_back(page);
+        if (pages.empty() || pages.back() < page) {
+            pages.push_back(page);
+        } else {
+            const auto at = std::lower_bound(pages.begin(), pages.end(), page);
+            if (at == pages.end() || *at != page) { pages.insert(at, page); }
+        }
     }
 }
 

@@ -54,6 +54,15 @@ int main() {
             require(budget.used == charged, "last checkpoint releases its own charge");
         }
         require(budget.used == 0, "lane retirement must return metadata quota");
+        std::vector<std::uint32_t> growth{0, 1, 137};
+        kvmem::append_prefill_growth_pages(growth, 138, 140);
+        require(growth == std::vector<std::uint32_t>{0, 1, 137, 138, 139},
+                "uncommitted lookahead must stay resident through unit settlement");
+        growth = {0, 1, 139};
+        kvmem::append_prefill_growth_pages(growth, 138, 140);
+        kvmem::append_prefill_growth_pages(growth, 138, 140);
+        require(growth == std::vector<std::uint32_t>{0, 1, 138, 139},
+                "growth preservation must merge a selected tail without duplicate pages");
         require(kvmem::kvmem_pool_page_budget(262144, 1024, 576, 2) == 1216,
                 "two windows, chunk growth and safety slack must fit the device pool");
         const std::array instructions{kvmem::TokenRange{0, 400}, kvmem::TokenRange{12000, 80}};
