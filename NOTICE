@@ -39,5 +39,13 @@ at 71a0624fb36aaaa2df24ccf428236493c813a441. Original llama.cpp/GGML
 authorship and MIT terms are retained in ports/hygon-k100/external/LICENSE.MIT.
 The diagnostic backend is separate from the Apache-2.0 NInfer implementation.
 
+Hygon DTK physical-Core adapter
+The runtime-name mapping approach and selected equivalent mappings reference
+JCraigWasTaken/ninfer-gfx906, src/core/hip_compat.h, revision
+ad0f68a48dc5135a11b08b33afe02a711980f797 (Apache-2.0).
+Source: https://github.com/JCraigWasTaken/ninfer-gfx906
+The adapter is narrowed to this distribution's current physical Core; it does
+not include the donor's v2 engine, device mathematics or model implementation.
+
 This file records attribution and does not modify any license terms or imply
 endorsement by upstream projects.
