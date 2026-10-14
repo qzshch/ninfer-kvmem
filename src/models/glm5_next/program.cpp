@@ -228,7 +228,8 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
                                 std::numeric_limits<float>::quiet_NaN());
         const std::array<std::uint32_t, 1> count{1};
         for (unsigned b = 0; b < rank.size(); ++b)
-            (void)state.retrieval->score(b, q, count, rank[b]);
+            if (state.retrieval->block(b).full)
+                (void)state.retrieval->score(b, q, count, rank[b]);
         kvmem::BlockSelectionConfig config{128, options_.kvmem_window_pages / 2, 1, 1, 0};
         auto selection = kvmem::select_blocks(*state.retrieval, rank, config);
         std::vector<std::uint8_t> pages((options_.max_context + 63) / 64);
