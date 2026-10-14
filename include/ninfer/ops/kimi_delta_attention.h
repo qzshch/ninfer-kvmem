@@ -10,6 +10,8 @@
 
 namespace ninfer::ops {
 
+enum class KdaDecayParameter : std::uint8_t { LogRate, NegativeRate };
+
 /**
  * Caller-owned transient capacity for every T in [min_tokens,max_tokens]. D=128,
  * Hqk>=1, Hv>=Hqk and Hv%Hqk==0. Returns zero when all calls use scratch-free recurrence.
@@ -39,6 +41,8 @@ namespace ninfer::ops {
  * beta BF16 [Hv,T], A_log FP32 [Hv], dt_bias FP32 [128,Hv], state FP32 [128,128,Hv].
  * Physical state index is ((h*128+value)*128+key). Hqk>=1, Hv>=Hqk, Hv%Hqk==0, T>=1.
  * lower_bound is finite in [-5,0]; scale is 1/sqrt(128). Inputs/out are non-overlapping.
+ * With NegativeRate (DTK), the same FP32 parameter stores -a_h directly. This
+ * preserves GLM's source representation without log/exp weight rewriting.
  * State input/output may be disjoint or exactly alias; no other operand overlaps state.
  *
  * The independent oracle evaluates the complete recurrence naively in FP64 from the represented
@@ -62,14 +66,16 @@ namespace ninfer::ops {
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
                           float lower_bound, float scale, WorkspaceArena& workspace, Tensor& state,
-                          Tensor& out, DeviceExecutionView execution);
+                          Tensor& out, DeviceExecutionView execution,
+                          KdaDecayParameter decay_parameter = KdaDecayParameter::LogRate);
 
 /** Distinct-state form of the same mathematical contract; exact state alias is also allowed. */
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& A_log, const Tensor& dt_bias,
                           float lower_bound, float scale, WorkspaceArena& workspace,
                           const Tensor& state_in, Tensor& state_out, Tensor& out,
-                          DeviceExecutionView execution);
+                          DeviceExecutionView execution,
+                          KdaDecayParameter decay_parameter = KdaDecayParameter::LogRate);
 
 /**
  * Scratch-free one-token update for B independent state-pool slots, using the same head mapping.

@@ -22,6 +22,7 @@ struct Arguments {
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
     float lower_bound, scale;
+    bool negative_rate = false;
 };
 
 inline bool valid_heads(int qk, int value) { return qk > 0 && value >= qk && value % qk == 0; }

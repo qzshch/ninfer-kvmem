@@ -1,5 +1,9 @@
 # Weight conversion
 
+The experimental Hygon branch has a separate lossless GLM-5.3-Flash source importer
+and resident DTK route; see [its artifact and execution contract](../ports/hygon-k100/glm53-execution.md).
+The general CUDA recipes below retain their existing scope.
+
 NInfer's converter creates `.ninfer` artifacts from local weights and a Python recipe. A recipe
 can reuse an official conversion, change selected layers or projections, combine sources, or call
 your own conversion method. The artifact contains the resulting configuration, encoded weights,

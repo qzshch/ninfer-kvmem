@@ -6,6 +6,11 @@
 
 ## 1. 产品执行模型
 
+默认 CUDA 产品采用下述单卡调度。实验性 GLM/DTK 路线使用三卡分层常驻、一个 lane、
+32K 上限和 Aggregate greedy，通过公共 Engine 的独立平台实现调用原生 Model/Program/Ops。
+其权重、状态、KV、KVMem 元数据、草稿回滚边界和未完成的通用产品功能，见
+[GLM/DTK 执行合同](../../ports/hygon-k100/glm53-execution.md)。
+
 Generation Engine 使用一张 GPU、一个常驻模型和启动时确定的 `max_concurrency=1..8`。
 服务的 `/v1/models` 与 `/v1/models/{id}` 同时报告 `max_model_len` 和 `max_concurrency`，
 供外部代理同步执行槽上限。该上限不保证任意长度的请求都能同时驻留；Host/KV 准入仍按实际资源报价。

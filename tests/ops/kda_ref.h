@@ -22,6 +22,7 @@ struct Inputs {
     std::vector<float> a_log;
     std::vector<float> dt_bias;
     std::vector<float> state;
+    bool negative_rate = false;
 };
 
 struct Result {
@@ -95,16 +96,17 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
                 static_cast<double>(in.state[state_base + static_cast<std::size_t>(index)]);
         }
 
-        const double a_scale      = std::exp(static_cast<double>(in.a_log[head]));
+        const double a_scale = in.negative_rate ? -static_cast<double>(in.a_log[head])
+                                                : std::exp(static_cast<double>(in.a_log[head]));
         const std::size_t dt_base = static_cast<std::size_t>(head * D);
         for (std::int64_t token = 0; token < T; ++token) {
             const std::size_t vector_base = static_cast<std::size_t>((token * H + head) * D);
             const std::size_t qk_base =
                 static_cast<std::size_t>((token * Hq + head / (H / Hq)) * D);
             for (std::int64_t column = 0; column < D; ++column) {
-                const double gate = static_cast<double>(in.g[vector_base + column]) +
-                                    static_cast<double>(in.dt_bias[dt_base + column]);
-                const double log_decay                  = lower_bound * sigmoid(a_scale * gate);
+                const double gate      = static_cast<double>(in.g[vector_base + column]) +
+                                         static_cast<double>(in.dt_bias[dt_base + column]);
+                const double log_decay = lower_bound * sigmoid(a_scale * gate);
                 alpha[static_cast<std::size_t>(column)] = std::exp(log_decay);
             }
             const double beta =

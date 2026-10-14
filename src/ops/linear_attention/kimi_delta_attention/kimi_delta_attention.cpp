@@ -222,26 +222,34 @@ std::size_t kimi_delta_attention_workspace_capacity_bytes(std::int32_t qk_heads,
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
                           float lower_bound, float scale, WorkspaceArena& workspace, Tensor& state,
-                          Tensor& out, DeviceExecutionView execution) {
+                          Tensor& out, DeviceExecutionView execution,
+                          KdaDecayParameter decay_parameter) {
     kimi_delta_attention(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, workspace, state,
-                         state, out, execution);
+                         state, out, execution, decay_parameter);
 }
 
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                           const Tensor& beta, const Tensor& a_log, const Tensor& dt_bias,
                           float lower_bound, float scale, WorkspaceArena& workspace,
                           const Tensor& state_in, Tensor& state_out, Tensor& out,
-                          DeviceExecutionView execution) {
+                          DeviceExecutionView execution, KdaDecayParameter decay_parameter) {
     namespace kda = detail::kimi_delta_attention;
     const auto geometry =
         validate(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in, state_out, out);
-    const auto args =
+    auto args =
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in, state_out, out);
+    if (decay_parameter != KdaDecayParameter::LogRate &&
+        decay_parameter != KdaDecayParameter::NegativeRate)
+        throw std::invalid_argument("kimi_delta_attention: invalid decay parameterization");
+    args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
 #if defined(NINFER_HYGON_DTK)
     (void)geometry;
     (void)workspace;
     kda::launch_recurrent(args, execution.stream);
 #else
+    if (args.negative_rate)
+        throw std::invalid_argument(
+            "kimi_delta_attention: negative-rate operands require DTK recurrence");
     if (geometry.tokens < kda::kChunkedMinTokens) {
         kda::launch_recurrent(args, execution.stream);
         return;

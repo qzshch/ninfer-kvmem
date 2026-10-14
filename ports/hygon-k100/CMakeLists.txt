@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.28)
 
-# A staged build of the existing physical Core, not a replacement inference build.
+# Finite Hygon DTK Core/Ops and resident GLM public Engine build.
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
   set(CMAKE_HIP_ARCHITECTURES gfx928 CACHE STRING "Hygon K100_AI target")
 endif()
 if(NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx928")
   message(FATAL_ERROR "This port qualification targets gfx928 only")
 endif()
-project(ninfer_k100_core_qualification LANGUAGES CXX HIP)
+project(ninfer_k100_core_qualification LANGUAGES C CXX HIP)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_HIP_STANDARD 20)
@@ -20,8 +20,8 @@ find_package(Threads REQUIRED)
 include(CTest)
 get_filename_component(NINFER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
-# Compile current v3/KVMem physical storage code directly. Graph execution and
-# mathematical operators are deliberately outside this first qualification.
+# Compile current v3/KVMem physical storage code directly; Ops/Model/Program/Engine
+# are separate consumers below. Graph execution remains outside this profile.
 set(core_sources
   arena.cu device.cu dtype.cpp tensor.cpp layout.cpp weight_view.cpp
   host_worker_pool.cpp gdn_replay_records.cpp cyclic_kv_cache.cpp
@@ -47,6 +47,7 @@ set_source_files_properties("${NINFER_ROOT}/src/ops/linear/portable/launch.cu" P
 add_library(ninfer_k100_projection STATIC
   "${NINFER_ROOT}/src/ops/linear/linear.cpp"
   "${NINFER_ROOT}/src/ops/linear/fp32.cpp"
+  "${NINFER_ROOT}/src/ops/linear/portable/indexed_hip.hip"
   "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
 target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
 target_include_directories(ninfer_k100_projection PRIVATE "${NINFER_ROOT}/third_party")
@@ -58,10 +59,50 @@ target_link_libraries(ninfer_k100_kda PUBLIC ninfer_k100_physical_core)
 
 add_library(ninfer_k100_hyper_connection STATIC "${NINFER_ROOT}/src/ops/hyper_connection/launch_hip.hip")
 target_link_libraries(ninfer_k100_hyper_connection PUBLIC ninfer_k100_physical_core)
+add_library(ninfer_k100_resident_transform STATIC "${NINFER_ROOT}/src/ops/resident_transform/launch_hip.hip")
+target_link_libraries(ninfer_k100_resident_transform PUBLIC ninfer_k100_physical_core)
+add_library(ninfer_k100_sparse_latent STATIC "${NINFER_ROOT}/src/ops/sparse_latent_attention/launch_hip.hip")
+target_link_libraries(ninfer_k100_sparse_latent PUBLIC ninfer_k100_physical_core)
+add_library(ninfer_k100_dflash_block STATIC "${NINFER_ROOT}/src/ops/dflash_block/launch_hip.hip")
+target_link_libraries(ninfer_k100_dflash_block PUBLIC ninfer_k100_physical_core)
+set(artifact_sources schema.cpp formats.cpp layouts.cpp file_io.cpp reader.cpp binder.cpp materializer.cpp views.cpp)
+list(TRANSFORM artifact_sources PREPEND "${NINFER_ROOT}/src/artifact/")
+add_library(ninfer_k100_artifact STATIC ${artifact_sources})
+target_include_directories(ninfer_k100_artifact PUBLIC "${NINFER_ROOT}/third_party")
+target_link_libraries(ninfer_k100_artifact PUBLIC ninfer_k100_physical_core)
+add_library(ninfer_k100_glm_model STATIC "${NINFER_ROOT}/src/models/glm5_next/model.cpp")
+target_link_libraries(ninfer_k100_glm_model PUBLIC ninfer_k100_artifact)
+add_subdirectory("${NINFER_ROOT}/third_party/llama-jinja" "${CMAKE_CURRENT_BINARY_DIR}/jinja")
+add_library(ninfer_k100_unicode STATIC "${NINFER_ROOT}/src/text/unicode.cpp"
+  "${NINFER_ROOT}/third_party/utf8proc/utf8proc.c")
+target_include_directories(ninfer_k100_unicode PUBLIC "${NINFER_ROOT}/src" "${NINFER_ROOT}/third_party")
+target_include_directories(ninfer_jinja PRIVATE "${NINFER_ROOT}/src" "${NINFER_ROOT}/third_party")
+target_link_libraries(ninfer_jinja PRIVATE ninfer_k100_unicode)
+add_library(ninfer_k100_text STATIC "${NINFER_ROOT}/src/text/jinja.cpp")
+target_include_directories(ninfer_k100_text PUBLIC "${NINFER_ROOT}/src" "${NINFER_ROOT}/include" "${NINFER_ROOT}/third_party")
+target_link_libraries(ninfer_k100_text PUBLIC ninfer_jinja ninfer_k100_unicode)
+add_library(ninfer_k100_glm_frontend STATIC "${NINFER_ROOT}/src/models/glm5_next/frontend.cpp"
+  "${NINFER_ROOT}/src/runtime/engine/public_types.cpp")
+find_library(PCRE2_LIBRARY NAMES pcre2-8 REQUIRED)
+target_link_libraries(ninfer_k100_glm_frontend PUBLIC ninfer_k100_glm_model ninfer_k100_text "${PCRE2_LIBRARY}")
 
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
+add_library(ninfer_k100_glm_program STATIC "${NINFER_ROOT}/src/models/glm5_next/program.cpp")
+target_link_libraries(ninfer_k100_glm_program PUBLIC ninfer_k100_glm_model ninfer_k100_projection
+  ninfer_k100_kda ninfer_k100_hyper_connection ninfer_k100_resident_transform ninfer_k100_sparse_latent ninfer_k100_dflash_block kvmem_core)
+add_library(ninfer_k100_engine STATIC "${NINFER_ROOT}/src/runtime/engine/engine_dtk.cpp"
+  "${NINFER_ROOT}/src/runtime/contract/sampling.cpp")
+target_link_libraries(ninfer_k100_engine PUBLIC ninfer_k100_glm_program ninfer_k100_glm_frontend Threads::Threads)
+add_executable(ninfer_k100_generate ninfer_generate.cpp)
+target_link_libraries(ninfer_k100_generate PRIVATE ninfer_k100_engine)
 
 if(BUILD_TESTING)
+  add_executable(k100_tokenizer_test tests/tokenizer.cpp)
+  target_link_libraries(k100_tokenizer_test PRIVATE ninfer_k100_glm_frontend)
+  set(NINFER_K100_TOKENIZER_FIXTURE "" CACHE FILEPATH "Pinned official CPU tokenizer/Jinja parity fixture")
+  if(NINFER_K100_TOKENIZER_FIXTURE)
+    add_test(NAME k100_tokenizer COMMAND k100_tokenizer_test "${NINFER_K100_TOKENIZER_FIXTURE}")
+  endif()
   foreach(name IN ITEMS device arena tensor host_context_arena kv_cache state_store gdn_replay_records)
     add_executable(k100_${name}_test "${NINFER_ROOT}/tests/test_${name}.cpp")
     target_link_libraries(k100_${name}_test PRIVATE ninfer_k100_physical_core)
@@ -105,6 +146,30 @@ if(BUILD_TESTING)
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
   find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+  add_executable(k100_dflash_block_test tests/dflash_block.cpp)
+  target_link_libraries(k100_dflash_block_test PRIVATE ninfer_k100_dflash_block)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_dflash_block_device${device} COMMAND k100_dflash_block_test)
+    set_tests_properties(k100_dflash_block_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
+  add_executable(k100_attention_test tests/attention.cpp)
+  target_link_libraries(k100_attention_test PRIVATE ninfer_k100_sparse_latent ninfer_k100_dflash_block)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_attention_device${device} COMMAND k100_attention_test)
+    set_tests_properties(k100_attention_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
+  add_executable(k100_resident_transform_test tests/resident_transform.cpp)
+  target_link_libraries(k100_resident_transform_test PRIVATE ninfer_k100_resident_transform)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_resident_transform_device${device} COMMAND k100_resident_transform_test)
+    set_tests_properties(k100_resident_transform_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
   add_executable(k100_hyper_connection_test tests/hyper_connection.cpp)
   target_link_libraries(k100_hyper_connection_test PRIVATE ninfer_k100_hyper_connection)
   foreach(device RANGE 0 2)
