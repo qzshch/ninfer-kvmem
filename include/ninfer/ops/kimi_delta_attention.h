@@ -50,6 +50,9 @@ namespace ninfer::ops {
  * small matrix products use TF32 MMA; Q readout and state updates use BF16 MMA with FP32
  * accumulators. State snapshots and Delta stay FP32, converting only their BF16 MMA operands.
  * Transcendental approximations and reduction association are implementation details.
+ * The experimental Hygon DTK implementation uses scratch-free FP32 recurrence for every T,
+ * including pooled one-token updates. Its shared-memory reductions have no CUDA warp-width
+ * dependency; the CUDA chunked dispatch described above remains unchanged.
  *
  * workspace supplies the capacity query above and is scoped to the call; the Op allocates no
  * device storage. execution supplies the stream and physical SM count for launch decomposition.

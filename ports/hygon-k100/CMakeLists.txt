@@ -50,6 +50,11 @@ add_library(ninfer_k100_projection STATIC
   "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
 target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
 
+add_library(ninfer_k100_kda STATIC
+  "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp"
+  "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/recurrent_hip.hip")
+target_link_libraries(ninfer_k100_kda PUBLIC ninfer_k100_physical_core)
+
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 
 if(BUILD_TESTING)
@@ -83,6 +88,15 @@ if(BUILD_TESTING)
   foreach(device RANGE 0 2)
     add_test(NAME k100_linear_device${device} COMMAND k100_linear_test ${NINFER_K100_REAL_WEIGHT_SAMPLE})
     set_tests_properties(k100_linear_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
+  add_executable(k100_kda_test tests/kda.cpp)
+  target_include_directories(k100_kda_test PRIVATE "${NINFER_ROOT}/tests")
+  target_link_libraries(k100_kda_test PRIVATE ninfer_k100_kda)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_kda_device${device} COMMAND k100_kda_test)
+    set_tests_properties(k100_kda_device${device} PROPERTIES
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()

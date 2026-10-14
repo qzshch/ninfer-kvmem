@@ -210,9 +210,13 @@ std::size_t kimi_delta_attention_workspace_capacity_bytes(std::int32_t qk_heads,
     if (!kda::valid_heads(qk_heads, value_heads) || min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("kimi_delta_attention workspace: invalid heads or interval");
     }
+#if defined(NINFER_HYGON_DTK)
+    return 0;
+#else
     return max_tokens < kda::kChunkedMinTokens
                ? 0
                : kda::chunked_workspace_bytes(value_heads, max_tokens);
+#endif
 }
 
 void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -233,6 +237,11 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
         validate(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in, state_out, out);
     const auto args =
         arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, state_in, state_out, out);
+#if defined(NINFER_HYGON_DTK)
+    (void)geometry;
+    (void)workspace;
+    kda::launch_recurrent(args, execution.stream);
+#else
     if (geometry.tokens < kda::kChunkedMinTokens) {
         kda::launch_recurrent(args, execution.stream);
         return;
@@ -246,6 +255,7 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
     auto* packets = static_cast<kda::Chunk*>(region.data);
     kda::launch_prepare(args, packets, execution.stream);
     kda::launch_chunk_recurrence(args, packets, execution);
+#endif
 }
 
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
