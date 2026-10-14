@@ -12,7 +12,8 @@ namespace ninfer {
 
 // Existing dense Op ABI uses Weight axes directly; callers establish BF16/FP32 and layout.
 inline Tensor as_dense(const Weight& weight) {
-    const auto dtype = weight.qtype == QType::FP32 ? DType::FP32 : DType::BF16;
+    const auto dtype = weight.qtype == QType::FP32 ? DType::FP32 :
+                       weight.qtype == QType::FP16 ? DType::FP16 : DType::BF16;
     auto* data       = const_cast<void*>(weight.qdata);
     switch (weight.ndim) {
     case 1:

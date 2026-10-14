@@ -1,6 +1,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
+#if defined(NINFER_HYGON_DTK)
+#include "ops/linear/portable/launch.h"
+#else
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
@@ -8,6 +11,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#endif
 
 #include <cstdint>
 #include <limits>
@@ -76,6 +80,11 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+#if defined(NINFER_HYGON_DTK)
+    (void)policy;
+    (void)workspace;
+    detail::portable_linear_launch(x,w,out,stream);
+#else
     switch (w.qtype) {
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
@@ -100,9 +109,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         return;
     case QType::FP32:
     case QType::INT32:
+    case QType::FP16:
+    case QType::MXFP4_G32_E8M0:
+    case QType::Q8_G32_FP16_BLOCK:
         break;
     }
     throw std::invalid_argument("linear: unsupported weight qtype");
+#endif
 }
 
 } // namespace
@@ -115,6 +128,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         throw std::invalid_argument("linear workspace: invalid token interval");
     }
 
+#if defined(NINFER_HYGON_DTK)
+    detail::validate_portable_linear_weight(qtype, output_rows, input_rows);
+    if (max_tokens > 65535) { throw std::invalid_argument("linear: token extent exceeds grid limit"); }
+    return 0;
+#else
     switch (qtype) {
     case QType::Q4_G64_FP16:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
@@ -144,9 +162,13 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
                                                            min_tokens, max_tokens);
     case QType::FP32:
     case QType::INT32:
+    case QType::FP16:
+    case QType::MXFP4_G32_E8M0:
+    case QType::Q8_G32_FP16_BLOCK:
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
+#endif
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

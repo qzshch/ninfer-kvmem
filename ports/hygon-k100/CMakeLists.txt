@@ -43,6 +43,13 @@ add_library(ninfer_k100_norm STATIC
   "${NINFER_ROOT}/src/ops/launcher/rmsnorm_hip.hip")
 target_link_libraries(ninfer_k100_norm PUBLIC ninfer_k100_physical_core)
 
+set_source_files_properties("${NINFER_ROOT}/src/ops/linear/portable/launch.cu" PROPERTIES LANGUAGE HIP)
+add_library(ninfer_k100_projection STATIC
+  "${NINFER_ROOT}/src/ops/linear/linear.cpp"
+  "${NINFER_ROOT}/src/ops/linear/fp32.cpp"
+  "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
+target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
+
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 
 if(BUILD_TESTING)
@@ -69,5 +76,14 @@ if(BUILD_TESTING)
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:"
       RUN_SERIAL TRUE TIMEOUT 120)
+  endforeach()
+  add_executable(k100_linear_test tests/linear.cpp)
+  target_link_libraries(k100_linear_test PRIVATE ninfer_k100_projection)
+  set(NINFER_K100_REAL_WEIGHT_SAMPLE "" CACHE FILEPATH "64x5120 original MXFP4 rows for the real-source oracle")
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_linear_device${device} COMMAND k100_linear_test ${NINFER_K100_REAL_WEIGHT_SAMPLE})
+    set_tests_properties(k100_linear_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
 endif()

@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    InterleavedBlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
     NumericFormat,
@@ -77,7 +78,9 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
-CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
+CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp16", "fp32", "int32")))
+BLOCK_INTERLEAVED_V1 = Layout("block_interleaved_v1", 256,
+    frozenset(("mxfp4_g32_e8m0", "q8_g32_fp16_block")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
@@ -102,6 +105,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            BLOCK_INTERLEAVED_V1,
         )
     }
 )
@@ -264,6 +268,13 @@ def encoded_size(
         if len(dims) > 16:
             raise ValueError("contiguous_le_v1 supports rank 0 through 16")
         return prod(dims) * numeric_spec.word_bytes
+    if layout_spec is BLOCK_INTERLEAVED_V1:
+        if not isinstance(numeric_spec, InterleavedBlockFormat):
+            raise ValueError("block_interleaved_v1 requires a registered block format")
+        n, k = _shape(shape, rank=2)
+        if k % numeric_spec.group_size:
+            raise ValueError("block_interleaved_v1 requires K divisible by 32")
+        return n * (k // numeric_spec.group_size) * numeric_spec.block_bytes
     if layout_spec is ROW_SPLIT_K128_V1:
         if not isinstance(numeric_spec, QuantFormat):
             raise ValueError("row_split_k128_v1 requires a grouped quantized format")

@@ -14,6 +14,7 @@ cmake -S "$HERE" -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ \
   -DCMAKE_HIP_COMPILER="$DTK_ROOT/llvm/bin/clang++" \
   -DCMAKE_PREFIX_PATH="$DTK_ROOT" -DCMAKE_HIP_ARCHITECTURES=gfx928 \
+  -DNINFER_K100_REAL_WEIGHT_SAMPLE="${NINFER_K100_REAL_WEIGHT_SAMPLE:-}" \
   -DBUILD_TESTING=ON
 cmake --build "$BUILD" -j "${BUILD_JOBS:-24}"
 ctest --test-dir "$BUILD" --output-on-failure --no-tests=error \

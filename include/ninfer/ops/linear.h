@@ -68,7 +68,7 @@ enum class LinearPolicy : std::uint8_t {
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
- * @par Supported execution domain
+ * @par CUDA BF16 execution domain
  * Registered execution uses RowSplit Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, or Q8_G32_FP16 weights
  * with FP16 scales, block-scaled NVFP4 weights, row-scaled FP8_E4M3FN_ROW_BF16 weights, plus
  * registered contiguous BF16 problems. Each format owns a finite registry of exact physical
@@ -80,7 +80,12 @@ enum class LinearPolicy : std::uint8_t {
  * `[5120,6144]`, and `[256,5120]` at every positive T. Text and MTP packed-weight problems accept
  * every positive column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. FP32 is unsupported.
+ * represent a text token. This CUDA BF16 overload does not accept FP32 weights
+ * or activations. The separate FP32 boundary below has its own finite domain.
+ * On DTK, BF16 Linear supports contiguous BF16/FP16/FP32 weights and
+ * block-interleaved MXFP4/Q8 weights, positive N/K (block K%32=0), T in
+ * [1,65535], A16 compute and zero workspace. A8/A4 permissions do not require
+ * quantizing activations.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -131,5 +136,19 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/** FP32 boundary used by DeepSeek hyper-connections, compressors and output heads.
+ * Computes the same complete bias-free dot product as Linear, with contiguous
+ * FP32 [K,T] input and FP32 [N,T] output. Supports contiguous BF16/FP16/FP32 and
+ * block_interleaved_v1 MXFP4_G32_E8M0/Q8_G32_FP16_BLOCK matrices, any positive N/K
+ * (block formats require K%32=0), and T in [1,65535]. Inputs, output and weights
+ * must not overlap. No allocation/workspace, activation cast, or persistent state
+ * effect. The oracle independently decodes represented weights/inputs and sums
+ * each full dot product in FP64; accumulator/reduction error belongs to the
+ * numerical criterion. DTK's BF16 Linear uses these same weight formats in A16
+ * compute, with its usual BF16 input/output boundaries and 16-byte alignment.
+ * CUDA's existing BF16 Linear registry is unchanged.
+ */
+void linear_fp32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the twelve persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,13 +8,14 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly twelve persistent numeric tensor formats.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
 | Canonical name | Category | Logical width | Logical meaning |
 |---|---|---:|---|
 | `bf16` | direct floating point | 16 | bfloat16 bit encoding |
+| `fp16` | direct floating point | 16 | IEEE-754 binary16 bit encoding |
 | `fp32` | direct floating point | 32 | IEEE-754 binary32 |
 | `int32` | direct signed integer | 32 | 32-bit two's-complement integer |
 
@@ -39,6 +40,23 @@ The row-scaled floating-point weight format is:
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
+The two interleaved block formats are:
+
+| Canonical name | Group | Code domain | Scale | Bits/weight |
+|---|---:|---|---|---:|
+| `mxfp4_g32_e8m0` | 32 | E2M1, including signed zero | unsigned E8M0 | 4.25 |
+| `q8_g32_fp16_block` | 32 | signed byte `[-128,127]` | finite binary16 multiplier | 8.50 |
+
+For MXFP4 a scale word `e` in `[0,254]` means exactly `2^(e-127)`;
+`255` is invalid for finite weights. Each weight is the E2M1 value in Section 3.3
+multiplied by that scale. For Q8 block, reconstruction is the signed byte times
+the stored finite binary16 scale, which may be signed or zero. The `-128` code
+and interleaved representation distinguish it from `q8_g32_fp16`.
+Both formats require rank-two `[N,K]`, positive dimensions, and `K % 32 == 0`
+in the currently registered layout. Their reference decoder is
+`tools/artifact/codecs/block_interleaved.py`. Conversion preserves encoded blocks;
+no new floating-point quantizer is implied.
+
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
 [`src/artifact/formats.cpp`](../../src/artifact/formats.cpp). Additional formats need an explicit
@@ -60,7 +78,7 @@ identify a tensor's model role, physical byte layout, or supported consumer.
 
 A **direct scalar format** assigns one fixed-width logical word to every logical tensor coordinate.
 It defines the value of that word without a group, scale, zero point, or reconstruction step. `bf16`,
-`fp32`, and `int32` are direct scalar formats.
+`fp16`, `fp32`, and `int32` are direct scalar formats.
 
 The adjective “direct” does not require a particular physical layout or prohibit a registered
 lossless storage transformation. It means only that layout decoding recovers the original logical
@@ -76,7 +94,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+The eight quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -121,7 +139,8 @@ exactly the same direct words or logical codes and scales. The currently registe
 `contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
 `block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
 `fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+alignment rules belong to the layout registry. `block_interleaved_v1` stores the
+MXFP4 and Q8 block formats without a separate scale plane.
 
 ### 2.7 Compute profile and kernel support
 
@@ -173,6 +192,14 @@ original logical words without canonicalizing a NaN payload or changing its quie
 Whether a particular model tensor permits non-finite values is a parameter or conversion constraint, not
 a different BF16 format. A compute operation is not required to preserve a NaN payload unless its
 compute profile says so.
+
+#### `fp16`
+
+`fp16` is IEEE-754 binary16: one sign bit, five exponent bits with bias 15,
+and ten fraction bits. Its minimum positive subnormal is `2^-24`. All 65,536
+words are valid at the storage boundary, including signed zero, infinities,
+and distinct NaN payloads. The direct codec preserves words exactly; conversion
+from another dtype must be explicit.
 
 #### `fp32`
 

@@ -11,10 +11,11 @@ The storage registry contains exactly these identities:
 
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
-| `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
+| `contiguous_le_v1` | tensor layout | `bf16`, `fp16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `block_interleaved_v1` | tensor layout | `mxfp4_g32_e8m0`, `q8_g32_fp16_block` | rank 2 `[N,K]`, `K % 32 == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -60,6 +61,7 @@ Words are serialized least-significant byte first:
 | Format | Bytes per element | Stored word |
 |---|---:|---|
 | `bf16` | 2 | the exact 16-bit bfloat16 logical word, little-endian |
+| `fp16` | 2 | the exact 16-bit IEEE-754 binary16 logical word, little-endian |
 | `fp32` | 4 | the exact 32-bit IEEE-754 binary32 logical word, little-endian |
 | `int32` | 4 | the exact 32-bit two's-complement logical word, little-endian |
 
@@ -75,6 +77,19 @@ payload_bytes = elements * bytes_per_element(format)
 ```
 
 The tensor object's JSON `bytes` must equal `payload_bytes` exactly.
+
+### 2.4 `block_interleaved_v1`
+
+For `[N,K]`, each row contains `K/32` adjacent encoded blocks, with no row
+padding. MXFP4 uses 17 bytes: one unsigned E8M0 scale, followed by 16 packed
+bytes. Low nibbles represent logical elements 0 through 15; high nibbles
+represent 16 through 31. Q8 uses 34 bytes: a little-endian binary16 scale,
+then 32 signed bytes in element order. Numeric validity follows the format
+contract. Encoded size is `N * (K/32) * block_bytes` exactly.
+
+A row subview keeps the parent bytes and starts at `row * (K/32) * block_bytes`.
+Scale and code pointers alias the encoded row; their byte counts must not be
+added as disjoint planes. Runtime consumers neither repack nor requantize it.
 
 ## 3. `row_split_k128_v1`
 

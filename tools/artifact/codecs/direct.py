@@ -1,4 +1,4 @@
-"""Exact BF16, FP32, and INT32 words in contiguous little-endian layout."""
+"""Exact BF16, FP16, FP32, and INT32 words in contiguous little-endian layout."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from ._tensor_bytes import Payload, _payload_length, _payload_tensor
 
 _DIRECT_DTYPES = {
     "bf16": torch.bfloat16,
+    "fp16": torch.float16,
     "fp32": torch.float32,
     "int32": torch.int32,
 }
@@ -24,7 +25,7 @@ def encode_direct(tensor: torch.Tensor, format: str | DirectFormat) -> bytes:
 
     spec = _format(format)
     if not isinstance(spec, DirectFormat):
-        raise ValueError("direct encoding requires BF16, FP32, or I32")
+        raise ValueError("direct encoding requires BF16, FP16, FP32, or I32")
     expected_dtype = _DIRECT_DTYPES[spec.name]
     if tensor.dtype != expected_dtype:
         raise TypeError(
@@ -51,7 +52,7 @@ def decode_direct(
 
     spec = _format(format)
     if not isinstance(spec, DirectFormat):
-        raise ValueError("direct decoding requires BF16, FP32, or I32")
+        raise ValueError("direct decoding requires BF16, FP16, FP32, or I32")
     dims = _shape(shape)
     if len(dims) > 16:
         raise ValueError("contiguous_le_v1 supports rank 0 through 16")
