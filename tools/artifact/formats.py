@@ -45,11 +45,12 @@ class Fp8RowFormat:
 
 @dataclass(frozen=True, slots=True)
 class InterleavedBlockFormat:
-    """32 logical values with their scale in each persistent encoded block."""
+    """A fixed group of logical values and scale data in each encoded block."""
 
     name: str
     block_bytes: int
     group_size: int = 32
+    base_scale_offset: int = 0
 
 
 NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | InterleavedBlockFormat
@@ -68,6 +69,13 @@ NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 MXFP4_G32_E8M0 = InterleavedBlockFormat("mxfp4_g32_e8m0", 17)
 Q8_G32_FP16_BLOCK = InterleavedBlockFormat("q8_g32_fp16_block", 34)
+BLOCK256_FORMATS = MappingProxyType({item.name:item for item in (
+    InterleavedBlockFormat("iq3_s_g256_block",110,256),
+    InterleavedBlockFormat("iq4_xs_g256_block",136,256),
+    InterleavedBlockFormat("q3_k_g256_block",110,256,108),
+    InterleavedBlockFormat("q4_k_g256_block",144,256),
+    InterleavedBlockFormat("q6_k_g256_block",210,256,208),
+)})
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP16, FP32, INT32)})
@@ -78,7 +86,8 @@ NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
 NUMERIC_FORMATS = MappingProxyType(
     {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS,
-     MXFP4_G32_E8M0.name: MXFP4_G32_E8M0, Q8_G32_FP16_BLOCK.name: Q8_G32_FP16_BLOCK}
+     MXFP4_G32_E8M0.name: MXFP4_G32_E8M0, Q8_G32_FP16_BLOCK.name: Q8_G32_FP16_BLOCK,
+     **BLOCK256_FORMATS}
 )
 
 

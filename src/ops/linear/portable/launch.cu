@@ -26,6 +26,8 @@ __device__ std::uint16_t encode_bf16(float value) {
     }
     return static_cast<std::uint16_t>((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
+#include "ops/linear/portable/block256.cuh"
+
 template<QType Format>
 __device__ float load_weight(const void* data, std::int64_t row, std::int32_t column, int k) {
     const auto index = row * k + column;
@@ -48,6 +50,13 @@ __device__ float load_weight(const void* data, std::int64_t row, std::int32_t co
         const auto scale = static_cast<std::uint16_t>(block[0] | (static_cast<unsigned>(block[1]) << 8));
         const auto code = static_cast<const signed char*>(static_cast<const void*>(block + 2))[column % 32];
         return decode_half(scale) * static_cast<float>(code);
+    }
+    if constexpr(Format==QType::IQ3_S_G256_BLOCK||Format==QType::IQ4_XS_G256_BLOCK||
+                 Format==QType::Q3_K_G256_BLOCK||Format==QType::Q4_K_G256_BLOCK||Format==QType::Q6_K_G256_BLOCK) {
+        constexpr int bytes=Format==QType::IQ4_XS_G256_BLOCK?136:Format==QType::Q4_K_G256_BLOCK?144:
+                            Format==QType::Q6_K_G256_BLOCK?210:110;
+        const auto* block=static_cast<const unsigned char*>(data)+(row*(k/256)+column/256)*bytes;
+        return decode_block256<Format>(block,column%256);
     }
     return 0.0f; // unreachable for the finite instantiation set below
 }
@@ -95,6 +104,10 @@ void validate_portable_linear_weight(QType type, std::int32_t n, std::int32_t k)
     case QType::MXFP4_G32_E8M0: case QType::Q8_G32_FP16_BLOCK:
         if (k % 32 == 0) { return; }
         throw std::invalid_argument("linear: block format requires K%32=0");
+    case QType::IQ3_S_G256_BLOCK:case QType::IQ4_XS_G256_BLOCK:
+    case QType::Q3_K_G256_BLOCK:case QType::Q4_K_G256_BLOCK:case QType::Q6_K_G256_BLOCK:
+        if(k%256==0)return;
+        throw std::invalid_argument("linear: block format requires K%256=0");
     default: throw std::invalid_argument("linear: format has no portable projection implementation");
     }
 }
@@ -104,7 +117,7 @@ void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaS
         x.ne[1] > 65535 || x.ne[1] <= 0) {
         throw std::invalid_argument("linear: invalid data, dtype, or token grid extent");
     }
-    const bool block = w.qtype == QType::MXFP4_G32_E8M0 || w.qtype == QType::Q8_G32_FP16_BLOCK;
+    const bool block = interleaved_block_geometry(w.qtype).values!=0;
     if (w.layout != (block ? QuantLayout::BlockInterleaved : QuantLayout::Contiguous)) {
         throw std::invalid_argument("linear: persistent format/layout mismatch");
     }
@@ -114,6 +127,11 @@ void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaS
     case QType::BF16: launch<QType::BF16>(x,w,out,stream); break;
     case QType::MXFP4_G32_E8M0: launch<QType::MXFP4_G32_E8M0>(x,w,out,stream); break;
     case QType::Q8_G32_FP16_BLOCK: launch<QType::Q8_G32_FP16_BLOCK>(x,w,out,stream); break;
+    case QType::IQ3_S_G256_BLOCK:launch<QType::IQ3_S_G256_BLOCK>(x,w,out,stream);break;
+    case QType::IQ4_XS_G256_BLOCK:launch<QType::IQ4_XS_G256_BLOCK>(x,w,out,stream);break;
+    case QType::Q3_K_G256_BLOCK:launch<QType::Q3_K_G256_BLOCK>(x,w,out,stream);break;
+    case QType::Q4_K_G256_BLOCK:launch<QType::Q4_K_G256_BLOCK>(x,w,out,stream);break;
+    case QType::Q6_K_G256_BLOCK:launch<QType::Q6_K_G256_BLOCK>(x,w,out,stream);break;
     default: throw std::logic_error("validated projection type was not dispatched");
     }
     CUDA_CHECK(cudaGetLastError());

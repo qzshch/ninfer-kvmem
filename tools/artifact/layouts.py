@@ -16,6 +16,7 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    BLOCK256_FORMATS,
     InterleavedBlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
@@ -80,7 +81,7 @@ class RowScaleGeometry:
 
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp16", "fp32", "int32")))
 BLOCK_INTERLEAVED_V1 = Layout("block_interleaved_v1", 256,
-    frozenset(("mxfp4_g32_e8m0", "q8_g32_fp16_block")))
+    frozenset(("mxfp4_g32_e8m0", "q8_g32_fp16_block", *BLOCK256_FORMATS)))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
@@ -273,7 +274,7 @@ def encoded_size(
             raise ValueError("block_interleaved_v1 requires a registered block format")
         n, k = _shape(shape, rank=2)
         if k % numeric_spec.group_size:
-            raise ValueError("block_interleaved_v1 requires K divisible by 32")
+            raise ValueError("block_interleaved_v1 requires complete K-axis blocks")
         return n * (k // numeric_spec.group_size) * numeric_spec.block_bytes
     if layout_spec is ROW_SPLIT_K128_V1:
         if not isinstance(numeric_spec, QuantFormat):

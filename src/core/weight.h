@@ -19,7 +19,30 @@ enum class QType : std::uint16_t {
     FP16                = 9,
     MXFP4_G32_E8M0     = 10,
     Q8_G32_FP16_BLOCK  = 11,
+    IQ3_S_G256_BLOCK   = 12,
+    IQ4_XS_G256_BLOCK  = 13,
+    Q3_K_G256_BLOCK    = 14,
+    Q4_K_G256_BLOCK    = 15,
+    Q6_K_G256_BLOCK    = 16,
 };
+
+struct InterleavedBlockGeometry {
+    std::uint32_t values=0, bytes=0, base_scale_offset=0;
+    DType base_scale_dtype=DType::FP16;
+};
+
+inline constexpr InterleavedBlockGeometry interleaved_block_geometry(QType type) {
+    switch(type) {
+    case QType::MXFP4_G32_E8M0:return {32,17,0,DType::U8};
+    case QType::Q8_G32_FP16_BLOCK:return {32,34,0,DType::FP16};
+    case QType::IQ3_S_G256_BLOCK:return {256,110,0,DType::FP16};
+    case QType::IQ4_XS_G256_BLOCK:return {256,136,0,DType::FP16};
+    case QType::Q3_K_G256_BLOCK:return {256,110,108,DType::FP16};
+    case QType::Q4_K_G256_BLOCK:return {256,144,0,DType::FP16};
+    case QType::Q6_K_G256_BLOCK:return {256,210,208,DType::FP16};
+    default:return {};
+    }
+}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,

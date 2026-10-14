@@ -20,6 +20,11 @@ constexpr std::array kFormats = {
     std::pair{QType::FP16, std::string_view{"fp16"}},
     std::pair{QType::MXFP4_G32_E8M0, std::string_view{"mxfp4_g32_e8m0"}},
     std::pair{QType::Q8_G32_FP16_BLOCK, std::string_view{"q8_g32_fp16_block"}},
+    std::pair{QType::IQ3_S_G256_BLOCK, std::string_view{"iq3_s_g256_block"}},
+    std::pair{QType::IQ4_XS_G256_BLOCK, std::string_view{"iq4_xs_g256_block"}},
+    std::pair{QType::Q3_K_G256_BLOCK, std::string_view{"q3_k_g256_block"}},
+    std::pair{QType::Q4_K_G256_BLOCK, std::string_view{"q4_k_g256_block"}},
+    std::pair{QType::Q6_K_G256_BLOCK, std::string_view{"q6_k_g256_block"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},

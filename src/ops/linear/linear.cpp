@@ -112,6 +112,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP16:
     case QType::MXFP4_G32_E8M0:
     case QType::Q8_G32_FP16_BLOCK:
+    case QType::IQ3_S_G256_BLOCK:case QType::IQ4_XS_G256_BLOCK:
+    case QType::Q3_K_G256_BLOCK:case QType::Q4_K_G256_BLOCK:case QType::Q6_K_G256_BLOCK:
         break;
     }
     throw std::invalid_argument("linear: unsupported weight qtype");
@@ -165,6 +167,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP16:
     case QType::MXFP4_G32_E8M0:
     case QType::Q8_G32_FP16_BLOCK:
+    case QType::IQ3_S_G256_BLOCK:case QType::IQ4_XS_G256_BLOCK:
+    case QType::Q3_K_G256_BLOCK:case QType::Q4_K_G256_BLOCK:case QType::Q6_K_G256_BLOCK:
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");

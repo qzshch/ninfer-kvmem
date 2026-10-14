@@ -3,6 +3,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp32.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/portable/launch.cu"
 )
+target_include_directories(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../../third_party")
 
 include("${CMAKE_CURRENT_LIST_DIR}/bf16/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/fp8/sources.cmake")

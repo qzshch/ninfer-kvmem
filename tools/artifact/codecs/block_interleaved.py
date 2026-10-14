@@ -17,6 +17,9 @@ def decode_block(payload: bytes, format_name: str) -> tuple[float, ...]:
     spec = get_format(format_name)
     if not isinstance(spec, InterleavedBlockFormat) or len(payload) != spec.block_bytes:
         raise ValueError("block length/format mismatch")
+    if spec.group_size==256:
+        from .block256 import decode_block256
+        return decode_block256(payload,format_name)
     if format_name == "mxfp4_g32_e8m0":
         if payload[0] == 255:
             raise ValueError("MXFP4 E8M0 NaN scale is not a finite weight block")

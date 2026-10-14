@@ -99,12 +99,12 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto k       = shape[1];
     out.padded_columns = k;
     if (layout == QuantLayout::BlockInterleaved) {
-        if ((format != QType::MXFP4_G32_E8M0 && format != QType::Q8_G32_FP16_BLOCK) || k % 32) {
-            throw std::invalid_argument("block_interleaved_v1 requires MXFP4/Q8 blocks and K%32=0");
+        const auto block = interleaved_block_geometry(format);
+        if (!block.values || k % block.values) {
+            throw std::invalid_argument("block_interleaved_v1 requires a registered format and complete K-axis blocks");
         }
-        out.group_size = 32;
-        const auto block_bytes = format == QType::MXFP4_G32_E8M0 ? 17 : 34;
-        out.code_bytes_per_row = mul(k / 32, block_bytes);
+        out.group_size = block.values;
+        out.code_bytes_per_row = mul(k / block.values, block.bytes);
         // Scale words are interleaved with codes, not a second disjoint plane.
         out.scale_bytes_per_row = out.code_bytes_per_row;
         out.code_bytes = out.bytes = mul(n, out.code_bytes_per_row);
@@ -211,8 +211,8 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
     }
     if (geometry.layout == QuantLayout::BlockInterleaved) {
-        const auto block_bytes = geometry.format == QType::MXFP4_G32_E8M0 ? 17 : 34;
-        return row * geometry.code_bytes_per_row + group * block_bytes;
+        const auto block = interleaved_block_geometry(geometry.format);
+        return row * geometry.code_bytes_per_row + group * block.bytes + block.base_scale_offset;
     }
     return geometry.scale_offset + row * geometry.scale_bytes_per_row + group * 2;
 }
@@ -232,7 +232,9 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     out.high_row_bytes  = g.high_bytes_per_row;
     out.scale_row_bytes = g.scale_bytes_per_row;
     out.codes           = parent.data + out.row_begin * out.code_row_bytes;
-    if (g.layout == QuantLayout::BlockInterleaved) { out.scales = out.codes; }
+    if (g.layout == QuantLayout::BlockInterleaved) {
+        out.scales = out.codes + interleaved_block_geometry(g.format).base_scale_offset;
+    }
     if (g.high_bytes) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
@@ -310,10 +312,11 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
     } else if (g.layout == QuantLayout::BlockInterleaved) {
-        out.scale_dtype = g.format == QType::MXFP4_G32_E8M0 ? DType::U8 : DType::FP16;
-        out.scale_ne[0] = dimension(g.shape[1] / 32);
+        const auto block=interleaved_block_geometry(g.format);
+        out.scale_dtype = block.base_scale_dtype;
+        out.scale_ne[0] = dimension(g.shape[1] / block.values);
         out.scale_ne[1] = out.n;
-        out.scale_nb[0] = g.format == QType::MXFP4_G32_E8M0 ? 17 : 34;
+        out.scale_nb[0] = block.bytes;
         out.scale_nb[1] = static_cast<std::int64_t>(g.code_bytes_per_row);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     }

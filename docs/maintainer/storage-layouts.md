@@ -15,7 +15,7 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
-| `block_interleaved_v1` | tensor layout | `mxfp4_g32_e8m0`, `q8_g32_fp16_block` | rank 2 `[N,K]`, `K % 32 == 0` | 256 bytes |
+| `block_interleaved_v1` | tensor layout | seven preserved block formats from the numeric registry | rank 2 `[N,K]`, `K % group_size == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -80,14 +80,18 @@ The tensor object's JSON `bytes` must equal `payload_bytes` exactly.
 
 ### 2.4 `block_interleaved_v1`
 
-For `[N,K]`, each row contains `K/32` adjacent encoded blocks, with no row
+For `[N,K]`, each row contains `K/G` adjacent encoded blocks, with no row
 padding. MXFP4 uses 17 bytes: one unsigned E8M0 scale, followed by 16 packed
 bytes. Low nibbles represent logical elements 0 through 15; high nibbles
 represent 16 through 31. Q8 uses 34 bytes: a little-endian binary16 scale,
 then 32 signed bytes in element order. Numeric validity follows the format
-contract. Encoded size is `N * (K/32) * block_bytes` exactly.
+contract. For these two formats G=32. The five 256-value block formats use G=256;
+their block sizes are IQ3_S=110, IQ4_XS=136, Q3_K=110, Q4_K=144 and Q6_K=210
+bytes. Their binary16 base multipliers begin at offsets 0, 0, 108, 0 and 208,
+respectively. The scalar codec in the numeric reference defines each internal
+plane and subscale. Encoded size is `N * (K/G) * block_bytes` exactly.
 
-A row subview keeps the parent bytes and starts at `row * (K/32) * block_bytes`.
+A row subview keeps the parent bytes and starts at `row * (K/G) * block_bytes`.
 Scale and code pointers alias the encoded row; their byte counts must not be
 added as disjoint planes. Runtime consumers neither repack nor requantize it.
 

@@ -49,6 +49,7 @@ add_library(ninfer_k100_projection STATIC
   "${NINFER_ROOT}/src/ops/linear/fp32.cpp"
   "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
 target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
+target_include_directories(ninfer_k100_projection PRIVATE "${NINFER_ROOT}/third_party")
 
 add_library(ninfer_k100_kda STATIC
   "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp"
@@ -97,6 +98,23 @@ if(BUILD_TESTING)
   foreach(device RANGE 0 2)
     add_test(NAME k100_kda_device${device} COMMAND k100_kda_test)
     set_tests_properties(k100_kda_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
+  find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+  set(block_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/block-fixtures")
+  add_custom_command(OUTPUT "${block_fixture_dir}/stamp"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/block_fixtures.py" "${block_fixture_dir}"
+    DEPENDS tests/block_fixtures.py "${NINFER_ROOT}/tools/artifact/codecs/block256.py"
+      "${NINFER_ROOT}/third_party/ggml-blocks/iq3s_grid.inc")
+  add_custom_target(k100_block_fixtures DEPENDS "${block_fixture_dir}/stamp")
+  add_executable(k100_block_projection_test tests/block_projection.cpp "${NINFER_ROOT}/src/artifact/formats.cpp")
+  target_include_directories(k100_block_projection_test PRIVATE "${NINFER_ROOT}/third_party")
+  target_link_libraries(k100_block_projection_test PRIVATE ninfer_k100_projection)
+  add_dependencies(k100_block_projection_test k100_block_fixtures)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_block_projection_device${device} COMMAND k100_block_projection_test "${block_fixture_dir}")
+    set_tests_properties(k100_block_projection_device${device} PROPERTIES
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()

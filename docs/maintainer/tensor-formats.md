@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the twelve persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the seventeen persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly twelve persistent numeric tensor formats.
+NInfer has exactly seventeen persistent numeric tensor formats.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -56,6 +56,26 @@ Both formats require rank-two `[N,K]`, positive dimensions, and `K % 32 == 0`
 in the currently registered layout. Their reference decoder is
 `tools/artifact/codecs/block_interleaved.py`. Conversion preserves encoded blocks;
 no new floating-point quantizer is implied.
+
+Five additional preserved block formats use 256 values per block:
+
+| Name | Block bytes | Reconstruction |
+|---|---:|---|
+| `iq3_s_g256_block` | 110 | binary16 multiplier, eight odd 4-bit subscales, 512-entry magnitude grid and explicit signs |
+| `iq4_xs_g256_block` | 136 | binary16 multiplier, eight signed 6-bit subscales, nonuniform 16-entry codebook |
+| `q3_k_g256_block` | 110 | binary16 multiplier, sixteen signed 6-bit subscales, signed 3-bit codes |
+| `q4_k_g256_block` | 144 | binary16 scale/minimum multipliers, eight unsigned 6-bit scale/minimum pairs, unsigned 4-bit codes |
+| `q6_k_g256_block` | 210 | binary16 multiplier, sixteen signed 8-bit subscales, signed 6-bit codes |
+
+The exact index/plane reconstruction is defined by the independent scalar codec
+[`block256.py`](../../tools/artifact/codecs/block256.py), with the immutable IQ3_S
+grid and its pinned MIT source retained in `third_party/ggml-blocks`. IQ4's codebook
+is `[-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113]`.
+The Q4 reconstruction is `d * scale * code - dmin * minimum`; the other schemes
+multiply their decoded signed value by the decoded block/subscale. Multipliers
+must be finite; signed and zero multipliers are legal. Rank-two positive `[N,K]`
+requires `K % 256 == 0`. These formats preserve upstream words without introducing
+a new source quantizer. Layout registration does not imply support by every backend.
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -140,7 +160,7 @@ exactly the same direct words or logical codes and scales. The currently registe
 `block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
 `fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
 alignment rules belong to the layout registry. `block_interleaved_v1` stores the
-MXFP4 and Q8 block formats without a separate scale plane.
+registered interleaved block formats without a separate scale plane.
 
 ### 2.7 Compute profile and kernel support
 

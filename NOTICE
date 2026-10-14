@@ -27,6 +27,11 @@ separate MIT-licensed components as Apache-only.
 XGrammar
 Copyright (c) 2024 by XGrammar Contributors
 License and notice: third_party/xgrammar/LICENSE, third_party/xgrammar/NOTICE
+
+IQ3_S reconstruction grid (data only)
+Source: ggml-org/llama.cpp, revision 62df1815bc053066761f4eac58e288f23778e164
+Copyright (c) 2023-2026 The ggml authors
+License: MIT, retained at third_party/ggml-blocks/LICENSE
 The original notice is retained with its source distribution.
 
 Other bundled dependencies retain their own copyright and license files.
