@@ -37,6 +37,12 @@ target_include_directories(ninfer_k100_physical_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include" "${NINFER_ROOT}/src" "${NINFER_ROOT}/include")
 target_link_libraries(ninfer_k100_physical_core PUBLIC hip::host Threads::Threads)
 
+# Reuse the public Op wrapper and substitute a DTK mathematical implementation.
+add_library(ninfer_k100_norm STATIC
+  "${NINFER_ROOT}/src/ops/wrapper/rmsnorm.cpp"
+  "${NINFER_ROOT}/src/ops/launcher/rmsnorm_hip.hip")
+target_link_libraries(ninfer_k100_norm PUBLIC ninfer_k100_physical_core)
+
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 
 if(BUILD_TESTING)
@@ -55,4 +61,13 @@ if(BUILD_TESTING)
   target_link_libraries(k100_peer_transfer_test PRIVATE ninfer_k100_physical_core)
   add_test(NAME k100_peer_transfer COMMAND k100_peer_transfer_test)
   set_tests_properties(k100_peer_transfer PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+  add_executable(k100_rmsnorm_test tests/rmsnorm.cpp)
+  target_link_libraries(k100_rmsnorm_test PRIVATE ninfer_k100_norm)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_rmsnorm_device${device} COMMAND k100_rmsnorm_test)
+    set_tests_properties(k100_rmsnorm_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:"
+      RUN_SERIAL TRUE TIMEOUT 120)
+  endforeach()
 endif()
