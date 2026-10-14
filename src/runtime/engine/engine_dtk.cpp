@@ -310,6 +310,8 @@ public:
         result.timings.kvmem.enabled = options.kvmem_window_pages != 0;
         result.timings.kvmem.selection_calls =
             program->stats().kvmem_selections - before.kvmem_selections;
+        result.timings.kvmem.selection_restricted_calls =
+            program->stats().kvmem_restricted_steps - before.kvmem_restricted_steps;
         return result;
     }
 

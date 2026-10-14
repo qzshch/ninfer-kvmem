@@ -184,10 +184,13 @@ struct KvmemDiagnostics {
     std::uint64_t query_capture_submit_wait_ns = 0;
     std::uint64_t query_capture_host_wall_ns   = 0;
     std::uint64_t selection_calls              = 0;
-    std::uint64_t scored_blocks                = 0;
-    std::uint64_t selection_host_wall_ns       = 0;
-    std::uint64_t replay_tokens                = 0;
-    std::uint64_t replay_units                 = 0;
+    // Selections that exclude at least one available history page. This also
+    // applies to resident sparse attention; it does not imply Host KV placement.
+    std::uint64_t selection_restricted_calls = 0;
+    std::uint64_t scored_blocks              = 0;
+    std::uint64_t selection_host_wall_ns     = 0;
+    std::uint64_t replay_tokens              = 0;
+    std::uint64_t replay_units               = 0;
     // Entire scheduler replay step, including nested replay placement and existing waits.
     std::uint64_t replay_step_host_wall_ns        = 0;
     std::uint64_t replay_execution_host_ns        = 0;

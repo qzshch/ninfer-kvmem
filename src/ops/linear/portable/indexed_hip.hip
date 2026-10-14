@@ -26,6 +26,7 @@ __global__ void indexed_kernel(const float* x, const void* w, const std::int32_t
         __syncthreads();
     }
     if (!lane) out[(static_cast<long long>(t) * choices + c) * n + row] = partial[0];
+    return;
 }
 
 template <QType F>
@@ -34,6 +35,7 @@ __global__ void embedding_kernel(const void* w, const std::int32_t* ids, float* 
     if (col < k)
         out[static_cast<long long>(t) * k + col] =
             decode_bf16(encode_bf16(load_weight<F>(w, ids[t], col, k)));
+    return;
 }
 
 template <QType F>
@@ -44,6 +46,7 @@ void launch(const float* x, const Weight& w, const std::int32_t* ids, float* out
                                                                  choices, shared);
     else
         embedding_kernel<F><<<dim3((w.k + 255) / 256, t), 256, 0, s>>>(w.qdata, ids, out, w.k);
+    return;
 }
 
 void dispatch(const float* x, const Weight& w, const std::int32_t* ids, float* o, int n, int c,
@@ -74,6 +77,7 @@ void dispatch(const float* x, const Weight& w, const std::int32_t* ids, float* o
     }
 #undef DISPATCH
     CUDA_CHECK(cudaGetLastError());
+    return;
 }
 } // namespace
 
@@ -82,10 +86,12 @@ void indexed_linear_fp32(const float* x, const Weight& w, const std::int32_t* id
     if (!x || x == o || n < 1 || (ids == nullptr && w.n / n < c))
         throw std::invalid_argument("indexed_linear: input or bank coverage");
     dispatch(x, w, ids, o, n, c, t, shared, s);
+    return;
 }
 
 void embedding_fp32(const Weight& w, const std::int32_t* ids, float* o, int t, cudaStream_t s) {
     if (!ids) throw std::invalid_argument("embedding: missing device ids");
     dispatch(nullptr, w, ids, o, w.n, 1, t, true, s);
+    return;
 }
 } // namespace ninfer::ops

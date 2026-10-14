@@ -85,11 +85,18 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
         options.speculative.backend      = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens = 7;
     }
-    options.startup_observer.callback = [](const ninfer::StartupEvent& event) {
+    options.startup_observer.callback = [last = std::uint64_t{}](
+                                            const ninfer::StartupEvent& event) mutable {
+        if (event.status == ninfer::StartupStatus::Begin) last = 0;
         if (event.status == ninfer::StartupStatus::Begin ||
-            event.status == ninfer::StartupStatus::Complete)
+            event.status == ninfer::StartupStatus::Complete ||
+            (event.status == ninfer::StartupStatus::Progress &&
+             event.current >= last + (4ULL << 30))) {
+            last = event.current;
             std::cerr << "startup phase=" << static_cast<int>(event.phase)
-                      << " status=" << static_cast<int>(event.status) << '\n';
+                      << " status=" << static_cast<int>(event.status) << " bytes=" << event.current
+                      << '/' << event.total << " seconds=" << event.elapsed_ns / 1e9 << '\n';
+        }
     };
     ninfer::Engine engine(options);
     report["devices_after_load"] = devices();
@@ -138,7 +145,8 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
         {"drafted_tokens", result.speculative.drafted_tokens},
         {"accepted_draft_tokens", result.speculative.accepted_tokens},
         {"accepted_per_position", result.speculative.accepted_per_position},
-        {"kvmem_selection_calls", result.timings.kvmem.selection_calls}};
+        {"kvmem_selection_calls", result.timings.kvmem.selection_calls},
+        {"kvmem_restricted_calls", result.timings.kvmem.selection_restricted_calls}};
     auto memory                  = engine.memory_summary();
     report["native_allocations"] = {{"encoded_weights", memory.weights.capacity_bytes},
                                     {"state_kv_features_snapshots", memory.sequence.capacity_bytes},
@@ -199,6 +207,7 @@ int main(int argc, char** argv) {
             window < 0 || (!draft && verify))
             throw std::invalid_argument("invalid or missing native inference arguments");
         Json result;
+        std::string verification_failure;
         if (verify) {
             auto ordinary    = run(artifact, input, kind, context, output, window, false);
             auto speculative = run(artifact, input, kind, context, output, window, true);
@@ -208,10 +217,10 @@ int main(int argc, char** argv) {
                       {"dflash2", std::move(speculative)},
                       {"greedy_equal", equal}};
             if (!equal)
-                throw std::runtime_error(
-                    "native DFlash2 output differs from native ordinary generation");
-            if (result["dflash2"]["result"]["accepted_draft_tokens"].get<std::uint64_t>() == 0)
-                throw std::runtime_error("DFlash2 verification produced no positive acceptance");
+                verification_failure =
+                    "native DFlash2 output differs from native ordinary generation";
+            else if (result["dflash2"]["result"]["accepted_draft_tokens"].get<std::uint64_t>() == 0)
+                verification_failure = "DFlash2 verification produced no positive acceptance";
         } else
             result = run(artifact, input, kind, context, output, window, draft);
         if (!report_path.empty()) {
@@ -220,6 +229,7 @@ int main(int argc, char** argv) {
             f << result.dump(2) << '\n';
         }
         std::cout << result.dump(2) << '\n';
+        if (!verification_failure.empty()) throw std::runtime_error(verification_failure);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

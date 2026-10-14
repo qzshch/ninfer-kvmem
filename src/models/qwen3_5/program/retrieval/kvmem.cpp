@@ -649,6 +649,7 @@ void ProgramImpl::apply_kvmem_retrieval_placement(SequenceState& sequence) {
         pages, (sequence.text_kv_valid + kPagedKVPageSize - 1U) / kPagedKVPageSize, mapped);
     auto& diagnostics = requests[sequence.lane].timings.kvmem;
     ++diagnostics.selection_calls;
+    if (pages.size() < mapped) ++diagnostics.selection_restricted_calls;
     diagnostics.scored_blocks += selection.scored_blocks;
     diagnostics.selection_host_wall_ns += kvmem_elapsed_ns(selection_begin);
     const auto placement = text_kv_addresses->apply_device_placement(
