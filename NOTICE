@@ -33,5 +33,11 @@ Other bundled dependencies retain their own copyright and license files.
 See docs/upstream-and-licenses.md for the source and license locations.
 Model and companion weights are separately distributed under their own terms.
 
+Hygon K100 diagnostic patch
+ports/hygon-k100/external/dtk-gfx928.patch modifies mxxm-t/mx-llama.cpp
+at 71a0624fb36aaaa2df24ccf428236493c813a441. Original llama.cpp/GGML
+authorship and MIT terms are retained in ports/hygon-k100/external/LICENSE.MIT.
+The diagnostic backend is separate from the Apache-2.0 NInfer implementation.
+
 This file records attribution and does not modify any license terms or imply
 endorsement by upstream projects.

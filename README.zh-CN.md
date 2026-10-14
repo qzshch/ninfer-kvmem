@@ -1,5 +1,9 @@
 # ninfer-kvmem
 
+> **`feat/hygon-k100` 实验分支：** 正在移植海光 DTK/K100 多卡平台。
+> [目标、参考仓库与实测状态](ports/hygon-k100/README.md)。
+> 下文 CUDA 日用版的测试结果不代表 K100 已完成推理适配。
+
 [English](README.md) | 简体中文
 
 **面向单卡长上下文、多请求与工具调用的 NInfer + KVMem 集成构筑，由 [qzshch](https://github.com/qzshch) 维护。**

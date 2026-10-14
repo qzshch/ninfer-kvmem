@@ -1,4 +1,3 @@
-# Preserve repository-pinned upstream sources byte-for-byte; NInfer-owned files retain Git's
-# default whitespace checks.
-/third_party/spdlog/include/** -whitespace
-/third_party/spdlog/src/** -whitespace
+/ports/hygon-k100/** text eol=lf
+# A unified diff's blank context line contains its mandatory leading space.
+/ports/hygon-k100/external/*.patch whitespace=-blank-at-eol

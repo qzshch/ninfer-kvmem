@@ -1,5 +1,9 @@
 # ninfer-kvmem
 
+> **`feat/hygon-k100` experimental branch:** Hygon DTK/K100 multi-device port in
+> progress. See [scope, references and measured status](ports/hygon-k100/README.md).
+> The CUDA qualification below is not a K100 inference result.
+
 English | [简体中文](README.zh-CN.md)
 
 **A NInfer + KVMem integration for single-GPU long-context inference, concurrent requests and agent workflows, maintained by [qzshch](https://github.com/qzshch).**

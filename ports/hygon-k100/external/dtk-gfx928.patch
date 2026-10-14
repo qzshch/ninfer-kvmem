@@ -1,0 +1,99 @@
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -51,7 +51,7 @@
+     find_package(rccl REQUIRED)
+ endif()
+ 
+-if (${hip_VERSION} VERSION_LESS 6.1)
++if (${hip_VERSION} VERSION_LESS 5.3) # DTK version numbering
+     message(FATAL_ERROR "At least ROCM/HIP V6.1 is required")
+ endif()
+ 
+--- a/ggml/src/ggml-cuda/softmax.cu
++++ b/ggml/src/ggml-cuda/softmax.cu
+@@ -2,9 +2,7 @@
+ #include "ggml.h"
+ #include "softmax.cuh"
+ 
+-#ifdef GGML_USE_HIP
+-#include <hip/hip_cooperative_groups.h>
+-#else
++#ifndef GGML_USE_HIP // SCNET_DTK_SOFTMAX_FALLBACK
+ #include <cooperative_groups.h>
+ #include <cooperative_groups/reduce.h>
+ #endif // GGML_USE_HIP
+@@ -143,6 +141,7 @@
+ }
+ 
+ // TODO: Template to allow keeping ncols in registers if they fit
++#ifndef GGML_USE_HIP
+ static __device__ void soft_max_f32_parallelize_cols_single_row(const float * __restrict__ x,
+                                                                 float * __restrict__ dst,
+                                                                 float * __restrict__ tmp_maxs,
+@@ -248,6 +247,8 @@
+         col += step_size * n_elem_per_thread;
+     }
+ }
++#endif
++
+ 
+ #ifdef __clang__
+ #pragma clang diagnostic pop
+@@ -305,6 +306,7 @@
+     soft_max_f32<true, 0, 0><<<block_nums, block_dims, nbytes_shared, stream>>>(x, mask, sinks, dst, p);
+ }
+ 
++#ifndef GGML_USE_HIP
+ __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_parallelize_cols(const float * __restrict__ x,
+                                                      float * __restrict__ dst,
+                                                      float * __restrict__ tmp_maxs,
+@@ -323,6 +325,8 @@
+                                                  tmp_sums, shared_vals[0], shared_vals[1], p);
+     }
+ }
++#endif
++
+ 
+ template <typename T>
+ static void soft_max_f32_cuda(const float *                                x,
+@@ -352,6 +356,7 @@
+         // Parallelize across SMs for top-p/dist-sampling
+         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
+         // Can be adapted further for lower-SM-count GPUs, though keeping data in registers should be implemented first as that is the optimal solution.
++#ifndef GGML_USE_HIP
+         if (ggml_cuda_info().devices[id].supports_cooperative_launch &&
+             ncols_x / (params.ne01 * params.ne02 * params.ne03) > 8192 && mask == nullptr && sinks == nullptr &&
+             params.scale == 1.0f && params.max_bias == 0.0f) {
+@@ -363,7 +368,9 @@
+             CUDA_CHECK(cudaLaunchCooperativeKernel((void *) soft_max_f32_parallelize_cols,
+                                                    dim3(ggml_cuda_info().devices[id].nsm, 1, 1),
+                                                    dim3(WARP_SIZE * 8, 1, 1), kernel_args, 0, stream));
+-        } else {
++        } else
++#endif
++        {
+             const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
+             soft_max_f32<false, 0, 0>
+                 <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params);
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -202,7 +202,7 @@
+ #define CDNA3
+ #endif // defined(__gfx942__)
+ 
+-#if defined(__gfx90a__)
++#if defined(__gfx90a__) || defined(__gfx928__) // SCNET_DTK_GFX928_ARCH
+ #define CDNA2
+ #endif // defined(__gfx90a__)
+ 
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10957,6 +10957,8 @@
+ 
+     // gpt-oss issue with Vulkan mmq_id
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
++    // SCNET_MXFP4_DECODE_PROBE: exercise the single-token routed-expert path.
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 1, 2880));
+     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
+     // and 1024 at the LLAMA_MAX_EXPERTS limit
+     for (int n : {1, 5, 64, 300}) {
