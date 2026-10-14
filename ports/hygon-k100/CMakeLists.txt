@@ -56,6 +56,9 @@ add_library(ninfer_k100_kda STATIC
   "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/recurrent_hip.hip")
 target_link_libraries(ninfer_k100_kda PUBLIC ninfer_k100_physical_core)
 
+add_library(ninfer_k100_hyper_connection STATIC "${NINFER_ROOT}/src/ops/hyper_connection/launch_hip.hip")
+target_link_libraries(ninfer_k100_hyper_connection PUBLIC ninfer_k100_physical_core)
+
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 
 if(BUILD_TESTING)
@@ -102,6 +105,14 @@ if(BUILD_TESTING)
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
   find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+  add_executable(k100_hyper_connection_test tests/hyper_connection.cpp)
+  target_link_libraries(k100_hyper_connection_test PRIVATE ninfer_k100_hyper_connection)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_hyper_connection_device${device} COMMAND k100_hyper_connection_test)
+    set_tests_properties(k100_hyper_connection_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
   set(block_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/block-fixtures")
   add_custom_command(OUTPUT "${block_fixture_dir}/stamp"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/block_fixtures.py" "${block_fixture_dir}"
