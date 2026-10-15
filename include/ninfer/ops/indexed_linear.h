@@ -36,6 +36,22 @@ void indexed_linear_grouped_fp32(const float* x, const Weight& bank, const std::
 void indexed_linear_grouped(const Tensor& input, const Weight& bank, const std::int32_t* ids,
                              Tensor& output, int rows, int choices, int tokens, bool shared_input,
                              int bank_begin, WorkspaceArena& workspace, cudaStream_t stream);
+// Complete owned-bank SwiGLU projection chain. input [K,T], gate/up weights
+// [banks*F,K], down weights [banks*N,F], ids [T,choices], output [N,T*choices].
+// For each owned assignment: g=BF16(Wgate*x), u=BF16(Wup*x),
+// a=BF16(SiLU(clamp_upper(g,limit))), h=BF16(a*clamp(u,-limit,limit)),
+// y=BF16(Wdown*h). limit<=0 disables clipping. BF16 uses RNE; FP32 storage
+// promotes each of these same semantic BF16 boundaries without changing them.
+// Input/output are contiguous, disjoint, and share FP32 or BF16 storage.
+// Nonowned ids write exact zero; no input/weight read for those assignments.
+// Same geometry limits as grouped linear. Intermediate and routing storage is
+// caller-owned call-scoped workspace; routing may be reused across the chain.
+std::size_t indexed_swiglu_linear_workspace_capacity_bytes(DType storage, int banks,
+    int intermediate_rows, int choices, int tokens);
+void indexed_swiglu_linear(const Tensor& input, const Weight& gate, const Weight& up,
+    const Weight& down, const std::int32_t* ids, Tensor& output, int intermediate_rows,
+    int output_rows, int choices, int tokens, int bank_begin, float limit,
+    WorkspaceArena& workspace, cudaStream_t stream);
 // Same complete-dot/bank-ownership ideal, independent FP32/BF16 storage.
 // x [K,T*(shared?1:choices)], out [rows,T*choices], contiguous and disjoint.
 // FP32 output is unrounded; BF16 output rounds only the completed dot.

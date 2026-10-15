@@ -50,25 +50,12 @@ void Program::feed_forward(const Tensor& x, const LayerParameters& p, float* out
     auto logits = work.alloc(DType::FP32, {288, tokens});
     auto* weights = floats(work, 8ULL * tokens);
     auto* ids = static_cast<int*>(work.alloc_bytes(8ULL * tokens * sizeof(int)).data);
-    auto g = work.alloc(DType::BF16, {2048, 8 * tokens});
-    auto u = work.alloc(DType::BF16, {2048, 8 * tokens});
     auto experts = work.alloc(DType::BF16, {H, 8 * tokens});
     projection(x, p.router, logits, d);
     ops::resident_router(static_cast<const float*>(logits.data), static_cast<const float*>(p.router_bias.data),
                           ids, weights, 288, 8, tokens, 2.5f, stream);
-    const auto indexed = [&](const Tensor& input, const Weight& bank, Tensor& result, int rows, bool shared) {
-        const int first = tensor_parallel_ ? p.expert_begin : 0;
-        if (tokens >= 16)
-            ops::indexed_linear_grouped(input, bank, ids, result, rows, 8, tokens,
-                                        shared, first, work, stream);
-        else ops::indexed_linear_mixed(input, bank, ids, result, rows, 8, tokens, shared, first, stream);
-    };
-    indexed(x, p.experts.gate, g, 2048, true);
-    indexed(x, p.experts.up, u, 2048, true);
-    if (tensor_parallel_)
-        ops::resident_swiglu_owned(g, u, ids, p.expert_begin, p.experts.gate.n / 2048, g, 10.f, stream);
-    else ops::resident_swiglu(g, u, g, 10.f, stream);
-    indexed(g, p.experts.down, experts, H, false);
+    ops::indexed_swiglu_linear(x, p.experts.gate, p.experts.up, p.experts.down, ids, experts,
+        2048, H, 8, tokens, tensor_parallel_ ? p.expert_begin : 0, 10.f, work, stream);
     if (tensor_parallel_) {
         mlp(x, p.ffn, out, tokens, d);
         ops::resident_moe_partial(experts, weights, out + H * tokens, H, 8, tokens, stream);

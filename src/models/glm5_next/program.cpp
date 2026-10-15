@@ -444,31 +444,18 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
         return;
     }
     auto *logits = floats(w, (288) * t), *weights = floats(w, (8) * t),
-         *g = floats(w, (8 * 2048) * t), *u = floats(w, (8 * 2048) * t),
          *experts = floats(w, (8 * H) * t), *shared = floats(w, (H)*t);
     auto* ids = static_cast<std::int32_t*>(w.alloc_bytes(8 * 4 * t).data);
     projection(x, p.router, logits, t, d, false);
     ops::resident_router(logits, fp(p.router_bias), ids, weights, 288, 8, t, 2.5f, s);
-    const auto indexed = [&](const float* input, const Weight& bank, float* result, int rows, bool same) {
-        if (t >= 16) ops::indexed_linear_grouped_fp32(input, bank, ids, result, rows, 8, t,
-            same, tensor_parallel_ ? p.expert_begin : 0, w, s, true);
-        else if (tensor_parallel_) ops::indexed_linear_owned_fp32(input, bank, ids, result,
-            rows, 8, t, same, p.expert_begin, s, true);
-        else ops::indexed_linear_fp32(input, bank, ids, result, rows, 8, t, same, s, true);
-    };
+    Tensor input(const_cast<float*>(x), DType::FP32, {H, t});
+    Tensor result(experts, DType::FP32, {H, 8 * t});
+    ops::indexed_swiglu_linear(input, p.experts.gate, p.experts.up, p.experts.down, ids, result,
+        2048, H, 8, t, tensor_parallel_ ? p.expert_begin : 0, 10.f, w, s);
     if (tensor_parallel_) {
-        indexed(x, p.experts.gate, g, 2048, true);
-        indexed(x, p.experts.up, u, 2048, true);
-        Tensor gate(g, DType::FP32, {2048, 8 * t}), up(u, DType::FP32, {2048, 8 * t});
-        ops::resident_swiglu_owned(gate, up, ids, p.expert_begin, p.experts.gate.n / 2048, gate, 10.f, s);
-        indexed(g, p.experts.down, experts, H, false);
         mlp(x, p.ffn, out, p.ffn.gate.n, t, d, 10.f);
         ops::resident_moe_partial(experts, weights, out + H * t, H, 8, t, s);
     } else {
-    indexed(x, p.experts.gate, g, 2048, true);
-    indexed(x, p.experts.up, u, 2048, true);
-    ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
-    indexed(g, p.experts.down, experts, H, false);
     mlp(x, p.ffn, shared, 2048, t, d, 10.f);
     ops::resident_moe_sum(experts, weights, shared, out, H, 8, t, s);
     }
