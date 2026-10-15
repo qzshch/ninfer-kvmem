@@ -50,6 +50,21 @@ int main() try {
     require(ledger.busy(3) && ledger.frontier(0) == 1);
     ledger.complete(continuation);
     ledger.complete(temporal);
+    // A full set of ready rows fits one Decode owner, leaving the temporal
+    // frame unreserved. Every logical lane commits exactly one frontier step.
+    FrameLedger compact(8, 2);
+    std::array<int, 8> ready_tokens{}, ready_outputs{};
+    std::array<runtime::TokenSpan, 8> ready_spans{};
+    const std::array<unsigned, 8> lane_order{7,0,6,1,5,2,4,3};
+    for (unsigned r = 0; r < 8; ++r) {
+        ready_tokens[r] = 12 + r; ready_outputs[r] = r;
+        ready_spans[r] = {lane_order[r], 0, r, 1};
+    }
+    const auto packed = compact.reserve({runtime::TokenBatchKind::Decode, ready_tokens, ready_spans, ready_outputs});
+    require(packed.slot == 1 && compact.active(1) && !compact.active(0));
+    for (unsigned lane = 0; lane < 8; ++lane) require(compact.busy(lane) && compact.frontier(lane) == 0);
+    compact.complete(packed);
+    for (unsigned lane = 0; lane < 8; ++lane) require(!compact.busy(lane) && compact.frontier(lane) == 1);
     ledger.fail();
     rejects([&] { ledger.reserve(batch(c)); });
     rejects([&] { ledger.reset(); });
