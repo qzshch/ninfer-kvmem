@@ -1,6 +1,7 @@
 // Native DTK implementation of the public NInfer KDA recurrence. Apache-2.0.
 // Eight value rows per group; reductions use shared memory and no warp ABI.
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/chunked_dtk.h"
 
 namespace ninfer::ops::detail::kimi_delta_attention {
 namespace {
@@ -16,8 +17,29 @@ __device__ std::uint16_t to_bf16(float value) {
 
 __device__ float sigmoid(float value) { return 1.f / (1.f + expf(-value)); }
 
-template <bool Pooled>
-__global__ void recurrence(Arguments a, const std::int32_t* slots) {
+__global__ void prepare_heads(Arguments a, DtkPrepared* prepared) {
+    const int h = blockIdx.x, t = blockIdx.y, c = threadIdx.x;
+    const int qh = h / (a.value_heads / a.qk_heads);
+    const auto qbase = (static_cast<long long>(t) * a.qk_heads + qh) * 128;
+    const auto base = (static_cast<long long>(t) * a.value_heads + h) * 128;
+    const float q = from_bf16(a.q[qbase + c]), k = from_bf16(a.k[qbase + c]);
+    __shared__ float qr[128], kr[128];
+    qr[c] = q * q; kr[c] = k * k;
+    __syncthreads();
+    for (int distance = 64; distance; distance /= 2) {
+        if (c < distance) { qr[c] += qr[c + distance]; kr[c] += kr[c + distance]; }
+        __syncthreads();
+    }
+    auto& p = prepared[static_cast<long long>(t) * a.value_heads + h];
+    p.q[c] = q * rsqrtf(qr[0] + kQkL2NormEps);
+    p.k[c] = k * rsqrtf(kr[0] + kQkL2NormEps);
+    const float rate = a.negative_rate ? -a.a_log[h] : expf(a.a_log[h]);
+    p.alpha[c] = expf(a.lower_bound * sigmoid(rate * (from_bf16(a.g[base + c]) + a.dt_bias[h * 128 + c])));
+    if (!c) p.beta = sigmoid(from_bf16(a.beta[static_cast<long long>(t) * a.value_heads + h]));
+}
+
+template <bool Pooled, bool Prepared = false>
+__global__ void recurrence(Arguments a, const std::int32_t* slots, const DtkPrepared* prepared = nullptr) {
     constexpr int D = 128, V = 8;
     const int h = blockIdx.x, vbase = blockIdx.y * V, batch = blockIdx.z, c = threadIdx.x;
     const int qh                  = h / (a.value_heads / a.qk_heads);
@@ -35,28 +57,35 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots) {
             (static_cast<std::int64_t>(t) * a.qk_heads + qh) * D;
         const std::int64_t vstart =
             (static_cast<std::int64_t>(t) * a.value_heads + h) * D;
-        const float qi = from_bf16(a.q[qbase + c]), ki = from_bf16(a.k[qbase + c]);
-        reduce[0][c] = qi * qi;
-        reduce[1][c] = ki * ki;
-        __syncthreads();
-        for (int distance = D / 2; distance; distance /= 2) {
-            if (c < distance) {
-                reduce[0][c] += reduce[0][c + distance];
-                reduce[1][c] += reduce[1][c + distance];
+        float alpha;
+        if constexpr (Prepared) {
+            const auto& p = prepared[static_cast<long long>(t) * a.value_heads + h];
+            q[c] = p.q[c]; k[c] = p.k[c]; alpha = p.alpha[c];
+            if (!c) beta = p.beta;
+        } else {
+            const float qi = from_bf16(a.q[qbase + c]), ki = from_bf16(a.k[qbase + c]);
+            reduce[0][c] = qi * qi;
+            reduce[1][c] = ki * ki;
+            __syncthreads();
+            for (int distance = D / 2; distance; distance /= 2) {
+                if (c < distance) {
+                    reduce[0][c] += reduce[0][c + distance];
+                    reduce[1][c] += reduce[1][c + distance];
+                }
+                __syncthreads();
+            }
+            if (c == 0) {
+                inv_q = rsqrtf(reduce[0][0] + kQkL2NormEps);
+                inv_k = rsqrtf(reduce[1][0] + kQkL2NormEps);
+                beta  = sigmoid(from_bf16(
+                    a.beta[static_cast<std::int64_t>(t) * a.value_heads + h]));
             }
             __syncthreads();
+            q[c]              = qi * inv_q;
+            k[c]              = ki * inv_k;
+            const float gate  = from_bf16(a.g[vstart + c]) + a.dt_bias[h * D + c];
+            alpha = expf(a.lower_bound * sigmoid(rate * gate));
         }
-        if (c == 0) {
-            inv_q = rsqrtf(reduce[0][0] + kQkL2NormEps);
-            inv_k = rsqrtf(reduce[1][0] + kQkL2NormEps);
-            beta  = sigmoid(from_bf16(
-                a.beta[static_cast<std::int64_t>(t) * a.value_heads + h]));
-        }
-        __syncthreads();
-        q[c]              = qi * inv_q;
-        k[c]              = ki * inv_k;
-        const float gate  = from_bf16(a.g[vstart + c]) + a.dt_bias[h * D + c];
-        const float alpha = expf(a.lower_bound * sigmoid(rate * gate));
         for (int v = 0; v < V; ++v) {
             state[v] *= alpha;
             reduce[v][c] = state[v] * k[c];
@@ -89,6 +118,14 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots) {
     return;
 }
 } // namespace
+
+void launch_prepared_update(const Arguments& args, const std::int32_t* slots, int sequences,
+                            void* storage, cudaStream_t stream) {
+    auto* prepared = static_cast<DtkPrepared*>(storage);
+    prepare_heads<<<dim3(args.value_heads, args.tokens), 128, 0, stream>>>(args, prepared);
+    recurrence<true, true><<<dim3(args.value_heads, 16, sequences), 128, 0, stream>>>(args, slots, prepared);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_recurrent(const Arguments& args, cudaStream_t stream) {
     recurrence<false><<<dim3(args.value_heads, 16, 1), 128, 0, stream>>>(args, nullptr);

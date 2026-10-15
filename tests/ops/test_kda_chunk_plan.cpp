@@ -10,7 +10,9 @@ int main() try {
         for (int rows = sequences; rows <= 1024; ++rows) {
             const auto bytes = dtk_packed_workspace_bytes(24, rows, sequences);
             if (rows < 16) {
-                if (bytes) throw std::runtime_error("recurrent route requested packet storage");
+                if (bytes < static_cast<std::size_t>(rows) * 24 * (3 * 128 + 1) * sizeof(float) ||
+                    bytes % alignof(DtkPrepared))
+                    throw std::runtime_error("prepared recurrence exceeds its workspace quote");
                 continue;
             }
             for (int sample = 0; sample < 16; ++sample) {

@@ -325,13 +325,13 @@ void kimi_delta_attention_packed_update(
     args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
     args.sequence_offsets = static_cast<const std::int32_t*>(offsets.data);
     const auto bytes = kimi_delta_attention_packed_workspace_capacity_bytes(q.ne[1], v.ne[1], count, q.ne[2]);
-    if (bytes) {
-        auto scope = workspace.scope();
-        auto storage = workspace.alloc_bytes(bytes);
+    auto scope = workspace.scope();
+    auto storage = workspace.alloc_bytes(bytes);
+    if (args.tokens >= detail::kimi_delta_attention::kDtkTimeTile)
         detail::kimi_delta_attention::launch_packed_chunks(
             args, static_cast<const std::int32_t*>(slots.data), count, storage.data, stream);
-    } else detail::kimi_delta_attention::launch_batch_update(
-            args, static_cast<const std::int32_t*>(slots.data), count, stream);
+    else detail::kimi_delta_attention::launch_prepared_update(
+            args, static_cast<const std::int32_t*>(slots.data), count, storage.data, stream);
 #else
     (void)workspace;
     (void)stream;

@@ -66,6 +66,8 @@ inline std::size_t chunked_workspace_bytes(int value_heads, int tokens) {
 void launch_recurrent(const Arguments& args, cudaStream_t stream);
 void launch_batch_update(const Arguments& args, const std::int32_t* slots, int batch,
                          cudaStream_t stream);
+void launch_prepared_update(const Arguments& args, const std::int32_t* slots, int sequences,
+                            void* storage, cudaStream_t stream);
 void launch_packed_chunks(const Arguments& args, const std::int32_t* slots, int sequences,
                            void* storage, cudaStream_t stream);
 void launch_prepare(const Arguments& args, Chunk* workspace, cudaStream_t stream);

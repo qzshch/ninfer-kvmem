@@ -107,7 +107,8 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
  * decays, a block-local triangular solve and FP32 state prediction/update.
  * Q/K, solves and delta remain FP32; only the public output rounds to BF16.
  * workspace is caller-owned, disjoint call-scoped storage sized by the query
- * below. Smaller M retains scratch-free recurrence. Non-DTK rejects execution.
+ * below. Smaller M prepares head-only FP32 vectors once before the value-row
+ * recurrence. Non-DTK rejects execution.
  */
 std::size_t kimi_delta_attention_packed_workspace_capacity_bytes(
     std::int32_t qk_heads, std::int32_t value_heads, std::int32_t sequences, std::int32_t rows);

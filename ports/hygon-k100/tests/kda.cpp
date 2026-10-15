@@ -158,7 +158,7 @@ void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float 
 }
 
 void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
-                bool packed = false) {
+                bool packed = false, bool short_spans = false) {
     constexpr int batch = 3, slot_count = 6;
     const std::vector<std::int32_t> slots{4, 1, 5};
     const std::size_t state_size = 128 * 128 * heads, vector_size = 128 * heads;
@@ -168,7 +168,7 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
     std::vector<float> q, k, v, g, b;
     std::vector<int> offsets{0};
     for (int row = 0; row < batch; ++row) {
-        const int length = packed ? std::array{1, 8, 33}[row] : 1;
+        const int length = packed ? (short_spans ? std::array{1, 2, 5}[row] : std::array{1, 8, 33}[row]) : 1;
         auto a = inputs(qheads, heads, length, row);
         offsets.push_back(offsets.back() + length);
         a.negative_rate = negative;
@@ -277,9 +277,17 @@ int main() try {
         run_batch(ctx, 64, 64, negative, true);
         cases += 2;
     }
-    for (int heads : {20, 24}) for (int tokens : {15, 16, 17, 33}) {
+    for (int heads : {20, 24}) for (int tokens : {1, 8, 15, 16, 17, 33}) {
         run(ctx, heads, heads, tokens, 0, -5, true, true, true);
         ++cases;
+    }
+    for (bool negative : {false, true}) {
+        run_batch(ctx, 2, 4, negative, true, true);
+        ++cases;
+        for (int heads : {20, 24}) {
+            run(ctx, heads, heads, 1, 2, -5, true, negative, true);
+            ++cases;
+        }
     }
     for (int mode : {1, 2, 3}) {
         run(ctx, 1, 5, 65, mode, -5, true, true, true);
