@@ -30,10 +30,10 @@ int main(int argc, char** argv) try {
             while (frontend.encode(text).size() < 400) text += "alpha beta gamma. ";
             prompts[2] = frontend.encode(text);
         }
-        for (bool graph : {false, true}) {
+        for (bool graph : {false, true}) for (unsigned frames : {1u, 2u}) {
             ProgramOptions options;
             options.max_context = 1024; options.max_lanes = 4; options.draft = false;
-            options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
+            options.decode_frames = frames; options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
             Program program(model, devices, options);
             for (unsigned chunk : {1u, 17u, 128u}) {
                 program.reset();
@@ -61,10 +61,38 @@ int main(int argc, char** argv) try {
                         generated[r].push_back(anchors[r]);
                         input.push_back(anchors[r]); lanes.push_back(slots[r]); owners.push_back(r);
                     }
-                    const auto next = program.target_batch(input, lanes);
+                    std::vector<int> next;
+                    if (frames == 1 || input.size() == 1) next = program.target_batch(input, lanes);
+                    else {
+                        const unsigned split = 1;
+                        auto enqueue = [&](unsigned begin, unsigned end) {
+                            std::vector<runtime::TokenSpan> spans;
+                            std::vector<int> rows;
+                            for (unsigned j = begin; j < end; ++j) {
+                                spans.push_back({static_cast<unsigned>(lanes[j]),
+                                    static_cast<unsigned>(program.frontier(lanes[j])), j - begin, 1});
+                                rows.push_back(j - begin);
+                            }
+                            return program.submit({runtime::TokenBatchKind::Decode,
+                                {input.data() + begin, end - begin}, spans, rows});
+                        };
+                        const auto first = enqueue(0, split);
+                        bool rejected = false;
+                        try { program.reset_lane(lanes[0]); } catch (const std::logic_error&) { rejected = true; }
+                        if (!rejected) throw std::runtime_error("reset accepted a pending sequence writer");
+                        const auto second = enqueue(split, input.size());
+                        // Caller input may disappear immediately after submission.
+                        std::fill(input.begin(), input.end(), -123);
+                        auto tail = program.finish(second);
+                        next = program.finish(first);
+                        next.insert(next.end(), tail.begin(), tail.end());
+                        rejected = false;
+                        try { program.finish(first); } catch (const std::logic_error&) { rejected = true; }
+                        if (!rejected) throw std::runtime_error("retired frame ticket accepted");
+                    }
                     for (unsigned j = 0; j < next.size(); ++j) anchors[owners[j]] = next[j];
                 }
-                if (plan == Parallelism::Pipeline && !graph && chunk == 1) expected = generated;
+                if (plan == Parallelism::Pipeline && !graph && chunk == 1 && frames == 1) expected = generated;
                 else if (generated != expected) throw std::runtime_error("native PP/TP/EP scalar/temporal/Graph generated token mismatch");
                 if (graph && (!program.stats().graph_captures ||
                               program.stats().graph_replays <= program.stats().graph_captures))

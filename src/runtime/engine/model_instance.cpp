@@ -69,6 +69,8 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.decode_frames != 1)
+        throw std::invalid_argument("independent Decode frames currently require the DTK GLM backend");
     if (options.tensor_expert_parallel)
         throw std::invalid_argument("tensor/expert parallel execution requires the DTK three-device GLM build");
     switch (options.purpose) {

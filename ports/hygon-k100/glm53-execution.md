@@ -38,7 +38,12 @@ captures device stages and the output head lazily. Request slots, token IDs and
 frontiers are metadata inputs. Graph mode and eager mode implement the same
 mathematics. Graph resources consume device memory and must fit the resource
 budget. Temporal prefill currently executes eagerly; Graph replay applies to
-ordinary Decode and does not imply overlapping pipeline execution.
+ordinary Decode. `--decode-frames 2 --lanes N` (N>=2, ordinary only) splits
+Decode requests across two independent frames, each with its own streams,
+activations, scratch, pinned metadata/results and Graphs. The second frame is
+Decode-only. A sequence cannot have two pending writers. Runtime publishes a
+completed frame independently; cancellation drains its device writes before
+releasing the lane. Extra frame scratch is included in the memory summary.
 
 KVMem block means, selection and restrictions execute on the devices in the
 ordinary route. Request lanes own their respective recurrent and KV histories.

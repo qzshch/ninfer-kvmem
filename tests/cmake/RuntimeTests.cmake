@@ -1,3 +1,5 @@
+ninfer_add_test(ninfer_glm_frames_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_glm_frames.cpp")
 ninfer_add_test(ninfer_token_batch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_token_batch.cpp")
 

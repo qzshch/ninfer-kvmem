@@ -118,6 +118,7 @@ public:
         if (options.device != 0 || (options.max_concurrency < 1 || options.max_concurrency > 8) ||
             options.max_context < 1 || options.max_context > 32768 ||
             options.max_pending_requests < 1 || !options.prefill_chunk || options.enable_vision ||
+            !options.decode_frames || options.decode_frames > 2 || options.decode_frames > options.max_concurrency ||
             options.purpose != EnginePurpose::Generation ||
             options.kv_cache != KvCacheStorage::BFloat16 ||
             options.kv_capacity.mode != KvCapacityMode::Explicit ||
@@ -133,7 +134,7 @@ public:
             throw std::invalid_argument("DTK GLM speculation supports DFlash2 K7 or native MTP K1");
         if (options.speculative.backend != SpeculativeBackend::None && options.max_concurrency != 1)
             throw std::invalid_argument("DTK speculative execution requires one resident lane");
-        if (options.tensor_expert_parallel && options.speculative.backend != SpeculativeBackend::None)
+        if ((options.tensor_expert_parallel || options.decode_frames > 1) && options.speculative.backend != SpeculativeBackend::None)
             throw std::invalid_argument("DTK TP/EP currently requires ordinary generation");
         if (options.speculative.backend == SpeculativeBackend::DFlash2 && options.use_cuda_graph)
             throw std::invalid_argument("DFlash profile requires eager execution");
@@ -161,7 +162,7 @@ public:
                 static_cast<int>(options.max_context), options.kvmem_window_pages,
                 static_cast<int>(options.max_concurrency), options.use_cuda_graph,
                 options.speculative.backend == SpeculativeBackend::DFlash2,
-                options.speculative.backend == SpeculativeBackend::Mtp, options.prefill_chunk});
+                options.speculative.backend == SpeculativeBackend::Mtp, options.prefill_chunk, options.decode_frames});
         load.architecture   = "Glm5NextForConditionalGeneration";
         load.model_name     = "GLM-5.3-Flash UD-IQ4_XS";
         load.cuda_sync_mode = devices[0]->sync_mode();
@@ -191,7 +192,7 @@ public:
         memory.weights.used_bytes = memory.weights.peak_used_bytes = memory.weights.capacity_bytes;
         memory.sequence.used_bytes = memory.sequence.peak_used_bytes =
             memory.sequence.capacity_bytes;
-        memory.workspace.capacity_bytes = 6ULL * 1024 * 1024 * 1024;
+        memory.workspace.capacity_bytes = program->workspace_capacity_bytes();
         runtime.lane_count              = options.max_concurrency;
         worker                          = std::thread([this] { run(); });
     }
@@ -487,23 +488,56 @@ public:
                 }
                 const bool had_decode = !tokens.empty();
                 if (!tokens.empty()) {
-                    auto result = program->execute({runtime::TokenBatchKind::Decode, tokens, spans, outputs});
-                    std::uint64_t committed = 0;
-                    for (unsigned row = 0; row < spans.size(); ++row) {
-                        auto& lane = *lanes[spans[row].lane];
-                        observe_input(lane, spans[row].input_frontier, 1);
-                        lane.anchor = result[row];
-                        if (lane.job->cancel)
-                            lane.result.finish_reason = FinishReason::Cancelled;
-                        else {
-                            append_token(lane.job, lane.result, lane.anchor, lane.limit);
-                            ++committed;
+                    struct Flight {
+                        models::glm5_next::FrameTicket ticket;
+                        std::vector<runtime::TokenSpan> spans;
+                    };
+                    std::vector<Flight> flights;
+                    const auto count = std::min<unsigned>(options.decode_frames, spans.size());
+                    const auto per_frame = (spans.size() + count - 1) / count;
+                    for (std::size_t begin = 0; begin < spans.size(); begin += per_frame) {
+                        const auto end = std::min(spans.size(), begin + per_frame);
+                        std::vector<runtime::TokenSpan> selected(spans.begin() + begin, spans.begin() + end);
+                        std::vector<int> selected_rows(end - begin);
+                        for (unsigned row = 0; row < selected.size(); ++row) {
+                            selected[row].begin = row;
+                            selected_rows[row] = row;
                         }
+                        auto ticket = program->submit({runtime::TokenBatchKind::Decode,
+                            {tokens.data() + begin, end - begin}, selected, selected_rows});
+                        flights.push_back({ticket, std::move(selected)});
                     }
-                    std::lock_guard lock(mutex);
-                    ++runtime.decode_rounds;
-                    runtime.decode_row_rounds += spans.size();
-                    runtime.committed_decode_tokens += committed;
+                    // Publish whichever independent frame completes first. A
+                    // cancelled request keeps its physical lane until this join.
+                    while (!flights.empty()) {
+                        auto completed = std::find_if(flights.begin(), flights.end(),
+                            [&](const auto& f) { return program->ready(f.ticket); });
+                        if (completed == flights.end()) {
+                            std::this_thread::sleep_for(std::chrono::microseconds(50));
+                            continue;
+                        }
+                        auto result = program->finish(completed->ticket);
+                        std::uint64_t committed = 0;
+                        for (unsigned row = 0; row < completed->spans.size(); ++row) {
+                            const auto& span = completed->spans[row];
+                            auto& lane = *lanes[span.lane];
+                            observe_input(lane, span.input_frontier, 1);
+                            lane.anchor = result[row];
+                            if (lane.job->cancel) lane.result.finish_reason = FinishReason::Cancelled;
+                            else {
+                                append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                                ++committed;
+                            }
+                        }
+                        {
+                            std::lock_guard lock(mutex);
+                            ++runtime.decode_rounds;
+                            runtime.decode_row_rounds += completed->spans.size();
+                            runtime.committed_decode_tokens += committed;
+                        }
+                        flights.erase(completed);
+                        settle();
+                    }
                 }
                 // Publish completed decode requests before spending a prefill
                 // slice. Do not make their consumers wait for another unit.
@@ -584,6 +618,7 @@ public:
                 }
                 settle();
             } catch (...) {
+                program->drain();
                 available = false;
                 for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
                     if (lanes[slot]) {

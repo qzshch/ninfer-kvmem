@@ -21,6 +21,7 @@ int main(int argc, char** argv) try {
     options.max_context        = 1024;
     options.kv_capacity        = KvCapacityPolicy::explicit_capacity(1024);
     options.max_concurrency    = 8;
+    options.decode_frames      = 2;
     options.use_cuda_graph     = true;
     options.kvmem_window_pages = 6;
     options.pending_timeout_ms = 0;

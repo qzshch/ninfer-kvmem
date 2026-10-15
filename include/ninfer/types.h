@@ -215,6 +215,8 @@ struct EngineOptions {
     bool prefill_pack_projections = false;
     // DTK three-device GLM ordinary execution; other platforms reject this plan.
     bool tensor_expert_parallel = false;
+    // DTK ordinary Decode: one or two independent request frames.
+    unsigned decode_frames = 1;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

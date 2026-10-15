@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "runtime/contract/token_batch.h"
+#include "models/glm5_next/frame_ledger.h"
 #include <map>
 #include <functional>
 #include <span>
@@ -20,6 +21,7 @@ struct ProgramOptions {
     bool draft                  = true;
     bool mtp                    = false;
     unsigned prefill_chunk      = 1024;
+    unsigned decode_frames      = 1;
 };
 
 struct ProgramStats {
@@ -46,9 +48,17 @@ public:
     std::vector<std::int32_t> target_batch(std::span<const std::int32_t> tokens,
                                            std::span<const std::int32_t> lanes);
     std::vector<std::int32_t> execute(const runtime::TokenBatch& batch);
-    int input_capacity() const noexcept { return max_rows_; }
+    // Single host worker; tickets own GPU work until finish() joins and commits.
+    FrameTicket submit(const runtime::TokenBatch& batch);
+    bool ready(FrameTicket ticket) const;
+    std::vector<std::int32_t> finish(FrameTicket ticket);
+    void drain() noexcept;
+    int input_capacity() const noexcept { return frames_[0]->capacity; }
+    unsigned frame_capacity() const noexcept { return options_.decode_frames; }
+    bool lane_busy(unsigned lane) const { return ledger_.busy(lane); }
+    std::size_t workspace_capacity_bytes() const noexcept;
 
-    int frontier(int lane) const { return frontiers_.at(lane); }
+    int frontier(int lane) const { return ledger_.frontier(lane); }
 
     void restore(int frontier, int snapshot_slot);
 
@@ -57,10 +67,9 @@ public:
     const ProgramStats& stats() const noexcept { return stats_; }
 private:
     struct DeviceState {
-        std::array<DeviceBuffer, 9> recurrent;
         DeviceBuffer streams, metadata, hidden;
         DeviceBuffer partial, received, coefficients, normalized;
-        std::unique_ptr<CudaCompletionEvent> ready, copied;
+        std::unique_ptr<CudaCompletionEvent> ready, copied, done;
         std::unique_ptr<WorkspaceArena> workspace;
     };
 
@@ -73,24 +82,35 @@ private:
 
     const Model& model_;
     const Parameters& parameters_;
-    std::array<DeviceContext*, 3> devices_;
     ProgramOptions options_;
+    FrameLedger ledger_;
     bool tensor_parallel_ = false;
     int position_ = 0;
-    std::array<int, 8> frontiers_{};
-    std::map<int, std::array<DecodeGraphExecutable, 4>> graphs_;
-    std::map<std::array<int, 4>, DecodeGraphExecutable> tensor_graphs_;
-    std::map<std::array<int, 2>, std::uint64_t> tensor_graph_families_;
-    std::uint64_t tensor_graph_clock_ = 0;
-    int max_rows_ = 1, batch_ = 1, sequences_ = 1, outputs_ = 1, tier_ = 128;
-    runtime::TokenBatchKind kind_ = runtime::TokenBatchKind::Decode;
+    std::array<std::array<DeviceBuffer, 9>, 3> recurrent_;
+    struct Frame {
+        // Destruction is explicitly ordered by Program, on each owning device.
+        std::array<std::unique_ptr<DeviceContext>, 3> owned_devices;
+        std::array<DeviceContext*, 3> devices{};
+        std::array<DeviceState, 3> state;
+        std::map<int, std::array<DecodeGraphExecutable, 4>> graphs;
+        std::map<std::array<int, 4>, DecodeGraphExecutable> tensor_graphs;
+        std::map<std::array<int, 2>, std::uint64_t> tensor_graph_families;
+        std::uint64_t tensor_graph_clock = 0;
+        int capacity = 1, batch = 1, sequences = 1, outputs = 1, tier = 128;
+        runtime::TokenBatchKind kind = runtime::TokenBatchKind::Decode;
+        std::vector<int> host_metadata;
+        std::unique_ptr<PinnedHostBuffer> upload, result;
+        std::unique_ptr<CudaCompletionEvent> completed;
+        std::vector<runtime::TokenSpan> spans;
+    };
+    std::array<std::unique_ptr<Frame>, 2> frames_;
+    Frame* frame_ = nullptr;
+    std::array<std::array<std::unique_ptr<CudaCompletionEvent>, 3>, 8> sequence_ready_;
     enum MetadataField { TokenIds, StateSlots, Positions, OutputRows, PredictedIds, SequenceOffsets };
-    std::vector<int> host_metadata_;
     int* metadata(int device, MetadataField field) const noexcept;
     void batch_stage(int device);
     void batch_head();
     ProgramStats stats_;
-    std::array<DeviceState, 3> state_;
     std::array<LayerState, 45> layers_;
     std::array<std::array<LayerState, 45>, 2> parallel_layers_;
     LayerState& layer_state(int device, int layer) {
@@ -100,7 +120,7 @@ private:
     void tensor_launch(int category, int component, const std::function<void()>& body);
     void tensor_finalize(int device);
     void tensor_reduce(bool routed);
-    std::vector<std::int32_t> tensor_execute();
+    void tensor_execute();
     DeviceBuffer features_;
     LayerState mtp_state_;
     int mtp_frontier_ = 0;
