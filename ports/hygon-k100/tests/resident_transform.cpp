@@ -163,6 +163,47 @@ void conv(DeviceContext& ctx, int channels, int t, bool alias) {
     }
 }
 
+void pooled_conv(DeviceContext& ctx, int channels, bool alias) {
+    constexpr int rows = 3, slots = 5;
+    const std::vector<int> ids{4, 0, 2};
+    std::vector<float> x(rows * channels), s(slots * channels * 3), w(channels * 4);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = value(i + 319);
+    for (std::size_t i = 0; i < s.size(); ++i) s[i] = value(i + 91);
+    for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(i * 1.7) * .23;
+    WeightData weight(w, {static_cast<unsigned>(channels), 1, 4}, false);
+    auto dx = upload(x), ds = upload(s);
+    DeviceBuffer selectors(ids.size() * sizeof(int)), dy(x.size() * sizeof(float));
+    selectors.copy_from_host(ids.data(), selectors.bytes);
+    auto* output = static_cast<float*>(alias ? dx.p : dy.p);
+    ops::resident_causal_conv_batch(static_cast<float*>(dx.p), weight.view,
+                                    static_cast<float*>(ds.p), static_cast<int*>(selectors.p),
+                                    output, channels, rows, ctx.stream);
+    ctx.synchronize();
+    auto after = download(ds);
+    const auto y = download(alias ? dx : dy);
+    for (int slot = 0; slot < slots; ++slot) {
+        const auto found = std::find(ids.begin(), ids.end(), slot);
+        for (int c = 0; c < channels; ++c) {
+            const auto base = (slot * channels + c) * 3;
+            if (found == ids.end()) {
+                for (int j = 0; j < 3; ++j)
+                    require(after[base + j] == s[base + j], "conv changed inactive slot");
+                continue;
+            }
+            const int row = found - ids.begin();
+            const double input = x[row * channels + c];
+            const double sum = double(s[base]) * w[c * 4] +
+                               double(s[base + 1]) * w[c * 4 + 1] +
+                               double(s[base + 2]) * w[c * 4 + 2] + input * w[c * 4 + 3];
+            const auto pre = bf(sum);
+            check(y[row * channels + c], pre * sig(pre), true, "pooled conv FP64");
+            require(after[base] == s[base + 1] && after[base + 1] == s[base + 2] &&
+                        after[base + 2] == input,
+                    "pooled conv final state");
+        }
+    }
+}
+
 void elementwise(DeviceContext& ctx, int n, float limit) {
     std::vector<float> a(n), b(n);
     for (int i = 0; i < n; ++i) {
@@ -317,6 +358,11 @@ int main() {
                     conv(ctx, c, t, alias);
                     ++cases;
                 }
+        for (int c : {7, 8192})
+            for (bool alias : {false, true}) {
+                pooled_conv(ctx, c, alias);
+                ++cases;
+            }
         for (int n : {17, 4096, 131072})
             for (float limit : {0.f, 10.f}) {
                 elementwise(ctx, n, limit);

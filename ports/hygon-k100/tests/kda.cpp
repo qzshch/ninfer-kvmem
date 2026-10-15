@@ -148,7 +148,7 @@ void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float 
     check(std::vector<double>(state.begin(), state.end()), oracle.final_state, true);
 }
 
-void run_batch(DeviceContext& ctx, int qheads, int heads) {
+void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false) {
     constexpr int batch = 3, slot_count = 6;
     const std::vector<std::int32_t> slots{4, 1, 5};
     const std::size_t state_size = 128 * 128 * heads, vector_size = 128 * heads;
@@ -158,6 +158,9 @@ void run_batch(DeviceContext& ctx, int qheads, int heads) {
     std::vector<float> q, k, v, g, b;
     for (int row = 0; row < batch; ++row) {
         auto a = inputs(qheads, heads, 1, row);
+        a.negative_rate = negative;
+        if (negative && !row)
+            for (auto& x : a.a_log) x = -std::exp(x);
         if (row) {
             a.a_log   = rows[0].a_log;
             a.dt_bias = rows[0].dt_bias;
@@ -188,7 +191,9 @@ void run_batch(DeviceContext& ctx, int qheads, int heads) {
         ids(selectors.p, DType::I32, {batch});
     Tensor out(result.p, DType::BF16, {128, heads, 1, batch});
     ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dtb, -5, scale, states, ids, out,
-                                           ctx.stream);
+                                           ctx.stream,
+                                           negative ? ops::KdaDecayParameter::NegativeRate
+                                                    : ops::KdaDecayParameter::LogRate);
     ctx.synchronize();
     std::vector<float> after(pool.size());
     state.data.copy_to_host(after.data(), state.data.bytes);
@@ -238,6 +243,10 @@ int main() try {
     run_batch(ctx, 2, 4);
     ++cases;
     run_batch(ctx, 64, 64);
+    ++cases;
+    run_batch(ctx, 2, 4, true);
+    ++cases;
+    run_batch(ctx, 64, 64, true);
     ++cases;
     std::printf("PASS: %u KDA cases; independent full FP64 output/state oracle; H64; K7 width8; "
                 "distinct/alias state; guards; zero workspace\n",

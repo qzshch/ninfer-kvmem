@@ -270,12 +270,21 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        const Tensor& g, const Tensor& beta, const Tensor& a_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        Tensor& states, const Tensor& slots, Tensor& out,
-                                       cudaStream_t stream) {
+                                       cudaStream_t stream, KdaDecayParameter decay_parameter) {
     const auto geometry = validate_batch_update(q, k, v, g, beta, a_log, dt_bias, lower_bound,
                                                 scale, states, slots, out);
+    if (decay_parameter != KdaDecayParameter::LogRate &&
+        decay_parameter != KdaDecayParameter::NegativeRate)
+        throw std::invalid_argument("kimi_delta_attention: invalid decay parameterization");
+    auto args = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out);
+    args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
+#if !defined(NINFER_HYGON_DTK)
+    if (args.negative_rate)
+        throw std::invalid_argument(
+            "kimi_delta_attention: negative-rate operands require DTK recurrence");
+#endif
     detail::kimi_delta_attention::launch_batch_update(
-        arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out),
-        static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
+        args, static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
 }
 
 } // namespace ninfer::ops

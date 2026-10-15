@@ -6,7 +6,6 @@
 #include "ninfer/ops/resident_transform.h"
 #include "ninfer/ops/sparse_latent_attention.h"
 #include "ninfer/ops/dflash_block.h"
-#include "core/indexed_transfer.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -45,7 +44,6 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) CUDA_CHECK(e);
             }
         const auto bytes     = counts[d] * (StateFloats + ConvFloats) * 4;
-        recurrent_stride_[d] = bytes;
         for (int slot = 0; slot < (options.draft ? 9 : 1); ++slot)
             state_[d].recurrent[slot] = DeviceBuffer(bytes * options.max_lanes);
         state_[d].streams          = DeviceBuffer(4 * H * 4 * options.max_lanes);
@@ -63,10 +61,14 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
         const int d   = p.device;
         devices_[d]->bind_to_current_thread();
         if (p.linear) {
+            // Layer-major pools: a compact execution row selects a physical
+            // state directly, without gathering the complete recurrent image.
             auto* base  = static_cast<float*>(state_[d].recurrent[0].p) + cursor[d];
             l.recurrent = base;
-            for (int j = 0; j < 3; ++j) l.conv[j] = base + StateFloats + j * 8192 * 3;
-            cursor[d] += StateFloats + ConvFloats;
+            for (int j = 0; j < 3; ++j)
+                l.conv[j] = base + StateFloats * options.max_lanes +
+                            j * 8192 * 3 * options.max_lanes;
+            cursor[d] += (StateFloats + ConvFloats) * options.max_lanes;
         } else {
             const auto context = options_.max_context * options_.max_lanes;
             l.latent           = DeviceBuffer(static_cast<std::size_t>(context) * 512 * 2);
@@ -183,53 +185,53 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
     float *q = floats(w, 8192 * t), *k = floats(w, 8192 * t), *v = floats(w, 8192 * t),
           *g = floats(w, 8192 * t), *gate = floats(w, 8192 * t), *small = floats(w, 128 * t),
           *beta = floats(w, 64 * t), *result = floats(w, 8192 * t);
-    const bool compact_state = !options_.draft && options_.max_lanes > 1;
-    auto* recurrent          = state.recurrent;
-    if (compact_state) {
-        recurrent = floats(w, t * (StateFloats + ConvFloats));
-        indexed_transfer(recurrent, state.recurrent,
-                         static_cast<const int*>(state_[d].metadata.p) + 8,
-                         (StateFloats + ConvFloats) * 4, recurrent_stride_[d], t, false, s);
-    }
+    const auto* slots = static_cast<const int*>(state_[d].metadata.p) + 8;
     projection(x, p.query, q, t, d);
     projection(x, p.key, k, t, d);
     projection(x, p.value, v, t, d);
-    for (int row = 0; row < t; ++row) {
-        auto* base = compact_state ? recurrent + row * (StateFloats + ConvFloats) : state.recurrent;
-        ops::resident_causal_conv(q + row * 8192, p.query_conv, base + StateFloats, q + row * 8192,
-                                  8192, 1, s);
-        ops::resident_causal_conv(k + row * 8192, p.key_conv, base + StateFloats + 8192 * 3,
-                                  k + row * 8192, 8192, 1, s);
-        ops::resident_causal_conv(v + row * 8192, p.value_conv, base + StateFloats + 8192 * 6,
-                                  v + row * 8192, 8192, 1, s);
+    if (options_.draft) {
+        ops::resident_causal_conv(q, p.query_conv, state.conv[0], q, 8192, 1, s);
+        ops::resident_causal_conv(k, p.key_conv, state.conv[1], k, 8192, 1, s);
+        ops::resident_causal_conv(v, p.value_conv, state.conv[2], v, 8192, 1, s);
+    } else {
+        ops::resident_causal_conv_batch(q, p.query_conv, state.conv[0], slots, q, 8192, t, s);
+        ops::resident_causal_conv_batch(k, p.key_conv, state.conv[1], slots, k, 8192, t, s);
+        ops::resident_causal_conv_batch(v, p.value_conv, state.conv[2], slots, v, 8192, t, s);
     }
     projection(x, p.forget_in, small, t, d);
     projection(small, p.forget_out, g, t, d);
     projection(x, p.output_gate_in, small, t, d);
     projection(small, p.output_gate_out, gate, t, d);
     projection(x, p.input_gate, beta, t, d);
-    for (int row = 0; row < t; ++row) {
+    {
         auto temp = w.scope();
-        auto qb = w.alloc(DType::BF16, {128, 64, 1}), kb = w.alloc(DType::BF16, {128, 64, 1}),
-             vb = w.alloc(DType::BF16, {128, 64, 1}), gb = w.alloc(DType::BF16, {128, 64, 1}),
-             bb = w.alloc(DType::BF16, {64, 1}), yb = w.alloc(DType::BF16, {128, 64, 1});
-        ops::pack_bf16(q + row * 8192, static_cast<std::uint16_t*>(qb.data), 8192, s);
-        ops::pack_bf16(k + row * 8192, static_cast<std::uint16_t*>(kb.data), 8192, s);
-        ops::pack_bf16(v + row * 8192, static_cast<std::uint16_t*>(vb.data), 8192, s);
-        ops::pack_bf16(g + row * 8192, static_cast<std::uint16_t*>(gb.data), 8192, s);
-        ops::pack_bf16(beta + row * 64, static_cast<std::uint16_t*>(bb.data), 64, s);
-        Tensor image(recurrent + (compact_state ? row * (StateFloats + ConvFloats) : 0),
-                     DType::FP32, {128, 128, 64});
+        auto qb = w.alloc(DType::BF16, {128, 64, 1, t}),
+             kb = w.alloc(DType::BF16, {128, 64, 1, t}),
+             vb = w.alloc(DType::BF16, {128, 64, 1, t}),
+             gb = w.alloc(DType::BF16, {128, 64, 1, t}),
+             bb = w.alloc(DType::BF16, {64, 1, t}),
+             yb = w.alloc(DType::BF16, {128, 64, 1, t});
+        ops::pack_bf16(q, static_cast<std::uint16_t*>(qb.data), 8192 * t, s);
+        ops::pack_bf16(k, static_cast<std::uint16_t*>(kb.data), 8192 * t, s);
+        ops::pack_bf16(v, static_cast<std::uint16_t*>(vb.data), 8192 * t, s);
+        ops::pack_bf16(g, static_cast<std::uint16_t*>(gb.data), 8192 * t, s);
+        ops::pack_bf16(beta, static_cast<std::uint16_t*>(bb.data), 64 * t, s);
+        Tensor image(state.recurrent, DType::FP32, {128, 128, 64, options_.max_lanes});
         auto bias = p.decay_bias.reshape({128, 64});
-        ops::kimi_delta_attention(
-            qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f, 1.f / std::sqrt(128.f), w, image,
-            yb, devices_[d]->execution_view(), ops::KdaDecayParameter::NegativeRate);
-        ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result + row * 8192, 8192, s);
+        if (options_.draft) {
+            ops::kimi_delta_attention(
+                qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
+                1.f / std::sqrt(128.f), w, image, yb, devices_[d]->execution_view(),
+                ops::KdaDecayParameter::NegativeRate);
+        } else {
+            Tensor ids(const_cast<int*>(slots), DType::I32, {t});
+            ops::kimi_delta_attention_batch_update(
+                qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
+                1.f / std::sqrt(128.f), image, ids, yb, s,
+                ops::KdaDecayParameter::NegativeRate);
+        }
+        ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result, 8192 * t, s);
     }
-    if (compact_state)
-        indexed_transfer(recurrent, state.recurrent,
-                         static_cast<const int*>(state_[d].metadata.p) + 8,
-                         (StateFloats + ConvFloats) * 4, recurrent_stride_[d], t, true, s);
     ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, 64 * t, 1e-5f, false,
                        true, s);
     projection(result, p.output, out, t, d);
@@ -539,9 +541,15 @@ void Program::reset_lane(int lane) {
     frontiers_[lane] = 0;
     for (int d = 0; d < 3; ++d) {
         devices_[d]->bind_to_current_thread();
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(state_[d].recurrent[0].p) +
-                                       lane * recurrent_stride_[d],
-                                   0, recurrent_stride_[d], devices_[d]->stream));
+        for (int i = 0; i < 45; ++i) {
+            if (!parameters_.layers[i].linear || parameters_.layers[i].device != d) continue;
+            auto& layer = layers_[i];
+            CUDA_CHECK(cudaMemsetAsync(layer.recurrent + lane * StateFloats, 0,
+                                       StateFloats * sizeof(float), devices_[d]->stream));
+            for (auto* conv : layer.conv)
+                CUDA_CHECK(cudaMemsetAsync(conv + lane * 8192 * 3, 0,
+                                           8192 * 3 * sizeof(float), devices_[d]->stream));
+        }
     }
     // KV, pools and derived means are overwritten before every visible read.
 }

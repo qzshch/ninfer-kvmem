@@ -111,9 +111,14 @@ __global__ void streams_kernel(const float* x, float* y, int h) {
 }
 
 __global__ void conv_kernel(const float* x, const void* weight, DType type, float* state, float* o,
-                            int channels, int t) {
+                            int channels, int t, const std::int32_t* slots = nullptr) {
     const int c = blockIdx.x * 256 + threadIdx.x;
     if (c >= channels) return;
+    if (slots) {
+        state += static_cast<long long>(slots[blockIdx.y]) * channels * 3;
+        x += static_cast<long long>(blockIdx.y) * channels;
+        o += static_cast<long long>(blockIdx.y) * channels;
+    }
     float s0 = state[c * 3], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
     const float w0 = direct(weight, type, c * 4), w1 = direct(weight, type, c * 4 + 1),
                 w2 = direct(weight, type, c * 4 + 2), w3 = direct(weight, type, c * 4 + 3);
@@ -379,6 +384,18 @@ void resident_causal_conv(const float* x, const Tensor& w, float* state, float* 
     conv_kernel<<<(c + 255) / 256, 256, 0, s>>>(x, w.data, w.dtype, state, o, c, t);
     CUDA_CHECK(cudaGetLastError());
     return;
+}
+
+void resident_causal_conv_batch(const float* x, const Tensor& w, float* state,
+                                const std::int32_t* slots, float* o, int c, int rows,
+                                cudaStream_t s) {
+    shape(c, rows);
+    direct_weight(&w, c * 4);
+    if (!x || !o || !state || !slots)
+        throw std::invalid_argument("resident_conv_batch: operands");
+    conv_kernel<<<dim3((c + 255) / 256, rows), 256, 0, s>>>(
+        x, w.data, w.dtype, state, o, c, 1, slots);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void resident_router(const float* x, const float* b, std::int32_t* ids, float* w, int e, int k,

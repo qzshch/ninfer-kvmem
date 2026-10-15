@@ -69,7 +69,6 @@ private:
     ProgramOptions options_;
     int position_ = 0;
     std::array<int, 8> frontiers_{};
-    std::array<std::size_t, 3> recurrent_stride_{};
     std::map<int, std::array<DecodeGraphExecutable, 4>> graphs_;
     int batch_ = 1, tier_ = 128;
     void batch_stage(int device);

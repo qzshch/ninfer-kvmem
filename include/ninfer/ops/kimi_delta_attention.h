@@ -83,11 +83,14 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
  * A_log FP32 [Hv], dt_bias FP32 [128,Hv], states FP32 [128,128,Hv,Slots], device I32 slots [B].
  * B is in [1,8]. Caller-provided active slots are valid and distinct. Each row reads and writes
  * its selected state. Inputs, out, selectors and state do not overlap.
+ * decay_parameter has the same represented-parameter meaning as the ordinary overload.
+ * NegativeRate is supported by DTK; other implementations reject it before launching.
  */
 void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, const Tensor& A_log,
                                        const Tensor& dt_bias, float lower_bound, float scale,
                                        Tensor& states, const Tensor& slots, Tensor& out,
-                                       cudaStream_t stream);
+                                       cudaStream_t stream,
+                                       KdaDecayParameter decay_parameter = KdaDecayParameter::LogRate);
 
 } // namespace ninfer::ops
