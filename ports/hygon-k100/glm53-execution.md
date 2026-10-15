@@ -60,7 +60,8 @@ sums remain FP32. `--fp32-activations` retains the FP32-storage control for
 native whole-model comparisons.
 
 The optional build flag `-DNINFER_K100_MMAC=ON` selects Hygon FP32 MMAC for
-BF16-input projections, including Decode, owned/grouped experts and K-partials.
+BF16-input projections with reusable matrix columns, including grouped experts
+and K-partials. Single-column Decode retains its dedicated vector path.
 It requires actual vendor gfx928 builtins and fails compilation when they are
 absent. Encoded weights are decoded to FP32 only in transient shared memory.
 Use `check-mmac-isa.sh` for a compiler-only ISA check, then run the independent
