@@ -85,13 +85,8 @@ template <QType F, bool InputBf16, bool OutputBf16>
 void launch(const void* x, const Weight& w, const std::int32_t* ids, void* out, int rows,
             int choices, int t, bool shared, cudaStream_t s, bool rounded, int first) {
     if (x) {
-#ifdef NINFER_K100_MMAC
-        if (InputBf16 && rows >= 128 && w.k >= 128) {
-            mmac_indexed<F, InputBf16, OutputBf16><<<dim3((rows + 63) / 64, t, choices), 256, 0, s>>>(
-                x, w.qdata, ids, out, rows, w.k, choices, shared, rounded, first, w.n / rows);
-            return;
-        }
-#endif
+// Each indexed assignment has its own bank and one input row. A larger
+        // request batch does not make this a multi-row matrix multiplication.
 #ifdef NINFER_HYGON_DTK
         if (rows >= 512 && w.k % 256 == 0) {
             indexed_wave64<F, InputBf16, OutputBf16>

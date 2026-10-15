@@ -138,7 +138,7 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
 template <QType Format, bool InputBf16, bool OutputBf16>
 void launch_typed(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool rounded) {
 #ifdef NINFER_K100_MMAC
-    if (InputBf16 && w.n >= 128 && w.k >= 128) {
+    if (InputBf16 && x.ne[1] >= 16 && w.n >= 128 && w.k >= 128) {
         mmac_projection<Format, InputBf16, OutputBf16><<<dim3((w.n + 63) / 64, (x.ne[1] + 15) / 16), 256, 0, stream>>>(
             x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], rounded);
         return;
@@ -216,7 +216,7 @@ template <QType F, bool InputBf16>
 void partial_launch(const void* x, const Weight& w, float* out, int begin, int k, int t,
                      cudaStream_t s) {
 #ifdef NINFER_K100_MMAC
-    if (InputBf16 && w.n >= 128 && k >= 128) {
+    if (InputBf16 && t >= 16 && w.n >= 128 && k >= 128) {
         mmac_projection<F, InputBf16, false><<<dim3((w.n + 63) / 64, (t + 15) / 16), 256, 0, s>>>(
             x, w.qdata, out, w.n, w.k, begin, k, t, false);
         return;

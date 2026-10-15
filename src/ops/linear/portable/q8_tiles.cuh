@@ -12,7 +12,12 @@ __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
     const int lane = threadIdx.x, group = lane / 16, pair = lane % 16;
     const int first_row = blockIdx.x * Rows;
     const auto* bytes = static_cast<const unsigned char*>(weight);
-    __shared__ float input[TileK], scales[Rows][16], partial[Rows][256];
+    __shared__ float input[TileK], scales[Rows][16];
+#ifdef NINFER_HYGON_DTK
+    __shared__ float partial[Rows][128];
+#else
+    __shared__ float partial[Rows][256];
+#endif
     float sum[Rows]{};
     for (int base = 0; base < k; base += TileK) {
         for (int j = lane; j < TileK; j += 256)
@@ -40,6 +45,31 @@ __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
         }
         __syncthreads();
     }
+#ifdef NINFER_HYGON_DTK
+    // Keep the original 256-lane tree: joins128 and64 cross wave64;
+    // the remaining joins stay within the first wave. The two shared regions
+    // are disjoint while the lower half reads and the next quarter publishes.
+    if (lane >= 128)
+        for (int r = 0; r < Rows; ++r) partial[r][lane - 128] = sum[r];
+    __syncthreads();
+    if (lane < 128)
+        for (int r = 0; r < Rows; ++r) {
+            sum[r] += partial[r][lane];
+            if (lane >= 64) partial[r][lane] = sum[r];
+        }
+    __syncthreads();
+    if (lane < 64)
+        for (int r = 0; r < Rows; ++r) {
+            float v = sum[r] + partial[r][lane + 64];
+            for (int distance = 32; distance; distance /= 2)
+                v += __shfl_down(v, distance, 64);
+            if (!lane && first_row + r < n) {
+                if constexpr (OutputBf16)
+                    static_cast<std::uint16_t*>(out)[first_row + r] = encode_bf16(v);
+                else static_cast<float*>(out)[first_row + r] = projection_output(v, rounded);
+            }
+        }
+#else
     for (int r = 0; r < Rows; ++r) partial[r][lane] = sum[r];
     __syncthreads();
     for (int stride = 128; stride; stride /= 2) {
@@ -51,9 +81,9 @@ __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
         const float v = partial[lane][0];
         if constexpr (OutputBf16)
             static_cast<std::uint16_t*>(out)[first_row + lane] = encode_bf16(v);
-        else
-            static_cast<float*>(out)[first_row + lane] = projection_output(v, rounded);
+        else static_cast<float*>(out)[first_row + lane] = projection_output(v, rounded);
     }
+#endif
 }
 
 template <bool Bf16, bool OutputBf16 = Bf16>
