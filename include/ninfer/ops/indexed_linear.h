@@ -8,9 +8,12 @@ namespace ninfer::ops {
 // (shared_input) or [T,choices,K], out [T,choices,rows]. All activations and
 // output are FP32. A null ids pointer means bank=choice, useful for headwise
 // maps. Caller provides valid ids in [0,banks); no weight/index host read,
-// repack, allocation or activation rounding occurs. Operands are disjoint.
+// repack, allocation or input activation rounding occurs. Operands are disjoint.
+// bf16_output=true rounds each final dot to BF16 (RNE), promoted into FP32
+// storage; false retains the unrounded FP32 output.
 void indexed_linear_fp32(const float* x, const Weight& bank, const std::int32_t* ids, float* out,
-                         int rows, int choices, int tokens, bool shared_input, cudaStream_t stream);
+                         int rows, int choices, int tokens, bool shared_input, cudaStream_t stream,
+                         bool bf16_output = false);
 // Decode selected embedding rows directly to BF16-represented FP32 values.
 // ids [T] stay on device, out [T,K]; no complete embedding expansion.
 void embedding_fp32(const Weight& embedding, const std::int32_t* ids, float* out, int tokens,

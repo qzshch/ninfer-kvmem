@@ -7,12 +7,16 @@
 namespace ninfer::ops {
 namespace {
 #include "ops/linear/portable/weight_decode.cuh"
+
+__device__ float projection_output(float x, bool rounded) {
+    return rounded ? decode_bf16(encode_bf16(x)) : x;
+}
 #ifdef NINFER_HYGON_DTK
 #    include "ops/linear/portable/wave64_dot.cuh"
 
 template <QType F>
 __global__ void indexed_wave64(const float* x, const void* w, const std::int32_t* ids, float* out,
-                               int n, int k, int choices, bool shared) {
+                               int n, int k, int choices, bool shared, bool rounded) {
     const int row = blockIdx.x * 4 + threadIdx.x / 64;
     if (row >= n) return;
     const int t = blockIdx.y, c = blockIdx.z;
@@ -20,14 +24,15 @@ __global__ void indexed_wave64(const float* x, const void* w, const std::int32_t
     const auto* input =
         x + (static_cast<long long>(t) * (shared ? 1 : choices) + (shared ? 0 : c)) * k;
     const float sum = dot_wave64<F, false>(input, w, static_cast<long long>(bank) * n + row, k);
-    if ((threadIdx.x & 63) == 0) out[(static_cast<long long>(t) * choices + c) * n + row] = sum;
+    if ((threadIdx.x & 63) == 0)
+        out[(static_cast<long long>(t) * choices + c) * n + row] = projection_output(sum, rounded);
     return;
 }
 #endif
 
 template <QType F>
 __global__ void indexed_kernel(const float* x, const void* w, const std::int32_t* ids, float* out,
-                               int n, int k, int choices, bool shared) {
+                               int n, int k, int choices, bool shared, bool rounded) {
     const int row = blockIdx.x, t = blockIdx.y, c = blockIdx.z, lane = threadIdx.x;
     const int bank = ids ? ids[t * choices + c] : c;
     const auto* input =
@@ -42,7 +47,9 @@ __global__ void indexed_kernel(const float* x, const void* w, const std::int32_t
         if (lane < s) partial[lane] += partial[lane + s];
         __syncthreads();
     }
-    if (!lane) out[(static_cast<long long>(t) * choices + c) * n + row] = partial[0];
+    if (!lane)
+        out[(static_cast<long long>(t) * choices + c) * n + row] =
+            projection_output(partial[0], rounded);
     return;
 }
 
@@ -57,25 +64,25 @@ __global__ void embedding_kernel(const void* w, const std::int32_t* ids, float* 
 
 template <QType F>
 void launch(const float* x, const Weight& w, const std::int32_t* ids, float* out, int rows,
-            int choices, int t, bool shared, cudaStream_t s) {
+            int choices, int t, bool shared, cudaStream_t s, bool rounded) {
     if (x) {
 #ifdef NINFER_HYGON_DTK
         if (rows >= 512 && w.k % 256 == 0) {
             indexed_wave64<F>
                 <<<dim3((static_cast<unsigned>(rows) + 3) / 4, t, choices), 256, 0, s>>>(
-                    x, w.qdata, ids, out, rows, w.k, choices, shared);
+                    x, w.qdata, ids, out, rows, w.k, choices, shared, rounded);
             return;
         }
 #endif
         indexed_kernel<F><<<dim3(rows, t, choices), 256, 0, s>>>(x, w.qdata, ids, out, rows, w.k,
-                                                                 choices, shared);
+                                                                 choices, shared, rounded);
     } else
         embedding_kernel<F><<<dim3((w.k + 255) / 256, t), 256, 0, s>>>(w.qdata, ids, out, w.k);
     return;
 }
 
 void dispatch(const float* x, const Weight& w, const std::int32_t* ids, float* o, int n, int c,
-              int t, bool shared, cudaStream_t s) {
+              int t, bool shared, cudaStream_t s, bool rounded) {
     detail::validate_portable_linear_weight(w.qtype, w.n, w.k);
     const bool block = interleaved_block_geometry(w.qtype).values != 0;
     if (!w.qdata || !o ||
@@ -84,7 +91,7 @@ void dispatch(const float* x, const Weight& w, const std::int32_t* ids, float* o
         throw std::invalid_argument("indexed_linear: invalid bank/extent/layout");
 #define DISPATCH(F)                                                                                \
     case QType::F:                                                                                 \
-        launch<QType::F>(x, w, ids, o, n, c, t, shared, s);                                        \
+        launch<QType::F>(x, w, ids, o, n, c, t, shared, s, rounded);                               \
         break
     switch (w.qtype) {
         DISPATCH(FP32);
@@ -107,16 +114,16 @@ void dispatch(const float* x, const Weight& w, const std::int32_t* ids, float* o
 } // namespace
 
 void indexed_linear_fp32(const float* x, const Weight& w, const std::int32_t* ids, float* o, int n,
-                         int c, int t, bool shared, cudaStream_t s) {
+                         int c, int t, bool shared, cudaStream_t s, bool rounded) {
     if (!x || x == o || n < 1 || (ids == nullptr && w.n / n < c))
         throw std::invalid_argument("indexed_linear: input or bank coverage");
-    dispatch(x, w, ids, o, n, c, t, shared, s);
+    dispatch(x, w, ids, o, n, c, t, shared, s, rounded);
     return;
 }
 
 void embedding_fp32(const Weight& w, const std::int32_t* ids, float* o, int t, cudaStream_t s) {
     if (!ids) throw std::invalid_argument("embedding: missing device ids");
-    dispatch(nullptr, w, ids, o, w.n, 1, t, true, s);
+    dispatch(nullptr, w, ids, o, w.n, 1, t, true, s, false);
     return;
 }
 } // namespace ninfer::ops

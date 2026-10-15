@@ -10,11 +10,16 @@
 namespace ninfer::ops::detail {
 namespace {
 #include "ops/linear/portable/weight_decode.cuh"
+
+__device__ float projection_output(float x, bool rounded) {
+    return rounded ? decode_bf16(encode_bf16(x)) : x;
+}
 #ifdef NINFER_HYGON_DTK
 #    include "ops/linear/portable/wave64_dot.cuh"
 
 template <QType Format, bool Bf16>
-__global__ void projection_wave64(const void* x, const void* w, void* out, int n, int k) {
+__global__ void projection_wave64(const void* x, const void* w, void* out, int n, int k,
+                                  bool rounded) {
     const auto row = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 64;
     if (row >= n) return;
     const auto token = static_cast<std::int64_t>(blockIdx.y);
@@ -28,14 +33,14 @@ __global__ void projection_wave64(const void* x, const void* w, void* out, int n
         if constexpr (Bf16)
             static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(sum);
         else
-            static_cast<float*>(out)[token * n + row] = sum;
+            static_cast<float*>(out)[token * n + row] = projection_output(sum, rounded);
     }
     return;
 }
 #endif
 
 template <QType Format, bool Bf16>
-__global__ void projection(const void* x, const void* w, void* out, int n, int k) {
+__global__ void projection(const void* x, const void* w, void* out, int n, int k, bool rounded) {
     __shared__ float partial[256];
     const auto row     = static_cast<std::int64_t>(blockIdx.x);
     const auto token   = static_cast<std::int64_t>(blockIdx.y);
@@ -75,7 +80,7 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
         if constexpr (Bf16) {
             static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(partial[0]);
         } else {
-            static_cast<float*>(out)[token * n + row] = partial[0];
+            static_cast<float*>(out)[token * n + row] = projection_output(partial[0], rounded);
         }
     }
     return;
@@ -88,7 +93,7 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
 // Tails are masked; there is no padding request or duplicated mutable state.
 template <QType Format, bool Bf16>
 __global__ void projection_columns4(const void* x, const void* w, void* out, int n, int k,
-                                    int tokens) {
+                                    int tokens, bool rounded) {
     const int row = blockIdx.x, base = blockIdx.y * 4, lane = threadIdx.x;
     float sum[4]{};
     for (int column = lane; column < k; column += 256) {
@@ -119,7 +124,8 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
                 if constexpr (Bf16)
                     static_cast<std::uint16_t*>(out)[(base + t) * n + row] = encode_bf16(value);
                 else
-                    static_cast<float*>(out)[(base + t) * n + row] = value;
+                    static_cast<float*>(out)[(base + t) * n + row] =
+                        projection_output(value, rounded);
             }
         }
     return;
@@ -127,17 +133,17 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
 #endif
 
 template <QType Format>
-void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool bf16_output) {
 #ifdef NINFER_HYGON_DTK
     if (x.ne[1] > 1 && (Format == QType::Q8_G32_FP16_BLOCK || Format == QType::Q6_K_G256_BLOCK) &&
         w.n >= 128) {
         const dim3 grid(w.n, (x.ne[1] + 3) / 4);
         if (x.dtype == DType::BF16)
-            projection_columns4<Format, true>
-                <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, x.ne[1]);
+            projection_columns4<Format, true><<<grid, 256, 0, stream>>>(
+                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output);
         else
-            projection_columns4<Format, false>
-                <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, x.ne[1]);
+            projection_columns4<Format, false><<<grid, 256, 0, stream>>>(
+                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output);
         return;
     }
     // Small row counts retain the wider row to expose enough parallel columns.
@@ -146,18 +152,20 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         const dim3 grouped((static_cast<unsigned>(w.n) + 3) / 4, static_cast<unsigned>(x.ne[1]));
         if (x.dtype == DType::BF16)
             projection_wave64<Format, true>
-                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
         else
             projection_wave64<Format, false>
-                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
         return;
     }
 #endif
     const dim3 grid(static_cast<unsigned>(w.n), static_cast<unsigned>(x.ne[1]));
     if (x.dtype == DType::BF16) {
-        projection<Format, true><<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+        projection<Format, true>
+            <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
     } else {
-        projection<Format, false><<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+        projection<Format, false>
+            <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
     }
     return;
 }
@@ -188,7 +196,8 @@ void validate_portable_linear_weight(QType type, std::int32_t n, std::int32_t k)
     }
 }
 
-void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                            bool bf16_output) {
     validate_portable_linear_weight(w.qtype, w.n, w.k);
     if (!w.qdata || (x.dtype != DType::BF16 && x.dtype != DType::FP32) || out.dtype != x.dtype ||
         x.ne[1] > 65535 || x.ne[1] <= 0) {
@@ -200,34 +209,34 @@ void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaS
     }
     switch (w.qtype) {
     case QType::FP32:
-        launch<QType::FP32>(x, w, out, stream);
+        launch<QType::FP32>(x, w, out, stream, bf16_output);
         break;
     case QType::FP16:
-        launch<QType::FP16>(x, w, out, stream);
+        launch<QType::FP16>(x, w, out, stream, bf16_output);
         break;
     case QType::BF16:
-        launch<QType::BF16>(x, w, out, stream);
+        launch<QType::BF16>(x, w, out, stream, bf16_output);
         break;
     case QType::MXFP4_G32_E8M0:
-        launch<QType::MXFP4_G32_E8M0>(x, w, out, stream);
+        launch<QType::MXFP4_G32_E8M0>(x, w, out, stream, bf16_output);
         break;
     case QType::Q8_G32_FP16_BLOCK:
-        launch<QType::Q8_G32_FP16_BLOCK>(x, w, out, stream);
+        launch<QType::Q8_G32_FP16_BLOCK>(x, w, out, stream, bf16_output);
         break;
     case QType::IQ3_S_G256_BLOCK:
-        launch<QType::IQ3_S_G256_BLOCK>(x, w, out, stream);
+        launch<QType::IQ3_S_G256_BLOCK>(x, w, out, stream, bf16_output);
         break;
     case QType::IQ4_XS_G256_BLOCK:
-        launch<QType::IQ4_XS_G256_BLOCK>(x, w, out, stream);
+        launch<QType::IQ4_XS_G256_BLOCK>(x, w, out, stream, bf16_output);
         break;
     case QType::Q3_K_G256_BLOCK:
-        launch<QType::Q3_K_G256_BLOCK>(x, w, out, stream);
+        launch<QType::Q3_K_G256_BLOCK>(x, w, out, stream, bf16_output);
         break;
     case QType::Q4_K_G256_BLOCK:
-        launch<QType::Q4_K_G256_BLOCK>(x, w, out, stream);
+        launch<QType::Q4_K_G256_BLOCK>(x, w, out, stream, bf16_output);
         break;
     case QType::Q6_K_G256_BLOCK:
-        launch<QType::Q6_K_G256_BLOCK>(x, w, out, stream);
+        launch<QType::Q6_K_G256_BLOCK>(x, w, out, stream, bf16_output);
         break;
     default:
         throw std::logic_error("validated projection type was not dispatched");

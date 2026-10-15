@@ -42,7 +42,7 @@ std::uint16_t bf16(float v) {
 double unbf16(std::uint16_t b) { return std::bit_cast<float>(static_cast<unsigned>(b) << 16); }
 
 void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann::json& item,
-                 int t, bool shared, bool implicit) {
+                 int t, bool shared, bool implicit, bool rounded) {
     const auto raw    = read<std::byte>(root / item.at("encoded").get<std::string>());
     const auto oracle = read<double>(root / item.at("oracle").get<std::string>());
     const int k = item.at("k"), rows = item.at("parent_rows");
@@ -74,10 +74,21 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
     auto* output = reinterpret_cast<float*>(static_cast<std::byte*>(dy.p) + 16);
     ops::indexed_linear_fp32(static_cast<float*>(dx.p), w,
                              implicit ? nullptr : static_cast<std::int32_t*>(di.p), output, n,
-                             choices, t, shared, ctx.stream);
+                             choices, t, shared, ctx.stream, rounded);
     ctx.synchronize();
     std::vector<float> y(static_cast<std::size_t>(t) * choices * n);
     CUDA_CHECK(cudaMemcpy(y.data(), output, y.size() * 4, cudaMemcpyDeviceToHost));
+    if (rounded) {
+        ops::indexed_linear_fp32(static_cast<float*>(dx.p), w,
+                                 implicit ? nullptr : static_cast<std::int32_t*>(di.p), output, n,
+                                 choices, t, shared, ctx.stream, false);
+        ctx.synchronize();
+        std::vector<float> raw_y(y.size());
+        CUDA_CHECK(cudaMemcpy(raw_y.data(), output, raw_y.size() * 4, cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < y.size(); ++i)
+            require(y[i] == unbf16(bf16(raw_y[i])),
+                    "indexed fused boundary differs from exact CPU cast of raw output");
+    }
     for (int token = 0; token < t; ++token)
         for (int c = 0; c < choices; ++c)
             for (int row = 0; row < n; ++row) {
@@ -93,7 +104,18 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
                     absolute += std::abs(p);
                 }
                 double value = y[(token * choices + c) * n + row];
-                require(std::isfinite(value) && std::abs(value - sum) <= 4e-6 * absolute + 1e-30,
+                double floor = 0;
+                if (rounded) {
+                    const int word = bf16(static_cast<float>(sum));
+                    floor          = std::abs(unbf16(word) - sum);
+                    for (int d : {-1, 1})
+                        if (word + d >= 0 && word + d <= 65535)
+                            floor = std::min(floor, std::abs(unbf16(word + d) - sum));
+                    require(value == unbf16(bf16(static_cast<float>(value))),
+                            "indexed fused BF16 output representation");
+                }
+                require(std::isfinite(value) &&
+                            std::abs(value - sum) <= floor + 4e-6 * absolute + 1e-30,
                         "indexed projection full FP64 dot criterion");
             }
     std::vector<std::byte> guard(dy.bytes);
@@ -123,7 +145,7 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
 }
 
 double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann::json& item,
-           int tokens, bool bf) {
+           int tokens, bool bf, bool rounded = false) {
     const auto raw    = read<std::byte>(root / item.at("encoded").get<std::string>());
     const auto oracle = read<double>(root / item.at("oracle").get<std::string>());
     const int n = item.at("n"), k = item.at("k"), rows = item.at("parent_rows"),
@@ -159,10 +181,23 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
     if (bf)
         ops::linear(a, w, y, ctx.stream);
     else
-        ops::linear_fp32(a, w, y, ctx.stream);
+        ops::linear_fp32(a, w, y, ctx.stream, rounded);
     ctx.synchronize();
     auto observed = std::vector<std::byte>(output.bytes);
     output.copy_to_host(observed.data(), observed.size());
+    if (rounded) {
+        ops::linear_fp32(a, w, y, ctx.stream, false);
+        ctx.synchronize();
+        std::vector<std::byte> raw_y(output.bytes);
+        output.copy_to_host(raw_y.data(), raw_y.size());
+        for (int i = 0; i < n * tokens; ++i) {
+            float raw_value, fused_value;
+            std::memcpy(&raw_value, raw_y.data() + 16 + i * 4, 4);
+            std::memcpy(&fused_value, observed.data() + 16 + i * 4, 4);
+            require(fused_value == unbf16(bf16(raw_value)),
+                    "dense fused boundary differs from exact CPU cast of raw output");
+        }
+    }
     for (int i = 0; i < 16; ++i)
         require(observed[i] == std::byte{0xa5} &&
                     observed[observed.size() - 1 - i] == std::byte{0xa5},
@@ -185,17 +220,22 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
             if (bf) {
                 std::uint16_t v;
                 std::memcpy(&v, observed.data() + offset, 2);
-                value             = unbf16(v);
-                const auto approx = static_cast<int>(bf16(static_cast<float>(expected)));
-                floor             = std::abs(unbf16(approx) - expected);
-                for (int d : {-1, 1})
-                    if (approx + d >= 0 && approx + d <= 65535)
-                        floor = std::min(floor, std::abs(unbf16(approx + d) - expected));
+                value = unbf16(v);
             } else {
                 float v;
                 std::memcpy(&v, observed.data() + offset, 4);
                 value = v;
             }
+            if (bf || rounded) {
+                const auto approx = static_cast<int>(bf16(static_cast<float>(expected)));
+                floor             = std::abs(unbf16(approx) - expected);
+                for (int d : {-1, 1})
+                    if (approx + d >= 0 && approx + d <= 65535)
+                        floor = std::min(floor, std::abs(unbf16(approx + d) - expected));
+            }
+            if (rounded)
+                require(value == unbf16(bf16(static_cast<float>(value))),
+                        "dense fused BF16 output representation");
             const auto ratio =
                 std::max(0., std::abs(value - expected) - floor) / (4e-6 * absolute + 1e-30);
             worst = std::max(worst, ratio);
@@ -223,14 +263,20 @@ int main(int argc, char** argv) try {
             for (bool bf : {false, true}) {
                 worst = std::max(worst, run(ctx, root, item, tokens, bf));
                 ++count;
+                if (!bf) {
+                    worst = std::max(worst, run(ctx, root, item, tokens, false, true));
+                    ++count;
+                }
             }
     unsigned indexed = 0;
     for (const auto& item : cases)
         for (int tokens : {1, 3, 8})
             for (bool shared : {false, true})
                 for (bool implicit : {false, true}) {
-                    run_indexed(ctx, root, item, tokens, shared, implicit);
-                    ++indexed;
+                    for (bool rounded : {false, true}) {
+                        run_indexed(ctx, root, item, tokens, shared, implicit, rounded);
+                        ++indexed;
+                    }
                 }
     std::printf("PASS: %u indexed bank/head projections, plus exact BF16 embedding checks\n",
                 indexed);

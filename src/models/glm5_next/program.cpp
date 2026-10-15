@@ -146,8 +146,7 @@ float* Program::floats(WorkspaceArena& w, std::size_t n) {
 
 void Program::projection(const float* x, const Weight& w, float* y, int t, int d, bool round) {
     Tensor a(const_cast<float*>(x), DType::FP32, {w.k, t}), b(y, DType::FP32, {w.n, t});
-    ops::linear_fp32(a, w, b, devices_[d]->stream);
-    if (round) ops::round_bf16(y, static_cast<std::size_t>(w.n) * t, devices_[d]->stream);
+    ops::linear_fp32(a, w, b, devices_[d]->stream, round);
 }
 
 void Program::mlp(const float* x, const MlpParameters& p, float* out, int intermediate, int t,
@@ -335,8 +334,8 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
     } else
         ops::resident_sparse_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
                                        ids, prob, attended, slots, options_.max_context, t, s);
-    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, 64, t, false, s);
-    ops::round_bf16(expanded, 16384 * t, s);
+    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, 64, t, false, s,
+                             true);
     projection(expanded, p.output, out, t, d);
 }
 
@@ -355,13 +354,10 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
     auto* ids = static_cast<std::int32_t*>(w.alloc_bytes(8 * 4 * t).data);
     projection(x, p.router, logits, t, d, false);
     ops::resident_router(logits, fp(p.router_bias), ids, weights, 288, 8, t, 2.5f, s);
-    ops::indexed_linear_fp32(x, p.experts.gate, ids, g, 2048, 8, t, true, s);
-    ops::indexed_linear_fp32(x, p.experts.up, ids, u, 2048, 8, t, true, s);
-    ops::round_bf16(g, 8 * 2048 * t, s);
-    ops::round_bf16(u, 8 * 2048 * t, s);
+    ops::indexed_linear_fp32(x, p.experts.gate, ids, g, 2048, 8, t, true, s, true);
+    ops::indexed_linear_fp32(x, p.experts.up, ids, u, 2048, 8, t, true, s, true);
     ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
-    ops::indexed_linear_fp32(g, p.experts.down, ids, experts, H, 8, t, false, s);
-    ops::round_bf16(experts, 8 * H * t, s);
+    ops::indexed_linear_fp32(g, p.experts.down, ids, experts, H, 8, t, false, s, true);
     mlp(x, p.ffn, shared, 2048, t, d, 10.f);
     ops::resident_moe_sum(experts, weights, shared, out, H, 8, t, s);
 }

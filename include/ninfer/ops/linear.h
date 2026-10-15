@@ -140,15 +140,19 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 /** FP32 boundary used by DeepSeek hyper-connections, compressors and output heads.
  * Computes the same complete bias-free dot product as Linear, with contiguous
  * FP32 [K,T] input and FP32 [N,T] output. Supports contiguous BF16/FP16/FP32 and
- * block_interleaved_v1 MXFP4_G32_E8M0/Q8_G32_FP16_BLOCK matrices, any positive N/K
- * (block formats require K%32=0), and T in [1,65535]. Inputs, output and weights
- * must not overlap. No allocation/workspace, activation cast, or persistent state
+ * block_interleaved_v1 MXFP4/Q8/IQ3_S/IQ4_XS/Q3_K/Q4_K/Q6_K matrices, any positive N/K
+ * (32-value formats require K%32=0; 256-value formats K%256=0), and T in [1,65535]. Inputs, output
+ * and weights must not overlap. No allocation/workspace, activation cast, or persistent state
  * effect. The oracle independently decodes represented weights/inputs and sums
  * each full dot product in FP64; accumulator/reduction error belongs to the
  * numerical criterion. DTK's BF16 Linear uses these same weight formats in A16
  * compute, with its usual BF16 input/output boundaries and 16-byte alignment.
  * CUDA's existing BF16 Linear registry is unchanged.
  */
-void linear_fp32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+// bf16_output=true applies the model's explicit round-to-nearest-even BF16
+// output boundary and promotes the result back into FP32 storage. Inputs and
+// dot products are unchanged. This is an output cast, not activation quantization.
+void linear_fp32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
+                 bool bf16_output = false);
 
 } // namespace ninfer::ops
