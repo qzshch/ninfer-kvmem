@@ -141,6 +141,11 @@ int main(int argc,char** argv)try{
     for(auto [n,k]:{std::pair{2304,5120},std::pair{5120,2304}}){
         worst=std::max(worst,run(ctx,QType::MXFP4_G32_E8M0,n,k,1,false));++cases;
     }
+    for(auto type:{QType::MXFP4_G32_E8M0,QType::Q8_G32_FP16_BLOCK,QType::FP32,QType::BF16,QType::FP16})
+        for(int tokens:{1,8})for(bool bf16_io:{false,true}){
+            worst=std::max(worst,run(ctx,type,513,1024,tokens,bf16_io));++cases;
+            worst=std::max(worst,run(ctx,type,513,544,tokens,bf16_io));++cases;
+        }
     if(argc==2){
         std::ifstream stream(argv[1],std::ios::binary);require(static_cast<bool>(stream),"missing real MXFP4 sample");
         std::vector<std::byte> bytes(64*5120/32*17);stream.read(reinterpret_cast<char*>(bytes.data()),bytes.size());require(static_cast<std::size_t>(stream.gcount())==bytes.size(),"truncated real MXFP4 sample");

@@ -12,6 +12,7 @@ root=Path(sys.argv[1]);root.mkdir(parents=True,exist_ok=True)
 cases=[];rng=random.Random(73531)
 problems=[(name,19,4096,1,17) for name in BLOCK256_FORMATS]
 problems += [('iq3_s_g256_block',2048,4096,0,2048),('iq4_xs_g256_block',4096,2048,0,4096)]
+problems += [(name,1030,1024,1,1025) for name in BLOCK256_FORMATS]
 for index,(name,parent_rows,k,row_begin,n) in enumerate(problems):
     spec=BLOCK256_FORMATS[name]
     with (root/f'{index}.encoded').open('wb') as encoded,(root/f'{index}.fp64').open('wb') as oracle:

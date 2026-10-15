@@ -195,6 +195,8 @@ void router(DeviceContext& ctx, int experts, int active, int rows, int mode) {
     std::vector<float> l(experts * rows), bias(experts);
     for (int i = 0; i < experts * rows; ++i) l[i] = mode ? 0 : value(i) * 2;
     for (int i = 0; i < experts; ++i) bias[i] = mode ? 0 : static_cast<float>(std::sin(i) * .025);
+    if (mode == 2)
+        for (int i = 0; i < experts * rows; ++i) l[i] = i % 2 ? 128.f : -128.f;
     auto dl = upload(l), db = upload(bias);
     DeviceBuffer ids(rows * active * 4), weights(rows * active * 4);
     ops::resident_router(static_cast<float*>(dl.p), static_cast<float*>(db.p),
@@ -321,10 +323,13 @@ int main() {
                 ++cases;
             }
         for (int rows : {1, 8})
-            for (int mode : {0, 1}) {
-                router(ctx, 288, 8, rows, mode);
-                ++cases;
-            }
+            for (int mode : {0, 1, 2})
+                for (auto [experts, active] :
+                     {std::pair{288, 8}, std::pair{1, 1}, std::pair{17, 17}, std::pair{512, 32},
+                      std::pair{513, 8}}) {
+                    router(ctx, experts, active, rows, mode);
+                    ++cases;
+                }
         argmax(ctx);
         ++cases;
         for (int rows : {32, 128}) {

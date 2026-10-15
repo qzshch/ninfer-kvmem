@@ -147,8 +147,8 @@ __global__ void conv_kernel(const float* x, const void* weight, DType type, floa
     state[c * 3 + 2] = s2;
 }
 
-__global__ void router_kernel(const float* logits, const float* bias, std::int32_t* ids,
-                              float* weights, int experts, int active, float scale) {
+__global__ void router_serial_kernel(const float* logits, const float* bias, std::int32_t* ids,
+                                     float* weights, int experts, int active, float scale) {
     if (threadIdx.x) return;
     const int t = blockIdx.x;
     float selected[32], sum = 0;
@@ -170,6 +170,64 @@ __global__ void router_kernel(const float* logits, const float* bias, std::int32
         sum += selected[j];
     }
     for (int j = 0; j < active; ++j) weights[t * active + j] = selected[j] * scale / (sum + 1e-20f);
+}
+
+__device__ void router_max(float& value, int& id, int distance) {
+    const float other  = __shfl_down(value, distance, 64);
+    const int other_id = __shfl_down(id, distance, 64);
+    if (other > value || (other == value && other_id < id)) {
+        value = other;
+        id    = other_id;
+    }
+    return;
+}
+
+__global__ void router_kernel(const float* logits, const float* bias, std::int32_t* ids,
+                              float* weights, int experts, int active, float scale) {
+    __shared__ float probability[512], rank[512], wave_value[4];
+    __shared__ int wave_id[4];
+    const int t = blockIdx.x, thread = threadIdx.x, lane = thread & 63, wave = thread / 64;
+    for (int e = thread; e < experts; e += 256) {
+        const float p  = sig(logits[t * experts + e]);
+        probability[e] = p;
+        rank[e]        = p + bias[e];
+    }
+    __syncthreads();
+    float sum = 0.f;
+    for (int j = 0; j < active; ++j) {
+        float value = -INFINITY;
+        int id      = INT_MAX;
+        for (int e = thread; e < experts; e += 256) {
+            const float score = rank[e];
+            if (score > value || (score == value && e < id)) {
+                value = score;
+                id    = e;
+            }
+        }
+        for (int distance = 32; distance; distance /= 2) router_max(value, id, distance);
+        if (!lane) {
+            wave_value[wave] = value;
+            wave_id[wave]    = id;
+        }
+        __syncthreads();
+        if (!wave) {
+            value = lane < 4 ? wave_value[lane] : -INFINITY;
+            id    = lane < 4 ? wave_id[lane] : INT_MAX;
+            router_max(value, id, 2);
+            router_max(value, id, 1);
+            if (!lane) {
+                ids[t * active + j] = id;
+                sum += probability[id];
+                rank[id] = -INFINITY;
+            }
+        }
+        __syncthreads();
+    }
+    // Keep the selected-score sum and final normalization in the original order.
+    if (!thread)
+        for (int j = 0; j < active; ++j)
+            weights[t * active + j] = probability[ids[t * active + j]] * scale / (sum + 1e-20f);
+    return;
 }
 
 __global__ void moe_sum_kernel(const float* x, const float* w, const float* shared, float* o, int h,
@@ -328,7 +386,10 @@ void resident_router(const float* x, const float* b, std::int32_t* ids, float* w
     shape(e, t);
     if (!x || !b || !ids || !w || k < 1 || k > 32 || k > e || !std::isfinite(scale))
         throw std::invalid_argument("resident_router: operands");
-    router_kernel<<<t, 1, 0, s>>>(x, b, ids, w, e, k, scale);
+    if (e <= 512)
+        router_kernel<<<t, 256, 0, s>>>(x, b, ids, w, e, k, scale);
+    else
+        router_serial_kernel<<<t, 1, 0, s>>>(x, b, ids, w, e, k, scale);
     CUDA_CHECK(cudaGetLastError());
     return;
 }

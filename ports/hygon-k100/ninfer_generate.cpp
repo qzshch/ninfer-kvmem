@@ -67,7 +67,7 @@ struct MemorySampler {
 };
 
 Json run(const std::filesystem::path& artifact, const std::string& input, const std::string& kind,
-         int context, int output, int window, bool draft) {
+         int context, int output, int window, bool draft, int repeat = 1) {
     Json report = {{"backend", "native ninfer::Engine"},
                    {"speculative", draft ? "DFlash2 K7" : "ordinary"},
                    {"kvmem_window_pages", window},
@@ -106,47 +106,55 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
         {"architecture", load.architecture},      {"seconds", load.load_seconds},
         {"h2d_bytes", load.host_to_device_bytes}, {"device_objects", load.device_object_count},
         {"host_objects", load.host_object_count}, {"peak_staging_bytes", load.peak_staging_bytes}};
-    ninfer::PreparedPrompt prompt;
-    if (kind == "tokens")
-        prompt = engine.prepare_tokens(Json::parse(input).get<std::vector<ninfer::TokenId>>());
-    else if (kind == "raw")
-        prompt = engine.prepare_tokens(engine.tokenize_text(input));
-    else {
-        ninfer::PromptInput chat;
-        ninfer::ChatMessage message;
-        message.role = ninfer::ChatRole::User;
-        message.parts.push_back({ninfer::MessagePartKind::Text, input, {}});
-        chat.messages.push_back(std::move(message));
-        chat.options.reasoning_effort = ninfer::ReasoningEffort::Low;
-        prompt                        = engine.prepare(std::move(chat));
+    auto iterations = Json::array();
+    for (int iteration = 0; iteration < repeat; ++iteration) {
+        ninfer::PreparedPrompt prompt;
+        if (kind == "tokens")
+            prompt = engine.prepare_tokens(Json::parse(input).get<std::vector<ninfer::TokenId>>());
+        else if (kind == "raw")
+            prompt = engine.prepare_tokens(engine.tokenize_text(input));
+        else {
+            ninfer::PromptInput chat;
+            ninfer::ChatMessage message;
+            message.role = ninfer::ChatRole::User;
+            message.parts.push_back({ninfer::MessagePartKind::Text, input, {}});
+            chat.messages.push_back(std::move(message));
+            chat.options.reasoning_effort = ninfer::ReasoningEffort::Low;
+            prompt                        = engine.prepare(std::move(chat));
+        }
+        std::cerr << "native prefill tokens=" << prompt.summary().prompt_tokens
+                  << " backend=" << (draft ? "DFlash2 K7" : "ordinary") << '\n';
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = output;
+        request.execution.sampling.temperature    = 0.f;
+        auto result                        = engine.generate(std::move(prompt), std::move(request));
+        report["devices_after_generation"] = devices();
+        report["sampled_peak_bytes_500ms"] = sampler.peak();
+        report["result"]                   = {
+            {"prompt_tokens", result.prompt.prompt_tokens},
+            {"generated_ids", result.generated_token_ids},
+            {"content", result.content},
+            {"reasoning", result.reasoning},
+            {"finish_reason", static_cast<int>(result.finish_reason)},
+            {"prefill_seconds", result.timings.prefill_seconds},
+            {"decode_seconds", result.timings.decode_seconds},
+            {"total_seconds", result.timings.total_seconds},
+            {"decode_tokens_per_second",
+             result.timings.decode_seconds > 0 && result.generated_token_ids.size() > 1
+                 ? (result.generated_token_ids.size() - 1) / result.timings.decode_seconds
+                 : 0},
+            {"draft_rounds", result.speculative.rounds},
+            {"drafted_tokens", result.speculative.drafted_tokens},
+            {"accepted_draft_tokens", result.speculative.accepted_tokens},
+            {"accepted_per_position", result.speculative.accepted_per_position},
+            {"kvmem_selection_calls", result.timings.kvmem.selection_calls},
+            {"kvmem_restricted_calls", result.timings.kvmem.selection_restricted_calls}};
+        iterations.push_back(report["result"]);
+        std::cerr << "native iteration=" << iteration + 1 << '/' << repeat
+                  << " prefill_seconds=" << result.timings.prefill_seconds
+                  << " decode_seconds=" << result.timings.decode_seconds << '\n';
     }
-    std::cerr << "native prefill tokens=" << prompt.summary().prompt_tokens
-              << " backend=" << (draft ? "DFlash2 K7" : "ordinary") << '\n';
-    ninfer::RequestOptions request;
-    request.execution.requested_output_tokens = output;
-    request.execution.sampling.temperature    = 0.f;
-    auto result                        = engine.generate(std::move(prompt), std::move(request));
-    report["devices_after_generation"] = devices();
-    report["sampled_peak_bytes_500ms"] = sampler.peak();
-    report["result"]                   = {
-        {"prompt_tokens", result.prompt.prompt_tokens},
-        {"generated_ids", result.generated_token_ids},
-        {"content", result.content},
-        {"reasoning", result.reasoning},
-        {"finish_reason", static_cast<int>(result.finish_reason)},
-        {"prefill_seconds", result.timings.prefill_seconds},
-        {"decode_seconds", result.timings.decode_seconds},
-        {"total_seconds", result.timings.total_seconds},
-        {"decode_tokens_per_second",
-         result.timings.decode_seconds > 0 && result.generated_token_ids.size() > 1
-             ? (result.generated_token_ids.size() - 1) / result.timings.decode_seconds
-             : 0},
-        {"draft_rounds", result.speculative.rounds},
-        {"drafted_tokens", result.speculative.drafted_tokens},
-        {"accepted_draft_tokens", result.speculative.accepted_tokens},
-        {"accepted_per_position", result.speculative.accepted_per_position},
-        {"kvmem_selection_calls", result.timings.kvmem.selection_calls},
-        {"kvmem_restricted_calls", result.timings.kvmem.selection_restricted_calls}};
+    if (repeat > 1) report["iterations"] = std::move(iterations);
     auto memory                  = engine.memory_summary();
     report["native_allocations"] = {{"encoded_weights", memory.weights.capacity_bytes},
                                     {"state_kv_features_snapshots", memory.sequence.capacity_bytes},
@@ -162,7 +170,7 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path artifact, report_path;
         std::string input, kind;
-        int context = 32768, output = 64, window = 6;
+        int context = 32768, output = 64, window = 6, repeat = 1;
         bool draft = true, verify = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
@@ -175,7 +183,8 @@ int main(int argc, char** argv) {
                              "only.\n--artifact FILE (--prompt TEXT | --prompt-file FILE | "
                              "--raw-text TEXT | --token-ids-file FILE)\n[--max-context 32768] "
                              "[--max-new-tokens 64] [--kvmem-window-pages 6]\n[--ordinary | "
-                             "--verify-native-greedy] [--report FILE]\nGreedy Aggregate profile; "
+                             "--verify-native-greedy] [--report FILE]\n[--repeat N (ordinary "
+                             "only)]\nGreedy Aggregate profile; "
                              "DFlash2 K7 by default. No weight/KV offload.\nVerification loads "
                              "ordinary then DFlash2 serially and compares every generated token.\n";
                 return 0;
@@ -196,6 +205,8 @@ int main(int argc, char** argv) {
                 output = std::stoi(value());
             else if (a == "--kvmem-window-pages")
                 window = std::stoi(value());
+            else if (a == "--repeat")
+                repeat = std::stoi(value());
             else if (a == "--ordinary")
                 draft = false;
             else if (a == "--verify-native-greedy")
@@ -204,7 +215,7 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown argument: " + a);
         }
         if (artifact.empty() || kind.empty() || context < 1 || context > 32768 || output < 1 ||
-            window < 0 || (!draft && verify))
+            window < 0 || repeat < 1 || (repeat > 1 && (draft || verify)) || (!draft && verify))
             throw std::invalid_argument("invalid or missing native inference arguments");
         Json result;
         std::string verification_failure;
@@ -222,7 +233,7 @@ int main(int argc, char** argv) {
             else if (result["dflash2"]["result"]["accepted_draft_tokens"].get<std::uint64_t>() == 0)
                 verification_failure = "DFlash2 verification produced no positive acceptance";
         } else
-            result = run(artifact, input, kind, context, output, window, draft);
+            result = run(artifact, input, kind, context, output, window, draft, repeat);
         if (!report_path.empty()) {
             std::ofstream f(report_path);
             if (!f) throw std::runtime_error("cannot write native report");

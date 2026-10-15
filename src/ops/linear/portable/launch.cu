@@ -1,5 +1,6 @@
 // Native NInfer matrix math for the DeepSeek artifact formats. Apache-2.0.
-// One row/token workgroup; no hidden allocation, external engine, or warp-width assumption.
+// DTK groups large rows by wave64; other profiles retain the block reduction.
+// No hidden allocation or external engine.
 #include "ops/linear/portable/launch.h"
 #include "core/device.h"
 
@@ -9,6 +10,29 @@
 namespace ninfer::ops::detail {
 namespace {
 #include "ops/linear/portable/weight_decode.cuh"
+#ifdef NINFER_HYGON_DTK
+#    include "ops/linear/portable/wave64_dot.cuh"
+
+template <QType Format, bool Bf16>
+__global__ void projection_wave64(const void* x, const void* w, void* out, int n, int k) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 64;
+    if (row >= n) return;
+    const auto token = static_cast<std::int64_t>(blockIdx.y);
+    const void* input;
+    if constexpr (Bf16)
+        input = static_cast<const std::uint16_t*>(x) + token * k;
+    else
+        input = static_cast<const float*>(x) + token * k;
+    const float sum = dot_wave64<Format, Bf16>(input, w, row, k);
+    if ((threadIdx.x & 63) == 0) {
+        if constexpr (Bf16)
+            static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(sum);
+        else
+            static_cast<float*>(out)[token * n + row] = sum;
+    }
+    return;
+}
+#endif
 
 template <QType Format, bool Bf16>
 __global__ void projection(const void* x, const void* w, void* out, int n, int k) {
@@ -44,6 +68,19 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
 
 template <QType Format>
 void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+#ifdef NINFER_HYGON_DTK
+    // Small row counts retain the wider row to expose enough parallel columns.
+    if (w.n >= 512 && w.k % 256 == 0) {
+        const dim3 grouped((static_cast<unsigned>(w.n) + 3) / 4, static_cast<unsigned>(x.ne[1]));
+        if (x.dtype == DType::BF16)
+            projection_wave64<Format, true>
+                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+        else
+            projection_wave64<Format, false>
+                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
+        return;
+    }
+#endif
     const dim3 grid(static_cast<unsigned>(w.n), static_cast<unsigned>(x.ne[1]));
     if (x.dtype == DType::BF16) {
         projection<Format, true><<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k);
