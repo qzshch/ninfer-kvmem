@@ -112,17 +112,17 @@ int main(int argc, char** argv) try {
                     }
                 }
                 program.reset();
-                const auto enqueue = [&](int token, int lane) {
+                const auto enqueue = [&](int token, int lane, runtime::TokenBatchKind kind = runtime::TokenBatchKind::Decode) {
                     const runtime::TokenSpan span{static_cast<unsigned>(lane),
                         static_cast<unsigned>(program.frontier(lane)), 0, 1};
                     const int row = 0;
-                    return program.submit({runtime::TokenBatchKind::Decode, {&token, 1}, {&span, 1}, {&row, 1}});
+                    return program.submit({kind, {&token, 1}, {&span, 1}, {&row, 1}});
                 };
                 const auto first = enqueue(prompts[0][0], slots[0]);
-                const auto second = enqueue(prompts[1][0], slots[1]);
+                const auto second = enqueue(prompts[1][0], slots[1], runtime::TokenBatchKind::Prefill);
                 const auto a = program.finish(first)[0];
                 // Refill a completed frame while the other request still owns
-                // its ticket/state reservation; no common round barrier.
+                // its Prefill ticket/state reservation; no common round barrier.
                 const auto continuation = enqueue(a, slots[0]);
                 const auto a2 = program.finish(continuation)[0];
                 const auto b = program.finish(second)[0];

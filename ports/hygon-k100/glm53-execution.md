@@ -42,7 +42,8 @@ ordinary Decode. `--decode-frames 2 --lanes N` (N>=2, ordinary only) splits
 Decode requests across two independent frames, each with its own streams,
 activations, scratch, pinned metadata/results and Graphs. The second frame is
 Decode-only. A sequence cannot have two pending writers. Runtime publishes a
-completed frame independently; cancellation drains its device writes before
+completed Prefill or Decode frame independently, and can refill a Decode frame
+while another request is still prefilling; cancellation drains its device writes before
 releasing the lane. Extra frame scratch is included in the memory summary.
 
 KVMem block means, selection and restrictions execute on the devices in the

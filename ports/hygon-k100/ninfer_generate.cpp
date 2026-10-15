@@ -93,7 +93,8 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
     options.tensor_expert_parallel = tensor_parallel;
     options.decode_frames = decode_frames;
     options.bf16_activations = bf16_activations;
-    report["activation_storage"] = bf16_activations ? "BF16 at semantic boundaries" : "FP32 control";
+    report["activation_storage"] = draft ? "FP32 companion profile"
+        : bf16_activations ? (mtp ? "BF16 target; FP32 companion" : "BF16 at semantic boundaries") : "FP32 control";
     report["decode_frames"] = decode_frames;
     report["parallelism"] = tensor_parallel ? "TP/EP" : "PP";
     options.kvmem_window_pages = window;

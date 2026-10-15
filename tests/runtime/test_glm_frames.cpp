@@ -44,7 +44,12 @@ int main() try {
     const auto temporal = ledger.reserve(prefill);
     rejects([&] { auto x = batch(b); x.kind = runtime::TokenBatchKind::Prefill; ledger.reserve(x); });
     const auto decode = ledger.reserve(batch(b));
-    ledger.complete(decode); ledger.complete(temporal);
+    ledger.complete(decode);
+    auto next = b; next[0].input_frontier = 1;
+    const auto continuation = ledger.reserve(batch(next));
+    require(ledger.busy(3) && ledger.frontier(0) == 1);
+    ledger.complete(continuation);
+    ledger.complete(temporal);
     ledger.fail();
     rejects([&] { ledger.reserve(batch(c)); });
     rejects([&] { ledger.reset(); });

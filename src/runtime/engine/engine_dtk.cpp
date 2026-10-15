@@ -410,6 +410,8 @@ public:
         struct Flight {
             models::glm5_next::FrameTicket ticket;
             std::vector<runtime::TokenSpan> spans;
+            runtime::TokenBatchKind kind = runtime::TokenBatchKind::Decode;
+            Clock::time_point submitted{};
         };
         std::vector<Flight> flights;
         const auto settle = [&] {
@@ -480,24 +482,56 @@ public:
                 for (auto completed = flights.begin(); completed != flights.end();) {
                     if (!program->ready(completed->ticket)) { ++completed; continue; }
                     auto result = program->finish(completed->ticket);
-                    retired_decode = true;
-                    std::uint64_t committed = 0;
-                    for (unsigned row = 0; row < completed->spans.size(); ++row) {
-                        const auto& span = completed->spans[row];
-                        auto& lane = *lanes[span.lane];
-                        observe_input(lane, span.input_frontier, 1);
-                        lane.anchor = result[row];
-                        if (lane.job->cancel) lane.result.finish_reason = FinishReason::Cancelled;
-                        else {
-                            append_token(lane.job, lane.result, lane.anchor, lane.limit);
-                            ++committed;
+                    if (completed->kind == runtime::TokenBatchKind::Decode) {
+                        retired_decode = true;
+                        std::uint64_t committed = 0;
+                        for (unsigned row = 0; row < completed->spans.size(); ++row) {
+                            const auto& span = completed->spans[row];
+                            auto& lane = *lanes[span.lane];
+                            observe_input(lane, span.input_frontier, 1);
+                            lane.anchor = result[row];
+                            if (lane.job->cancel) lane.result.finish_reason = FinishReason::Cancelled;
+                            else {
+                                append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                                ++committed;
+                            }
                         }
-                    }
-                    {
-                        std::lock_guard lock(mutex);
-                        ++runtime.decode_rounds;
-                        runtime.decode_row_rounds += completed->spans.size();
-                        runtime.committed_decode_tokens += committed;
+                        {
+                            std::lock_guard lock(mutex);
+                            ++runtime.decode_rounds;
+                            runtime.decode_row_rounds += completed->spans.size();
+                            runtime.committed_decode_tokens += committed;
+                        }
+                    } else {
+                        unsigned input_count = 0;
+                        std::size_t output = 0;
+                        for (const auto& span : completed->spans) {
+                            auto& lane = *lanes[span.lane];
+                            observe_input(lane, span.input_frontier, span.count);
+                            lane.prompt_offset += span.count;
+                            lane.result.computed_prefill_tokens += span.count;
+                            input_count += span.count;
+                            const bool complete = lane.prompt_offset == lane.job->prompt.size();
+                            if (complete && lane.limit) lane.anchor = result.at(output++);
+                            if (lane.job->cancel) {
+                                lane.result.finish_reason = FinishReason::Cancelled;
+                                continue;
+                            }
+                            if (!complete) continue;
+                            lane.result.timings.prefill_seconds = seconds(lane.started);
+                            lane.result.timings.first_token_seconds = lane.result.timings.prefill_seconds;
+                            lane.decode_start = Clock::now();
+                            if (!lane.limit) lane.result.finish_reason = FinishReason::OutputLimit;
+                            else append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                        }
+                        const auto cost = seconds(completed->submitted) / input_count;
+                        prefill_seconds_per_token = prefill_seconds_per_token > 0
+                            ? .75 * prefill_seconds_per_token + .25 * cost : cost;
+                        if (completed->spans.size() > 1) {
+                            std::lock_guard lock(mutex);
+                            ++runtime.packed_prefill_batches;
+                            runtime.packed_prefill_tokens += input_count;
+                        }
                     }
                     completed = flights.erase(completed);
                     settle();
@@ -518,7 +552,8 @@ public:
                     outputs.push_back(row);
                     spans.push_back({slot, static_cast<unsigned>(program->frontier(slot)), row, 1});
                 }
-                const bool had_decode = !tokens.empty() || !flights.empty();
+                const bool had_decode = !tokens.empty() || std::any_of(flights.begin(), flights.end(),
+                    [](const auto& f) { return f.kind == runtime::TokenBatchKind::Decode; });
                 const bool waiting_prefill = std::any_of(lanes.begin(), lanes.end(), [](const auto& lane) {
                     return lane && !lane->job->cancel && lane->prompt_offset < lane->job->prompt.size();
                 });
@@ -552,7 +587,8 @@ public:
                 std::vector<unsigned> prefill_lanes;
                 for (unsigned step = 0; step < options.max_concurrency; ++step) {
                     const unsigned slot = (prefill_cursor + step) % options.max_concurrency;
-                    if (lanes[slot] && lanes[slot]->prompt_offset < lanes[slot]->job->prompt.size())
+                    if (lanes[slot] && !program->lane_busy(slot) &&
+                        lanes[slot]->prompt_offset < lanes[slot]->job->prompt.size())
                         prefill_lanes.push_back(slot);
                 }
                 if (!prefill_lanes.empty() && program->primary_frame_available()) {
@@ -591,36 +627,8 @@ public:
                     prefill_cursor = (prefill_lanes.back() + 1) % options.max_concurrency;
                     if (!tokens.empty()) {
                         const auto start = Clock::now();
-                        auto result = program->execute({runtime::TokenBatchKind::Prefill, tokens, spans, outputs});
-                        const double cost = seconds(start) / tokens.size();
-                        prefill_seconds_per_token = prefill_seconds_per_token > 0
-                            ? .75 * prefill_seconds_per_token + .25 * cost : cost;
-                        std::size_t output = 0;
-                        for (const auto& span : spans) {
-                            auto& lane = *lanes[span.lane];
-                            observe_input(lane, span.input_frontier, span.count);
-                            lane.prompt_offset += span.count;
-                            lane.result.computed_prefill_tokens += span.count;
-                            const bool complete = lane.prompt_offset == lane.job->prompt.size();
-                            if (complete && lane.limit) lane.anchor = result[output++];
-                            if (lane.job->cancel) {
-                                lane.result.finish_reason = FinishReason::Cancelled;
-                                continue;
-                            }
-                            if (!complete) continue;
-                            lane.result.timings.prefill_seconds = seconds(lane.started);
-                            lane.result.timings.first_token_seconds = lane.result.timings.prefill_seconds;
-                            lane.decode_start = Clock::now();
-                            if (!lane.limit)
-                                lane.result.finish_reason = FinishReason::OutputLimit;
-                            else
-                                append_token(lane.job, lane.result, lane.anchor, lane.limit);
-                        }
-                        if (spans.size() > 1) {
-                            std::lock_guard lock(mutex);
-                            ++runtime.packed_prefill_batches;
-                            runtime.packed_prefill_tokens += tokens.size();
-                        }
+                        auto ticket = program->submit({runtime::TokenBatchKind::Prefill, tokens, spans, outputs});
+                        flights.push_back({ticket, std::move(spans), runtime::TokenBatchKind::Prefill, start});
                     }
                 }
                 settle();
