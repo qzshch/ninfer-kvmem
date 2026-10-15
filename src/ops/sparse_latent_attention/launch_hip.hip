@@ -1,6 +1,7 @@
 #include "ninfer/ops/sparse_latent_attention.h"
 #include "core/device.h"
 #include <cmath>
+#include <climits>
 #include <stdexcept>
 
 namespace ninfer::ops {
@@ -98,6 +99,28 @@ __global__ void pool_scores(const T* query, const float* weights, const std::uin
     return;
 }
 
+__device__ bool pool_better(float a, int ai, float b, int bi) {
+    return a > b || (a == b && ai < bi);
+}
+__device__ void pool_exchange(float* value, int* index, int i, int j, bool descending) {
+    if (descending ? pool_better(value[j], index[j], value[i], index[i])
+                   : pool_better(value[i], index[i], value[j], index[j])) {
+        const float v = value[i]; const int id = index[i];
+        value[i] = value[j]; index[i] = index[j]; value[j] = v; index[j] = id;
+    }
+}
+__device__ void pool_sort(float* value, int* index, int offset, int width, bool descending) {
+    for (int size = 2; size <= width; size *= 2)
+        for (int distance = size / 2; distance; distance /= 2) {
+            for (int i = threadIdx.x; i < width; i += 256) {
+                const int j = i ^ distance;
+                if (j > i) pool_exchange(value, index, offset + i, offset + j,
+                                        ((i & size) == 0) == descending);
+            }
+            __syncthreads();
+        }
+}
+
 __global__ void pool_select(float* scores, std::int32_t* ids, int visible,
                             const int* positions = nullptr) {
     if (positions) {
@@ -106,43 +129,67 @@ __global__ void pool_select(float* scores, std::int32_t* ids, int visible,
         ids += blockIdx.x * 2051;
     }
     const int lane = threadIdx.x, complete = visible / 4;
-    __shared__ float value[256];
-    __shared__ int index[256];
+    __shared__ float value[1024];
+    __shared__ int index[1024], incoming, kept, sorted, poison;
     for (int i = lane; i < 2051; i += 256) ids[i] = -1;
+    if (!lane) { kept = 0; sorted = 0; poison = 0; }
     __syncthreads();
-    for (int j = 0; j < min(complete, 512); ++j) {
-        float best = -INFINITY;
-        int id     = 0;
-        for (int pool = lane; pool < complete; pool += 256) {
-            const auto v = scores[pool];
-            if (v > best || (v == best && pool < id)) {
-                best = v;
-                id   = pool;
+    for (int base = 0; base < complete; base += 512) {
+        if (!lane) incoming = 0;
+        __syncthreads();
+        for (int i = lane; i < 512 && base + i < complete; i += 256) {
+            const float v = scores[base + i];
+            if (v == INFINITY) atomicExch(&poison, 1);
+            if (isfinite(v)) {
+                const int at = atomicAdd(&incoming, 1);
+                value[512 + at] = v; index[512 + at] = base + i;
             }
         }
-        value[lane] = best;
-        index[lane] = id;
         __syncthreads();
-        for (int s = 128; s; s /= 2) {
-            if (lane < s && (value[lane + s] > value[lane] ||
-                             (value[lane + s] == value[lane] && index[lane + s] < index[lane]))) {
-                value[lane] = value[lane + s];
-                index[lane] = index[lane + s];
+        if (poison) break;
+        if (!incoming) continue;
+        if (kept + incoming <= 512) {
+            for (int i = lane; i < incoming; i += 256) {
+                value[kept + i] = value[512 + i]; index[kept + i] = index[512 + i];
+            }
+            __syncthreads();
+            if (!lane) kept += incoming;
+            __syncthreads();
+            continue;
+        }
+        if (!sorted) {
+            for (int i = kept + lane; i < 512; i += 256) { value[i] = -INFINITY; index[i] = INT_MAX; }
+            __syncthreads();
+            pool_sort(value, index, 0, 512, true);
+        }
+        for (int i = incoming + lane; i < 512; i += 256) { value[512 + i] = -INFINITY; index[512 + i] = INT_MAX; }
+        __syncthreads();
+        pool_sort(value, index, 512, 512, false);
+        // A descending prefix and ascending suffix form one bitonic sequence.
+        for (int distance = 512; distance; distance /= 2) {
+            for (int i = lane; i < 1024; i += 256) {
+                const int j = i ^ distance;
+                if (j > i) pool_exchange(value, index, i, j, true);
             }
             __syncthreads();
         }
-        // All threads observe the same completed reduction. The remaining
-        // iterations would leave both scratch and the prefilled -1 IDs intact.
-        if (!isfinite(value[0])) break;
-        if (!lane) {
-            const int p = index[0];
-            for (int k = 0; k < 4; ++k) ids[j * 4 + k] = p * 4 + k;
-            scores[p] = -INFINITY;
-        }
+        if (!lane) { kept = 512; sorted = 1; }
         __syncthreads();
     }
-    if (lane < visible % 4) ids[2048 + lane] = (visible / 4) * 4 + lane;
-    return;
+    if (!poison) {
+        if (!sorted) {
+            int width = 1; while (width < kept) width *= 2;
+            for (int i = kept + lane; i < width; i += 256) { value[i] = -INFINITY; index[i] = INT_MAX; }
+            __syncthreads();
+            pool_sort(value, index, 0, width, true);
+        }
+        for (int i = lane; i < kept; i += 256) {
+            const int p = index[i];
+            for (int j = 0; j < 4; ++j) ids[i * 4 + j] = p * 4 + j;
+            scores[p] = -INFINITY;
+        }
+    }
+    if (lane < visible % 4) ids[2048 + lane] = complete * 4 + lane;
 }
 
 __global__ void attention_scores(const float* q, const std::uint16_t* kv, const std::int32_t* ids,

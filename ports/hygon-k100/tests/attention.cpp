@@ -274,11 +274,40 @@ void pooling(DeviceContext& ctx, int visible, bool masked) {
     for (int c = 0; c < visible % 4; ++c) reference[2048 + c] = complete * 4 + c;
     require(ids == reference, "exact represented-score top512 pools / partial tail / padding");
 }
+void selection_edges(DeviceContext& ctx) {
+    for (int pools : {1, 31, 256, 511, 512, 513, 8192}) for (int mode : {0, 1, 2, 3}) {
+        std::vector<float> score(pools);
+        for (int i = 0; i < pools; ++i) {
+            score[i] = mode == 0 ? 0.f : static_cast<float>((i * 17) % 31 - 15);
+            if (mode == 1 && i % 7) score[i] = -INFINITY;
+            if (mode == 2) score[i] = i % 2 ? NAN : -INFINITY;
+        }
+        if (mode == 3) score.back() = INFINITY;
+        auto input = upload(score);
+        DeviceBuffer out(2051 * 4 + 32); out.fill(0xa5);
+        ops::index_pool_select(static_cast<float*>(input.p), reinterpret_cast<int*>(static_cast<std::byte*>(out.p) + 16),
+                               pools * 4, ctx.stream);
+        ctx.synchronize();
+        std::vector<int> got(2059); out.copy_to_host(got.data(), out.bytes);
+        for (int i = 0; i < 4; ++i) require(got[i] == static_cast<int>(0xa5a5a5a5u) && got[got.size()-1-i] == static_cast<int>(0xa5a5a5a5u), "pool selection guards");
+        std::vector<int> order;
+        if (mode != 3) for (int i = 0; i < pools; ++i) if (std::isfinite(score[i])) order.push_back(i);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return score[a] > score[b] || (score[a] == score[b] && a < b); });
+        if (order.size() > 512) order.resize(512);
+        std::vector<int> expected(2051, -1);
+        for (unsigned i = 0; i < order.size(); ++i) for (int c = 0; c < 4; ++c) expected[i*4+c] = order[i]*4+c;
+        require(std::equal(expected.begin(), expected.end(), got.begin()+4), "exact finite top-k order/ties/exhaustion");
+        auto after = download<float>(input);
+        for (int i : order) score[i] = -INFINITY;
+        for (int i = 0; i < pools; ++i) require(after[i] == score[i] || (std::isnan(after[i]) && std::isnan(score[i])), "pool score scratch mutation");
+    }
+}
 } // namespace
 
 int main() {
     try {
         DeviceContext ctx;
+        selection_edges(ctx);
         unsigned cases = 0;
         for (int v : {1, 3, 4, 7, 2047, 2048, 2051, 32768})
             for (bool mask : {false, true}) {
