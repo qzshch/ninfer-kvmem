@@ -1,6 +1,7 @@
 #include "models/glm5_next/math.h"
 #include "ninfer/ops/resident_transform.h"
 #include "core/device.h"
+#include "core/arena.h"
 #include <bit>
 #include <cmath>
 #include <cstdio>
