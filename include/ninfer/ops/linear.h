@@ -155,4 +155,12 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void linear_fp32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                  bool bf16_output = false);
 
+// K-axis contribution to the same FP64 ideal as linear_fp32. x is compact
+// FP32 [columns,tokens]; w retains its original [N,K] encoding and row stride.
+// out [N,tokens] is unrounded FP32, summing only [begin,begin+columns).
+// Encoded intervals contain complete blocks. Disjoint operands, no allocation
+// or repacking. The caller reduces contributions before a semantic output cast.
+void linear_partial_fp32(const float* x, const Weight& w, float* out, int begin,
+                          int columns, int tokens, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -14,6 +14,7 @@ namespace {
 __device__ float projection_output(float x, bool rounded) {
     return rounded ? decode_bf16(encode_bf16(x)) : x;
 }
+#include "ops/linear/portable/q8_tiles.cuh"
 #ifdef NINFER_HYGON_DTK
 #    include "ops/linear/portable/wave64_dot.cuh"
 
@@ -135,6 +136,21 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
 template <QType Format>
 void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool bf16_output) {
 #ifdef NINFER_HYGON_DTK
+    if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
+        if (w.n >= 128 && w.k >= 512 && (x.ne[1] == 1 || x.ne[1] >= 16)) {
+            const auto invoke = [&]<bool B>() {
+                if (x.ne[1] == 1)
+                    q8_decode_tile<B><<<(w.n + 3) / 4, 256, 0, stream>>>(
+                        x.data, w.qdata, out.data, w.n, w.k, 0, w.k, bf16_output);
+                else
+                    q8_matrix_tile<B><<<dim3((w.n + 7) / 8, (x.ne[1] + 7) / 8), 256, 0, stream>>>(
+                        x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], bf16_output);
+            };
+            if (x.dtype == DType::BF16) invoke.template operator()<true>();
+            else invoke.template operator()<false>();
+            return;
+        }
+    }
     if (x.ne[1] > 1 && (Format == QType::Q8_G32_FP16_BLOCK || Format == QType::Q6_K_G256_BLOCK) &&
         w.n >= 128) {
         const dim3 grid(w.n, (x.ne[1] + 3) / 4);
@@ -169,7 +185,59 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, 
     }
     return;
 }
+
+template <QType F>
+__global__ void partial_projection(const float* x, const void* w, float* out, int n,
+                                    int parent_k, int begin, int k) {
+    const int row = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    float sum = 0.f;
+    for (int c = lane; c < k; c += 256)
+        sum += load_weight<F>(w, row, begin + c, parent_k) * x[static_cast<long long>(t) * k + c];
+    __shared__ float partial[256];
+    partial[lane] = sum;
+    __syncthreads();
+    for (int s = 128; s; s /= 2) {
+        if (lane < s) partial[lane] += partial[lane + s];
+        __syncthreads();
+    }
+    if (!lane) out[static_cast<long long>(t) * n + row] = partial[0];
+}
+
+template <QType F>
+void partial_launch(const float* x, const Weight& w, float* out, int begin, int k, int t,
+                     cudaStream_t s) {
+    if constexpr (F == QType::Q8_G32_FP16_BLOCK) {
+        if (w.n >= 128 && k >= 512 && (t == 1 || t >= 16)) {
+            if (t == 1)
+                q8_decode_tile<false><<<(w.n + 3) / 4, 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k, false);
+            else
+                q8_matrix_tile<false><<<dim3((w.n + 7) / 8, (t + 7) / 8), 256, 0, s>>>(
+                    x, w.qdata, out, w.n, w.k, begin, k, t, false);
+            return;
+        }
+    }
+    partial_projection<F><<<dim3(w.n, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
+}
 } // namespace
+
+void portable_partial_linear_launch(const float* x, const Weight& w, float* out, int begin, int k,
+                                     int t, cudaStream_t stream) {
+    validate_portable_linear_weight(w.qtype, w.n, w.k);
+    const auto block = interleaved_block_geometry(w.qtype).values;
+    if (!x || !out || x == out || !w.qdata || begin < 0 || k < 1 || k > w.k || begin > w.k - k ||
+        t < 1 || t > 65535 || (block && (begin % block || k % block)) ||
+        w.layout != (block ? QuantLayout::BlockInterleaved : QuantLayout::Contiguous))
+        throw std::invalid_argument("partial linear: invalid represented K interval");
+#define PARTIAL(F) case QType::F: partial_launch<QType::F>(x, w, out, begin, k, t, stream); break
+    switch (w.qtype) {
+        PARTIAL(FP32); PARTIAL(FP16); PARTIAL(BF16); PARTIAL(MXFP4_G32_E8M0);
+        PARTIAL(Q8_G32_FP16_BLOCK); PARTIAL(IQ3_S_G256_BLOCK); PARTIAL(IQ4_XS_G256_BLOCK);
+        PARTIAL(Q3_K_G256_BLOCK); PARTIAL(Q4_K_G256_BLOCK); PARTIAL(Q6_K_G256_BLOCK);
+        default: throw std::invalid_argument("partial linear: unsupported format");
+    }
+#undef PARTIAL
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void validate_portable_linear_weight(QType type, std::int32_t n, std::int32_t k) {
     if (n <= 0 || k <= 0) {

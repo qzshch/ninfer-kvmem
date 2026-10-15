@@ -115,7 +115,11 @@ std::vector<double> decode(const std::vector<std::byte>& bytes, QType type, std:
 }
 
 double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_io,
-           const std::vector<std::byte>* real = nullptr, bool rounded = false) {
+           const std::vector<std::byte>* real = nullptr, bool rounded = false,
+           int begin = 0, int columns = 0) {
+    const bool partial = columns != 0;
+    const int input_k = partial ? columns : k;
+    require(!partial || (!bf16_io && !rounded), "partial result must remain FP32");
     const int row_offset  = real ? 0 : 1;
     const int parent_rows = real ? n : n + 2;
     auto weights          = real ? *real : fixture(type, static_cast<std::size_t>(parent_rows) * k);
@@ -131,7 +135,7 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
     auto weight = native_weight(WeightView{{static_cast<unsigned>(n), static_cast<unsigned>(k)},
                                            {{&parent, static_cast<std::uint64_t>(row_offset) * k,
                                              static_cast<std::uint64_t>(row_offset + n) * k}}});
-    const std::size_t input_count  = static_cast<std::size_t>(k) * tokens,
+    const std::size_t input_count  = static_cast<std::size_t>(input_k) * tokens,
                       output_count = static_cast<std::size_t>(n) * tokens;
     std::vector<float> x(input_count);
     std::vector<std::uint16_t> xb(input_count);
@@ -150,9 +154,12 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
     input.copy_from_host(bf16_io ? static_cast<const void*>(xb.data()) : x.data(), input.bytes);
     output.fill(0xa5);
     const auto dtype = bf16_io ? DType::BF16 : DType::FP32;
-    Tensor a(input.p, dtype, {k, tokens}),
+    Tensor a(input.p, dtype, {input_k, tokens}),
         y(static_cast<std::byte*>(output.p) + 16, dtype, {n, tokens});
-    if (bf16_io) {
+    if (partial) {
+        ops::linear_partial_fp32(static_cast<const float*>(a.data), weight,
+                                 static_cast<float*>(y.data), begin, columns, tokens, ctx.stream);
+    } else if (bf16_io) {
         ops::linear(a, weight, y, ctx.stream);
     } else {
         ops::linear_fp32(a, weight, y, ctx.stream, rounded);
@@ -184,9 +191,9 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
     for (int t = 0; t < tokens; ++t)
         for (int row = 0; row < n; ++row) {
             double expected = 0, absolute_sum = 0;
-            for (int c = 0; c < k; ++c) {
-                const double product = host[static_cast<std::size_t>(row + row_offset) * k + c] *
-                                       x[static_cast<std::size_t>(t) * k + c];
+            for (int c = 0; c < input_k; ++c) {
+                const double product = host[static_cast<std::size_t>(row + row_offset) * k + begin + c] *
+                                       x[static_cast<std::size_t>(t) * input_k + c];
                 expected += product;
                 absolute_sum += std::abs(product);
             }
@@ -219,6 +226,16 @@ int main(int argc, char** argv) try {
     ninfer::DeviceContext ctx;
     unsigned cases = 0;
     double worst   = 0;
+    for (int tokens : {1, 15, 16, 17, 33})
+        for (int k : {544, 4096, 8192, 16384}) {
+            for (bool bf16_io : {false, true}) {
+                worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, 513, k, tokens, bf16_io));
+                ++cases;
+            }
+            worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, 513, k, tokens,
+                                        false, nullptr, false, 32, k - 64));
+            ++cases;
+        }
     for (auto type :
          {QType::MXFP4_G32_E8M0, QType::Q8_G32_FP16_BLOCK, QType::FP32, QType::BF16, QType::FP16})
         for (int tokens : {1, 5, 6, 32})
