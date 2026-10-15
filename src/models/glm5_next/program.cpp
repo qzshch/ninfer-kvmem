@@ -78,12 +78,13 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
         state_[d].metadata         = DeviceBuffer(host_metadata_.size() * sizeof(int));
         state_[d].hidden           = DeviceBuffer(H * 4 * max_rows_);
         state_[d].workspace        = std::make_unique<WorkspaceArena>(2ULL * 1024 * 1024 * 1024);
+        state_[d].ready = std::make_unique<CudaCompletionEvent>(*devices_[d]);
+        state_[d].copied = std::make_unique<CudaCompletionEvent>(*devices_[d]);
         if (tensor_parallel_) {
             state_[d].partial = DeviceBuffer(2ULL * H * 4 * max_rows_);
             if (!d) state_[d].received = DeviceBuffer(4ULL * H * 4 * max_rows_);
             state_[d].coefficients = DeviceBuffer(24ULL * 4 * max_rows_);
             state_[d].normalized = DeviceBuffer(H * 4ULL * max_rows_);
-            state_[d].ready = std::make_unique<CudaCompletionEvent>(*devices_[d]);
         }
         stats_.persistent_bytes[d] = bytes * (options.draft ? 9 : options.max_lanes) +
                                      state_[d].streams.bytes + state_[d].metadata.bytes +
@@ -164,6 +165,7 @@ Program::~Program() {
         }
         for (auto& [key, graph] : tensor_graphs_) if (key[3] % 3 == d) graph.reset();
         state_[d].ready.reset();
+        state_[d].copied.reset();
         state_[d].partial = {}; state_[d].received = {};
         state_[d].coefficients = {}; state_[d].normalized = {};
         state_[d].workspace.reset();
@@ -438,12 +440,27 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
 }
 
 void Program::peer(void* dst, int d, const void* src, int source, std::size_t bytes) {
+    if (d == source) {
+        devices_[d]->bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, devices_[d]->stream));
+        return;
+    }
     devices_[source]->bind_to_current_thread();
-    devices_[source]->synchronize();
+    state_[source].ready->record(devices_[source]->stream);
     devices_[d]->bind_to_current_thread();
+    // Destination consumers from the preceding use must finish before this
+    // transfer overwrites their buffer. Both dependencies stay on device.
+    state_[d].ready->record(devices_[d]->stream);
+    state_[source].ready->wait(devices_[d]->transfer_stream);
+    state_[d].ready->wait(devices_[d]->transfer_stream);
     CUDA_CHECK(hipMemcpyPeerAsync(dst, devices_[d]->device, src, devices_[source]->device, bytes,
-                                  devices_[d]->stream));
-    devices_[d]->synchronize();
+                                  devices_[d]->transfer_stream));
+    state_[d].copied->record(devices_[d]->transfer_stream);
+    state_[d].copied->wait(devices_[d]->stream);
+    devices_[source]->bind_to_current_thread();
+    // Protect source-buffer lifetime before its next producer can reuse it.
+    state_[d].copied->wait(devices_[source]->stream);
+    devices_[d]->bind_to_current_thread();
     stats_.peer_bytes += bytes;
 }
 

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,19 +28,21 @@ struct Storage {
     ninfer::DeviceContext context;
     ninfer::DeviceBuffer source;
     ninfer::DeviceBuffer target;
+    ninfer::DeviceBuffer history;
     ninfer::CudaCompletionEvent produced;
     ninfer::CudaCompletionEvent copied;
 
     explicit Storage(int device)
         : context(device), source(kCount * sizeof(std::uint32_t)),
-          target(kCount * sizeof(std::uint32_t)), produced(context), copied(context) {}
+          target(kCount * sizeof(std::uint32_t)), history(8 * kCount * sizeof(std::uint32_t)),
+          produced(context), copied(context) {}
 
     // Members are released while their owning device is selected. Production
     // multi-device allocation ownership remains a separate port requirement.
     ~Storage() { context.bind_to_current_thread_noexcept(); }
 };
 
-void verify(const std::vector<std::uint32_t>& values, unsigned salt) {
+void verify(std::span<const std::uint32_t> values, unsigned salt) {
     for (std::size_t i = 0; i < values.size(); ++i) {
         const auto expected = static_cast<std::uint32_t>(i) * 2654435761u ^ salt;
         if (values[i] != expected) {
@@ -64,7 +67,7 @@ int main() try {
                     props.gcnArchName, props.warpSize, props.totalGlobalMem);
         devices[device] = std::make_unique<Storage>(device);
     }
-    std::vector<std::uint32_t> host(kCount);
+    std::vector<std::uint32_t> host(8 * kCount);
     unsigned transfers = 0;
     for (int src = 0; src < 3; ++src) {
         auto& from = *devices[src];
@@ -87,20 +90,29 @@ int main() try {
                 check(hipGetLastError());
                 from.produced.record(from.context.stream);
                 to.context.bind_to_current_thread();
+                to.produced.record(to.context.stream);
                 from.produced.wait(to.context.transfer_stream);
+                to.produced.wait(to.context.transfer_stream);
                 check(hipMemcpyPeerAsync(to.target.p, dst, from.source.p, src,
                                          from.source.bytes, to.context.transfer_stream));
                 to.copied.record(to.context.transfer_stream);
                 to.copied.wait(to.context.stream);
-                check(hipMemcpyAsync(host.data(), to.target.p, to.target.bytes,
-                                     hipMemcpyDeviceToHost, to.context.stream));
-                to.context.synchronize();
-                verify(host, salt);
+                check(hipMemcpyAsync(static_cast<std::uint32_t*>(to.history.p) + repetition * kCount,
+                    to.target.p, to.target.bytes, hipMemcpyDeviceToDevice, to.context.stream));
+                from.context.bind_to_current_thread();
+                to.copied.wait(from.context.stream);
                 ++transfers;
             }
+            to.context.bind_to_current_thread();
+            check(hipMemcpyAsync(host.data(), to.history.p, to.history.bytes,
+                                 hipMemcpyDeviceToHost, to.context.stream));
+            to.context.synchronize();
+            for (unsigned repetition = 0; repetition < 8; ++repetition)
+                verify(std::span(host).subspan(repetition * kCount, kCount),
+                       1009u * src + 7919u * dst + 104729u * repetition);
         }
     }
-    std::printf("PASS: %u exact peer copies, 6 directions, non-blocking producer/transfer/consumer ordering\n", transfers);
+    std::printf("PASS: %u exact peer copies, 6 directions, eight in-flight copies with producer/consumer reuse fences\n", transfers);
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -59,7 +59,7 @@ private:
         std::array<DeviceBuffer, 9> recurrent;
         DeviceBuffer streams, metadata, hidden;
         DeviceBuffer partial, received, coefficients, normalized;
-        std::unique_ptr<CudaCompletionEvent> ready;
+        std::unique_ptr<CudaCompletionEvent> ready, copied;
         std::unique_ptr<WorkspaceArena> workspace;
     };
 
