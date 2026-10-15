@@ -39,6 +39,23 @@ __device__ float4 represented_four(const void* weights, std::int64_t row, int co
                 scale * iq4_values[(packed >> (shift + 8)) & 15],
                 scale * iq4_values[(packed >> (shift + 16)) & 15],
                 scale * iq4_values[(packed >> (shift + 24)) & 15]};
+    } else if constexpr (F == QType::Q6_K_G256_BLOCK) {
+        const auto* b = static_cast<const unsigned char*>(weights) +
+                        (row * (k / 256) + column / 256) * 210;
+        const int c = column % 256, chunk = c / 128, quad = (c % 128) / 32, lane = c % 32;
+        const auto* low = reinterpret_cast<const unsigned short*>(b + chunk * 64 + (quad % 2) * 32 + lane);
+        const auto* high = reinterpret_cast<const unsigned short*>(b + 128 + chunk * 32 + lane);
+        // A210-byte block has two-byte alignment even on odd rows.
+        const unsigned lo = low[0] | (static_cast<unsigned>(low[1]) << 16);
+        const unsigned hi = high[0] | (static_cast<unsigned>(high[1]) << 16);
+        const float scale = block_half(b + 208) * reinterpret_cast<const signed char*>(b + 192)[c / 16];
+        float v[4];
+        for (int j = 0; j < 4; ++j) {
+            const unsigned l = (lo >> (j * 8 + (quad < 2 ? 0 : 4))) & 15u;
+            const unsigned h = (hi >> (j * 8 + quad * 2)) & 3u;
+            v[j] = scale * (static_cast<int>(l | (h << 4)) - 32);
+        }
+        return {v[0], v[1], v[2], v[3]};
     } else if constexpr (F == QType::Q8_G32_FP16_BLOCK) {
         const auto* b =
             static_cast<const unsigned char*>(weights) + (row * (k / 32) + column / 32) * 34;
