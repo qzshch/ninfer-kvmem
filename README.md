@@ -1,7 +1,7 @@
 # ninfer-kvmem
 
 > **`feat/hygon-k100` experimental branch:** Hygon DTK/K100 multi-device port in
-> progress. See [scope, references and measured status](ports/hygon-k100/README.md).
+> progress. See [build and execution contract](ports/hygon-k100/README.md).
 > The CUDA qualification below is not a K100 inference result.
 
 English | [简体中文](README.zh-CN.md)

@@ -62,3 +62,13 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# K100 local engineering records
+/ports/hygon-k100/results/
+/ports/hygon-k100/*-results.json
+/ports/hygon-k100/external/*-results.json
+/ports/hygon-k100/glm53-performance.md
+/ports/hygon-k100/glm53-resident-plan.json
+/ports/hygon-k100/resident-capacity.md
+/ports/hygon-k100/validation.md
+/ports/hygon-k100/references.md
