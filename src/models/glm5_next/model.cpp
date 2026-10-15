@@ -38,7 +38,7 @@ void shard_parameters(Parameters& p, int rank) {
     }
 }
 
-void config_contract(const artifact::Json& c, const artifact::Json& d) {
+void config_contract(const artifact::Json& c) {
     require(c.at("architectures") == artifact::Json::array({"Glm5NextForConditionalGeneration"}) &&
                 c.at("hidden_size") == 4096 && c.at("num_hidden_layers") == 45 &&
                 c.at("vocab_size") == 154880,
@@ -70,6 +70,9 @@ void config_contract(const artifact::Json& c, const artifact::Json& d) {
         require(c.at("layer_types").at(i) ==
                     (i % 4 == 3 ? "deepseek_sparse_attention" : "linear_attention"),
                 "GLM layer mathematics mismatch");
+}
+
+void dflash_contract(const artifact::Json& d) {
     require(d.at("architectures") == artifact::Json::array({"DFlash2DraftModel"}) &&
                 d.at("hidden_size") == 4096 && d.at("num_hidden_layers") == 5 &&
                 d.at("vocab_size") == 154880 && d.at("num_attention_heads") == 32 &&
@@ -95,8 +98,11 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
             "GLM TP/EP currently accepts ordinary execution only");
     const auto& dir = reader.directory();
     config_         = dir.component("text").config;
-    draft_config_   = dir.component("dflash2").config;
-    config_contract(config_, draft_config_);
+    config_contract(config_);
+    if (dflash) {
+        draft_config_ = dir.component("dflash2").config;
+        dflash_contract(draft_config_);
+    }
     std::array<std::unique_ptr<artifact::Binder>, 3> binders;
     for (auto& b : binders) b = std::make_unique<artifact::Binder>(reader);
 

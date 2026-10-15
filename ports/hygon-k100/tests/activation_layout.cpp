@@ -24,7 +24,7 @@ int main() try {
         }
         for (int c = 0; c < width; ++c) gain[c] = .5f + (c % 7) * .125f;
         DeviceBuffer input(x.size()*4), compact(words.size()*2), g(gain.size()*4),
-                     control(x.size()*4), output(words.size()*2+32);
+                     control(x.size()*4), output(words.size()*2+32), teacher(x.size()*4);
         input.copy_from_host(x.data(),input.bytes); compact.copy_from_host(words.data(),compact.bytes);
         g.copy_from_host(gain.data(),g.bytes); output.fill(0xa5);
         Tensor weight(g.p,DType::FP32,{width}), bf(compact.p,DType::BF16,{width,rows});
@@ -49,6 +49,15 @@ int main() try {
                     throw std::runtime_error("model RMS epsilon or physical activation boundary changed");
             }
         }
+        // MTP retains the post-norm teacher after the BF16 workspace is reused.
+        ops::unpack_bf16(static_cast<const unsigned short*>(y.data), static_cast<float*>(teacher.p),
+                         x.size(), device.stream);
+        CUDA_CHECK(cudaMemsetAsync(y.data, 0, words.size()*2, device.stream));
+        device.synchronize();
+        std::vector<float> retained(x.size()); teacher.copy_to_host(retained.data(), teacher.bytes);
+        for (std::size_t i = 0; i < retained.size(); ++i)
+            if (std::bit_cast<unsigned>(retained[i]) != std::bit_cast<unsigned>(reference[i]))
+                throw std::runtime_error("MTP teacher changed after BF16 scratch reuse");
     }
-    std::puts("PASS: model RMSNorm FP64 oracle and exact FP32/BF16 storage boundary, including small MLA inputs");
+    std::puts("PASS: model RMSNorm FP64 oracle, exact storage boundary and retained MTP post-norm teacher");
 } catch(const std::exception& e) { std::fprintf(stderr,"FAIL: %s\n",e.what()); return 1; }

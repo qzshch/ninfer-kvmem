@@ -18,7 +18,7 @@ struct ProgramOptions {
     unsigned kvmem_window_pages = 0;
     int max_lanes               = 1;
     bool graph                  = false;
-    bool draft                  = true;
+    bool draft                  = false;
     bool mtp                    = false;
     unsigned prefill_chunk      = 1024;
     unsigned decode_frames      = 1;

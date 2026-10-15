@@ -138,13 +138,15 @@ void Program::mla(const Tensor& x, const MlaParameters& p, LayerState& state,
         static_cast<std::uint16_t*>(state.latent.p), static_cast<std::uint16_t*>(state.keys.p),
         static_cast<std::uint16_t*>(state.gates.p), static_cast<std::uint16_t*>(state.pools.p),
         slots, positions, options_.max_context, tokens, stream);
-    auto* allowed = static_cast<std::uint8_t*>(work.alloc_bytes(tokens * ((options_.max_context + 63) / 64)).data);
-    if (options_.kvmem_window_pages)
+    std::uint8_t* allowed = nullptr;
+    if (options_.kvmem_window_pages) {
+        allowed = static_cast<std::uint8_t*>(work.alloc_bytes(tokens * ((options_.max_context + 63) / 64)).data);
         ops::resident_retrieval(bf(iq), static_cast<const std::uint16_t*>(state.keys.p),
             static_cast<float*>(state.means.p), allowed, slots, positions, options_.max_context,
             tokens, options_.kvmem_window_pages / 2, stream);
+    }
     ops::resident_pool_select(bf(iq), static_cast<const float*>(ih.data), static_cast<const std::uint16_t*>(state.pools.p),
-        options_.kvmem_window_pages ? allowed : nullptr, scores, ids, slots, positions,
+        allowed, scores, ids, slots, positions,
         options_.max_context, frame_->tier, tokens, stream, selected_counts);
     auto query_heads = query.reshape({256, heads * tokens});
     ops::indexed_linear_mixed(query_heads, p.key_absorb, nullptr, absorbed, 512, heads, tokens, false, 0, stream);

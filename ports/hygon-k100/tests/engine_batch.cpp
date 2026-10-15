@@ -32,7 +32,7 @@ int main(int argc, char** argv) try {
         } else throw std::invalid_argument("unknown Engine qualification option");
     }
     options.use_cuda_graph     = true;
-    options.kvmem_window_pages = 6;
+    options.kvmem_window_pages = 0;
     options.pending_timeout_ms = 0;
     options.prefill_pack_projections = true;
     Engine engine(options);
@@ -80,6 +80,8 @@ int main(int argc, char** argv) try {
                     "heterogeneous full-model batch vs independent references");
             first = std::min(first, submitted[i] + result.engine_timing.queue_wait_seconds +
                                         result.timings.first_token_seconds);
+            require(!result.timings.kvmem.enabled && !result.timings.kvmem.selection_calls,
+                    "ordinary performance baseline unexpectedly enabled KVMem");
             latencies.push_back({{"prefill_seconds", result.timings.prefill_seconds},
                                  {"decode_seconds", result.timings.decode_seconds}});
         }

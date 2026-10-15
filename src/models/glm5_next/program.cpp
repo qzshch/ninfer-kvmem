@@ -70,7 +70,8 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
         const auto channels = static_cast<std::size_t>(model_.parameters(d).layers[0].kda.query.n);
         std::size_t need = counts[d] * channels * (128 + 9) * sizeof(float) * options.max_lanes;
         const auto mla = (context * (512 + 128 + 128) * 2 +
-            ((context + 3) / 4) * 128 * 2 + ((context + 127) / 128) * 128 * 4) * options.max_lanes;
+            ((context + 3) / 4) * 128 * 2 + (options.kvmem_window_pages ?
+                ((context + 127) / 128) * 128 * 4 : 0)) * options.max_lanes;
         for (const auto& p : model_.parameters(d).layers) if (!p.linear) need += mla;
         for (unsigned f = 0; f < options.decode_frames; ++f) {
             const auto& frame = *frames_[f];
@@ -144,9 +145,10 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
             l.gates            = DeviceBuffer(l.keys.bytes);
             l.pools = DeviceBuffer(static_cast<std::size_t>((options_.max_context + 3) / 4) *
                                    options_.max_lanes * 128 * 2);
-            l.means = DeviceBuffer(static_cast<std::size_t>((options_.max_context + 127) / 128) *
-                                   options_.max_lanes * 128 * 4);
-            if (options_.draft)
+            if (options_.kvmem_window_pages)
+                l.means = DeviceBuffer(static_cast<std::size_t>((options_.max_context + 127) / 128) *
+                                       options_.max_lanes * 128 * 4);
+            if (options_.draft && options_.kvmem_window_pages)
                 l.retrieval = std::make_unique<kvmem::RetrievalIndex>(128, 1, 1, 128);
             stats_.persistent_bytes[d] +=
                 l.latent.bytes + l.keys.bytes + l.gates.bytes + l.pools.bytes + l.means.bytes;
@@ -168,8 +170,8 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
         l.keys   = DeviceBuffer(static_cast<std::size_t>(options.max_context) * 128 * 2);
         l.gates  = DeviceBuffer(l.keys.bytes);
         l.pools  = DeviceBuffer(static_cast<std::size_t>((options.max_context + 3) / 4) * 128 * 2);
-        l.means =
-            DeviceBuffer(static_cast<std::size_t>((options.max_context + 127) / 128) * 128 * 4);
+        if (options_.kvmem_window_pages)
+            l.means = DeviceBuffer(static_cast<std::size_t>((options.max_context + 127) / 128) * 128 * 4);
         stats_.persistent_bytes[2] +=
             l.latent.bytes + l.keys.bytes + l.gates.bytes + l.pools.bytes + l.means.bytes;
     }
@@ -410,14 +412,15 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
             static_cast<std::uint16_t*>(state.keys.p), static_cast<std::uint16_t*>(state.gates.p),
             static_cast<std::uint16_t*>(state.pools.p), slots, positions, options_.max_context, t,
             s);
-        auto* allowed =
-            static_cast<std::uint8_t*>(w.alloc_bytes(t * ((options_.max_context + 63) / 64)).data);
-        if (options_.kvmem_window_pages)
+        std::uint8_t* allowed = nullptr;
+        if (options_.kvmem_window_pages) {
+            allowed = static_cast<std::uint8_t*>(w.alloc_bytes(t * ((options_.max_context + 63) / 64)).data);
             ops::resident_retrieval(iq, static_cast<const std::uint16_t*>(state.keys.p),
                                     static_cast<float*>(state.means.p), allowed, slots, positions,
                                     options_.max_context, t, options_.kvmem_window_pages / 2, s);
+        }
         ops::resident_pool_select(iq, ih, static_cast<const std::uint16_t*>(state.pools.p),
-                                  options_.kvmem_window_pages ? allowed : nullptr, scores, ids,
+                                  allowed, scores, ids,
                                   slots, positions, options_.max_context, frame_->tier, t, s, selected_counts);
     }
     ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, heads, t, false, s);
@@ -748,6 +751,11 @@ void Program::batch_head() {
         ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, rms_norm_epsilon, false, true, stream);
         normalized = final_input;
     }
+    // NextN consumes the same post-output-norm teacher in both storage modes.
+    // Keep it in the persistent hidden buffer before mtp_forward resets scratch.
+    if (options_.mtp && options_.bf16_activations)
+        ops::unpack_bf16(static_cast<const std::uint16_t*>(normalized.data), final,
+                         static_cast<std::size_t>(H) * frame_->outputs, stream);
     auto* logits = floats(work, 154880 * frame_->outputs);
     Tensor scores(logits, DType::FP32, {154880, frame_->outputs});
     projection(normalized, parameters_.output_head, scores, 0);

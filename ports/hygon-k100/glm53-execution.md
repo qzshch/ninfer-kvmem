@@ -48,8 +48,12 @@ completed Prefill or Decode frame independently, and can refill a Decode frame
 while another request is still prefilling; cancellation drains its device writes before
 releasing the lane. Extra frame scratch is included in the memory summary.
 
-KVMem block means, selection and restrictions execute on the devices in the
-ordinary route. Request lanes own their respective recurrent and KV histories.
+The native launcher defaults to ordinary generation with KVMem disabled
+(`--kvmem-window-pages 0`). GLM's own DSA pool selection and sparse attention
+remain active. Without the extra KVMem restriction, more candidates can reach
+native DSA attention. KVMem-only means and masks are not allocated when disabled.
+When explicitly enabled, KVMem block means, selection and restrictions execute
+on the devices in the ordinary route. Request lanes own their recurrent and KV histories.
 This profile does not expose HTTP serving, streaming, vision, general prefix
 cache scheduling or CausalScoring from the default CUDA product.
 
@@ -70,11 +74,21 @@ control; enabling matrix instructions alone does not establish a speedup.
 
 ## Companion routes
 
-DFlash2 uses the GLM-specific companion and K7 verification in a single-lane eager
+Companions require explicit selection. `--mtp` selects the checkpoint's native
+MTP K1. `--mtp --verify-native-greedy` loads ordinary and MTP serially, compares
+every generated token and records both profiles' end-to-end costs. The target's
+post-output-norm hidden is retained for NextN in both activation storage modes.
+The opt-in `ninfer_k100_mtp_check` also checks short output bounds and repeated
+request reuse, with optional `--graph` or `--fp32-activations`. It needs an explicit
+artifact and a local report path; it is not an automatic artifact-loading CTest.
+
+`--dflash2` uses the GLM-specific companion and K7 verification in a single-lane eager
 route. It cannot be combined with the ordinary Graph batch route. Native MTP K1
 uses the target artifact's selected MTP weights, with serial target verification
 and rejection fallback. Availability of either route is not a speedup guarantee.
-The appropriate companion must be present in the converted artifact.
+TP/EP and temporal target verification are not yet implemented for MTP. The
+appropriate selected companion must be present in the converted artifact;
+ordinary and MTP loading do not require the DFlash2 component.
 
 ## Invocation and verification
 

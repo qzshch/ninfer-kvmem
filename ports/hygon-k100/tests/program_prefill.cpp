@@ -31,7 +31,7 @@ int main(int argc, char** argv) try {
     options.max_lanes = 4;
     options.draft = false;
     options.graph = true;
-    options.kvmem_window_pages = 6;
+    options.kvmem_window_pages = 0;
     Program program(model, devices, options);
     std::string history = "Remember marker RIVER PINE 27. ";
     while (frontend.encode(history).size() < 400) history += "alpha beta gamma. ";
@@ -40,7 +40,7 @@ int main(int argc, char** argv) try {
         frontend.encode("Write the next number: 7, 8, 9,")};
     const std::array<int, 3> slots{3, 0, 2}, lengths{8, 5, 9};
     for (int r = 0; r < 3; ++r)
-        require(!prompts[r].empty() && prompts[r].size() + lengths[r] <= options.max_context,
+        require(!prompts[r].empty() && prompts[r].size() + lengths[r] <= static_cast<std::size_t>(options.max_context),
                 "fixture prompt capacity");
     std::array<std::vector<TokenId>, 3> reference;
     for (int r = 0; r < 3; ++r) {
@@ -107,7 +107,7 @@ int main(int argc, char** argv) try {
                 "intermediate prompt rows executed the output head");
     }
     std::cout << "PASS native temporal prefill vs single-input generation; ragged spans, "
-                 "remapped slots, context boundaries, KVMem, output selection, Decode Graphs\n";
+                 "remapped slots, context boundaries, native DSA, output selection, Decode Graphs; KVMem disabled\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

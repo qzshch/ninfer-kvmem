@@ -89,7 +89,7 @@ struct Parameters {
 class Model {
 public:
     Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devices,
-          const StartupObserver* observer = nullptr, bool dflash = true, bool mtp = false,
+          const StartupObserver* observer = nullptr, bool dflash = false, bool mtp = false,
           Parallelism parallelism = Parallelism::Pipeline);
     ~Model();
     Model(const Model&)            = delete;

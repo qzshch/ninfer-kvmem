@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "native_profile.h"
 #include "core/device.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -254,8 +255,16 @@ int main(int argc, char** argv) {
     try {
         std::filesystem::path artifact, report_path;
         std::string input, kind;
-        int context = 32768, output = 64, window = 6, repeat = 1, lanes = 1, prefill_chunk = 1024, decode_frames = 1;
-        bool draft = true, verify = false, graph = false, mtp = false, pack_prefill = false, tensor_parallel = false, bf16_activations = true;
+        ninfer::k100::NativeProfile profile;
+        auto& window = profile.kvmem_window_pages;
+        auto& repeat = profile.repeat;
+        auto& lanes = profile.lanes;
+        auto& decode_frames = profile.decode_frames;
+        auto& graph = profile.graph;
+        auto& tensor_parallel = profile.tensor_parallel;
+        auto& verify = profile.verify;
+        int context = 32768, output = 64, prefill_chunk = 1024;
+        bool pack_prefill = false, bf16_activations = true;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             auto value    = [&] {
@@ -267,15 +276,16 @@ int main(int argc, char** argv) {
                     << "Native GLM-5.3-Flash on three Hygon K100 devices; v3 .ninfer "
                        "only.\n--artifact FILE (--prompt TEXT | --prompt-file FILE | "
                        "--raw-text TEXT | --token-ids-file FILE)\n[--max-context 32768] "
-                       "[--max-new-tokens 64] [--kvmem-window-pages 6]\n[--ordinary | --mtp | "
-                       "--verify-native-greedy] [--report FILE]\n[--graph] [--lanes 1..8] "
+                       "[--max-new-tokens 64] [--kvmem-window-pages 0]\n[--ordinary | --mtp | "
+                       "--dflash2] [--verify-native-greedy (--mtp or --dflash2)] [--report FILE]\n[--graph] [--lanes 1..8] "
                        "[--fp32-activations] [--decode-frames 1|2] [--prefill-chunk N] [--pack-prefill] [--tp-ep (ordinary only)] "
                        "[--repeat N (ordinary/MTP "
                        "only)]\nPrefill controls apply to ordinary generation; temporal "
                        "prefill uses eager execution with at most 1024 input rows per unit.\n"
                        "Greedy Aggregate profile; "
-                       "DFlash2 K7 by default. No weight/KV offload.\nVerification loads "
-                       "ordinary then DFlash2 serially and compares every generated token.\n";
+                       "ordinary generation and KVMem disabled by default. Native DSA Top-K remains active. "
+                       "No weight/KV offload.\nVerification loads ordinary then the selected companion "
+                       "serially, compares every generated token and records delivered-token costs.\n";
                 return 0;
             }
             if (a == "--artifact")
@@ -310,40 +320,51 @@ int main(int argc, char** argv) {
                 pack_prefill = true;
             else if (a == "--tp-ep")
                 tensor_parallel = true;
-            else if (a == "--mtp") {
-                mtp   = true;
-                draft = false;
-            } else if (a == "--ordinary")
-                draft = false;
+            else if (a == "--mtp")
+                profile.select(ninfer::k100::Companion::Mtp);
+            else if (a == "--dflash2")
+                profile.select(ninfer::k100::Companion::DFlash2);
+            else if (a == "--ordinary")
+                profile.select(ninfer::k100::Companion::None);
             else if (a == "--verify-native-greedy")
                 verify = true;
             else
                 throw std::invalid_argument("unknown argument: " + a);
         }
-        if (artifact.empty() || kind.empty() || context < 1 || context > 32768 || output < 1 ||
-            window < 0 || repeat < 1 || prefill_chunk < 1 || lanes < 1 || lanes > 8 ||
-            decode_frames < 1 || decode_frames > 2 || decode_frames > lanes ||
-            (decode_frames > 1 && (draft || mtp || verify)) ||
-            (mtp && (lanes != 1 || verify)) ||
-            ((lanes > 1 || graph) && (draft || verify)) || (repeat > 1 && (draft || verify)) ||
-            (!draft && verify) || (tensor_parallel && (draft || mtp || verify)))
+        profile.validate();
+        const bool draft = profile.companion == ninfer::k100::Companion::DFlash2;
+        const bool mtp = profile.companion == ninfer::k100::Companion::Mtp;
+        if (artifact.empty() || kind.empty() || context < 1 || context > 32768 || output < 1 || prefill_chunk < 1)
             throw std::invalid_argument("invalid or missing native inference arguments");
         Json result;
         std::string verification_failure;
         if (verify) {
             auto ordinary    = run(artifact, input, kind, context, output, window, false,
-                                   1, 1, false, false, prefill_chunk, pack_prefill);
-            auto speculative = run(artifact, input, kind, context, output, window, true);
+                                   1, 1, graph, false, prefill_chunk, pack_prefill, false, 1,
+                                   draft ? false : bf16_activations);
+            auto speculative = run(artifact, input, kind, context, output, window, draft,
+                                   1, 1, graph, mtp, prefill_chunk, pack_prefill, false, 1,
+                                   draft ? false : bf16_activations);
             bool equal =
                 ordinary["result"]["generated_ids"] == speculative["result"]["generated_ids"];
             result = {{"ordinary", std::move(ordinary)},
-                      {"dflash2", std::move(speculative)},
+                      {mtp ? "mtp" : "dflash2", std::move(speculative)},
                       {"greedy_equal", equal}};
+            const auto& baseline = result["ordinary"]["result"];
+            const auto& companion = result[mtp ? "mtp" : "dflash2"]["result"];
+            const auto decode_cost = [](const Json& row) -> Json {
+                const auto tokens = row.at("generated_ids").size();
+                return tokens > 1 ? Json(row.at("decode_seconds").get<double>() / (tokens - 1)) : Json(nullptr);
+            };
+            result["cost_comparison"] = {
+                {"ordinary_prefill_seconds", baseline["prefill_seconds"]},
+                {"companion_prefill_seconds", companion["prefill_seconds"]},
+                {"ordinary_decode_seconds_per_delivered_token", decode_cost(baseline)},
+                {"companion_decode_seconds_per_delivered_token", decode_cost(companion)},
+                {"ordinary_total_seconds", baseline["total_seconds"]},
+                {"companion_total_seconds", companion["total_seconds"]}};
             if (!equal)
-                verification_failure =
-                    "native DFlash2 output differs from native ordinary generation";
-            else if (result["dflash2"]["result"]["accepted_draft_tokens"].get<std::uint64_t>() == 0)
-                verification_failure = "DFlash2 verification produced no positive acceptance";
+                verification_failure = "native companion output differs from native ordinary generation";
         } else
             result = run(artifact, input, kind, context, output, window, draft, repeat, lanes,
                          graph, mtp, prefill_chunk, pack_prefill, tensor_parallel, decode_frames, bf16_activations);

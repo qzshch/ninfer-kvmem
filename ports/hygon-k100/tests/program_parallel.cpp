@@ -33,7 +33,7 @@ int main(int argc, char** argv) try {
         for (bool graph : {false, true}) for (unsigned frames : {1u, 2u}) for (bool compact : {false, true}) {
             ProgramOptions options;
             options.max_context = 1024; options.max_lanes = 4; options.draft = false;
-            options.bf16_activations = compact; options.decode_frames = frames; options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
+            options.bf16_activations = compact; options.decode_frames = frames; options.graph = graph; options.kvmem_window_pages = 0; options.prefill_chunk = 128;
             Program program(model, devices, options);
             for (unsigned chunk : {1u, 17u, 128u}) {
                 program.reset();
@@ -132,6 +132,6 @@ int main(int argc, char** argv) try {
             }
         }
     }
-    std::cout << "PASS: native PP versus TP/EP; ragged prefill, remapped slots, KVMem, eager/Graph ordinary Decode\n";
+    std::cout << "PASS: native PP versus TP/EP; ragged prefill, remapped slots, native DSA, eager/Graph ordinary Decode; KVMem disabled\n";
     return 0;
 } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

@@ -5,7 +5,8 @@ using the vendor DTK HIP toolchain and the gfx928 compiler target. Hygon is the
 hardware vendor; HIP interface names do not imply AMD hardware compatibility.
 
 The GLM text route uses the public Engine, v3 .ninfer artifacts, resident encoded
-weights, device recurrent state, compressed MLA KV and KVMem. See the
+weights, device recurrent state and compressed MLA KV. KVMem and speculative
+companions are disabled by default. See the
 [execution contract](glm53-execution.md) for the finite supported profile.
 
 ## Build
