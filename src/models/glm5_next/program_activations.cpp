@@ -64,7 +64,9 @@ void Program::feed_forward(const Tensor& x, const LayerParameters& p, float* out
     };
     indexed(x, p.experts.gate, g, 2048, true);
     indexed(x, p.experts.up, u, 2048, true);
-    ops::resident_swiglu(g, u, g, 10.f, stream);
+    if (tensor_parallel_)
+        ops::resident_swiglu_owned(g, u, ids, p.expert_begin, p.experts.gate.n / 2048, g, 10.f, stream);
+    else ops::resident_swiglu(g, u, g, 10.f, stream);
     indexed(g, p.experts.down, experts, H, false);
     if (tensor_parallel_) {
         mlp(x, p.ffn, out, tokens, d);

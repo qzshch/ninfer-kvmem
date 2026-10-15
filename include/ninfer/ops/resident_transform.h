@@ -26,6 +26,11 @@ void resident_norm(const float* input, const Tensor* gain, const Tensor* bias, c
 void resident_norm(const Tensor& input, const Tensor* gain, const Tensor* bias, const Tensor* gate,
                    Tensor& output, float epsilon, bool center, cudaStream_t stream);
 void resident_swiglu(const Tensor& gate, const Tensor& up, Tensor& output, float limit, cudaStream_t stream);
+// Row-masked SwiGLU. ids[numel/width] selects an expert per row; only IDs in
+// [first,first+banks) read gate/up. Other rows write exact zero, including when
+// their input storage is nonfinite. Same-dtype exact aliases are valid.
+void resident_swiglu_owned(const Tensor& gate, const Tensor& up, const std::int32_t* ids,
+                           int first, int banks, Tensor& output, float limit, cudaStream_t stream);
 void resident_causal_conv_packed(const Tensor& input, const Tensor& kernel, float* states,
                                  const std::int32_t* slots, const std::int32_t* offsets,
                                  Tensor& output, int sequences, cudaStream_t stream);

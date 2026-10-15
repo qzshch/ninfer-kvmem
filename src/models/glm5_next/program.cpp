@@ -457,7 +457,8 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
     if (tensor_parallel_) {
         indexed(x, p.experts.gate, g, 2048, true);
         indexed(x, p.experts.up, u, 2048, true);
-        ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
+        Tensor gate(g, DType::FP32, {2048, 8 * t}), up(u, DType::FP32, {2048, 8 * t});
+        ops::resident_swiglu_owned(gate, up, ids, p.expert_begin, p.experts.gate.n / 2048, gate, 10.f, s);
         indexed(g, p.experts.down, experts, H, false);
         mlp(x, p.ffn, out, p.ffn.gate.n, t, d, 10.f);
         ops::resident_moe_partial(experts, weights, out + H * t, H, 8, t, s);

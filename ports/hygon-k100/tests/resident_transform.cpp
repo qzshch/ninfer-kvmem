@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <numeric>
 #include <stdexcept>
@@ -307,6 +308,45 @@ void typed_swiglu(DeviceContext& ctx) {
     }
 }
 
+void owned_swiglu(DeviceContext& ctx) {
+    constexpr int width = 129, rows = 8;
+    const std::array<int, rows> owner{95, 96, 191, 192, 287, 0, 120, -1};
+    DeviceBuffer ids(sizeof(owner)); ids.copy_from_host(owner.data(), ids.bytes);
+    for (bool bf16 : {false, true}) for (bool alias : {false, true}) {
+        std::vector<float> g(width * rows), u(g.size());
+        for (int row = 0; row < rows; ++row) for (int c = 0; c < width; ++c) {
+            const auto i = row * width + c;
+            g[i] = owner[row] >= 96 && owner[row] < 192 ? value(i) * 8 : NAN;
+            u[i] = owner[row] >= 96 && owner[row] < 192 ? value(i + 7) * 8 : NAN;
+        }
+        auto dg = bf16 ? upload_bf16(g) : upload(g), du = bf16 ? upload_bf16(u) : upload(u);
+        DeviceBuffer output(g.size() * (bf16 ? 2 : 4) + 32); output.fill(0xa5);
+        Tensor a(dg.p, bf16 ? DType::BF16 : DType::FP32, {width, rows});
+        Tensor b(du.p, a.dtype, {width, rows});
+        Tensor y(alias ? a.data : static_cast<std::byte*>(output.p) + 16, a.dtype, {width, rows});
+        ops::resident_swiglu_owned(a, b, static_cast<int*>(ids.p), 96, 96, y, 10, ctx.stream);
+        ctx.synchronize();
+        std::vector<unsigned char> raw(g.size() * (bf16 ? 2 : 4));
+        if (alias) dg.copy_to_host(raw.data(), raw.size());
+        else output.copy_to_host(raw.data(), raw.size(), 16);
+        for (int row = 0; row < rows; ++row) for (int c = 0; c < width; ++c) {
+            const auto i = row * width + c;
+            float observed;
+            if (bf16) { std::uint16_t bits; std::memcpy(&bits, raw.data() + i * 2, 2); observed = std::bit_cast<float>(static_cast<unsigned>(bits) << 16); }
+            else std::memcpy(&observed, raw.data() + i * 4, 4);
+            if (owner[row] < 96 || owner[row] >= 192) require(observed == 0, "unowned nonfinite SwiGLU input was read");
+            else {
+                const double gate = std::min<double>(g[i], 10), up = std::clamp<double>(u[i], -10, 10);
+                check(observed, bf(gate * sig(gate)) * up, true, "owned SwiGLU FP64");
+            }
+        }
+        if (!alias) {
+            std::vector<unsigned char> guards(output.bytes); output.copy_to_host(guards.data(), guards.size());
+            for (int i = 0; i < 16; ++i) require(guards[i] == 0xa5 && guards[guards.size()-1-i] == 0xa5, "owned SwiGLU guards");
+        }
+    }
+}
+
 void router(DeviceContext& ctx, int experts, int active, int rows, int mode) {
     std::vector<float> l(experts * rows), bias(experts);
     for (int i = 0; i < experts * rows; ++i) l[i] = mode ? 0 : value(i) * 2;
@@ -488,6 +528,7 @@ int main() {
     try {
         DeviceContext ctx;
         typed_swiglu(ctx);
+        owned_swiglu(ctx);
         norm(ctx, 128, 20, false, true, true, true, true, 1);
         norm(ctx, 128, 3, true, false, true, true, true, 1);
         for (int storage : {1, 2, 3}) for (bool center : {false, true}) for (bool gate : {false, true})

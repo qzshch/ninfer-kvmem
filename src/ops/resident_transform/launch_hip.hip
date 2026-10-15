@@ -93,11 +93,15 @@ __global__ void norm_kernel(const Input* x, const void* gain, DType gt, const vo
     return;
 }
 
-template <int Mode, class T>
+template <int Mode, class T, bool Owned = false>
 __global__ void element_kernel(const T* a, const T* b, T* o, std::size_t n,
-                               float limit) {
+                               float limit, const int* ids = nullptr, int width = 0, int first = 0, int banks = 0) {
     const auto i = static_cast<std::size_t>(blockIdx.x) * 256 + threadIdx.x;
     if (i >= n) return;
+    if constexpr (Owned) {
+        const auto bank = static_cast<long long>(ids[i / width]) - first;
+        if (bank < 0 || bank >= banks) { o[i] = T{}; return; }
+    }
     if constexpr (Mode == 0) {
         const float g = limit > 0 ? fminf(represented(a[i]), limit) : represented(a[i]);
         const float u = limit > 0 ? fminf(fmaxf(represented(b[i]), -limit), limit) : represented(b[i]);
@@ -387,6 +391,23 @@ void resident_swiglu(const Tensor& a, const Tensor& b, Tensor& out, float limit,
             static_cast<const std::uint16_t*>(b.data), static_cast<std::uint16_t*>(out.data), n, limit);
     else element_kernel<0><<<(n + 255) / 256, 256, 0, stream>>>(static_cast<const float*>(a.data),
             static_cast<const float*>(b.data), static_cast<float*>(out.data), n, limit);
+    CUDA_CHECK(cudaGetLastError());
+}
+void resident_swiglu_owned(const Tensor& a, const Tensor& b, const int* ids,
+                           int first, int banks, Tensor& out, float limit, cudaStream_t stream) {
+    activation(a); activation(b); activation(out);
+    if (!ids || first < 0 || banks < 1 || first > INT_MAX - banks ||
+        a.ne[0] != b.ne[0] || a.ne[0] != out.ne[0] || a.dtype != b.dtype ||
+        a.dtype != out.dtype || a.numel() != b.numel() || a.numel() != out.numel())
+        throw std::invalid_argument("resident owned swiglu: operands/range");
+    const auto n = a.numel(); count(n);
+    if (a.dtype == DType::BF16)
+        element_kernel<0, std::uint16_t, true><<<(n + 255) / 256, 256, 0, stream>>>(
+            static_cast<const std::uint16_t*>(a.data), static_cast<const std::uint16_t*>(b.data),
+            static_cast<std::uint16_t*>(out.data), n, limit, ids, a.ne[0], first, banks);
+    else element_kernel<0, float, true><<<(n + 255) / 256, 256, 0, stream>>>(
+            static_cast<const float*>(a.data), static_cast<const float*>(b.data),
+            static_cast<float*>(out.data), n, limit, ids, a.ne[0], first, banks);
     CUDA_CHECK(cudaGetLastError());
 }
 void resident_causal_conv_packed(const Tensor& x, const Tensor& kernel, float* state,
