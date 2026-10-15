@@ -686,7 +686,8 @@ std::vector<std::int32_t> Program::execute(const runtime::TokenBatch& input) {
         CUDA_CHECK(cudaMemcpyAsync(state_[d].metadata.p, host_metadata_.data(),
                                    host_metadata_.size() * sizeof(int),
                                    cudaMemcpyHostToDevice, devices_[d]->stream));
-        devices_[d]->synchronize();
+        // Consumers use this same stream. The owning host frame remains stable
+        // until the complete stage chain finishes; no per-upload host wait.
     }
     // Temporal prefill uses the same stage composition eagerly. Decode Graphs
     // retain exact request geometry; no temporal span is relabeled as a lane.

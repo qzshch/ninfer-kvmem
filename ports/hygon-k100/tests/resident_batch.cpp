@@ -26,10 +26,14 @@ unsigned short bf(float x) {
 
 float ub(unsigned short x) { return std::bit_cast<float>(static_cast<unsigned>(x) << 16); }
 
-void attention_transition(DeviceContext& device, bool temporal = false) {
+void attention_transition(DeviceContext& device, bool temporal = false, int mask_mode = 0) {
     constexpr int cap = 129, lanes = 3, pools_count = (cap + 3) / 4, count = 2051;
     const std::array<int, lanes> slots = temporal ? std::array{2, 2, 2} : std::array{2, 0, 1};
     const std::array<int, lanes> positions = temporal ? std::array{126, 127, 128} : std::array{3, 6, 128};
+    constexpr int pages = (cap + 63) / 64;
+    std::vector<unsigned char> allowed(lanes * pages);
+    if (mask_mode == 1)
+        for (int row = 0; row < lanes; ++row) allowed[row * pages] = 1;
     std::vector<unsigned short> keys(lanes * cap * 128), gates(keys.size()),
         pools(lanes * pools_count * 128), latent(lanes * cap * 512);
     std::vector<float> bias(512), query(lanes * 4096), weights(lanes * 32), q(lanes * 64 * 512),
@@ -104,7 +108,8 @@ void attention_transition(DeviceContext& device, bool temporal = false) {
         dl(latent.size() * 2), db(bias.size() * 4), dq(query.size() * 4), dw(weights.size() * 4),
         dquery(q.size() * 4), dnk(newkey.size() * 4), dng(newgate.size() * 4),
         dnl(newlatent.size() * 4), ds(lanes * 4), dpos(lanes * 4), scores(lanes * 8192 * 4),
-        ids(lanes * count * 4), prob(lanes * 64 * count * 4), out(q.size() * 4);
+        ids(lanes * count * 4), prob(lanes * 64 * count * 4), out(q.size() * 4),
+        allowed_device(allowed.size());
     dk.copy_from_host(keys.data(), dk.bytes);
     dg.copy_from_host(gates.data(), dg.bytes);
     dp.copy_from_host(pools.data(), dp.bytes);
@@ -118,6 +123,7 @@ void attention_transition(DeviceContext& device, bool temporal = false) {
     dnl.copy_from_host(newlatent.data(), dnl.bytes);
     ds.copy_from_host(slots.data(), ds.bytes);
     dpos.copy_from_host(positions.data(), dpos.bytes);
+    allowed_device.copy_from_host(allowed.data(), allowed.size());
     DecodeGraphDefinition definition;
     definition.capture(device.stream, [&] {
         ops::resident_index_append(
@@ -127,7 +133,8 @@ void attention_transition(DeviceContext& device, bool temporal = false) {
             static_cast<unsigned short*>(dp.p), static_cast<int*>(ds.p), static_cast<int*>(dpos.p),
             cap, lanes, device.stream);
         ops::resident_pool_select(static_cast<float*>(dq.p), static_cast<float*>(dw.p),
-                                  static_cast<unsigned short*>(dp.p), nullptr,
+                                  static_cast<unsigned short*>(dp.p),
+                                  mask_mode ? static_cast<unsigned char*>(allowed_device.p) : nullptr,
                                   static_cast<float*>(scores.p), static_cast<int*>(ids.p),
                                   static_cast<int*>(ds.p), static_cast<int*>(dpos.p), cap, 256,
                                   lanes, device.stream);
@@ -159,6 +166,8 @@ void attention_transition(DeviceContext& device, bool temporal = false) {
         std::vector<double> rank(complete);
         std::vector<int> order(complete);
         std::iota(order.begin(), order.end(), 0);
+        if (mask_mode)
+            std::erase_if(order, [&](int pool) { return !allowed[row * pages + pool / 16]; });
         for (int pool = 0; pool < complete; ++pool)
             for (int h = 0; h < 32; ++h) {
                 double dot = 0;
@@ -171,7 +180,7 @@ void attention_transition(DeviceContext& device, bool temporal = false) {
         std::stable_sort(order.begin(), order.end(),
                          [&](int a, int b) { return rank[a] > rank[b]; });
         std::vector<int> selected(count, -1);
-        for (int j = 0; j < complete; ++j)
+        for (int j = 0; j < static_cast<int>(order.size()); ++j)
             for (int c = 0; c < 4; ++c) selected[j * 4 + c] = order[j] * 4 + c;
         for (int c = 0; c < visible % 4; ++c) selected[2048 + c] = complete * 4 + c;
         for (int j = 0; j < count; ++j)
@@ -216,6 +225,8 @@ int main() {
         DeviceContext device(0);
         attention_transition(device);
         attention_transition(device, true);
+        attention_transition(device, true, 1);
+        attention_transition(device, true, 2);
         constexpr int capacity = 513, lanes = 3, blocks = (capacity + 127) / 128,
                       pages = (capacity + 63) / 64;
         std::vector<unsigned short> keys(lanes * capacity * 128);

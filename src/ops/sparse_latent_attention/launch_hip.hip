@@ -125,7 +125,10 @@ __global__ void pool_select(float* scores, std::int32_t* ids, int visible,
             }
             __syncthreads();
         }
-        if (!lane && isfinite(value[0])) {
+        // All threads observe the same completed reduction. The remaining
+        // iterations would leave both scratch and the prefilled -1 IDs intact.
+        if (!isfinite(value[0])) break;
+        if (!lane) {
             const int p = index[0];
             for (int k = 0; k < 4; ++k) ids[j * 4 + k] = p * 4 + k;
             scores[p] = -INFINITY;
