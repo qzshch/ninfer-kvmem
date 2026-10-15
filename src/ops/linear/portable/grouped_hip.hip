@@ -23,11 +23,11 @@ __global__ void collect_routes(const int* ids, int* counts, int* assignments,
     assignments[static_cast<long long>(bank) * count + at] = i;
 }
 
-__global__ void group_tasks(const int* counts, Task* tasks, int* total, int banks) {
+__global__ void group_tasks(const int* counts, Task* tasks, int* total, int banks, int columns) {
     int used = 0;
     for (int bank = 0; bank < banks; ++bank)
-        for (int at = 0; at < counts[bank]; at += 8)
-            tasks[used++] = {bank, at, min(8, counts[bank] - at)};
+        for (int at = 0; at < counts[bank]; at += columns)
+            tasks[used++] = {bank, at, min(columns, counts[bank] - at)};
     *total = used;
 }
 
@@ -108,15 +108,22 @@ void grouped_impl(const void* x, const Weight& w, const int* ids, void* out,
     auto* counts = static_cast<int*>(work.alloc_bytes(bytes).data);
     auto* assignments = counts + banks;
     auto* tasks = reinterpret_cast<Task*>(assignments + banks * count);
-    const int task_capacity = (count + 7) / 8 + banks;
-    auto* total = reinterpret_cast<int*>(tasks + task_capacity);
+    const int storage_capacity = (count + 7) / 8 + banks;
+    auto* total = reinterpret_cast<int*>(tasks + storage_capacity);
+#ifdef NINFER_K100_MMAC
+    const bool matrix = InputBf16 && rows >= 128 && w.k >= 128;
+#else
+    constexpr bool matrix = false;
+#endif
+    const int columns = matrix ? 16 : 8;
+    const int task_capacity = (count + columns - 1) / columns + banks;
     CUDA_CHECK(cudaMemsetAsync(counts, 0, banks * sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(out, 0, static_cast<std::size_t>(count) * rows * (OutputBf16 ? 2 : 4), stream));
     collect_routes<<<(count + 255) / 256, 256, 0, stream>>>(ids, counts, assignments, first, banks, count);
-    group_tasks<<<1, 1, 0, stream>>>(counts, tasks, total, banks);
+    group_tasks<<<1, 1, 0, stream>>>(counts, tasks, total, banks, columns);
 #ifdef NINFER_K100_MMAC
 #define GROUPED(F) case QType::F: \
-    if (InputBf16 && rows >= 128 && w.k >= 128) \
+    if (matrix) \
         grouped_mmac<QType::F, InputBf16, OutputBf16><<<dim3((rows + 63) / 64, task_capacity), 256, 0, stream>>>( \
             x, w.qdata, out, assignments, tasks, total, rows, w.k, choices, count, shared, rounded); \
     else grouped_projection<QType::F, InputBf16, OutputBf16><<<dim3((rows + 7) / 8, task_capacity), 256, 0, stream>>>( \

@@ -315,7 +315,7 @@ int main(int argc, char** argv) try {
                         ++indexed;
                     }
                 }
-    for (const auto& item : cases) for (int tokens : {1, 3, 33}) for (bool shared : {false, true}) {
+    for (const auto& item : cases) for (int tokens : {1, 3, 32, 33}) for (bool shared : {false, true}) {
         run_indexed(ctx, root, item, tokens, shared, false, true, true, true);
         run_indexed(ctx, root, item, tokens, shared, true, true, false, true);
     }
