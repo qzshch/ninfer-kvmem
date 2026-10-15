@@ -234,7 +234,7 @@ int main(int argc, char** argv) try {
                 }
     std::printf("PASS: %u indexed bank/head projections, plus exact BF16 embedding checks\n",
                 indexed);
-    std::printf("PASS: %u block projection cases; five source formats; independent scalar CPU "
+    std::printf("PASS: %u block projection cases; six source formats; independent scalar CPU "
                 "block decode and full FP64 dot; max_arithmetic_budget_fraction=%.9g\n",
                 count, worst);
     return 0;

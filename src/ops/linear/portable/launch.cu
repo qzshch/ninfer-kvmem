@@ -70,7 +70,8 @@ template <QType Format>
 void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
 #ifdef NINFER_HYGON_DTK
     // Small row counts retain the wider row to expose enough parallel columns.
-    if (w.n >= 512 && w.k % 256 == 0) {
+    // Dense Q8 also retains it: warm native-shape A/B regressed with wave64.
+    if (Format != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && w.k % 256 == 0) {
         const dim3 grouped((static_cast<unsigned>(w.n) + 3) / 4, static_cast<unsigned>(x.ne[1]));
         if (x.dtype == DType::BF16)
             projection_wave64<Format, true>

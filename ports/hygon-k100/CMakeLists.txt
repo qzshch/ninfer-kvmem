@@ -136,6 +136,15 @@ if(BUILD_TESTING)
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
+  add_executable(k100_weight_decode_test tests/weight_decode.hip)
+  target_include_directories(k100_weight_decode_test PRIVATE "${NINFER_ROOT}/third_party")
+  target_link_libraries(k100_weight_decode_test PRIVATE ninfer_k100_physical_core)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_weight_decode_device${device} COMMAND k100_weight_decode_test)
+    set_tests_properties(k100_weight_decode_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
+      ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 60)
+  endforeach()
   add_executable(k100_kda_test tests/kda.cpp)
   target_include_directories(k100_kda_test PRIVATE "${NINFER_ROOT}/tests")
   target_link_libraries(k100_kda_test PRIVATE ninfer_k100_kda)
