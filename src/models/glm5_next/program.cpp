@@ -14,13 +14,15 @@
 namespace ninfer::models::glm5_next {
 namespace {
 constexpr int H = 4096, Features = 20480, FeatureSlots = 2056;
-constexpr std::size_t StateFloats = 64 * 128 * 128, ConvFloats = 3 * 8192 * 3;
 
 const float* fp(const Tensor& x) { return static_cast<const float*>(x.data); }
 } // namespace
 
 Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, ProgramOptions options)
-    : model_(model), parameters_(model.parameters()), devices_(devices), options_(options) {
+    : model_(model), parameters_(model.parameters()), devices_(devices), options_(options),
+      tensor_parallel_(model.parallelism() == Parallelism::TensorExpert) {
+    if (tensor_parallel_ && (options.draft || options.mtp))
+        throw std::invalid_argument("GLM tensor/expert Program requires ordinary execution");
     if (options.max_lanes < 1 || options.max_lanes > 8 ||
         (options.draft && (options.max_lanes != 1 || options.graph)) || options.max_context < 1 ||
         options.max_context > 32768 ||
@@ -39,7 +41,25 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
     host_metadata_.resize(5 * max_rows_ + 2 * options.max_lanes + 1);
     std::array<std::size_t, 3> counts{};
     for (const auto& l : parameters_.layers)
-        if (l.linear) ++counts[l.device];
+        if (l.linear) {
+            if (tensor_parallel_) for (auto& count : counts) ++count;
+            else ++counts[l.device];
+        }
+    if (tensor_parallel_) for (int d = 0; d < 3; ++d) {
+        devices_[d]->bind_to_current_thread();
+        const auto context = static_cast<std::size_t>(options.max_context);
+        const auto channels = static_cast<std::size_t>(model_.parameters(d).layers[0].kda.query.n);
+        std::size_t need = counts[d] * channels * (128 + 9) * sizeof(float) * options.max_lanes;
+        const auto mla = (context * (512 + 128 + 128) * 2 +
+            ((context + 3) / 4) * 128 * 2 + ((context + 127) / 128) * 128 * 4) * options.max_lanes;
+        for (const auto& p : model_.parameters(d).layers) if (!p.linear) need += mla;
+        need += static_cast<std::size_t>(8 * H + (d == 0 ? 4 * H : 0) + 24) * 4 * max_rows_;
+        need += host_metadata_.size() * sizeof(int) + (2ULL << 30);
+        std::size_t available = 0, total = 0;
+        CUDA_CHECK(hipMemGetInfo(&available, &total));
+        if (need > available || available - need < (512ULL << 20))
+            throw std::runtime_error("GLM TP/EP resident state/workspace and reserve exceed free device memory; reduce resident context/lanes");
+    }
     for (int d = 0; d < 3; ++d) {
         devices_[d]->bind_to_current_thread();
         for (int p = 0; p < 3; ++p)
@@ -50,32 +70,44 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 auto e = hipDeviceEnablePeerAccess(p, 0);
                 if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) CUDA_CHECK(e);
             }
-        const auto bytes     = counts[d] * (StateFloats + ConvFloats) * 4;
+        const auto channels = tensor_parallel_ ? model_.parameters(d).layers[0].kda.query.n : 8192;
+        const auto bytes = counts[d] * static_cast<std::size_t>(channels) * (128 + 9) * 4;
         for (int slot = 0; slot < (options.draft ? 9 : 1); ++slot)
             state_[d].recurrent[slot] = DeviceBuffer(bytes * options.max_lanes);
         state_[d].streams          = DeviceBuffer(4 * H * 4 * max_rows_);
         state_[d].metadata         = DeviceBuffer(host_metadata_.size() * sizeof(int));
         state_[d].hidden           = DeviceBuffer(H * 4 * max_rows_);
         state_[d].workspace        = std::make_unique<WorkspaceArena>(2ULL * 1024 * 1024 * 1024);
+        if (tensor_parallel_) {
+            state_[d].partial = DeviceBuffer(2ULL * H * 4 * max_rows_);
+            if (!d) state_[d].received = DeviceBuffer(4ULL * H * 4 * max_rows_);
+            state_[d].coefficients = DeviceBuffer(24ULL * 4 * max_rows_);
+            state_[d].normalized = DeviceBuffer(H * 4ULL * max_rows_);
+            state_[d].ready = std::make_unique<CudaCompletionEvent>(*devices_[d]);
+        }
         stats_.persistent_bytes[d] = bytes * (options.draft ? 9 : options.max_lanes) +
                                      state_[d].streams.bytes + state_[d].metadata.bytes +
-                                     state_[d].hidden.bytes;
+                                     state_[d].hidden.bytes + state_[d].partial.bytes + state_[d].received.bytes +
+                                     state_[d].coefficients.bytes + state_[d].normalized.bytes;
     }
     std::array<std::size_t, 3> cursor{};
+    for (int d = 0; d < 3; ++d)
     for (int i = 0; i < 45; ++i) {
-        const auto& p = parameters_.layers[i];
-        auto& l       = layers_[i];
-        const int d   = p.device;
+        const auto& p = model_.parameters(d).layers[i];
+        if (!tensor_parallel_ && p.device != d) continue;
+        auto& l = layer_state(d, i);
         devices_[d]->bind_to_current_thread();
         if (p.linear) {
+            const auto channels = static_cast<std::size_t>(p.kda.query.n);
+            const auto state_floats = channels * 128;
             // Layer-major pools: a compact execution row selects a physical
             // state directly, without gathering the complete recurrent image.
             auto* base  = static_cast<float*>(state_[d].recurrent[0].p) + cursor[d];
             l.recurrent = base;
             for (int j = 0; j < 3; ++j)
-                l.conv[j] = base + StateFloats * options.max_lanes +
-                            j * 8192 * 3 * options.max_lanes;
-            cursor[d] += (StateFloats + ConvFloats) * options.max_lanes;
+                l.conv[j] = base + state_floats * options.max_lanes +
+                            j * channels * 3 * options.max_lanes;
+            cursor[d] += (state_floats + 9 * channels) * options.max_lanes;
         } else {
             const auto context = options_.max_context * options_.max_lanes;
             l.latent           = DeviceBuffer(static_cast<std::size_t>(context) * 512 * 2);
@@ -122,17 +154,18 @@ Program::~Program() {
             devices_[d]->synchronize();
         } catch (...) {}
         for (int i = 0; i < 45; ++i)
-            if (parameters_.layers[i].device == d) {
-                layers_[i].latent = {};
-                layers_[i].keys   = {};
-                layers_[i].gates  = {};
-                layers_[i].pools  = {};
-                layers_[i].means  = {};
+            if (tensor_parallel_ || parameters_.layers[i].device == d) {
+                auto& l = layer_state(d, i);
+                l.latent = {}; l.keys = {}; l.gates = {}; l.pools = {}; l.means = {};
             }
         for (auto& [key, family] : graphs_) {
             family[d].reset();
             if (d == 0) family[3].reset();
         }
+        for (auto& [key, graph] : tensor_graphs_) if (key[3] % 3 == d) graph.reset();
+        state_[d].ready.reset();
+        state_[d].partial = {}; state_[d].received = {};
+        state_[d].coefficients = {}; state_[d].normalized = {};
         state_[d].workspace.reset();
         state_[d].streams  = {};
         state_[d].metadata = {};
@@ -172,7 +205,9 @@ void Program::mlp(const float* x, const MlpParameters& p, float* out, int interm
     projection(x, p.up, u, t, d);
     ops::resident_swiglu(g, u, g, static_cast<std::size_t>(intermediate) * t, limit,
                          devices_[d]->stream);
-    projection(g, p.down, out, t, d);
+    if (tensor_parallel_)
+        ops::linear_partial_fp32(g, p.down, out, p.column_begin, intermediate, t, devices_[d]->stream);
+    else projection(g, p.down, out, t, d);
 }
 
 void Program::hyper_prepare(const float* residual, const HyperParameters& p, float* coeff,
@@ -190,28 +225,29 @@ void Program::hyper_prepare(const float* residual, const HyperParameters& p, flo
 
 void Program::kda(const float* x, const KdaParameters& p, LayerState& state, float* out, int d,
                   int t) {
+    const int channels = p.query.n, heads = channels / 128;
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
-    float *q = floats(w, 8192 * t), *k = floats(w, 8192 * t), *v = floats(w, 8192 * t),
-          *g = floats(w, 8192 * t), *gate = floats(w, 8192 * t), *small = floats(w, 128 * t),
-          *beta = floats(w, 64 * t), *result = floats(w, 8192 * t);
+    float *q = floats(w, channels * t), *k = floats(w, channels * t), *v = floats(w, channels * t),
+          *g = floats(w, channels * t), *gate = floats(w, channels * t), *small = floats(w, 128 * t),
+          *beta = floats(w, heads * t), *result = floats(w, channels * t);
     const auto* slots = metadata(d, SequenceOffsets) + options_.max_lanes + 1;
     const auto* offsets = metadata(d, SequenceOffsets);
     projection(x, p.query, q, t, d);
     projection(x, p.key, k, t, d);
     projection(x, p.value, v, t, d);
     if (options_.draft) {
-        ops::resident_causal_conv(q, p.query_conv, state.conv[0], q, 8192, 1, s);
-        ops::resident_causal_conv(k, p.key_conv, state.conv[1], k, 8192, 1, s);
-        ops::resident_causal_conv(v, p.value_conv, state.conv[2], v, 8192, 1, s);
+        ops::resident_causal_conv(q, p.query_conv, state.conv[0], q, channels, 1, s);
+        ops::resident_causal_conv(k, p.key_conv, state.conv[1], k, channels, 1, s);
+        ops::resident_causal_conv(v, p.value_conv, state.conv[2], v, channels, 1, s);
     } else {
         ops::resident_causal_conv_packed(q, p.query_conv, state.conv[0], slots, offsets,
-                                         q, 8192, sequences_, s);
+                                         q, channels, sequences_, s);
         ops::resident_causal_conv_packed(k, p.key_conv, state.conv[1], slots, offsets,
-                                         k, 8192, sequences_, s);
+                                         k, channels, sequences_, s);
         ops::resident_causal_conv_packed(v, p.value_conv, state.conv[2], slots, offsets,
-                                         v, 8192, sequences_, s);
+                                         v, channels, sequences_, s);
     }
     projection(x, p.forget_in, small, t, d);
     projection(small, p.forget_out, g, t, d);
@@ -220,19 +256,19 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
     projection(x, p.input_gate, beta, t, d);
     {
         auto temp = w.scope();
-        auto qb = w.alloc(DType::BF16, {128, 64, t}),
-             kb = w.alloc(DType::BF16, {128, 64, t}),
-             vb = w.alloc(DType::BF16, {128, 64, t}),
-             gb = w.alloc(DType::BF16, {128, 64, t}),
-             bb = w.alloc(DType::BF16, {64, t}),
-             yb = w.alloc(DType::BF16, {128, 64, t});
-        ops::pack_bf16(q, static_cast<std::uint16_t*>(qb.data), 8192 * t, s);
-        ops::pack_bf16(k, static_cast<std::uint16_t*>(kb.data), 8192 * t, s);
-        ops::pack_bf16(v, static_cast<std::uint16_t*>(vb.data), 8192 * t, s);
-        ops::pack_bf16(g, static_cast<std::uint16_t*>(gb.data), 8192 * t, s);
-        ops::pack_bf16(beta, static_cast<std::uint16_t*>(bb.data), 64 * t, s);
-        Tensor image(state.recurrent, DType::FP32, {128, 128, 64, options_.max_lanes});
-        auto bias = p.decay_bias.reshape({128, 64});
+        auto qb = w.alloc(DType::BF16, {128, heads, t}),
+             kb = w.alloc(DType::BF16, {128, heads, t}),
+             vb = w.alloc(DType::BF16, {128, heads, t}),
+             gb = w.alloc(DType::BF16, {128, heads, t}),
+             bb = w.alloc(DType::BF16, {heads, t}),
+             yb = w.alloc(DType::BF16, {128, heads, t});
+        ops::pack_bf16(q, static_cast<std::uint16_t*>(qb.data), channels * t, s);
+        ops::pack_bf16(k, static_cast<std::uint16_t*>(kb.data), channels * t, s);
+        ops::pack_bf16(v, static_cast<std::uint16_t*>(vb.data), channels * t, s);
+        ops::pack_bf16(g, static_cast<std::uint16_t*>(gb.data), channels * t, s);
+        ops::pack_bf16(beta, static_cast<std::uint16_t*>(bb.data), heads * t, s);
+        Tensor image(state.recurrent, DType::FP32, {128, 128, heads, options_.max_lanes});
+        auto bias = p.decay_bias.reshape({128, heads});
         if (options_.draft) {
             ops::kimi_delta_attention(
                 qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
@@ -246,11 +282,13 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
                 1.f / std::sqrt(128.f), image, ids, ranges, yb, s,
                 ops::KdaDecayParameter::NegativeRate);
         }
-        ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result, 8192 * t, s);
+        ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result, channels * t, s);
     }
-    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, 64 * t, 1e-5f, false,
+    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, heads * t, 1e-5f, false,
                        true, s);
-    projection(result, p.output, out, t, d);
+    if (tensor_parallel_)
+        ops::linear_partial_fp32(result, p.output, out, p.head_begin * 128, channels, t, s);
+    else projection(result, p.output, out, t, d);
 }
 
 void Program::publish_retrieval_mean(LayerState& layer, int block, int d) {
@@ -267,15 +305,16 @@ void Program::publish_retrieval_mean(LayerState& layer, int block, int d) {
 
 void Program::mla(const float* x, const MlaParameters& p, LayerState& state, float* out, int d,
                   int t) {
+    const int heads = p.query_heads.n / 256;
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
-    auto *low = floats(w, (1536) * t), *query = floats(w, (16384) * t),
-         *latent = floats(w, (512) * t), *absorbed = floats(w, (64 * 512) * t),
-         *attended = floats(w, (64 * 512) * t), *expanded = floats(w, (16384) * t),
+    auto *low = floats(w, (1536) * t), *query = floats(w, ((heads * 256)) * t),
+         *latent = floats(w, (512) * t), *absorbed = floats(w, (heads * 512) * t),
+         *attended = floats(w, (heads * 512) * t), *expanded = floats(w, ((heads * 256)) * t),
          *iq = floats(w, (4096) * t), *ik = floats(w, (128) * t), *ig = floats(w, (128) * t),
          *ih = floats(w, (32) * t), *scores = floats(w, (8192) * t),
-         *prob = floats(w, (64 * 2051) * t);
+         *prob = floats(w, (heads * 2051) * t);
     auto* ids  = static_cast<std::int32_t*>(w.alloc_bytes(2051 * 4 * t).data);
     projection(x, p.query_lowrank, low, t, d);
     ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, t, 1e-5f, false, true, s);
@@ -345,16 +384,18 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
                                   options_.kvmem_window_pages ? allowed : nullptr, scores, ids,
                                   slots, positions, options_.max_context, tier_, t, s);
     }
-    ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, 64, t, false, s);
+    ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, heads, t, false, s);
     if (options_.draft) {
         ops::sparse_latent_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
-                                     ids, prob, attended, 64, 512, t, 2051, 1.f / 16, s);
+                                     ids, prob, attended, heads, 512, t, 2051, 1.f / 16, s);
     } else
         ops::resident_sparse_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
-                                       ids, prob, attended, slots, options_.max_context, t, s);
-    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, 64, t, false, s,
+                                       ids, prob, attended, slots, options_.max_context, t, s, heads);
+    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, heads, t, false, s,
                              true);
-    projection(expanded, p.output, out, t, d);
+    if (tensor_parallel_)
+        ops::linear_partial_fp32(expanded, p.output, out, p.head_begin * 256, heads * 256, t, s);
+    else projection(expanded, p.output, out, t, d);
 }
 
 void Program::feed_forward(const float* x, const LayerParameters& p, float* out, int t) {
@@ -363,7 +404,7 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
     if (p.dense) {
-        mlp(x, p.ffn, out, 12288, t, d, 10.f);
+        mlp(x, p.ffn, out, p.ffn.gate.n, t, d, 10.f);
         return;
     }
     auto *logits = floats(w, (288) * t), *weights = floats(w, (8) * t),
@@ -372,12 +413,28 @@ void Program::feed_forward(const float* x, const LayerParameters& p, float* out,
     auto* ids = static_cast<std::int32_t*>(w.alloc_bytes(8 * 4 * t).data);
     projection(x, p.router, logits, t, d, false);
     ops::resident_router(logits, fp(p.router_bias), ids, weights, 288, 8, t, 2.5f, s);
-    ops::indexed_linear_fp32(x, p.experts.gate, ids, g, 2048, 8, t, true, s, true);
-    ops::indexed_linear_fp32(x, p.experts.up, ids, u, 2048, 8, t, true, s, true);
+    const auto indexed = [&](const float* input, const Weight& bank, float* result, int rows, bool same) {
+        if (t >= 16) ops::indexed_linear_grouped_fp32(input, bank, ids, result, rows, 8, t,
+            same, tensor_parallel_ ? p.expert_begin : 0, w, s, true);
+        else if (tensor_parallel_) ops::indexed_linear_owned_fp32(input, bank, ids, result,
+            rows, 8, t, same, p.expert_begin, s, true);
+        else ops::indexed_linear_fp32(input, bank, ids, result, rows, 8, t, same, s, true);
+    };
+    if (tensor_parallel_) {
+        indexed(x, p.experts.gate, g, 2048, true);
+        indexed(x, p.experts.up, u, 2048, true);
+        ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
+        indexed(g, p.experts.down, experts, H, false);
+        mlp(x, p.ffn, out, p.ffn.gate.n, t, d, 10.f);
+        ops::resident_moe_partial(experts, weights, out + H * t, H, 8, t, s);
+    } else {
+    indexed(x, p.experts.gate, g, 2048, true);
+    indexed(x, p.experts.up, u, 2048, true);
     ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
-    ops::indexed_linear_fp32(g, p.experts.down, ids, experts, H, 8, t, false, s, true);
+    indexed(g, p.experts.down, experts, H, false);
     mlp(x, p.ffn, shared, 2048, t, d, 10.f);
     ops::resident_moe_sum(experts, weights, shared, out, H, 8, t, s);
+    }
 }
 
 void Program::peer(void* dst, int d, const void* src, int source, std::size_t bytes) {
@@ -559,13 +616,16 @@ void Program::reset_lane(int lane) {
     for (int d = 0; d < 3; ++d) {
         devices_[d]->bind_to_current_thread();
         for (int i = 0; i < 45; ++i) {
-            if (!parameters_.layers[i].linear || parameters_.layers[i].device != d) continue;
-            auto& layer = layers_[i];
-            CUDA_CHECK(cudaMemsetAsync(layer.recurrent + lane * StateFloats, 0,
-                                       StateFloats * sizeof(float), devices_[d]->stream));
+            const auto& p = model_.parameters(d).layers[i];
+            if (!p.linear || (!tensor_parallel_ && p.device != d)) continue;
+            const auto channels = static_cast<std::size_t>(p.kda.query.n);
+            const auto state_floats = channels * 128;
+            auto& layer = layer_state(d, i);
+            CUDA_CHECK(cudaMemsetAsync(layer.recurrent + lane * state_floats, 0,
+                                       state_floats * sizeof(float), devices_[d]->stream));
             for (auto* conv : layer.conv)
-                CUDA_CHECK(cudaMemsetAsync(conv + lane * 8192 * 3, 0,
-                                           8192 * 3 * sizeof(float), devices_[d]->stream));
+                CUDA_CHECK(cudaMemsetAsync(conv + lane * channels * 3, 0,
+                                           channels * 3 * sizeof(float), devices_[d]->stream));
         }
     }
     // KV, pools and derived means are overwritten before every visible read.
@@ -689,6 +749,9 @@ std::vector<std::int32_t> Program::execute(const runtime::TokenBatch& input) {
         // Consumers use this same stream. The owning host frame remains stable
         // until the complete stage chain finishes; no per-upload host wait.
     }
+    std::vector<int> result;
+    if (tensor_parallel_) result = tensor_execute();
+    else {
     // Temporal prefill uses the same stage composition eagerly. Decode Graphs
     // retain exact request geometry; no temporal span is relabeled as a lane.
     const bool graph = options_.graph && kind_ == runtime::TokenBatchKind::Decode;
@@ -722,7 +785,7 @@ std::vector<std::int32_t> Program::execute(const runtime::TokenBatch& input) {
         } else
             batch_stage(d);
     }
-    std::vector<int> result(outputs_);
+    result.resize(outputs_);
     if (outputs_) {
         peer(state_[0].hidden.p, 0, state_[2].hidden.p, 2,
               static_cast<std::size_t>(H * 4) * outputs_);
@@ -741,6 +804,7 @@ std::vector<std::int32_t> Program::execute(const runtime::TokenBatch& input) {
         // No head means no final device-to-host result copy. Still complete the
         // last stage before publishing any input frontier or reusing scratch.
         devices_[2]->synchronize();
+    }
     }
     for (const auto& span : input.spans) {
         for (unsigned t = 0; t < span.count; ++t) {

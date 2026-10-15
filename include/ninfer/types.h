@@ -213,6 +213,8 @@ struct EngineOptions {
     std::uint32_t prefill_chunk = 1024;
     // Pack independent text-prefill FFN columns. Stateful mixers remain lane-local.
     bool prefill_pack_projections = false;
+    // DTK three-device GLM ordinary execution; other platforms reject this plan.
+    bool tensor_expert_parallel = false;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

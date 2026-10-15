@@ -13,6 +13,56 @@ void require(bool condition, const char* message) {
     if (!condition) throw artifact::ArtifactError(message);
 }
 
+Weight rows(const Weight& source, int begin, int count) {
+    require(begin >= 0 && count > 0 && count <= source.n && begin <= source.n - count,
+            "GLM local weight row interval");
+    const auto block = interleaved_block_geometry(source.qtype);
+    require(source.layout == QuantLayout::Contiguous || source.layout == QuantLayout::BlockInterleaved,
+            "GLM TP requires direct or interleaved stored rows");
+    const auto stride = block.values ? static_cast<std::size_t>(source.k / block.values) * block.bytes :
+        static_cast<std::size_t>(source.k) * (source.qtype == QType::FP32 ? 4 : 2);
+    auto result = source;
+    result.qdata = static_cast<const std::byte*>(source.qdata) + begin * stride;
+    result.n = result.shape[0] = result.padded_shape[0] = count;
+    return result;
+}
+
+void shard_parameters(Parameters& p, int rank) {
+    constexpr int vocabulary_starts[3]{0, 51712, 103424}, vocabulary_rows[3]{51712, 51712, 51456};
+    p.output_begin = vocabulary_starts[rank];
+    p.output_head = rows(p.output_head, p.output_begin, vocabulary_rows[rank]);
+    constexpr int heads[3]{24, 20, 20}, starts[3]{0, 24, 44};
+    constexpr int shared[3]{768, 768, 512}, shared_starts[3]{0, 768, 1536};
+    const int h = heads[rank], first = starts[rank], channels = h * 128;
+    for (auto& l : p.layers) {
+        if (l.linear) {
+            auto& a = l.kda;
+            a.head_begin = first;
+            for (auto* w : {&a.query, &a.key, &a.value, &a.forget_out, &a.output_gate_out})
+                *w = rows(*w, first * 128, channels);
+            a.input_gate = rows(a.input_gate, first, h);
+            for (auto* conv : {&a.query_conv, &a.key_conv, &a.value_conv})
+                *conv = Tensor(static_cast<float*>(conv->data) + first * 128 * 4,
+                               DType::FP32, {4, 1, channels});
+            a.negative_decay_rate = Tensor(static_cast<float*>(a.negative_decay_rate.data) + first,
+                                           DType::FP32, {h});
+            a.decay_bias = Tensor(static_cast<float*>(a.decay_bias.data) + first * 128,
+                                  DType::FP32, {channels});
+        } else {
+            auto& a = l.mla;
+            a.head_begin = first;
+            a.query_heads = rows(a.query_heads, first * 256, h * 256);
+            a.key_absorb = rows(a.key_absorb, first * 512, h * 512);
+            a.value_expand = rows(a.value_expand, first * 256, h * 256);
+        }
+        const int intermediate = l.dense ? 4096 : shared[rank];
+        const int offset = l.dense ? rank * 4096 : shared_starts[rank];
+        l.ffn.column_begin = offset;
+        l.ffn.gate = rows(l.ffn.gate, offset, intermediate);
+        l.ffn.up = rows(l.ffn.up, offset, intermediate);
+    }
+}
+
 void config_contract(const artifact::Json& c, const artifact::Json& d) {
     require(c.at("architectures") == artifact::Json::array({"Glm5NextForConditionalGeneration"}) &&
                 c.at("hidden_size") == 4096 && c.at("num_hidden_layers") == 45 &&
@@ -64,8 +114,10 @@ void config_contract(const artifact::Json& c, const artifact::Json& d) {
 } // namespace
 
 Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devices,
-             const StartupObserver* observer, bool dflash, bool mtp)
-    : devices_(devices) {
+             const StartupObserver* observer, bool dflash, bool mtp, Parallelism parallelism)
+    : devices_(devices), parallelism_(parallelism) {
+    require(parallelism != Parallelism::TensorExpert || (!dflash && !mtp),
+            "GLM TP/EP currently accepts ordinary execution only");
     const auto& dir = reader.directory();
     config_         = dir.component("text").config;
     draft_config_   = dir.component("dflash2").config;
@@ -91,6 +143,18 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
     };
     auto mlp = [&](MlpParameters& m, const std::string& p, int intermediate, int dev,
                    int banks = 1) {
+        if (parallelism == Parallelism::TensorExpert && banks == 288) {
+            const auto bind = [&](Weight& w, std::string name, int n, int k, int rows_per_bank) {
+                demands.push_back({dev, &w, binders[dev]->parameter_rows(
+                    name, {static_cast<unsigned>(n), static_cast<unsigned>(k)},
+                    static_cast<unsigned>(dev * 96 * rows_per_bank),
+                    static_cast<unsigned>(96 * rows_per_bank))});
+            };
+            bind(m.gate, p + "gate", banks * intermediate, 4096, intermediate);
+            bind(m.up, p + "up", banks * intermediate, 4096, intermediate);
+            bind(m.down, p + "down", banks * 4096, intermediate, 4096);
+            return;
+        }
         add(m.gate, p + "gate", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
         add(m.up, p + "up", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
         add(m.down, p + "down",
@@ -115,12 +179,15 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
         add(x.position_bias, z + "position_bias", {4, 128}, dev, QType::FP32);
         add(x.pool_gate, z + "pool_gate", {128, 4096}, dev);
     };
-    add(parameters_.embedding, "text/token_embedding", {154880, 4096}, 0);
-    add(parameters_.output_head, "text/output_head", {154880, 4096}, 0);
-    norm(parameters_.output_norm, "text/output_norm", 4096, 0, QType::FP32);
+    for (int rank = 0; rank < (parallelism == Parallelism::TensorExpert ? 3 : 1); ++rank) {
+    auto& local = rank == 0 ? parameters_ : replicas_[rank - 1];
+    if (rank == 0) add(local.embedding, "text/token_embedding", {154880, 4096}, 0);
+    add(local.output_head, "text/output_head", {154880, 4096}, rank);
+    norm(local.output_norm, "text/output_norm", 4096, rank, QType::FP32);
     for (int i = 0; i < 45; ++i) {
-        auto& l       = parameters_.layers[i];
-        l.device      = i < 16 ? 0 : i < 31 ? 1 : 2;
+        auto& l       = local.layers[i];
+        l.device      = parallelism == Parallelism::TensorExpert ? rank : i < 16 ? 0 : i < 31 ? 1 : 2;
+        l.expert_begin = parallelism == Parallelism::TensorExpert ? rank * 96 : 0;
         l.linear      = i % 4 != 3;
         l.dense       = i < 3;
         const int dev = l.device;
@@ -166,6 +233,7 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
             add(l.router, p + "ffn/router", {288, 4096}, dev, QType::FP32);
             norm(l.router_bias, p + "ffn/router_bias", 288, dev, QType::FP32);
         }
+    }
     }
     if (mtp) {
         require(dir.component("mtp").config.at("num_hidden_layers") == 1 &&
@@ -241,6 +309,9 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
                 weight_tensor(view, {dims[0], dims[1], dims[2], dims[3]});
         }
     }
+    if (parallelism == Parallelism::TensorExpert)
+        for (int rank = 0; rank < 3; ++rank)
+            shard_parameters(rank == 0 ? parameters_ : replicas_[rank - 1], rank);
 }
 
 Model::~Model() {

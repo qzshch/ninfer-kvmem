@@ -12,8 +12,13 @@ metadata, companion resources and device Graphs. Runtime owns request admission,
 cancellation, deadlines and result publication. Ops implement mathematics and
 state transitions; Core supplies storage, streams, events and transfers.
 
-Target layers use three resident stages: [0,16), [16,31), [31,45).
-Embedding and output head use device zero. The current stage execution is serial.
+The default PP plan uses three resident stages: [0,16), [16,31), [31,45).
+Ordinary generation also accepts `--tp-ep`, which distributes attention heads,
+dense projections and resident expert banks across all three devices. It cannot
+be combined with DFlash2 or MTP. `--graph` captures the local Decode mathematics;
+peer transfers and their event dependencies execute between those graphs.
+PP places embedding and output head on device zero and executes stages serially.
+TP/EP broadcasts embeddings and merges the three vocabulary partitions' argmax.
 Encoded weights remain encoded; the loader does not expand the complete model
 to BF16. All selected model weights, KV and recurrent state remain on devices.
 Host input/output staging does not provide an offload fallback.

@@ -364,13 +364,13 @@ void resident_pool_select(const float* query, const float* weights, const std::u
 
 void resident_sparse_attention(const float* query, const std::uint16_t* latents, const int* ids,
                                float* probabilities, float* out, const int* slots, int capacity,
-                               int tokens, cudaStream_t s) {
+                               int tokens, cudaStream_t s, int heads) {
     if (!query || !latents || !ids || !probabilities || !out || !slots || capacity < 1 ||
-        capacity > 32768 || tokens < 1 || tokens > 32768)
+        capacity > 32768 || tokens < 1 || tokens > 32768 || heads < 1 || heads > 64)
         throw std::invalid_argument("resident sparse attention operands/geometry");
-    attention_scores<<<dim3(64, tokens), 256, 0, s>>>(query, latents, ids, probabilities, 64, 512,
+    attention_scores<<<dim3(heads, tokens), 256, 0, s>>>(query, latents, ids, probabilities, heads, 512,
                                                       2051, 1.f / 16, slots, capacity);
-    attention_values<<<dim3(2, 64, tokens), 256, 0, s>>>(latents, ids, probabilities, out, 64, 512,
+    attention_values<<<dim3(2, heads, tokens), 256, 0, s>>>(latents, ids, probabilities, out, heads, 512,
                                                          2051, slots, capacity);
     CUDA_CHECK(cudaGetLastError());
     return;

@@ -58,6 +58,8 @@ private:
     struct DeviceState {
         std::array<DeviceBuffer, 9> recurrent;
         DeviceBuffer streams, metadata, hidden;
+        DeviceBuffer partial, received, coefficients, normalized;
+        std::unique_ptr<CudaCompletionEvent> ready;
         std::unique_ptr<WorkspaceArena> workspace;
     };
 
@@ -72,9 +74,13 @@ private:
     const Parameters& parameters_;
     std::array<DeviceContext*, 3> devices_;
     ProgramOptions options_;
+    bool tensor_parallel_ = false;
     int position_ = 0;
     std::array<int, 8> frontiers_{};
     std::map<int, std::array<DecodeGraphExecutable, 4>> graphs_;
+    std::map<std::array<int, 4>, DecodeGraphExecutable> tensor_graphs_;
+    std::map<std::array<int, 2>, std::uint64_t> tensor_graph_families_;
+    std::uint64_t tensor_graph_clock_ = 0;
     int max_rows_ = 1, batch_ = 1, sequences_ = 1, outputs_ = 1, tier_ = 128;
     runtime::TokenBatchKind kind_ = runtime::TokenBatchKind::Decode;
     enum MetadataField { TokenIds, StateSlots, Positions, OutputRows, PredictedIds, SequenceOffsets };
@@ -85,6 +91,13 @@ private:
     ProgramStats stats_;
     std::array<DeviceState, 3> state_;
     std::array<LayerState, 45> layers_;
+    std::array<std::array<LayerState, 45>, 2> parallel_layers_;
+    LayerState& layer_state(int device, int layer) {
+        return tensor_parallel_ && device ? parallel_layers_.at(device - 1).at(layer) : layers_.at(layer);
+    }
+    void tensor_phase(int layer, int device, bool feed_forward);
+    void tensor_reduce(bool routed);
+    std::vector<std::int32_t> tensor_execute();
     DeviceBuffer features_;
     LayerState mtp_state_;
     int mtp_frontier_ = 0;

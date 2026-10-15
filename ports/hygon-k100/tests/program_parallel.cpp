@@ -1,0 +1,77 @@
+#include "artifact/reader.h"
+#include "models/glm5_next/frontend.h"
+#include "models/glm5_next/program.h"
+#include <algorithm>
+#include <array>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace ninfer;
+using namespace ninfer::models::glm5_next;
+
+int main(int argc, char** argv) try {
+    if (argc != 2) throw std::invalid_argument("explicit GLM v3 artifact required; loads PP then TP/EP serially");
+    std::array<std::unique_ptr<DeviceContext>, 3> owned;
+    std::array<DeviceContext*, 3> devices{};
+    for (int d = 0; d < 3; ++d) { owned[d] = std::make_unique<DeviceContext>(d); devices[d] = owned[d].get(); }
+    std::array<std::vector<int>, 3> prompts, expected;
+    const std::array<int, 3> slots{3, 0, 2};
+    for (auto plan : {Parallelism::Pipeline, Parallelism::TensorExpert}) {
+        artifact::Reader reader(argv[1]);
+        Model model(reader, devices, nullptr, false, false, plan);
+        Frontend frontend(model.tokenizer());
+        if (plan == Parallelism::Pipeline) {
+            prompts[0] = frontend.encode("Complete: 1, 2, 3,");
+            prompts[1] = frontend.encode("Remember the marker PINE 27. Summarize it in one sentence.");
+            std::string text = "Remember marker RIVER 83. ";
+            while (frontend.encode(text).size() < 400) text += "alpha beta gamma. ";
+            prompts[2] = frontend.encode(text);
+        }
+        for (bool graph : {false, true}) {
+            ProgramOptions options;
+            options.max_context = 1024; options.max_lanes = 4; options.draft = false;
+            options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
+            Program program(model, devices, options);
+            for (unsigned chunk : {1u, 17u, 128u}) {
+                program.reset();
+                std::array<unsigned, 3> positions{};
+                std::array<int, 3> anchors{};
+                while (positions[0] < prompts[0].size() || positions[1] < prompts[1].size() || positions[2] < prompts[2].size()) {
+                    std::vector<int> input, output_rows, finishing;
+                    std::vector<runtime::TokenSpan> spans;
+                    for (int r = 0; r < 3; ++r) {
+                        const auto count = std::min<std::size_t>(std::min<unsigned>(chunk, 42), prompts[r].size() - positions[r]);
+                        if (!count) continue;
+                        spans.push_back({static_cast<unsigned>(slots[r]), positions[r], static_cast<unsigned>(input.size()), static_cast<unsigned>(count)});
+                        input.insert(input.end(), prompts[r].begin() + positions[r], prompts[r].begin() + positions[r] + count);
+                        positions[r] += count;
+                        if (positions[r] == prompts[r].size()) { output_rows.push_back(input.size() - 1); finishing.push_back(r); }
+                    }
+                    const auto ids = program.execute({runtime::TokenBatchKind::Prefill, input, spans, output_rows});
+                    for (unsigned j = 0; j < ids.size(); ++j) anchors[finishing[j]] = ids[j];
+                }
+                std::array<std::vector<int>, 3> generated;
+                const std::array<int, 3> lengths{8, 5, 9};
+                for (int step = 0; step < 9; ++step) {
+                    std::vector<int> input, lanes, owners;
+                    for (int r = 0; r < 3; ++r) if (step < lengths[r]) {
+                        generated[r].push_back(anchors[r]);
+                        input.push_back(anchors[r]); lanes.push_back(slots[r]); owners.push_back(r);
+                    }
+                    const auto next = program.target_batch(input, lanes);
+                    for (unsigned j = 0; j < next.size(); ++j) anchors[owners[j]] = next[j];
+                }
+                if (plan == Parallelism::Pipeline && !graph && chunk == 1) expected = generated;
+                else if (generated != expected) throw std::runtime_error("native PP/TP/EP scalar/temporal/Graph generated token mismatch");
+                program.reset_lane(slots[1]);
+                if (program.frontier(slots[1]) != 0 || program.frontier(slots[0]) == 0)
+                    throw std::runtime_error("TP physical-slot reset/frontier isolation");
+            }
+        }
+    }
+    std::cout << "PASS: native PP versus TP/EP; ragged prefill, remapped slots, KVMem, eager/Graph ordinary Decode\n";
+    return 0;
+} catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

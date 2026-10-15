@@ -51,10 +51,27 @@ void resident_router(const float* logits, const float* bias, std::int32_t* ids, 
 // plus the shared output, then BF16. Expert outputs are [T,active,hidden].
 void resident_moe_sum(const float* experts, const float* weights, const float* shared, float* out,
                       int hidden, int active, int tokens, cudaStream_t stream);
+// Local EP weighted sum, unrounded FP32. No shared expert contribution.
+void resident_moe_partial(const float* experts, const float* weights, float* out,
+                          int hidden, int active, int tokens, cudaStream_t stream);
+// Three device-local K/EP contributions [count] -> BF16-represented FP32.
+// routed=true: each input is [2,count], shared K-partial then EP weighted sum;
+// shared contributions are BF16-rounded before adding the routed contributions.
+// Operands are disjoint. No allocation or transport inside this Op.
+void resident_tp_sum(const float* a, const float* b, const float* c, float* out,
+                     std::size_t count, bool routed, cudaStream_t stream);
 // Device argmax, one int per row, lower-id tie; values [rows,width]. A row
 // containing any nonfinite value publishes -1, never a fabricated token id.
 void resident_argmax(const float* values, std::int32_t* ids, int width, int rows,
                      cudaStream_t stream);
+struct ArgmaxPair { float value; std::int32_t id; };
+// Local vocabulary interval [begin,begin+width). Any nonfinite value marks the
+// pair invalid (-1); merge propagates invalidity from every rank, and uses the
+// global lower-id tie rule. pairs for merge are [3,rows], output ids [rows].
+void resident_argmax_pairs(const float* values, ArgmaxPair* pairs, int width, int rows,
+                           int begin, cudaStream_t stream);
+void resident_argmax_merge(const ArgmaxPair* pairs, std::int32_t* ids, int rows,
+                           cudaStream_t stream);
 // Retrieval metadata only: arithmetic mean across rows of a BF16 matrix, or
 // sum across rows of an FP32 matrix. Outputs [width] stay on the device.
 void resident_mean_bf16(const std::uint16_t* values, float* out, int width, int rows,

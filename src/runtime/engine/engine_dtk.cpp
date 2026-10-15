@@ -133,6 +133,8 @@ public:
             throw std::invalid_argument("DTK GLM speculation supports DFlash2 K7 or native MTP K1");
         if (options.speculative.backend != SpeculativeBackend::None && options.max_concurrency != 1)
             throw std::invalid_argument("DTK speculative execution requires one resident lane");
+        if (options.tensor_expert_parallel && options.speculative.backend != SpeculativeBackend::None)
+            throw std::invalid_argument("DTK TP/EP currently requires ordinary generation");
         if (options.speculative.backend == SpeculativeBackend::DFlash2 && options.use_cuda_graph)
             throw std::invalid_argument("DFlash profile requires eager execution");
         const auto start = Clock::now();
@@ -149,7 +151,9 @@ public:
         model = std::make_unique<models::glm5_next::Model>(
             reader, pointers, &options.startup_observer,
             options.speculative.backend == SpeculativeBackend::DFlash2,
-            options.speculative.backend == SpeculativeBackend::Mtp);
+            options.speculative.backend == SpeculativeBackend::Mtp,
+            options.tensor_expert_parallel ? models::glm5_next::Parallelism::TensorExpert :
+                                             models::glm5_next::Parallelism::Pipeline);
         frontend = std::make_unique<models::glm5_next::Frontend>(model->tokenizer());
         program  = std::make_unique<models::glm5_next::Program>(
             *model, pointers,
@@ -161,7 +165,9 @@ public:
         load.architecture   = "Glm5NextForConditionalGeneration";
         load.model_name     = "GLM-5.3-Flash UD-IQ4_XS";
         load.cuda_sync_mode = devices[0]->sync_mode();
-        load.prefill_signature = options.speculative.backend == SpeculativeBackend::None
+        load.prefill_signature = options.tensor_expert_parallel
+            ? "DTK; three-device tensor/expert parallel; packed causal time spans; greedy"
+            : options.speculative.backend == SpeculativeBackend::None
             ? "DTK; three resident layer stages; packed causal time spans; greedy"
             : "DTK; three resident layer stages; single-input companion profile; greedy";
         load.load_seconds       = seconds(start);

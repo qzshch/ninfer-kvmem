@@ -68,7 +68,8 @@ struct MemorySampler {
 
 Json run(const std::filesystem::path& artifact, const std::string& input, const std::string& kind,
          int context, int output, int window, bool draft, int repeat = 1, int lanes = 1,
-         bool graph = false, bool mtp = false, int prefill_chunk = 1024, bool pack_prefill = false) {
+         bool graph = false, bool mtp = false, int prefill_chunk = 1024, bool pack_prefill = false,
+         bool tensor_parallel = false) {
     Json report = {{"backend", "native ninfer::Engine"},
                    {"speculative", mtp     ? "MTP K1"
                                    : draft ? "DFlash2 K7"
@@ -84,6 +85,8 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
     options.use_cuda_graph     = graph;
     options.prefill_chunk      = prefill_chunk;
     options.prefill_pack_projections = pack_prefill;
+    options.tensor_expert_parallel = tensor_parallel;
+    report["parallelism"] = tensor_parallel ? "TP/EP" : "PP";
     options.kvmem_window_pages = window;
     options.pending_timeout_ms = 0;
     if (mtp) {
@@ -242,7 +245,7 @@ int main(int argc, char** argv) {
         std::filesystem::path artifact, report_path;
         std::string input, kind;
         int context = 32768, output = 64, window = 6, repeat = 1, lanes = 1, prefill_chunk = 1024;
-        bool draft = true, verify = false, graph = false, mtp = false, pack_prefill = false;
+        bool draft = true, verify = false, graph = false, mtp = false, pack_prefill = false, tensor_parallel = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             auto value    = [&] {
@@ -256,7 +259,7 @@ int main(int argc, char** argv) {
                        "--raw-text TEXT | --token-ids-file FILE)\n[--max-context 32768] "
                        "[--max-new-tokens 64] [--kvmem-window-pages 6]\n[--ordinary | --mtp | "
                        "--verify-native-greedy] [--report FILE]\n[--graph] [--lanes 1..8] "
-                       "[--prefill-chunk N] [--pack-prefill] "
+                       "[--prefill-chunk N] [--pack-prefill] [--tp-ep (ordinary only)] "
                        "[--repeat N (ordinary/MTP "
                        "only)]\nPrefill controls apply to ordinary generation; temporal "
                        "prefill uses eager execution with at most 1024 input rows per unit.\n"
@@ -291,6 +294,8 @@ int main(int argc, char** argv) {
                 prefill_chunk = std::stoi(value());
             else if (a == "--pack-prefill")
                 pack_prefill = true;
+            else if (a == "--tp-ep")
+                tensor_parallel = true;
             else if (a == "--mtp") {
                 mtp   = true;
                 draft = false;
@@ -305,7 +310,7 @@ int main(int argc, char** argv) {
             window < 0 || repeat < 1 || prefill_chunk < 1 || lanes < 1 || lanes > 8 ||
             (mtp && (lanes != 1 || verify)) ||
             ((lanes > 1 || graph) && (draft || verify)) || (repeat > 1 && (draft || verify)) ||
-            (!draft && verify))
+            (!draft && verify) || (tensor_parallel && (draft || mtp || verify)))
             throw std::invalid_argument("invalid or missing native inference arguments");
         Json result;
         std::string verification_failure;
@@ -325,7 +330,7 @@ int main(int argc, char** argv) {
                 verification_failure = "DFlash2 verification produced no positive acceptance";
         } else
             result = run(artifact, input, kind, context, output, window, draft, repeat, lanes,
-                         graph, mtp, prefill_chunk, pack_prefill);
+                         graph, mtp, prefill_chunk, pack_prefill, tensor_parallel);
         if (!report_path.empty()) {
             std::ofstream f(report_path);
             if (!f) throw std::runtime_error("cannot write native report");

@@ -1,6 +1,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/indexed_linear.h"
 #include "core/device.h"
+#include "core/arena.h"
 #include "core/weight_view.h"
 #include "artifact/formats.h"
 #include <nlohmann/json.hpp>
@@ -42,7 +43,7 @@ std::uint16_t bf16(float v) {
 double unbf16(std::uint16_t b) { return std::bit_cast<float>(static_cast<unsigned>(b) << 16); }
 
 void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann::json& item,
-                 int t, bool shared, bool implicit, bool rounded) {
+                 int t, bool shared, bool implicit, bool rounded, bool owned = false) {
     const auto raw    = read<std::byte>(root / item.at("encoded").get<std::string>());
     const auto oracle = read<double>(root / item.at("oracle").get<std::string>());
     const int k = item.at("k"), rows = item.at("parent_rows");
@@ -59,6 +60,11 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
     for (int token = 0; token < t; ++token)
         for (int c = 0; c < choices; ++c)
             ids[token * choices + c] = implicit ? c : (banks - 1 - c + token) % banks;
+    if (owned) for (int token = 0; token < t; ++token)
+        for (int c = 0; c < choices; ++c) {
+            auto& id = ids[token * choices + c];
+            id = (token + c) % 3 == 0 ? 95 : (token + c) % 3 == 1 ? 96 + id : 96 + banks;
+        }
     std::vector<float> x(static_cast<std::size_t>(t) * (shared ? 1 : choices) * k);
     for (std::size_t i = 0; i < x.size(); ++i) {
         unsigned b = static_cast<unsigned>(i) * 747796405u + 2891336453u;
@@ -72,16 +78,21 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
     di.copy_from_host(ids.data(), di.bytes);
     dy.fill(0xa5);
     auto* output = reinterpret_cast<float*>(static_cast<std::byte*>(dy.p) + 16);
-    ops::indexed_linear_fp32(static_cast<float*>(dx.p), w,
-                             implicit ? nullptr : static_cast<std::int32_t*>(di.p), output, n,
-                             choices, t, shared, ctx.stream, rounded);
+    WorkspaceArena scratch(ops::indexed_linear_grouped_workspace_capacity_bytes(banks, choices, t));
+    auto project = [&](bool round) {
+        if (owned && t >= 16) ops::indexed_linear_grouped_fp32(static_cast<float*>(dx.p), w,
+            static_cast<std::int32_t*>(di.p), output, n, choices, t, shared, 96, scratch, ctx.stream, round);
+        else if (owned) ops::indexed_linear_owned_fp32(static_cast<float*>(dx.p), w,
+            static_cast<std::int32_t*>(di.p), output, n, choices, t, shared, 96, ctx.stream, round);
+        else ops::indexed_linear_fp32(static_cast<float*>(dx.p), w,
+            implicit ? nullptr : static_cast<std::int32_t*>(di.p), output, n, choices, t, shared, ctx.stream, round);
+    };
+    project(rounded);
     ctx.synchronize();
     std::vector<float> y(static_cast<std::size_t>(t) * choices * n);
     CUDA_CHECK(cudaMemcpy(y.data(), output, y.size() * 4, cudaMemcpyDeviceToHost));
     if (rounded) {
-        ops::indexed_linear_fp32(static_cast<float*>(dx.p), w,
-                                 implicit ? nullptr : static_cast<std::int32_t*>(di.p), output, n,
-                                 choices, t, shared, ctx.stream, false);
+        project(false);
         ctx.synchronize();
         std::vector<float> raw_y(y.size());
         CUDA_CHECK(cudaMemcpy(raw_y.data(), output, raw_y.size() * 4, cudaMemcpyDeviceToHost));
@@ -93,8 +104,8 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
         for (int c = 0; c < choices; ++c)
             for (int row = 0; row < n; ++row) {
                 double sum = 0, absolute = 0;
-                const auto bank = ids[token * choices + c];
-                for (int col = 0; col < k; ++col) {
+                const int bank = ids[token * choices + c] - (owned ? 96 : 0);
+                for (int col = 0; bank >= 0 && bank < banks && col < k; ++col) {
                     double p = oracle[(static_cast<std::size_t>(bank) * n + row) * k + col] *
                                x[(static_cast<std::size_t>(token) * (shared ? 1 : choices) +
                                   (shared ? 0 : c)) *
@@ -145,7 +156,7 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
 }
 
 double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann::json& item,
-           int tokens, bool bf, bool rounded = false) {
+           int tokens, bool bf, bool rounded = false, bool partial = false) {
     const auto raw    = read<std::byte>(root / item.at("encoded").get<std::string>());
     const auto oracle = read<double>(root / item.at("oracle").get<std::string>());
     const int n = item.at("n"), k = item.at("k"), rows = item.at("parent_rows"),
@@ -161,7 +172,9 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
     auto w = native_weight(WeightView{{static_cast<unsigned>(n), static_cast<unsigned>(k)},
                                       {{&parent, static_cast<std::uint64_t>(begin) * k,
                                         static_cast<std::uint64_t>(begin + n) * k}}});
-    std::vector<float> x(static_cast<std::size_t>(k) * tokens);
+    const int input_k = partial ? k / 2 : k;
+    const int k_begin = partial ? k / 2 : 0;
+    std::vector<float> x(static_cast<std::size_t>(input_k) * tokens);
     std::vector<std::uint16_t> xb(x.size());
     for (std::size_t i = 0; i < x.size(); ++i) {
         unsigned bits = static_cast<unsigned>(i) * 747796405u + 2891336453u;
@@ -176,9 +189,12 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
     input.copy_from_host(bf ? static_cast<const void*>(xb.data()) : x.data(), input.bytes);
     output.fill(0xa5);
     const auto dtype = bf ? DType::BF16 : DType::FP32;
-    Tensor a(input.p, dtype, {k, tokens}),
+    Tensor a(input.p, dtype, {input_k, tokens}),
         y(static_cast<std::byte*>(output.p) + 16, dtype, {n, tokens});
-    if (bf)
+    if (partial)
+        ops::linear_partial_fp32(static_cast<const float*>(a.data), w, static_cast<float*>(y.data),
+                                 k_begin, input_k, tokens, ctx.stream);
+    else if (bf)
         ops::linear(a, w, y, ctx.stream);
     else
         ops::linear_fp32(a, w, y, ctx.stream, rounded);
@@ -209,9 +225,9 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
     for (int t = 0; t < tokens; ++t)
         for (int row = 0; row < n; ++row) {
             double expected = 0, absolute = 0;
-            for (int c = 0; c < k; ++c) {
-                auto p = oracle[static_cast<std::size_t>(begin + row) * k + c] *
-                         x[static_cast<std::size_t>(t) * k + c];
+            for (int c = 0; c < input_k; ++c) {
+                auto p = oracle[static_cast<std::size_t>(begin + row) * k + k_begin + c] *
+                         x[static_cast<std::size_t>(t) * input_k + c];
                 expected += p;
                 absolute += std::abs(p);
             }
@@ -268,6 +284,11 @@ int main(int argc, char** argv) try {
                     ++count;
                 }
             }
+    for (const auto& item : cases) if (item.at("k").get<int>() % 512 == 0)
+        for (int tokens : {1, 8, 17}) {
+            worst = std::max(worst, run(ctx, root, item, tokens, false, false, true));
+            ++count;
+        }
     unsigned indexed = 0;
     for (const auto& item : cases)
         for (int tokens : {1, 3, 8})
@@ -277,6 +298,13 @@ int main(int argc, char** argv) try {
                         run_indexed(ctx, root, item, tokens, shared, implicit, rounded);
                         ++indexed;
                     }
+                }
+    for (const auto& item : cases)
+        for (int tokens : {1, 8, 33})
+            for (bool shared : {false, true})
+                for (bool rounded : {false, true}) {
+                    run_indexed(ctx, root, item, tokens, shared, false, rounded, true);
+                    ++indexed;
                 }
     std::printf("PASS: %u indexed bank/head projections, plus exact BF16 embedding checks\n",
                 indexed);

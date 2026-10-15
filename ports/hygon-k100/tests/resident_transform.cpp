@@ -371,6 +371,50 @@ void metadata(DeviceContext& ctx, int rows) {
         check(m[c], btotal / rows, false, "block retrieval mean");
     }
 }
+void tensor_sums(DeviceContext& ctx) {
+    constexpr int count = 4096 * 3;
+    for (bool routed : {false, true}) {
+        std::vector<float> a(count * (routed ? 2 : 1)), b(a.size()), c(a.size());
+        for (unsigned i = 0; i < a.size(); ++i) {
+            a[i] = value(i + 1); b[i] = value(i + 17001); c[i] = value(i + 37001);
+        }
+        auto da = upload(a), db = upload(b), dc = upload(c);
+        DeviceBuffer out(count * 4 + 32);
+        out.fill(0xa5);
+        ops::resident_tp_sum(static_cast<float*>(da.p), static_cast<float*>(db.p), static_cast<float*>(dc.p),
+            reinterpret_cast<float*>(static_cast<std::byte*>(out.p) + 16), count, routed, ctx.stream);
+        ctx.synchronize();
+        auto observed = download(out);
+        for (int i = 0; i < count; ++i) {
+            double ideal = static_cast<double>(a[i]) + b[i] + c[i];
+            if (routed) ideal = bf(ideal) + static_cast<double>(a[count + i]) + b[count + i] + c[count + i];
+            check(observed[i + 4], ideal, true, "three-rank reduction/semantic shared boundary");
+        }
+        std::vector<std::byte> guards(out.bytes);
+        out.copy_to_host(guards.data(), guards.size());
+        for (int i = 0; i < 16; ++i)
+            require(guards[i] == std::byte{0xa5} && guards[guards.size() - i - 1] == std::byte{0xa5},
+                    "TP reduction output guard");
+    }
+    constexpr int rows = 8, width = 513;
+    std::vector<float> input(3 * rows * width, -5.f);
+    for (int d = 0; d < 3; ++d) for (int t = 0; t < rows; ++t)
+        input[(d * rows + t) * width + 7] = t == 0 ? 2.f : float(d + t);
+    input[(2 * rows + 4) * width + 511] = INFINITY;
+    input[(1 * rows + 5) * width] = NAN;
+    auto dx = upload(input);
+    DeviceBuffer pairs(3 * rows * sizeof(ops::ArgmaxPair)), ids(rows * sizeof(int));
+    for (int d = 0; d < 3; ++d)
+        ops::resident_argmax_pairs(static_cast<float*>(dx.p) + d * rows * width,
+            static_cast<ops::ArgmaxPair*>(pairs.p) + d * rows, width, rows, d * width, ctx.stream);
+    ops::resident_argmax_merge(static_cast<ops::ArgmaxPair*>(pairs.p), static_cast<int*>(ids.p), rows, ctx.stream);
+    ctx.synchronize();
+    std::vector<int> got(rows);
+    ids.copy_to_host(got.data(), ids.bytes);
+    for (int t = 0; t < rows; ++t)
+        require(got[t] == ((t == 4 || t == 5) ? -1 : (t == 0 ? 7 : 2 * width + 7)),
+                "distributed vocabulary ties/nonfinite propagation");
+}
 } // namespace
 
 int main() {
@@ -415,6 +459,7 @@ int main() {
                     ++cases;
                 }
         argmax(ctx);
+        tensor_sums(ctx);
         ++cases;
         for (int rows : {32, 128}) {
             metadata(ctx, rows);

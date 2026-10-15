@@ -69,6 +69,8 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.tensor_expert_parallel)
+        throw std::invalid_argument("tensor/expert parallel execution requires the DTK three-device GLM build");
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;

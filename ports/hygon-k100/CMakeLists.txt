@@ -48,6 +48,7 @@ add_library(ninfer_k100_projection STATIC
   "${NINFER_ROOT}/src/ops/linear/linear.cpp"
   "${NINFER_ROOT}/src/ops/linear/fp32.cpp"
   "${NINFER_ROOT}/src/ops/linear/portable/indexed_hip.hip"
+  "${NINFER_ROOT}/src/ops/linear/portable/grouped_hip.hip"
   "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
 target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
 target_include_directories(ninfer_k100_projection PRIVATE "${NINFER_ROOT}/third_party")
@@ -59,7 +60,8 @@ target_link_libraries(ninfer_k100_kda PUBLIC ninfer_k100_physical_core)
 
 add_library(ninfer_k100_hyper_connection STATIC "${NINFER_ROOT}/src/ops/hyper_connection/launch_hip.hip")
 target_link_libraries(ninfer_k100_hyper_connection PUBLIC ninfer_k100_physical_core)
-add_library(ninfer_k100_resident_transform STATIC "${NINFER_ROOT}/src/ops/resident_transform/launch_hip.hip")
+add_library(ninfer_k100_resident_transform STATIC "${NINFER_ROOT}/src/ops/resident_transform/launch_hip.hip"
+  "${NINFER_ROOT}/src/ops/resident_transform/parallel_hip.hip")
 target_link_libraries(ninfer_k100_resident_transform PUBLIC ninfer_k100_physical_core)
 add_library(ninfer_k100_sparse_latent STATIC "${NINFER_ROOT}/src/ops/sparse_latent_attention/launch_hip.hip")
 target_link_libraries(ninfer_k100_sparse_latent PUBLIC ninfer_k100_physical_core)
@@ -87,7 +89,8 @@ find_library(PCRE2_LIBRARY NAMES pcre2-8 REQUIRED)
 target_link_libraries(ninfer_k100_glm_frontend PUBLIC ninfer_k100_glm_model ninfer_k100_text "${PCRE2_LIBRARY}")
 
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
-add_library(ninfer_k100_glm_program STATIC "${NINFER_ROOT}/src/models/glm5_next/program.cpp")
+add_library(ninfer_k100_glm_program STATIC "${NINFER_ROOT}/src/models/glm5_next/program.cpp"
+  "${NINFER_ROOT}/src/models/glm5_next/program_parallel.cpp")
 target_link_libraries(ninfer_k100_glm_program PUBLIC ninfer_k100_glm_model ninfer_k100_projection
   ninfer_k100_kda ninfer_k100_hyper_connection ninfer_k100_resident_transform ninfer_k100_sparse_latent ninfer_k100_dflash_block kvmem_core)
 add_library(ninfer_k100_engine STATIC "${NINFER_ROOT}/src/runtime/engine/engine_dtk.cpp"
@@ -109,6 +112,8 @@ if(BUILD_TESTING)
   target_include_directories(k100_token_batch_test PRIVATE "${NINFER_ROOT}/src")
   add_test(NAME k100_token_batch COMMAND k100_token_batch_test)
   # Real artifact qualification is opt-in, never an implicit 145-GiB CTest load.
+  add_executable(ninfer_k100_parallel_check tests/program_parallel.cpp)
+  target_link_libraries(ninfer_k100_parallel_check PRIVATE ninfer_k100_glm_program ninfer_k100_glm_frontend)
   add_executable(ninfer_k100_prefill_check tests/program_prefill.cpp)
   target_link_libraries(ninfer_k100_prefill_check PRIVATE ninfer_k100_glm_program ninfer_k100_glm_frontend)
   add_executable(ninfer_k100_engine_check tests/engine_batch.cpp)

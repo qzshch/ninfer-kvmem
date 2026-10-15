@@ -41,13 +41,13 @@ void resident_pool_select(const float* query, const float* weights, const std::u
                           const std::uint8_t* allowed, float* scores, std::int32_t* ids,
                           const std::int32_t* slots, const std::int32_t* positions, int capacity,
                           int tier, int tokens, cudaStream_t stream);
-// Batch MLA: query/output [B,64,512], cache [lanes,C,512] BF16,
-// ids [B,2051] distinct visible offsets or -1; probabilities [B,64,2051].
+// Batch MLA: query/output [B,heads,512], cache [lanes,C,512] BF16,
+// ids [B,2051] distinct visible offsets or -1; probabilities [B,heads,2051].
 // Complete softmax(Q*KV^T/16)*KV, FP32 score/probability/value accumulation.
 void resident_sparse_attention(const float* query, const std::uint16_t* latents,
                                const std::int32_t* ids, float* probabilities, float* out,
                                const std::int32_t* slots, int capacity, int tokens,
-                               cudaStream_t stream);
+                               cudaStream_t stream, int heads = 64);
 // GLM DSA index mathematics. All cache arrays are caller-owned device buffers.
 // Append one BF16-represented key/gate [128] into full-position BF16 arrays and
 // publish a complete four-token pool when position%4==3. Position bias [4,128]
