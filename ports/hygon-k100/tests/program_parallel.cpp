@@ -66,6 +66,9 @@ int main(int argc, char** argv) try {
                 }
                 if (plan == Parallelism::Pipeline && !graph && chunk == 1) expected = generated;
                 else if (generated != expected) throw std::runtime_error("native PP/TP/EP scalar/temporal/Graph generated token mismatch");
+                if (graph && (!program.stats().graph_captures ||
+                              program.stats().graph_replays <= program.stats().graph_captures))
+                    throw std::runtime_error("ordinary Graph mode failed to reuse captured execution");
                 program.reset_lane(slots[1]);
                 if (program.frontier(slots[1]) != 0 || program.frontier(slots[0]) == 0)
                     throw std::runtime_error("TP physical-slot reset/frontier isolation");

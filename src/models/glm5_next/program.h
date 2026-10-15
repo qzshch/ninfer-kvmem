@@ -4,6 +4,7 @@
 #include "core/decode_graph.h"
 #include "runtime/contract/token_batch.h"
 #include <map>
+#include <functional>
 #include <span>
 #include "kvmem/block_retrieval.h"
 #include <array>
@@ -96,6 +97,8 @@ private:
         return tensor_parallel_ && device ? parallel_layers_.at(device - 1).at(layer) : layers_.at(layer);
     }
     void tensor_phase(int layer, int device, bool feed_forward);
+    void tensor_launch(int category, int component, const std::function<void()>& body);
+    void tensor_finalize(int device);
     void tensor_reduce(bool routed);
     std::vector<std::int32_t> tensor_execute();
     DeviceBuffer features_;
