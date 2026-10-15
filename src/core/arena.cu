@@ -241,13 +241,13 @@ std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
 
 void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
-PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
+PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes, bool portable) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
 
     void* ptr             = nullptr;
-    const cudaError_t err = cudaMallocHost(&ptr, size_bytes);
+    const cudaError_t err = cudaHostAlloc(&ptr, size_bytes, portable ? cudaHostAllocPortable : cudaHostAllocDefault);
     if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMallocHost failed", err));
+        throw std::runtime_error(cuda_error_message("cudaHostAlloc failed", err));
     }
 
     data_ = ptr;

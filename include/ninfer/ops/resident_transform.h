@@ -17,6 +17,18 @@ void unpack_bf16(const std::uint16_t* input, float* output, std::size_t count, c
 void resident_norm(const float* input, const Tensor* gain, const Tensor* bias, const float* gate,
                    float* output, int width, int rows, float epsilon, bool center, bool bf16_output,
                    cudaStream_t stream);
+// Typed storage forms of the same norm/SwiGLU/packed-conv ideals. Contiguous
+// FP32 or BF16 tensors; norm uses width=x.ne[0] and rows=numel/width. FP32 norm
+// outputs retain FP32; BF16 outputs use the existing final semantic cast. A gate
+// has the input dtype/extent. SwiGLU and conv require one matching dtype and
+// preserve both existing BF16 arithmetic boundaries even with FP32 storage.
+// Exact same-dtype input/output alias is valid. Conv state remains FP32.
+void resident_norm(const Tensor& input, const Tensor* gain, const Tensor* bias, const Tensor* gate,
+                   Tensor& output, float epsilon, bool center, cudaStream_t stream);
+void resident_swiglu(const Tensor& gate, const Tensor& up, Tensor& output, float limit, cudaStream_t stream);
+void resident_causal_conv_packed(const Tensor& input, const Tensor& kernel, float* states,
+                                 const std::int32_t* slots, const std::int32_t* offsets,
+                                 Tensor& output, int sequences, cudaStream_t stream);
 // gate/up BF16-represented inputs; limit>0 clips gate above limit, up to +/-limit.
 // The SiLU result and subsequent product each have BF16 semantic boundaries.
 void resident_swiglu(const float* gate, const float* up, float* output, std::size_t count,
@@ -51,8 +63,14 @@ void resident_router(const float* logits, const float* bias, std::int32_t* ids, 
 // plus the shared output, then BF16. Expert outputs are [T,active,hidden].
 void resident_moe_sum(const float* experts, const float* weights, const float* shared, float* out,
                       int hidden, int active, int tokens, cudaStream_t stream);
+// BF16 expert storage; same shared-plus-weighted sum and final BF16 boundary.
+void resident_moe_sum(const Tensor& experts, const float* weights, const float* shared, float* out,
+                      int hidden, int active, int tokens, cudaStream_t stream);
 // Local EP weighted sum, unrounded FP32. No shared expert contribution.
 void resident_moe_partial(const float* experts, const float* weights, float* out,
+                          int hidden, int active, int tokens, cudaStream_t stream);
+// BF16 expert storage, same unrounded FP32 weighted sum. x [hidden,active,T].
+void resident_moe_partial(const Tensor& experts, const float* weights, float* output,
                           int hidden, int active, int tokens, cudaStream_t stream);
 // Three device-local K/EP contributions [count] -> BF16-represented FP32.
 // routed=true: each input is [2,count], shared K-partial then EP weighted sum;

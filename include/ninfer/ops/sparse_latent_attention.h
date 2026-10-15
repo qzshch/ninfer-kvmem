@@ -41,6 +41,21 @@ void resident_pool_select(const float* query, const float* weights, const std::u
                           const std::uint8_t* allowed, float* scores, std::int32_t* ids,
                           const std::int32_t* slots, const std::int32_t* positions, int capacity,
                           int tier, int tokens, cudaStream_t stream);
+// Same append/retrieval/selection ideals with physical BF16 latent/key/gate/query
+// inputs. Head weights, bias, means, scores and reductions retain FP32.
+void resident_index_append(const std::uint16_t* latent, const std::uint16_t* key, const std::uint16_t* gate,
+                           const float* bias, std::uint16_t* latents, std::uint16_t* keys,
+                           std::uint16_t* gates, std::uint16_t* pools, const std::int32_t* slots,
+                           const std::int32_t* positions, int capacity, int tokens,
+                           cudaStream_t stream);
+void resident_retrieval(const std::uint16_t* query, const std::uint16_t* keys, float* means,
+                        std::uint8_t* allowed, const std::int32_t* slots,
+                        const std::int32_t* positions, int capacity, int tokens, int budget_blocks,
+                        cudaStream_t stream);
+void resident_pool_select(const std::uint16_t* query, const float* weights, const std::uint16_t* pools,
+                          const std::uint8_t* allowed, float* scores, std::int32_t* ids,
+                          const std::int32_t* slots, const std::int32_t* positions, int capacity,
+                          int tier, int tokens, cudaStream_t stream);
 // Batch MLA: query/output [B,heads,512], cache [lanes,C,512] BF16,
 // ids [B,2051] distinct visible offsets or -1; probabilities [B,heads,2051].
 // Complete softmax(Q*KV^T/16)*KV, FP32 score/probability/value accumulation.

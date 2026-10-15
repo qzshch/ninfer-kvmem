@@ -26,7 +26,7 @@ unsigned short bf(float x) {
 
 float ub(unsigned short x) { return std::bit_cast<float>(static_cast<unsigned>(x) << 16); }
 
-void attention_transition(DeviceContext& device, bool temporal = false, int mask_mode = 0) {
+void attention_transition(DeviceContext& device, bool temporal = false, int mask_mode = 0, bool physical_bf16 = false) {
     constexpr int cap = 129, lanes = 3, pools_count = (cap + 3) / 4, count = 2051;
     const std::array<int, lanes> slots = temporal ? std::array{2, 2, 2} : std::array{2, 0, 1};
     const std::array<int, lanes> positions = temporal ? std::array{126, 127, 128} : std::array{3, 6, 128};
@@ -124,20 +124,32 @@ void attention_transition(DeviceContext& device, bool temporal = false, int mask
     ds.copy_from_host(slots.data(), ds.bytes);
     dpos.copy_from_host(positions.data(), dpos.bytes);
     allowed_device.copy_from_host(allowed.data(), allowed.size());
+    if (physical_bf16) {
+        const auto upload_words = [&](DeviceBuffer& dst, const std::vector<float>& values) {
+            std::vector<unsigned short> words; for (auto v : values) words.push_back(bf(v));
+            dst.copy_from_host(words.data(), words.size() * 2);
+        };
+        upload_words(dq, query); upload_words(dnk, newkey);
+        upload_words(dng, newgate); upload_words(dnl, newlatent);
+    }
     DecodeGraphDefinition definition;
     definition.capture(device.stream, [&] {
+        const auto index = [&]<class T>() {
         ops::resident_index_append(
-            static_cast<float*>(dnl.p), static_cast<float*>(dnk.p), static_cast<float*>(dng.p),
+            static_cast<T*>(dnl.p), static_cast<T*>(dnk.p), static_cast<T*>(dng.p),
             static_cast<float*>(db.p), static_cast<unsigned short*>(dl.p),
             static_cast<unsigned short*>(dk.p), static_cast<unsigned short*>(dg.p),
             static_cast<unsigned short*>(dp.p), static_cast<int*>(ds.p), static_cast<int*>(dpos.p),
             cap, lanes, device.stream);
-        ops::resident_pool_select(static_cast<float*>(dq.p), static_cast<float*>(dw.p),
+        ops::resident_pool_select(static_cast<T*>(dq.p), static_cast<float*>(dw.p),
                                   static_cast<unsigned short*>(dp.p),
                                   mask_mode ? static_cast<unsigned char*>(allowed_device.p) : nullptr,
                                   static_cast<float*>(scores.p), static_cast<int*>(ids.p),
                                   static_cast<int*>(ds.p), static_cast<int*>(dpos.p), cap, 256,
                                   lanes, device.stream);
+        };
+        if (physical_bf16) index.template operator()<unsigned short>();
+        else index.template operator()<float>();
         ops::resident_sparse_attention(static_cast<float*>(dquery.p),
                                        static_cast<unsigned short*>(dl.p), static_cast<int*>(ids.p),
                                        static_cast<float*>(prob.p), static_cast<float*>(out.p),
@@ -224,6 +236,8 @@ int main() {
     try {
         DeviceContext device(0);
         attention_transition(device);
+        attention_transition(device, true, 1, true);
+        attention_transition(device, false, 0, true);
         attention_transition(device, true);
         attention_transition(device, true, 1);
         attention_transition(device, true, 2);
@@ -237,12 +251,17 @@ int main() {
         dk.copy_from_host(keys.data(), dk.bytes);
         std::array<int, lanes> slots{2, 0, 1};
         ds.copy_from_host(slots.data(), ds.bytes);
+        for (bool physical : {false, true}) {
         DecodeGraphDefinition definition;
         definition.capture(device.stream, [&] {
-            ops::resident_retrieval(static_cast<float*>(dq.p), static_cast<unsigned short*>(dk.p),
+            const auto retrieve = [&]<class T>() {
+            ops::resident_retrieval(static_cast<T*>(dq.p), static_cast<unsigned short*>(dk.p),
                                     static_cast<float*>(dm.p), static_cast<unsigned char*>(da.p),
                                     static_cast<int*>(ds.p), static_cast<int*>(dp.p), capacity,
                                     lanes, 3, device.stream);
+            };
+            if (physical) retrieve.template operator()<unsigned short>();
+            else retrieve.template operator()<float>();
         });
         DecodeGraphExecutable graph;
         graph.instantiate(definition);
@@ -263,7 +282,11 @@ int main() {
             for (std::size_t i = 0; i < query.size(); ++i)
                 query[i] = trial == 4 ? 0.f : float(std::cos(double(i + trial) * .034) * .125);
             dm.copy_from_host(means.data(), dm.bytes);
-            dq.copy_from_host(query.data(), dq.bytes);
+            if (physical) {
+                std::vector<unsigned short> words;
+                for (auto& v : query) { words.push_back(bf(v)); v = ub(words.back()); }
+                dq.copy_from_host(words.data(), words.size() * 2);
+            } else dq.copy_from_host(query.data(), dq.bytes);
             ds.copy_from_host(slots.data(), ds.bytes);
             dp.copy_from_host(positions.data(), dp.bytes);
             graph.launch(device.stream);
@@ -323,6 +346,7 @@ int main() {
                 require(source[slots[l] * stride + c] == compact[l * width + c], "raw scatter");
             for (int c = width; c < stride; ++c)
                 require(source[l * stride + c] == 0xa5, "raw transfer guard");
+        }
         }
         std::cout << "PASS dynamic Graph retrieval FP64 selection, FP32 means, ragged frontiers, "
                      "lane remapping, zero-score ties, exact indexed transfer\n";

@@ -3,6 +3,7 @@
 // No hidden allocation or external engine.
 #include "ops/linear/portable/launch.h"
 #include "core/device.h"
+#include "ops/linear/portable/mmac_mapping.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -15,10 +16,11 @@ __device__ float projection_output(float x, bool rounded) {
     return rounded ? decode_bf16(encode_bf16(x)) : x;
 }
 #include "ops/linear/portable/q8_tiles.cuh"
+#include "ops/linear/portable/mmac_tiles.cuh"
 #ifdef NINFER_HYGON_DTK
 #    include "ops/linear/portable/wave64_dot.cuh"
 
-template <QType Format, bool Bf16>
+template <QType Format, bool Bf16, bool OutputBf16 = Bf16>
 __global__ void projection_wave64(const void* x, const void* w, void* out, int n, int k,
                                   bool rounded) {
     const auto row = static_cast<std::int64_t>(blockIdx.x) * 4 + threadIdx.x / 64;
@@ -31,7 +33,7 @@ __global__ void projection_wave64(const void* x, const void* w, void* out, int n
         input = static_cast<const float*>(x) + token * k;
     const float sum = dot_wave64<Format, Bf16>(input, w, row, k);
     if ((threadIdx.x & 63) == 0) {
-        if constexpr (Bf16)
+        if constexpr (OutputBf16)
             static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(sum);
         else
             static_cast<float*>(out)[token * n + row] = projection_output(sum, rounded);
@@ -40,7 +42,7 @@ __global__ void projection_wave64(const void* x, const void* w, void* out, int n
 }
 #endif
 
-template <QType Format, bool Bf16>
+template <QType Format, bool Bf16, bool OutputBf16 = Bf16>
 __global__ void projection(const void* x, const void* w, void* out, int n, int k, bool rounded) {
     __shared__ float partial[256];
     const auto row     = static_cast<std::int64_t>(blockIdx.x);
@@ -78,7 +80,7 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
             __syncthreads();
         }
     if (tid == 0) {
-        if constexpr (Bf16) {
+        if constexpr (OutputBf16) {
             static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(partial[0]);
         } else {
             static_cast<float*>(out)[token * n + row] = projection_output(partial[0], rounded);
@@ -92,7 +94,7 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
 // Four independent activation columns share every represented weight load and
 // decode. Each column retains the existing 256-lane accumulation/reduction tree.
 // Tails are masked; there is no padding request or duplicated mutable state.
-template <QType Format, bool Bf16>
+template <QType Format, bool Bf16, bool OutputBf16 = Bf16>
 __global__ void projection_columns4(const void* x, const void* w, void* out, int n, int k,
                                     int tokens, bool rounded, int parent_k, int begin) {
     const int row = blockIdx.x, base = blockIdx.y * 4, lane = threadIdx.x;
@@ -122,7 +124,7 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
             for (int distance = 32; distance; distance /= 2)
                 value += __shfl_down(value, distance, 64);
             if (!lane && base + t < tokens) {
-                if constexpr (Bf16)
+                if constexpr (OutputBf16)
                     static_cast<std::uint16_t*>(out)[(base + t) * n + row] = encode_bf16(value);
                 else
                     static_cast<float*>(out)[(base + t) * n + row] =
@@ -133,66 +135,60 @@ __global__ void projection_columns4(const void* x, const void* w, void* out, int
 }
 #endif
 
-template <QType Format>
-void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool bf16_output) {
-#ifdef NINFER_HYGON_DTK
-    if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
-        if (w.n >= 128 && ((w.k >= 512 && x.ne[1] == 1) || x.ne[1] >= 16)) {
-            const auto invoke = [&]<bool B>() {
-                if (x.ne[1] == 1)
-                    q8_decode_tile<B><<<(w.n + 3) / 4, 256, 0, stream>>>(
-                        x.data, w.qdata, out.data, w.n, w.k, 0, w.k, bf16_output);
-                else
-                    q8_matrix_tile<B><<<dim3((w.n + 7) / 8, (x.ne[1] + 7) / 8), 256, 0, stream>>>(
-                        x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], bf16_output);
-            };
-            if (x.dtype == DType::BF16) invoke.template operator()<true>();
-            else invoke.template operator()<false>();
-            return;
-        }
-    }
-    if (x.ne[1] > 1 && (Format == QType::Q8_G32_FP16_BLOCK || Format == QType::Q6_K_G256_BLOCK) &&
-        w.n >= 128) {
-        const dim3 grid(w.n, (x.ne[1] + 3) / 4);
-        if (x.dtype == DType::BF16)
-            projection_columns4<Format, true><<<grid, 256, 0, stream>>>(
-                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output, w.k, 0);
-        else
-            projection_columns4<Format, false><<<grid, 256, 0, stream>>>(
-                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output, w.k, 0);
-        return;
-    }
-    // Small problems retain wider rows. Q8 uses its separate blocked route
-    // above; this wave route preserves the represented-four dequantization.
-    if (Format != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && w.k % 256 == 0) {
-        const dim3 grouped((static_cast<unsigned>(w.n) + 3) / 4, static_cast<unsigned>(x.ne[1]));
-        if (x.dtype == DType::BF16)
-            projection_wave64<Format, true>
-                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
-        else
-            projection_wave64<Format, false>
-                <<<grouped, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
+template <QType Format, bool InputBf16, bool OutputBf16>
+void launch_typed(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool rounded) {
+#ifdef NINFER_K100_MMAC
+    if (InputBf16 && w.n >= 128 && w.k >= 128) {
+        mmac_projection<Format, InputBf16, OutputBf16><<<dim3((w.n + 63) / 64, (x.ne[1] + 15) / 16), 256, 0, stream>>>(
+            x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], rounded);
         return;
     }
 #endif
-    const dim3 grid(static_cast<unsigned>(w.n), static_cast<unsigned>(x.ne[1]));
-    if (x.dtype == DType::BF16) {
-        projection<Format, true>
-            <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
-    } else {
-        projection<Format, false>
-            <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, bf16_output);
+#ifdef NINFER_HYGON_DTK
+    if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
+        if (w.n >= 128 && ((w.k >= 512 && x.ne[1] == 1) || x.ne[1] >= 16)) {
+            if (x.ne[1] == 1)
+                q8_decode_tile<InputBf16, OutputBf16><<<(w.n + 3) / 4, 256, 0, stream>>>(
+                    x.data, w.qdata, out.data, w.n, w.k, 0, w.k, rounded);
+            else
+                q8_matrix_tile<InputBf16, OutputBf16><<<dim3((w.n + 7) / 8, (x.ne[1] + 7) / 8), 256, 0, stream>>>(
+                    x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], rounded);
+            return;
+        }
     }
-    return;
+    if (x.ne[1] > 1 && (Format == QType::Q8_G32_FP16_BLOCK || Format == QType::Q6_K_G256_BLOCK) && w.n >= 128) {
+        projection_columns4<Format, InputBf16, OutputBf16><<<dim3(w.n, (x.ne[1] + 3) / 4), 256, 0, stream>>>(
+            x.data, w.qdata, out.data, w.n, w.k, x.ne[1], rounded, w.k, 0);
+        return;
+    }
+    if (Format != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && w.k % 256 == 0) {
+        projection_wave64<Format, InputBf16, OutputBf16><<<dim3((w.n + 3) / 4, x.ne[1]), 256, 0, stream>>>(
+            x.data, w.qdata, out.data, w.n, w.k, rounded);
+        return;
+    }
+#endif
+    projection<Format, InputBf16, OutputBf16><<<dim3(w.n, x.ne[1]), 256, 0, stream>>>(
+        x.data, w.qdata, out.data, w.n, w.k, rounded);
 }
 
-template <QType F>
-__global__ void partial_projection(const float* x, const void* w, float* out, int n,
+template <QType Format>
+void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool rounded) {
+    if (x.dtype == DType::BF16) {
+        if (out.dtype == DType::BF16) launch_typed<Format, true, true>(x, w, out, stream, rounded);
+        else launch_typed<Format, true, false>(x, w, out, stream, rounded);
+    } else {
+        if (out.dtype == DType::BF16) launch_typed<Format, false, true>(x, w, out, stream, rounded);
+        else launch_typed<Format, false, false>(x, w, out, stream, rounded);
+    }
+}
+
+template <QType F, bool InputBf16>
+__global__ void partial_projection(const void* x, const void* w, float* out, int n,
                                     int parent_k, int begin, int k) {
     const int row = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
     float sum = 0.f;
     for (int c = lane; c < k; c += 256)
-        sum += load_weight<F>(w, row, begin + c, parent_k) * x[static_cast<long long>(t) * k + c];
+        sum += load_weight<F>(w, row, begin + c, parent_k) * tile_input<InputBf16>(x, static_cast<long long>(t) * k + c);
     __shared__ float partial[256];
     partial[lane] = sum;
     __syncthreads();
@@ -204,54 +200,64 @@ __global__ void partial_projection(const float* x, const void* w, float* out, in
 }
 
 #ifdef NINFER_HYGON_DTK
-template <QType F>
-__global__ void partial_wave64(const float* x, const void* weights, float* out, int n,
+template <QType F, bool InputBf16>
+__global__ void partial_wave64(const void* x, const void* weights, float* out, int n,
                                int parent_k, int begin, int k) {
     const int row = blockIdx.x * 4 + threadIdx.x / 64, t = blockIdx.y;
     if (row >= n) return;
-    const float value = dot_wave64<F, false>(x + static_cast<long long>(t) * k, weights,
+    const auto* input = static_cast<const unsigned char*>(x) + static_cast<long long>(t) * k * (InputBf16 ? 2 : 4);
+    const float value = dot_wave64<F, InputBf16>(input, weights,
                                             row, k, parent_k, begin);
     if (!(threadIdx.x & 63)) out[static_cast<long long>(t) * n + row] = value;
 }
 #endif
 
-template <QType F>
-void partial_launch(const float* x, const Weight& w, float* out, int begin, int k, int t,
+template <QType F, bool InputBf16>
+void partial_launch(const void* x, const Weight& w, float* out, int begin, int k, int t,
                      cudaStream_t s) {
+#ifdef NINFER_K100_MMAC
+    if (InputBf16 && w.n >= 128 && k >= 128) {
+        mmac_projection<F, InputBf16, false><<<dim3((w.n + 63) / 64, (t + 15) / 16), 256, 0, s>>>(
+            x, w.qdata, out, w.n, w.k, begin, k, t, false);
+        return;
+    }
+#endif
     if constexpr (F == QType::Q8_G32_FP16_BLOCK) {
         if (w.n >= 128 && ((k >= 512 && t == 1) || t >= 16)) {
             if (t == 1)
-                q8_decode_tile<false><<<(w.n + 3) / 4, 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k, false);
+                q8_decode_tile<InputBf16, false><<<(w.n + 3) / 4, 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k, false);
             else
-                q8_matrix_tile<false><<<dim3((w.n + 7) / 8, (t + 7) / 8), 256, 0, s>>>(
+                q8_matrix_tile<InputBf16, false><<<dim3((w.n + 7) / 8, (t + 7) / 8), 256, 0, s>>>(
                     x, w.qdata, out, w.n, w.k, begin, k, t, false);
             return;
         }
     }
 #ifdef NINFER_HYGON_DTK
     if (t > 1 && (F == QType::Q8_G32_FP16_BLOCK || F == QType::Q6_K_G256_BLOCK) && w.n >= 128) {
-        projection_columns4<F, false><<<dim3(w.n, (t + 3) / 4), 256, 0, s>>>(
+        projection_columns4<F, InputBf16, false><<<dim3(w.n, (t + 3) / 4), 256, 0, s>>>(
             x, w.qdata, out, w.n, k, t, false, w.k, begin);
         return;
     }
     if (F != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && k % 256 == 0 && begin % 256 == 0) {
-        partial_wave64<F><<<dim3((w.n + 3) / 4, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
+        partial_wave64<F, InputBf16><<<dim3((w.n + 3) / 4, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
         return;
     }
 #endif
-    partial_projection<F><<<dim3(w.n, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
+    partial_projection<F, InputBf16><<<dim3(w.n, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
 }
 } // namespace
 
-void portable_partial_linear_launch(const float* x, const Weight& w, float* out, int begin, int k,
+void portable_partial_linear_launch(const void* x, DType input_type, const Weight& w, float* out, int begin, int k,
                                      int t, cudaStream_t stream) {
     validate_portable_linear_weight(w.qtype, w.n, w.k);
     const auto block = interleaved_block_geometry(w.qtype).values;
-    if (!x || !out || x == out || !w.qdata || begin < 0 || k < 1 || k > w.k || begin > w.k - k ||
+    if ((input_type != DType::FP32 && input_type != DType::BF16) || !x || !out || x == out || !w.qdata || begin < 0 || k < 1 || k > w.k || begin > w.k - k ||
         t < 1 || t > 65535 || (block && (begin % block || k % block)) ||
         w.layout != (block ? QuantLayout::BlockInterleaved : QuantLayout::Contiguous))
         throw std::invalid_argument("partial linear: invalid represented K interval");
-#define PARTIAL(F) case QType::F: partial_launch<QType::F>(x, w, out, begin, k, t, stream); break
+#define PARTIAL(F) case QType::F: \
+    if (input_type == DType::BF16) partial_launch<QType::F, true>(x, w, out, begin, k, t, stream); \
+    else partial_launch<QType::F, false>(x, w, out, begin, k, t, stream); break
     switch (w.qtype) {
         PARTIAL(FP32); PARTIAL(FP16); PARTIAL(BF16); PARTIAL(MXFP4_G32_E8M0);
         PARTIAL(Q8_G32_FP16_BLOCK); PARTIAL(IQ3_S_G256_BLOCK); PARTIAL(IQ4_XS_G256_BLOCK);
@@ -290,7 +296,7 @@ void validate_portable_linear_weight(QType type, std::int32_t n, std::int32_t k)
 void portable_linear_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
                             bool bf16_output) {
     validate_portable_linear_weight(w.qtype, w.n, w.k);
-    if (!w.qdata || (x.dtype != DType::BF16 && x.dtype != DType::FP32) || out.dtype != x.dtype ||
+    if (!w.qdata || (x.dtype != DType::BF16 && x.dtype != DType::FP32) || (out.dtype != DType::BF16 && out.dtype != DType::FP32) ||
         x.ne[1] > 65535 || x.ne[1] <= 0) {
         throw std::invalid_argument("linear: invalid data, dtype, or token grid extent");
     }

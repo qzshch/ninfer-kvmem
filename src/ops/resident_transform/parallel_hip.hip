@@ -15,13 +15,20 @@ void shape(int width, int rows) {
     if (width < 1 || rows < 1 || rows > 65535)
         throw std::invalid_argument("parallel transform: dimensions");
 }
-__global__ void moe_partial_kernel(const float* experts, const float* weights, float* out,
+template <class T>
+__global__ void moe_partial_kernel(const T* experts, const float* weights, float* out,
                                     int hidden, int active) {
     const int c = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y;
     if (c >= hidden) return;
     float sum = 0.f;
     for (int j = 0; j < active; ++j)
-        sum += experts[(static_cast<long long>(t) * active + j) * hidden + c] * weights[t * active + j];
+        {
+            const auto v = experts[(static_cast<long long>(t) * active + j) * hidden + c];
+            float value;
+            if constexpr (sizeof(T) == 2) value = __uint_as_float(static_cast<unsigned>(v) << 16);
+            else value = v;
+            sum += value * weights[t * active + j];
+        }
     out[static_cast<long long>(t) * hidden + c] = sum;
 }
 __global__ void tp_sum_kernel(const float* a, const float* b, const float* c, float* out,
@@ -51,6 +58,17 @@ void resident_moe_partial(const float* x, const float* weights, float* out, int 
     if (!x || !weights || !out || h < 1 || active < 1 || active > 32 || tokens < 1 || tokens > 65535)
         throw std::invalid_argument("resident_moe_partial: operands");
     moe_partial_kernel<<<dim3((h + 255) / 256, tokens), 256, 0, s>>>(x, weights, out, h, active);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void resident_moe_partial(const Tensor& x, const float* weights, float* out, int h, int active,
+                          int tokens, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || !x.data || !x.is_contiguous() ||
+        x.numel() != static_cast<long long>(h) * active * tokens || !weights || !out ||
+        h < 1 || active < 1 || active > 32 || tokens < 1 || tokens > 65535)
+        throw std::invalid_argument("resident BF16 expert sum: operands");
+    moe_partial_kernel<<<dim3((h + 255) / 256, tokens), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(x.data), weights, out, h, active);
     CUDA_CHECK(cudaGetLastError());
 }
 

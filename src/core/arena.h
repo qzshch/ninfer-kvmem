@@ -92,7 +92,8 @@ private:
 
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
+    // portable=true makes the pin visible to every device context.
+    explicit PinnedHostBuffer(std::size_t size_bytes, bool portable = false);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;

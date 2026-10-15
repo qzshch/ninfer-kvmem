@@ -22,6 +22,7 @@ struct ProgramOptions {
     bool mtp                    = false;
     unsigned prefill_chunk      = 1024;
     unsigned decode_frames      = 1;
+    bool bf16_activations       = true;
 };
 
 struct ProgramStats {
@@ -55,6 +56,7 @@ public:
     void drain() noexcept;
     int input_capacity() const noexcept { return frames_[0]->capacity; }
     unsigned frame_capacity() const noexcept { return options_.decode_frames; }
+    bool primary_frame_available() const { return !ledger_.active(0); }
     bool lane_busy(unsigned lane) const { return ledger_.busy(lane); }
     std::size_t workspace_capacity_bytes() const noexcept;
 
@@ -144,6 +146,15 @@ private:
              int device, int tokens = 1);
     void feed_forward(const float* input, const LayerParameters& weights, float* out,
                       int tokens = 1);
+    void mlp(const Tensor& input, const MlpParameters& weights, float* out, int tokens, int device);
+    void kda(const Tensor& input, const KdaParameters& weights, LayerState& state,
+             float* out, int device, int tokens);
+    void mla(const Tensor& input, const MlaParameters& weights, LayerState& state,
+             float* out, int device, int tokens);
+    void feed_forward(const Tensor& input, const LayerParameters& weights, float* out, int tokens);
+    void projection(const Tensor& input, const Weight& weights, Tensor& output, int device);
+    void output_projection(const Tensor& input, const Weight& weights, float* output,
+                           int begin, int device, int tokens);
     void peer(void* destination, int dst, const void* source, int src, std::size_t bytes);
     void capture(const float* streams, int layer, int device);
     void publish_retrieval_mean(LayerState& layer, int block, int device);

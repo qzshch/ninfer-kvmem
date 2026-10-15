@@ -69,6 +69,8 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (!options.bf16_activations)
+        throw std::invalid_argument("FP32 activation storage control requires the DTK GLM backend");
     if (options.decode_frames != 1)
         throw std::invalid_argument("independent Decode frames currently require the DTK GLM backend");
     if (options.tensor_expert_parallel)

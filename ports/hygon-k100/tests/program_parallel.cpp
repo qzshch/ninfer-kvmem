@@ -30,10 +30,10 @@ int main(int argc, char** argv) try {
             while (frontend.encode(text).size() < 400) text += "alpha beta gamma. ";
             prompts[2] = frontend.encode(text);
         }
-        for (bool graph : {false, true}) for (unsigned frames : {1u, 2u}) {
+        for (bool graph : {false, true}) for (unsigned frames : {1u, 2u}) for (bool compact : {false, true}) {
             ProgramOptions options;
             options.max_context = 1024; options.max_lanes = 4; options.draft = false;
-            options.decode_frames = frames; options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
+            options.bf16_activations = compact; options.decode_frames = frames; options.graph = graph; options.kvmem_window_pages = 6; options.prefill_chunk = 128;
             Program program(model, devices, options);
             for (unsigned chunk : {1u, 17u, 128u}) {
                 program.reset();
@@ -92,7 +92,7 @@ int main(int argc, char** argv) try {
                     }
                     for (unsigned j = 0; j < next.size(); ++j) anchors[owners[j]] = next[j];
                 }
-                if (plan == Parallelism::Pipeline && !graph && chunk == 1 && frames == 1) expected = generated;
+                if (plan == Parallelism::Pipeline && !graph && chunk == 1 && frames == 1 && !compact) expected = generated;
                 else if (generated != expected) throw std::runtime_error("native PP/TP/EP scalar/temporal/Graph generated token mismatch");
                 if (graph && (!program.stats().graph_captures ||
                               program.stats().graph_replays <= program.stats().graph_captures))
@@ -100,6 +100,35 @@ int main(int argc, char** argv) try {
                 program.reset_lane(slots[1]);
                 if (program.frontier(slots[1]) != 0 || program.frontier(slots[0]) == 0)
                     throw std::runtime_error("TP physical-slot reset/frontier isolation");
+            }
+            if (frames == 2) {
+                std::array<std::array<int, 2>, 2> serial{};
+                program.reset();
+                for (int r = 0; r < 2; ++r) {
+                    int token = prompts[r][0], lane = slots[r];
+                    for (int step = 0; step < 2; ++step) {
+                        token = program.target_batch({&token, 1}, {&lane, 1})[0];
+                        serial[r][step] = token;
+                    }
+                }
+                program.reset();
+                const auto enqueue = [&](int token, int lane) {
+                    const runtime::TokenSpan span{static_cast<unsigned>(lane),
+                        static_cast<unsigned>(program.frontier(lane)), 0, 1};
+                    const int row = 0;
+                    return program.submit({runtime::TokenBatchKind::Decode, {&token, 1}, {&span, 1}, {&row, 1}});
+                };
+                const auto first = enqueue(prompts[0][0], slots[0]);
+                const auto second = enqueue(prompts[1][0], slots[1]);
+                const auto a = program.finish(first)[0];
+                // Refill a completed frame while the other request still owns
+                // its ticket/state reservation; no common round barrier.
+                const auto continuation = enqueue(a, slots[0]);
+                const auto a2 = program.finish(continuation)[0];
+                const auto b = program.finish(second)[0];
+                const auto b2 = program.finish(enqueue(b, slots[1]))[0];
+                if (std::array{a, a2} != serial[0] || std::array{b, b2} != serial[1])
+                    throw std::runtime_error("independent frame refill changed request state/results");
             }
         }
     }

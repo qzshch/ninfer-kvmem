@@ -217,6 +217,8 @@ struct EngineOptions {
     bool tensor_expert_parallel = false;
     // DTK ordinary Decode: one or two independent request frames.
     unsigned decode_frames = 1;
+    // Physical activation storage; DTK also retains an FP32-storage control.
+    bool bf16_activations = true;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

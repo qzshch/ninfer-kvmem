@@ -50,6 +50,20 @@ ordinary route. Request lanes own their respective recurrent and KV histories.
 This profile does not expose HTTP serving, streaming, vision, general prefix
 cache scheduling or CausalScoring from the default CUDA product.
 
+Ordinary activations at existing BF16 arithmetic boundaries use physical BF16
+storage, including KDA, MLP/expert and MLA projection intermediates. Raw mHC,
+recurrent state, router probabilities, attention accumulations and TP/EP partial
+sums remain FP32. `--fp32-activations` retains the FP32-storage control for
+native whole-model comparisons.
+
+The optional build flag `-DNINFER_K100_MMAC=ON` selects Hygon FP32 MMAC for
+BF16-input projections, including Decode, owned/grouped experts and K-partials.
+It requires actual vendor gfx928 builtins and fails compilation when they are
+absent. Encoded weights are decoded to FP32 only in transient shared memory.
+Use `check-mmac-isa.sh` for a compiler-only ISA check, then run the independent
+GPU oracles and native model comparisons. The default SIMT build remains the
+control; enabling matrix instructions alone does not establish a speedup.
+
 ## Companion routes
 
 DFlash2 uses the GLM-specific companion and K7 verification in a single-lane eager

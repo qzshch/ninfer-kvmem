@@ -51,6 +51,11 @@ add_library(ninfer_k100_projection STATIC
   "${NINFER_ROOT}/src/ops/linear/portable/grouped_hip.hip"
   "${NINFER_ROOT}/src/ops/linear/portable/launch.cu")
 target_link_libraries(ninfer_k100_projection PUBLIC ninfer_k100_physical_core)
+option(NINFER_K100_MMAC "Use Hygon FP32 MMAC for BF16-activation projections (requires vendor builtins)" OFF)
+if(NINFER_K100_MMAC)
+  target_compile_definitions(ninfer_k100_projection PUBLIC NINFER_K100_MMAC=1)
+endif()
+
 target_include_directories(ninfer_k100_projection PRIVATE "${NINFER_ROOT}/third_party")
 
 add_library(ninfer_k100_kda STATIC
@@ -91,7 +96,8 @@ target_link_libraries(ninfer_k100_glm_frontend PUBLIC ninfer_k100_glm_model ninf
 
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 add_library(ninfer_k100_glm_program STATIC "${NINFER_ROOT}/src/models/glm5_next/program.cpp"
-  "${NINFER_ROOT}/src/models/glm5_next/program_parallel.cpp")
+  "${NINFER_ROOT}/src/models/glm5_next/program_parallel.cpp"
+  "${NINFER_ROOT}/src/models/glm5_next/program_activations.cpp")
 target_link_libraries(ninfer_k100_glm_program PUBLIC ninfer_k100_glm_model ninfer_k100_projection
   ninfer_k100_kda ninfer_k100_hyper_connection ninfer_k100_resident_transform ninfer_k100_sparse_latent ninfer_k100_dflash_block kvmem_core)
 add_library(ninfer_k100_engine STATIC "${NINFER_ROOT}/src/runtime/engine/engine_dtk.cpp"
@@ -109,6 +115,9 @@ if(BUILD_TESTING)
     set_tests_properties(k100_row_materialization_device${device} PROPERTIES
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}" RUN_SERIAL TRUE TIMEOUT 120)
   endforeach()
+  add_executable(k100_mmac_mapping_test "${NINFER_ROOT}/tests/ops/test_mmac_mapping.cpp")
+  target_include_directories(k100_mmac_mapping_test PRIVATE "${NINFER_ROOT}/src")
+  add_test(NAME k100_mmac_mapping COMMAND k100_mmac_mapping_test)
   add_executable(k100_glm_frames_test "${NINFER_ROOT}/tests/runtime/test_glm_frames.cpp")
   target_include_directories(k100_glm_frames_test PRIVATE "${NINFER_ROOT}/src")
   add_test(NAME k100_glm_frames COMMAND k100_glm_frames_test)

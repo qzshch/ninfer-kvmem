@@ -5,7 +5,7 @@ __device__ float tile_input(const void* x, long long i) {
     if constexpr (Bf16) return decode_bf16(static_cast<const std::uint16_t*>(x)[i]);
     else return static_cast<const float*>(x)[i];
 }
-template <bool Bf16>
+template <bool Bf16, bool OutputBf16 = Bf16>
 __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
                                int n, int parent_k, int begin, int k, bool rounded) {
     constexpr int Rows = 4, TileK = 512;
@@ -49,14 +49,14 @@ __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
     }
     if (lane < Rows && first_row + lane < n) {
         const float v = partial[lane][0];
-        if constexpr (Bf16)
+        if constexpr (OutputBf16)
             static_cast<std::uint16_t*>(out)[first_row + lane] = encode_bf16(v);
         else
             static_cast<float*>(out)[first_row + lane] = projection_output(v, rounded);
     }
 }
 
-template <bool Bf16>
+template <bool Bf16, bool OutputBf16 = Bf16>
 __global__ void q8_matrix_tile(const void* x, const void* weight, void* out,
                                int n, int parent_k, int begin, int k, int tokens, bool rounded) {
     constexpr int Rows = 8, Columns = 8, TileK = 128;
@@ -87,7 +87,7 @@ __global__ void q8_matrix_tile(const void* x, const void* weight, void* out,
     if (!part && row0 + r < n && token0 + t < tokens) {
         const float v = ((partial[lane] + partial[lane + 1]) + partial[lane + 2]) + partial[lane + 3];
         const auto index = static_cast<long long>(token0 + t) * n + row0 + r;
-        if constexpr (Bf16)
+        if constexpr (OutputBf16)
             static_cast<std::uint16_t*>(out)[index] = encode_bf16(v);
         else
             static_cast<float*>(out)[index] = projection_output(v, rounded);

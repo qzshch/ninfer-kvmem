@@ -43,7 +43,7 @@ std::uint16_t bf16(float v) {
 double unbf16(std::uint16_t b) { return std::bit_cast<float>(static_cast<unsigned>(b) << 16); }
 
 void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann::json& item,
-                 int t, bool shared, bool implicit, bool rounded, bool owned = false) {
+                 int t, bool shared, bool implicit, bool rounded, bool owned = false, bool physical_bf16 = false) {
     const auto raw    = read<std::byte>(root / item.at("encoded").get<std::string>());
     const auto oracle = read<double>(root / item.at("oracle").get<std::string>());
     const int k = item.at("k"), rows = item.at("parent_rows");
@@ -72,15 +72,27 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
         b ^= b >> 22;
         x[i] = std::bit_cast<float>((b & 0x807fffffu) | ((124 + b % 6) << 23));
     }
-    DeviceBuffer dx(x.size() * 4), di(ids.size() * 4),
-        dy(static_cast<std::size_t>(t) * choices * n * 4 + 32);
-    dx.copy_from_host(x.data(), dx.bytes);
+    std::vector<std::uint16_t> words(x.size());
+    if (physical_bf16) for (unsigned i = 0; i < x.size(); ++i) {
+        words[i] = bf16(x[i]); x[i] = unbf16(words[i]);
+    }
+    DeviceBuffer dx(x.size() * (physical_bf16 ? 2 : 4)), di(ids.size() * 4),
+        dy(static_cast<std::size_t>(t) * choices * n * (physical_bf16 ? 2 : 4) + 32);
+    dx.copy_from_host(physical_bf16 ? static_cast<const void*>(words.data()) : x.data(), dx.bytes);
     di.copy_from_host(ids.data(), di.bytes);
     dy.fill(0xa5);
     auto* output = reinterpret_cast<float*>(static_cast<std::byte*>(dy.p) + 16);
     WorkspaceArena scratch(ops::indexed_linear_grouped_workspace_capacity_bytes(banks, choices, t));
     auto project = [&](bool round) {
-        if (owned && t >= 16) ops::indexed_linear_grouped_fp32(static_cast<float*>(dx.p), w,
+        if (physical_bf16) {
+            Tensor input(dx.p, DType::BF16, {k, t * (shared ? 1 : choices)});
+            Tensor result(output, DType::BF16, {n, t * choices});
+            const auto* selected = implicit ? nullptr : static_cast<const int*>(di.p);
+            if (owned && t >= 16) ops::indexed_linear_grouped(input, w, selected, result,
+                n, choices, t, shared, owned ? 96 : 0, scratch, ctx.stream);
+            else ops::indexed_linear_mixed(input, w, selected, result,
+                n, choices, t, shared, owned ? 96 : 0, ctx.stream);
+        } else if (owned && t >= 16) ops::indexed_linear_grouped_fp32(static_cast<float*>(dx.p), w,
             static_cast<std::int32_t*>(di.p), output, n, choices, t, shared, 96, scratch, ctx.stream, round);
         else if (owned) ops::indexed_linear_owned_fp32(static_cast<float*>(dx.p), w,
             static_cast<std::int32_t*>(di.p), output, n, choices, t, shared, 96, ctx.stream, round);
@@ -90,8 +102,12 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
     project(rounded);
     ctx.synchronize();
     std::vector<float> y(static_cast<std::size_t>(t) * choices * n);
-    CUDA_CHECK(cudaMemcpy(y.data(), output, y.size() * 4, cudaMemcpyDeviceToHost));
-    if (rounded) {
+    if (physical_bf16) {
+        std::vector<std::uint16_t> result_words(y.size());
+        CUDA_CHECK(cudaMemcpy(result_words.data(), output, y.size() * 2, cudaMemcpyDeviceToHost));
+        for (unsigned i = 0; i < y.size(); ++i) y[i] = unbf16(result_words[i]);
+    } else CUDA_CHECK(cudaMemcpy(y.data(), output, y.size() * 4, cudaMemcpyDeviceToHost));
+    if (rounded && !physical_bf16) {
         project(false);
         ctx.synchronize();
         std::vector<float> raw_y(y.size());
@@ -116,7 +132,7 @@ void run_indexed(DeviceContext& ctx, const std::filesystem::path& root, const nl
                 }
                 double value = y[(token * choices + c) * n + row];
                 double floor = 0;
-                if (rounded) {
+                if (rounded || physical_bf16) {
                     const int word = bf16(static_cast<float>(sum));
                     floor          = std::abs(unbf16(word) - sum);
                     for (int d : {-1, 1})
@@ -299,6 +315,10 @@ int main(int argc, char** argv) try {
                         ++indexed;
                     }
                 }
+    for (const auto& item : cases) for (int tokens : {1, 3, 33}) for (bool shared : {false, true}) {
+        run_indexed(ctx, root, item, tokens, shared, false, true, true, true);
+        run_indexed(ctx, root, item, tokens, shared, true, true, false, true);
+    }
     for (const auto& item : cases)
         for (int tokens : {1, 8, 33})
             for (bool shared : {false, true})

@@ -44,6 +44,9 @@
 #define cudaMalloc hipMalloc
 #define cudaFree hipFree
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocDefault hipHostMallocDefault
 #define cudaFreeHost hipHostFree
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync

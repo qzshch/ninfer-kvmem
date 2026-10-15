@@ -48,8 +48,8 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
         auto& frame = *frames_[f];
         frame.capacity = f ? options.max_lanes : primary_rows;
         frame.host_metadata.resize(5 * frame.capacity + 2 * options.max_lanes + 1);
-        frame.upload = std::make_unique<PinnedHostBuffer>(frame.host_metadata.size() * sizeof(int));
-        frame.result = std::make_unique<PinnedHostBuffer>(frame.capacity * sizeof(int));
+        frame.upload = std::make_unique<PinnedHostBuffer>(frame.host_metadata.size() * sizeof(int), true);
+        frame.result = std::make_unique<PinnedHostBuffer>(frame.capacity * sizeof(int), true);
         for (int d = 0; d < 3; ++d) {
             if (f) frame.owned_devices[d] = std::make_unique<DeviceContext>(devices[d]->device);
             frame.devices[d] = f ? frame.owned_devices[d].get() : devices[d];
@@ -111,7 +111,7 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 local.partial = DeviceBuffer(2ULL * H * 4 * rows);
                 if (!d) local.received = DeviceBuffer(4ULL * H * 4 * rows);
                 local.coefficients = DeviceBuffer(24ULL * 4 * rows);
-                local.normalized = DeviceBuffer(H * 4ULL * rows);
+                local.normalized = DeviceBuffer(H * (options.bf16_activations ? 2ULL : 4ULL) * rows);
             }
             stats_.persistent_bytes[d] += local.streams.bytes + local.metadata.bytes + local.hidden.bytes +
                 local.partial.bytes + local.received.bytes + local.coefficients.bytes + local.normalized.bytes;
@@ -205,7 +205,10 @@ void Program::drain() noexcept {
     for (auto& frame : frames_) if (frame)
         for (auto* device : frame->devices) if (device) {
             device->bind_to_current_thread_noexcept();
-            try { device->synchronize(); } catch (...) {}
+            try {
+                device->synchronize();
+                CUDA_CHECK(cudaStreamSynchronize(device->transfer_stream));
+            } catch (...) {}
         }
 }
 
@@ -703,18 +706,29 @@ void Program::batch_stage(int d) {
         auto* coeff = floats(work, 24 * frame_->batch);
         auto* x     = floats(work, H * frame_->batch);
         auto* y     = floats(work, H * frame_->batch);
+        Tensor collapsed(x, DType::FP32, {H, frame_->batch});
+        auto normalized = work.alloc(DType::BF16, {H, frame_->batch});
         hyper_prepare(residual, p.attention_hc, coeff, x, d, frame_->batch);
-        ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true,
-                           stream);
-        if (p.linear)
-            kda(x, p.kda, layers_[i], y, d, frame_->batch);
-        else
-            mla(x, p.mla, layers_[i], y, d, frame_->batch);
+        if (options_.bf16_activations) {
+            ops::resident_norm(collapsed, &p.attention_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+            if (p.linear)
+                kda(normalized, p.kda, layers_[i], y, d, frame_->batch);
+            else
+                mla(normalized, p.mla, layers_[i], y, d, frame_->batch);
+        } else {
+            ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true, stream);
+            if (p.linear) kda(x, p.kda, layers_[i], y, d, frame_->batch);
+            else mla(x, p.mla, layers_[i], y, d, frame_->batch);
+        }
         ops::hyper_connection_expand(residual, y, coeff, residual, H, frame_->batch, stream);
         hyper_prepare(residual, p.ffn_hc, coeff, x, d, frame_->batch);
-        ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true,
-                           stream);
-        feed_forward(x, p, y, frame_->batch);
+        if (options_.bf16_activations) {
+            ops::resident_norm(collapsed, &p.ffn_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+            feed_forward(normalized, p, y, frame_->batch);
+        } else {
+            ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true, stream);
+            feed_forward(x, p, y, frame_->batch);
+        }
         ops::hyper_connection_expand(residual, y, coeff, residual, H, frame_->batch, stream);
     }
     if (d == 2 && frame_->outputs) {
@@ -736,10 +750,17 @@ void Program::batch_head() {
     work.reset();
     const auto stream = frame_->devices[0]->stream;
     auto* final       = static_cast<float*>(frame_->state[0].hidden.p);
-    ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, 1e-5f,
-                       false, true, stream);
+    Tensor final_input(final, DType::FP32, {H, frame_->outputs});
+    auto normalized = work.alloc(DType::BF16, {H, frame_->outputs});
+    if (options_.bf16_activations)
+        ops::resident_norm(final_input, &parameters_.output_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+    else {
+        ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, 1e-5f, false, true, stream);
+        normalized = final_input;
+    }
     auto* logits = floats(work, 154880 * frame_->outputs);
-    projection(final, parameters_.output_head, logits, frame_->outputs, 0, false);
+    Tensor scores(logits, DType::FP32, {154880, frame_->outputs});
+    projection(normalized, parameters_.output_head, scores, 0);
     ops::resident_argmax(logits, metadata(0, PredictedIds), 154880, frame_->outputs,
                          stream);
     stats_.workspace_peak[0] = std::max(stats_.workspace_peak[0], work.peak_used());
@@ -879,12 +900,14 @@ FrameTicket Program::submit(const runtime::TokenBatch& input) {
 
 bool Program::ready(FrameTicket ticket) const {
     ledger_.validate(ticket);
+    frames_[ticket.slot]->devices[0]->bind_to_current_thread();
     return frames_[ticket.slot]->completed->ready();
 }
 
 std::vector<std::int32_t> Program::finish(FrameTicket ticket) {
     ledger_.validate(ticket);
     frame_ = frames_[ticket.slot].get();
+    frame_->devices[0]->bind_to_current_thread();
     frame_->completed->synchronize();
     const auto* ids = static_cast<const int*>(frame_->result->data());
     std::vector<int> result(ids, ids + frame_->outputs);
@@ -1046,8 +1069,13 @@ void Program::reset() {
     draft_frontier_ = 0;
     for (int d = 0; d < 3; ++d) {
         frame_->devices[d]->bind_to_current_thread();
-        recurrent_[d][0].fill(0);
-        frame_->state[d].workspace->reset();
+        CUDA_CHECK(cudaMemsetAsync(recurrent_[d][0].p, 0, recurrent_[d][0].bytes, frame_->devices[d]->stream));
+        if (!options_.draft) for (int lane = 0; lane < options_.max_lanes; ++lane) {
+            if (!sequence_ready_[lane][d]) sequence_ready_[lane][d] =
+                std::make_unique<CudaCompletionEvent>(*frame_->devices[d]);
+            sequence_ready_[lane][d]->record(frame_->devices[d]->stream);
+        }
+        for (auto& frame : frames_) if (frame) frame->state[d].workspace->reset();
     }
     for (auto& l : layers_)
         if (l.retrieval) l.retrieval = std::make_unique<kvmem::RetrievalIndex>(128, 1, 1, 128);

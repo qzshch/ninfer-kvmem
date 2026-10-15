@@ -3,6 +3,7 @@
 #include <cmath>
 #include <climits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {
@@ -27,6 +28,15 @@ __device__ float direct(const void* data, DType type, int c) {
            (e ? ldexpf(1.f + m / 1024.f, e - 15) : ldexpf(static_cast<float>(m), -24));
 }
 
+template <class T> __device__ float represented(T x) {
+    if constexpr (std::is_same_v<T, float>) return x;
+    else return unbf(x);
+}
+template <class T> __device__ T stored(float x, bool rounded = true) {
+    if constexpr (std::is_same_v<T, float>) return rounded ? bf(x) : x;
+    else return bfword(x);
+}
+
 template <int Mode>
 __global__ void convert_kernel(const void* x, void* y, std::size_t n) {
     const auto i = static_cast<std::size_t>(blockIdx.x) * 256 + threadIdx.x;
@@ -38,14 +48,15 @@ __global__ void convert_kernel(const void* x, void* y, std::size_t n) {
         static_cast<float*>(y)[i] = unbf(static_cast<const std::uint16_t*>(x)[i]);
 }
 
-__global__ void norm_kernel(const float* x, const void* gain, DType gt, const void* bias, DType bt,
-                            const float* gate, float* y, int n, float eps, bool center,
+template <class Input, class Output>
+__global__ void norm_kernel(const Input* x, const void* gain, DType gt, const void* bias, DType bt,
+                            const Input* gate, Output* y, int n, float eps, bool center,
                             bool round) {
     const int r = blockIdx.x, lane = threadIdx.x;
     const auto off = static_cast<long long>(r) * n;
     __shared__ float red[256], mean, inv;
     float sum = 0;
-    for (int c = lane; c < n; c += 256) sum += center ? x[off + c] : x[off + c] * x[off + c];
+    for (int c = lane; c < n; c += 256) sum += center ? represented(x[off + c]) : represented(x[off + c]) * represented(x[off + c]);
     red[lane] = sum;
     __syncthreads();
     for (int s = 128; s; s /= 2) {
@@ -60,7 +71,7 @@ __global__ void norm_kernel(const float* x, const void* gain, DType gt, const vo
     if (center) {
         sum = 0;
         for (int c = lane; c < n; c += 256) {
-            float d = x[off + c] - mean;
+            float d = represented(x[off + c]) - mean;
             sum += d * d;
         }
         red[lane] = sum;
@@ -73,28 +84,28 @@ __global__ void norm_kernel(const float* x, const void* gain, DType gt, const vo
         __syncthreads();
     }
     for (int c = lane; c < n; c += 256) {
-        float value = (x[off + c] - mean) * inv;
+        float value = (represented(x[off + c]) - mean) * inv;
         if (gain) value *= direct(gain, gt, c);
         if (bias) value += direct(bias, bt, c);
-        if (gate) value *= sig(gate[off + c]);
-        y[off + c] = round ? bf(value) : value;
+        if (gate) value *= sig(represented(gate[off + c]));
+        y[off + c] = stored<Output>(value, round);
     }
     return;
 }
 
-template <int Mode>
-__global__ void element_kernel(const float* a, const float* b, float* o, std::size_t n,
+template <int Mode, class T>
+__global__ void element_kernel(const T* a, const T* b, T* o, std::size_t n,
                                float limit) {
     const auto i = static_cast<std::size_t>(blockIdx.x) * 256 + threadIdx.x;
     if (i >= n) return;
     if constexpr (Mode == 0) {
-        const float g = limit > 0 ? fminf(a[i], limit) : a[i];
-        const float u = limit > 0 ? fminf(fmaxf(b[i], -limit), limit) : b[i];
+        const float g = limit > 0 ? fminf(represented(a[i]), limit) : represented(a[i]);
+        const float u = limit > 0 ? fminf(fmaxf(represented(b[i]), -limit), limit) : represented(b[i]);
         const float activated =
             bf(static_cast<float>(static_cast<double>(g) / (1. + exp(-static_cast<double>(g)))));
-        o[i] = bf(activated * u);
+        o[i] = stored<T>(activated * u);
     }
-    if constexpr (Mode == 1) o[i] = bf(a[i] + b[i]);
+    if constexpr (Mode == 1) o[i] = stored<T>(represented(a[i]) + represented(b[i]));
 }
 
 template <bool Mean>
@@ -110,7 +121,8 @@ __global__ void streams_kernel(const float* x, float* y, int h) {
             y[(static_cast<long long>(t) * 4 + j) * h + c] = x[static_cast<long long>(t) * h + c];
 }
 
-__global__ void conv_kernel(const float* x, const void* weight, DType type, float* state, float* o,
+template <class T>
+__global__ void conv_kernel(const T* x, const void* weight, DType type, float* state, T* o,
                             int channels, int t, const std::int32_t* slots = nullptr,
                             const std::int32_t* offsets = nullptr) {
     const int c = blockIdx.x * 256 + threadIdx.x;
@@ -130,7 +142,7 @@ __global__ void conv_kernel(const float* x, const void* weight, DType type, floa
     // transforms; no device FP64 arithmetic assumption is needed.
     for (int j = 0; j < t; ++j) {
         const auto off        = static_cast<long long>(j) * channels + c;
-        const float v         = x[off];
+        const float v         = represented(x[off]);
         const float values[4] = {s0, s1, s2, v}, weights[4] = {w0, w1, w2, w3};
         float sum = 0, correction = 0;
         for (int i = 0; i < 4; ++i) {
@@ -144,8 +156,7 @@ __global__ void conv_kernel(const float* x, const void* weight, DType type, floa
             sum = next;
         }
         const float z = bf(sum + correction);
-        o[off] =
-            bf(static_cast<float>(static_cast<double>(z) / (1. + exp(-static_cast<double>(z)))));
+        o[off] = stored<T>(static_cast<float>(static_cast<double>(z) / (1. + exp(-static_cast<double>(z)))));
         s0 = s1;
         s1 = s2;
         s2 = v;
@@ -245,13 +256,14 @@ __global__ void router_kernel(const float* logits, const float* bias, std::int32
     return;
 }
 
-__global__ void moe_sum_kernel(const float* x, const float* w, const float* shared, float* o, int h,
+template <class T>
+__global__ void moe_sum_kernel(const T* x, const float* w, const float* shared, float* o, int h,
                                int active) {
     const int c = blockIdx.x * 256 + threadIdx.x, t = blockIdx.y;
     if (c >= h) return;
     float v = shared[static_cast<long long>(t) * h + c];
     for (int j = 0; j < active; ++j)
-        v += x[(static_cast<long long>(t) * active + j) * h + c] * w[t * active + j];
+        v += represented(x[(static_cast<long long>(t) * active + j) * h + c]) * w[t * active + j];
     o[static_cast<long long>(t) * h + c] = bf(v);
 }
 
@@ -326,6 +338,72 @@ void resident_norm(const float* x, const Tensor* g, const Tensor* b, const float
                                      eps, center, round);
     CUDA_CHECK(cudaGetLastError());
     return;
+}
+
+namespace {
+void activation(const Tensor& x) {
+    if (!x.data || !x.is_contiguous() || x.numel() < 1 ||
+        (x.dtype != DType::BF16 && x.dtype != DType::FP32))
+        throw std::invalid_argument("resident transform: contiguous FP32/BF16 activation required");
+}
+}
+void resident_norm(const Tensor& x, const Tensor* g, const Tensor* b, const Tensor* gate,
+                   Tensor& out, float eps, bool center, cudaStream_t stream) {
+    activation(x); activation(out);
+    const auto width = x.ne[0];
+    const auto rows = x.numel() / width;
+    if (out.ne[0] != width || out.numel() != x.numel() || !(eps > 0) || !std::isfinite(eps) ||
+        (x.data == out.data && x.dtype != out.dtype))
+        throw std::invalid_argument("resident typed norm: extent/alias/epsilon");
+    direct_weight(g, width); direct_weight(b, width);
+    if (gate) {
+        activation(*gate);
+        if (gate->numel() != x.numel() || gate->dtype != x.dtype)
+            throw std::invalid_argument("resident typed norm: gate storage/extent");
+    }
+    const auto launch = [&]<class Input, class Output>() {
+        norm_kernel<<<rows, 256, 0, stream>>>(static_cast<const Input*>(x.data),
+            g ? g->data : nullptr, g ? g->dtype : DType::FP32,
+            b ? b->data : nullptr, b ? b->dtype : DType::FP32,
+            gate ? static_cast<const Input*>(gate->data) : nullptr,
+            static_cast<Output*>(out.data), width, eps, center, out.dtype == DType::BF16);
+    };
+    if (x.dtype == DType::BF16) {
+        if (out.dtype == DType::BF16) launch.template operator()<std::uint16_t, std::uint16_t>();
+        else launch.template operator()<std::uint16_t, float>();
+    } else {
+        if (out.dtype == DType::BF16) launch.template operator()<float, std::uint16_t>();
+        else launch.template operator()<float, float>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+void resident_swiglu(const Tensor& a, const Tensor& b, Tensor& out, float limit, cudaStream_t stream) {
+    activation(a); activation(b); activation(out);
+    if (a.dtype != b.dtype || a.dtype != out.dtype || a.numel() != b.numel() || a.numel() != out.numel())
+        throw std::invalid_argument("resident typed swiglu: matching physical tensors required");
+    const auto n = a.numel(); count(n);
+    if (a.dtype == DType::BF16)
+        element_kernel<0><<<(n + 255) / 256, 256, 0, stream>>>(static_cast<const std::uint16_t*>(a.data),
+            static_cast<const std::uint16_t*>(b.data), static_cast<std::uint16_t*>(out.data), n, limit);
+    else element_kernel<0><<<(n + 255) / 256, 256, 0, stream>>>(static_cast<const float*>(a.data),
+            static_cast<const float*>(b.data), static_cast<float*>(out.data), n, limit);
+    CUDA_CHECK(cudaGetLastError());
+}
+void resident_causal_conv_packed(const Tensor& x, const Tensor& kernel, float* state,
+                                 const int* slots, const int* offsets, Tensor& out,
+                                 int sequences, cudaStream_t stream) {
+    activation(x); activation(out);
+    const int channels = x.ne[0]; shape(channels, sequences); direct_weight(&kernel, channels * 4);
+    if (x.dtype != out.dtype || x.numel() != out.numel() || !state || !slots || !offsets)
+        throw std::invalid_argument("resident typed conv: storage/state/spans");
+    const auto launch = [&]<class T>() {
+        conv_kernel<<<dim3((channels + 255) / 256, sequences), 256, 0, stream>>>(
+            static_cast<const T*>(x.data), kernel.data, kernel.dtype, state,
+            static_cast<T*>(out.data), channels, 1, slots, offsets);
+    };
+    if (x.dtype == DType::BF16) launch.template operator()<std::uint16_t>();
+    else launch.template operator()<float>();
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void resident_swiglu(const float* a, const float* b, float* o, std::size_t n, float limit,
@@ -409,6 +487,17 @@ void resident_moe_sum(const float* x, const float* w, const float* shared, float
     moe_sum_kernel<<<dim3((h + 255) / 256, t), 256, 0, s>>>(x, w, shared, o, h, k);
     CUDA_CHECK(cudaGetLastError());
     return;
+}
+
+void resident_moe_sum(const Tensor& x, const float* weights, const float* shared, float* out,
+                      int hidden, int active, int tokens, cudaStream_t stream) {
+    activation(x); shape(hidden, tokens);
+    if (x.dtype != DType::BF16 || x.numel() != static_cast<long long>(hidden) * active * tokens ||
+        active < 1 || active > 32 || !weights || !shared || !out)
+        throw std::invalid_argument("resident typed expert sum: operands");
+    moe_sum_kernel<<<dim3((hidden + 255) / 256, tokens), 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(x.data), weights, shared, out, hidden, active);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void resident_argmax(const float* x, std::int32_t* ids, int w, int t, cudaStream_t s) {

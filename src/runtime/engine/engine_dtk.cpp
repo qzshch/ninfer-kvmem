@@ -162,7 +162,7 @@ public:
                 static_cast<int>(options.max_context), options.kvmem_window_pages,
                 static_cast<int>(options.max_concurrency), options.use_cuda_graph,
                 options.speculative.backend == SpeculativeBackend::DFlash2,
-                options.speculative.backend == SpeculativeBackend::Mtp, options.prefill_chunk, options.decode_frames});
+                options.speculative.backend == SpeculativeBackend::Mtp, options.prefill_chunk, options.decode_frames, options.bf16_activations});
         load.architecture   = "Glm5NextForConditionalGeneration";
         load.model_name     = "GLM-5.3-Flash UD-IQ4_XS";
         load.cuda_sync_mode = devices[0]->sync_mode();
@@ -407,9 +407,15 @@ public:
         std::array<std::unique_ptr<Lane>, 8> lanes;
         unsigned prefill_cursor = 0;
         double prefill_seconds_per_token = 0;
+        struct Flight {
+            models::glm5_next::FrameTicket ticket;
+            std::vector<runtime::TokenSpan> spans;
+        };
+        std::vector<Flight> flights;
         const auto settle = [&] {
             for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
-                if (lanes[slot] && lanes[slot]->result.finish_reason != FinishReason::None) {
+                if (lanes[slot] && !program->lane_busy(slot) &&
+                    lanes[slot]->result.finish_reason != FinishReason::None) {
                     publish(*lanes[slot]);
                     lanes[slot].reset();
                     std::lock_guard lock(mutex);
@@ -470,10 +476,36 @@ public:
                 }
             }
             try {
+                bool retired_decode = false;
+                for (auto completed = flights.begin(); completed != flights.end();) {
+                    if (!program->ready(completed->ticket)) { ++completed; continue; }
+                    auto result = program->finish(completed->ticket);
+                    retired_decode = true;
+                    std::uint64_t committed = 0;
+                    for (unsigned row = 0; row < completed->spans.size(); ++row) {
+                        const auto& span = completed->spans[row];
+                        auto& lane = *lanes[span.lane];
+                        observe_input(lane, span.input_frontier, 1);
+                        lane.anchor = result[row];
+                        if (lane.job->cancel) lane.result.finish_reason = FinishReason::Cancelled;
+                        else {
+                            append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                            ++committed;
+                        }
+                    }
+                    {
+                        std::lock_guard lock(mutex);
+                        ++runtime.decode_rounds;
+                        runtime.decode_row_rounds += completed->spans.size();
+                        runtime.committed_decode_tokens += committed;
+                    }
+                    completed = flights.erase(completed);
+                    settle();
+                }
                 std::vector<int> tokens, outputs;
                 std::vector<runtime::TokenSpan> spans;
                 for (unsigned slot = 0; slot < options.max_concurrency; ++slot) {
-                    if (!lanes[slot]) continue;
+                    if (!lanes[slot] || program->lane_busy(slot)) continue;
                     auto& lane = *lanes[slot];
                     if (lane.job->cancel)
                         lane.result.finish_reason = FinishReason::Cancelled;
@@ -486,14 +518,20 @@ public:
                     outputs.push_back(row);
                     spans.push_back({slot, static_cast<unsigned>(program->frontier(slot)), row, 1});
                 }
-                const bool had_decode = !tokens.empty();
-                if (!tokens.empty()) {
-                    struct Flight {
-                        models::glm5_next::FrameTicket ticket;
-                        std::vector<runtime::TokenSpan> spans;
-                    };
-                    std::vector<Flight> flights;
-                    const auto count = std::min<unsigned>(options.decode_frames, spans.size());
+                const bool had_decode = !tokens.empty() || !flights.empty();
+                const bool waiting_prefill = std::any_of(lanes.begin(), lanes.end(), [](const auto& lane) {
+                    return lane && !lane->job->cancel && lane->prompt_offset < lane->job->prompt.size();
+                });
+                auto free_frames = options.decode_frames - static_cast<unsigned>(flights.size());
+                if (waiting_prefill && program->primary_frame_available()) {
+                    // The second frame carries Decode while the primary serves
+                    // prompt progress. The single-frame control alternates at
+                    // a completed Decode boundary, preserving prefill service.
+                    if (options.decode_frames > 1) --free_frames;
+                    else if (retired_decode) free_frames = 0;
+                }
+                if (!tokens.empty() && free_frames) {
+                    const auto count = std::min<unsigned>(free_frames, spans.size());
                     const auto per_frame = (spans.size() + count - 1) / count;
                     for (std::size_t begin = 0; begin < spans.size(); begin += per_frame) {
                         const auto end = std::min(spans.size(), begin + per_frame);
@@ -507,37 +545,6 @@ public:
                             {tokens.data() + begin, end - begin}, selected, selected_rows});
                         flights.push_back({ticket, std::move(selected)});
                     }
-                    // Publish whichever independent frame completes first. A
-                    // cancelled request keeps its physical lane until this join.
-                    while (!flights.empty()) {
-                        auto completed = std::find_if(flights.begin(), flights.end(),
-                            [&](const auto& f) { return program->ready(f.ticket); });
-                        if (completed == flights.end()) {
-                            std::this_thread::sleep_for(std::chrono::microseconds(50));
-                            continue;
-                        }
-                        auto result = program->finish(completed->ticket);
-                        std::uint64_t committed = 0;
-                        for (unsigned row = 0; row < completed->spans.size(); ++row) {
-                            const auto& span = completed->spans[row];
-                            auto& lane = *lanes[span.lane];
-                            observe_input(lane, span.input_frontier, 1);
-                            lane.anchor = result[row];
-                            if (lane.job->cancel) lane.result.finish_reason = FinishReason::Cancelled;
-                            else {
-                                append_token(lane.job, lane.result, lane.anchor, lane.limit);
-                                ++committed;
-                            }
-                        }
-                        {
-                            std::lock_guard lock(mutex);
-                            ++runtime.decode_rounds;
-                            runtime.decode_row_rounds += completed->spans.size();
-                            runtime.committed_decode_tokens += committed;
-                        }
-                        flights.erase(completed);
-                        settle();
-                    }
                 }
                 // Publish completed decode requests before spending a prefill
                 // slice. Do not make their consumers wait for another unit.
@@ -548,7 +555,7 @@ public:
                     if (lanes[slot] && lanes[slot]->prompt_offset < lanes[slot]->job->prompt.size())
                         prefill_lanes.push_back(slot);
                 }
-                if (!prefill_lanes.empty()) {
+                if (!prefill_lanes.empty() && program->primary_frame_available()) {
                     unsigned budget = std::min(options.prefill_chunk,
                                                 static_cast<unsigned>(program->input_capacity()));
                     if (had_decode) {
@@ -617,8 +624,10 @@ public:
                     }
                 }
                 settle();
+                if (!flights.empty()) std::this_thread::sleep_for(std::chrono::microseconds(50));
             } catch (...) {
                 program->drain();
+                flights.clear();
                 available = false;
                 for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
                     if (lanes[slot]) {

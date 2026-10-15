@@ -32,6 +32,16 @@ void indexed_linear_grouped_fp32(const float* x, const Weight& bank, const std::
                                   float* out, int rows, int choices, int tokens, bool shared_input,
                                   int bank_begin, WorkspaceArena& workspace, cudaStream_t stream,
                                   bool bf16_output = false);
+// Typed form of grouped projection, same numerical/ownership/workspace contract.
+void indexed_linear_grouped(const Tensor& input, const Weight& bank, const std::int32_t* ids,
+                             Tensor& output, int rows, int choices, int tokens, bool shared_input,
+                             int bank_begin, WorkspaceArena& workspace, cudaStream_t stream);
+// Same complete-dot/bank-ownership ideal, independent FP32/BF16 storage.
+// x [K,T*(shared?1:choices)], out [rows,T*choices], contiguous and disjoint.
+// FP32 output is unrounded; BF16 output rounds only the completed dot.
+void indexed_linear_mixed(const Tensor& x, const Weight& bank, const std::int32_t* ids,
+                           Tensor& out, int rows, int choices, int tokens, bool shared_input,
+                           int bank_begin, cudaStream_t stream);
 // Decode selected embedding rows directly to BF16-represented FP32 values.
 // ids [T] stay on device, out [T,K]; no complete embedding expansion.
 void embedding_fp32(const Weight& embedding, const std::int32_t* ids, float* out, int tokens,

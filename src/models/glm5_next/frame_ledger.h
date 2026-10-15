@@ -26,7 +26,10 @@ public:
             if (span.lane >= lanes_ || busy_[span.lane] ||
                 span.input_frontier != static_cast<unsigned>(frontiers_[span.lane]))
                 throw std::logic_error("GLM sequence has pending writes or stale frontier");
-        for (unsigned f = 0; f < frames_; ++f) {
+        for (unsigned index = 0; index < frames_; ++index) {
+            // Keep the temporal-capable primary frame available when only one
+            // independent Decode unit is ready.
+            const unsigned f = batch.kind == runtime::TokenBatchKind::Decode ? frames_ - 1 - index : index;
             if (slots_[f].active || (f && batch.kind != runtime::TokenBatchKind::Decode)) continue;
             auto& slot = slots_[f];
             // Prepare the owning record before changing any reservation.

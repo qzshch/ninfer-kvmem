@@ -35,17 +35,27 @@ void Program::tensor_phase(int layer, int d, bool ffn) {
     const auto& p = model_.parameters(d).layers[layer];
     auto* residual = static_cast<float*>(frame_->state[d].streams.p);
     auto* coeff = static_cast<float*>(frame_->state[d].coefficients.p);
-    auto* x = static_cast<float*>(frame_->state[d].normalized.p);
+    auto* collapsed = floats(work, H * frame_->batch);
+    Tensor source(collapsed, DType::FP32, {H, frame_->batch});
+    Tensor x(frame_->state[d].normalized.p, options_.bf16_activations ? DType::BF16 : DType::FP32, {H, frame_->batch});
     auto* partial = static_cast<float*>(frame_->state[d].partial.p);
     if (layer || ffn)
         ops::hyper_connection_expand(residual, static_cast<float*>(frame_->state[d].hidden.p),
             coeff, residual, H, frame_->batch, stream);
-    hyper_prepare(residual, ffn ? p.ffn_hc : p.attention_hc, coeff, x, d, frame_->batch);
+    hyper_prepare(residual, ffn ? p.ffn_hc : p.attention_hc, coeff, collapsed, d, frame_->batch);
     const auto& norm = ffn ? p.ffn_norm : p.attention_norm;
-    ops::resident_norm(x, &norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true, stream);
-    if (ffn) feed_forward(x, p, partial, frame_->batch);
-    else if (p.linear) kda(x, p.kda, layer_state(d, layer), partial, d, frame_->batch);
-    else mla(x, p.mla, layer_state(d, layer), partial, d, frame_->batch);
+    if (options_.bf16_activations) {
+        ops::resident_norm(source, &norm, nullptr, nullptr, x, 1e-5f, false, stream);
+        if (ffn) feed_forward(x, p, partial, frame_->batch);
+        else if (p.linear) kda(x, p.kda, layer_state(d, layer), partial, d, frame_->batch);
+        else mla(x, p.mla, layer_state(d, layer), partial, d, frame_->batch);
+    } else {
+        auto* input = static_cast<float*>(x.data);
+        ops::resident_norm(collapsed, &norm, nullptr, nullptr, input, H, frame_->batch, 1e-5f, false, true, stream);
+        if (ffn) feed_forward(input, p, partial, frame_->batch);
+        else if (p.linear) kda(input, p.kda, layer_state(d, layer), partial, d, frame_->batch);
+        else mla(input, p.mla, layer_state(d, layer), partial, d, frame_->batch);
+    }
     stats_.workspace_peak[d] = std::max(stats_.workspace_peak[d], work.peak_used());
 }
 
@@ -96,8 +106,12 @@ void Program::tensor_finalize(int d) {
         selected = compact;
     }
     ops::mean_streams(selected, static_cast<float*>(frame_->state[0].hidden.p), H, frame_->outputs, stream);
-    ops::resident_norm(static_cast<float*>(frame_->state[0].hidden.p), &parameters_.output_norm,
-        nullptr, nullptr, static_cast<float*>(frame_->state[0].hidden.p), H, frame_->outputs, 1e-5f, false, true, stream);
+    Tensor source(frame_->state[0].hidden.p, DType::FP32, {H, frame_->outputs});
+    Tensor normalized(frame_->state[0].normalized.p, options_.bf16_activations ? DType::BF16 : DType::FP32, {H, frame_->outputs});
+    if (options_.bf16_activations)
+        ops::resident_norm(source, &parameters_.output_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+    else ops::resident_norm(static_cast<const float*>(source.data), &parameters_.output_norm,
+        nullptr, nullptr, static_cast<float*>(normalized.data), H, frame_->outputs, 1e-5f, false, true, stream);
 }
 
 void Program::tensor_execute() {
@@ -157,9 +171,9 @@ void Program::tensor_execute() {
         for (int d = 1; d < 3; ++d) {
             frame_->devices[d]->bind_to_current_thread();
             frame_->state[0].ready->wait(frame_->devices[d]->stream);
-            const auto bytes = static_cast<std::size_t>(H) * frame_->outputs * sizeof(float);
-            CUDA_CHECK(hipMemcpyPeerAsync(frame_->state[d].hidden.p, frame_->devices[d]->device,
-                frame_->state[0].hidden.p, frame_->devices[0]->device, bytes, frame_->devices[d]->stream));
+            const auto bytes = static_cast<std::size_t>(H) * frame_->outputs * (options_.bf16_activations ? 2 : 4);
+            CUDA_CHECK(hipMemcpyPeerAsync(frame_->state[d].normalized.p, frame_->devices[d]->device,
+                frame_->state[0].normalized.p, frame_->devices[0]->device, bytes, frame_->devices[d]->stream));
             stats_.peer_bytes += bytes;
         }
         for (int d = 0; d < 3; ++d) {
@@ -169,7 +183,9 @@ void Program::tensor_execute() {
                 local_work.reset();
                 const auto& p = model_.parameters(d);
                 auto* logits = floats(local_work, static_cast<std::size_t>(p.output_head.n) * frame_->outputs);
-                projection(static_cast<const float*>(frame_->state[d].hidden.p), p.output_head, logits, frame_->outputs, d, false);
+                Tensor input(frame_->state[d].normalized.p, options_.bf16_activations ? DType::BF16 : DType::FP32, {H, frame_->outputs});
+                Tensor scores(logits, DType::FP32, {p.output_head.n, frame_->outputs});
+                projection(input, p.output_head, scores, d);
                 ops::resident_argmax_pairs(logits, static_cast<ops::ArgmaxPair*>(frame_->state[d].partial.p),
                     p.output_head.n, frame_->outputs, p.output_begin, frame_->devices[d]->stream);
             });

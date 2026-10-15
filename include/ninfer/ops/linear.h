@@ -163,4 +163,13 @@ void linear_fp32(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t str
 void linear_partial_fp32(const float* x, const Weight& w, float* out, int begin,
                           int columns, int tokens, cudaStream_t stream);
 
+// DTK represented-input projection with independently selected physical input
+// and output storage (contiguous FP32 or BF16). FP32 outputs are unrounded;
+// BF16 outputs cast only after the complete FP32 dot. Same encoded-weight and
+// numerical domain as linear_fp32, no activation or weight pre-rounding.
+void linear_mixed(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+// Same K-interval ideal as linear_partial_fp32; compact x may be FP32 or BF16.
+// Output remains unrounded FP32 for the caller's cross-device reduction.
+void linear_partial(const Tensor& x, const Weight& w, Tensor& out, int begin, cudaStream_t stream);
+
 } // namespace ninfer::ops

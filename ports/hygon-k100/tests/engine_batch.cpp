@@ -15,13 +15,14 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 int main(int argc, char** argv) try {
-    require(argc == 3, "artifact and report required");
+    require(argc == 3 || (argc == 4 && std::string(argv[3]) == "--tp-ep"), "artifact and report required; optional --tp-ep");
     EngineOptions options;
     options.artifact_path      = argv[1];
     options.max_context        = 1024;
     options.kv_capacity        = KvCapacityPolicy::explicit_capacity(1024);
     options.max_concurrency    = 8;
     options.decode_frames      = 2;
+    options.tensor_expert_parallel = argc == 4;
     options.use_cuda_graph     = true;
     options.kvmem_window_pages = 6;
     options.pending_timeout_ms = 0;

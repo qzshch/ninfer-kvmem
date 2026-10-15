@@ -116,10 +116,11 @@ std::vector<double> decode(const std::vector<std::byte>& bytes, QType type, std:
 
 double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_io,
            const std::vector<std::byte>* real = nullptr, bool rounded = false,
-           int begin = 0, int columns = 0) {
+           int begin = 0, int columns = 0, int mixed_output = -1) {
     const bool partial = columns != 0;
     const int input_k = partial ? columns : k;
-    require(!partial || (!bf16_io && !rounded), "partial result must remain FP32");
+    const bool output_bf16 = mixed_output < 0 ? bf16_io : mixed_output != 0;
+    require(!partial || (!output_bf16 && !rounded), "partial result must remain FP32");
     const int row_offset  = real ? 0 : 1;
     const int parent_rows = real ? n : n + 2;
     auto weights          = real ? *real : fixture(type, static_cast<std::size_t>(parent_rows) * k);
@@ -150,15 +151,19 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
         if (bf16_io) { x[i] = static_cast<float>(unbf16(xb[i])); }
     }
     const std::size_t word = bf16_io ? 2 : 4;
-    DeviceBuffer input(input_count * word), output(output_count * word + 32);
+    DeviceBuffer input(input_count * word), output(output_count * (output_bf16 ? 2 : 4) + 32);
     input.copy_from_host(bf16_io ? static_cast<const void*>(xb.data()) : x.data(), input.bytes);
     output.fill(0xa5);
     const auto dtype = bf16_io ? DType::BF16 : DType::FP32;
     Tensor a(input.p, dtype, {input_k, tokens}),
-        y(static_cast<std::byte*>(output.p) + 16, dtype, {n, tokens});
-    if (partial) {
+        y(static_cast<std::byte*>(output.p) + 16, output_bf16 ? DType::BF16 : DType::FP32, {n, tokens});
+    if (partial && mixed_output >= 0) {
+        ops::linear_partial(a, weight, y, begin, ctx.stream);
+    } else if (partial) {
         ops::linear_partial_fp32(static_cast<const float*>(a.data), weight,
                                  static_cast<float*>(y.data), begin, columns, tokens, ctx.stream);
+    } else if (mixed_output >= 0) {
+        ops::linear_mixed(a, weight, y, ctx.stream);
     } else if (bf16_io) {
         ops::linear(a, weight, y, ctx.stream);
     } else {
@@ -199,7 +204,7 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
             }
             double observed;
             const auto index = static_cast<std::size_t>(t) * n + row;
-            if (bf16_io) {
+            if (output_bf16) {
                 std::uint16_t v;
                 std::memcpy(&v, result.data() + 16 + index * 2, 2);
                 observed = unbf16(v);
@@ -208,7 +213,7 @@ double run(DeviceContext& ctx, QType type, int n, int k, int tokens, bool bf16_i
                 std::memcpy(&v, result.data() + 16 + index * 4, 4);
                 observed = v;
             }
-            const double floor     = (bf16_io || rounded) ? nearest_error(expected) : 0;
+            const double floor     = (output_bf16 || rounded) ? nearest_error(expected) : 0;
             const double allowance = 4e-6 * absolute_sum + 1e-30;
             const double ratio = std::max(0.0, std::abs(observed - expected) - floor) / allowance;
             worst              = std::max(worst, ratio);
@@ -226,6 +231,17 @@ int main(int argc, char** argv) try {
     ninfer::DeviceContext ctx;
     unsigned cases = 0;
     double worst   = 0;
+    for (auto type : {QType::FP32, QType::FP16, QType::BF16, QType::Q8_G32_FP16_BLOCK, QType::MXFP4_G32_E8M0})
+        for (int t : {1, 3, 17}) for (bool input_bf16 : {false, true}) {
+            worst = std::max(worst, run(ctx, type, 513, 1024, t, input_bf16, nullptr,
+                                        false, 0, 0, !input_bf16));
+            ++cases;
+            if (input_bf16) {
+                worst = std::max(worst, run(ctx, type, 513, 1024, t, true, nullptr,
+                                            false, 32, 960, 0));
+                ++cases;
+            }
+        }
     for (int tokens : {16, 17, 65}) for (int n : {2560, 8192})
         for (bool bf16_io : {false, true}) {
             worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, n, 128, tokens, bf16_io));

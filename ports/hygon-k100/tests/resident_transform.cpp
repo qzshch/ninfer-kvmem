@@ -70,6 +70,15 @@ std::vector<float> download(const DeviceBuffer& d) {
     return x;
 }
 
+DeviceBuffer upload_bf16(const std::vector<float>& x) {
+    std::vector<std::uint16_t> words; for (auto v : x) words.push_back(word(v));
+    DeviceBuffer d(words.size() * 2); d.copy_from_host(words.data(), d.bytes); return d;
+}
+std::vector<float> download_bf16(const DeviceBuffer& d) {
+    std::vector<std::uint16_t> words(d.bytes / 2); d.copy_to_host(words.data(), d.bytes);
+    std::vector<float> out; for (auto v : words) out.push_back(unword(v)); return out;
+}
+
 void check(double observed, double ideal, bool rounded, const char* what) {
     double floor = 0;
     if (rounded) {
@@ -88,7 +97,7 @@ void check(double observed, double ideal, bool rounded, const char* what) {
 }
 
 void norm(DeviceContext& ctx, int n, int rows, bool center, bool gate, bool rounded, bool bfloat,
-          bool alias) {
+          bool alias, int storage = 0) {
     std::vector<float> x(n * rows), g(n), b(n), z(x.size());
     for (int i = 0; i < n * rows; ++i) {
         x[i] = value(i);
@@ -99,15 +108,29 @@ void norm(DeviceContext& ctx, int n, int rows, bool center, bool gate, bool roun
         b[c] = bfloat ? bf(std::cos(c) * .173) : static_cast<float>(std::cos(c) * .173);
     }
     WeightData wg(g, {static_cast<unsigned>(n)}, bfloat), wb(b, {static_cast<unsigned>(n)}, bfloat);
-    auto dx = upload(x), dz = upload(z);
-    DeviceBuffer dy(x.size() * 4);
+    const bool input_bf16 = storage == 1 || storage == 3;
+    const bool output_bf16 = storage == 1 || storage == 2;
+    auto dx = input_bf16 ? upload_bf16(x) : upload(x);
+    auto dz = input_bf16 ? upload_bf16(z) : upload(z);
+    DeviceBuffer dy(x.size() * (output_bf16 ? 2 : 4));
     auto* o = alias ? static_cast<float*>(dx.p) : static_cast<float*>(dy.p);
-    ops::resident_norm(static_cast<float*>(dx.p), &wg.view, center ? &wb.view : nullptr,
+    if (storage) {
+        Tensor input(dx.p, input_bf16 ? DType::BF16 : DType::FP32, {n, rows});
+        Tensor gate_tensor(dz.p, input.dtype, {n, rows});
+        Tensor output(o, output_bf16 ? DType::BF16 : DType::FP32, {n, rows});
+        ops::resident_norm(input, &wg.view, center ? &wb.view : nullptr,
+                           gate ? &gate_tensor : nullptr, output, 1e-5f, center, ctx.stream);
+        rounded = output_bf16;
+    } else ops::resident_norm(static_cast<float*>(dx.p), &wg.view, center ? &wb.view : nullptr,
                        gate ? static_cast<float*>(dz.p) : nullptr, o, n, rows, 1e-5f, center,
                        rounded, ctx.stream);
     ctx.synchronize();
     std::vector<float> y(x.size());
-    CUDA_CHECK(cudaMemcpy(y.data(), o, y.size() * 4, cudaMemcpyDeviceToHost));
+    if (output_bf16) {
+        std::vector<std::uint16_t> words(x.size());
+        CUDA_CHECK(cudaMemcpy(words.data(), o, words.size() * 2, cudaMemcpyDeviceToHost));
+        for (unsigned j = 0; j < words.size(); ++j) y[j] = unword(words[j]);
+    } else CUDA_CHECK(cudaMemcpy(y.data(), o, y.size() * 4, cudaMemcpyDeviceToHost));
     for (int r = 0; r < rows; ++r) {
         double mean = 0, var = 0;
         if (center) {
@@ -163,7 +186,7 @@ void conv(DeviceContext& ctx, int channels, int t, bool alias) {
     }
 }
 
-void pooled_conv(DeviceContext& ctx, int channels, bool alias, bool packed = false) {
+void pooled_conv(DeviceContext& ctx, int channels, bool alias, bool packed = false, bool typed = false) {
     constexpr int rows = 3, slots = 5;
     const std::vector<int> ids{4, 0, 2};
     const std::vector<int> offsets = packed ? std::vector{0, 1, 4, 12} : std::vector{0, 1, 2, 3};
@@ -172,18 +195,23 @@ void pooled_conv(DeviceContext& ctx, int channels, bool alias, bool packed = fal
     for (std::size_t i = 0; i < s.size(); ++i) s[i] = value(i + 91);
     for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(i * 1.7) * .23;
     WeightData weight(w, {static_cast<unsigned>(channels), 1, 4}, false);
-    auto dx = upload(x), ds = upload(s);
+    auto dx = typed ? upload_bf16(x) : upload(x); auto ds = upload(s);
     DeviceBuffer selectors(ids.size() * sizeof(int)), bounds(offsets.size() * sizeof(int)),
-        dy(x.size() * sizeof(float));
+        dy(x.size() * (typed ? 2 : 4));
     selectors.copy_from_host(ids.data(), selectors.bytes);
     bounds.copy_from_host(offsets.data(), bounds.bytes);
     auto* output = static_cast<float*>(alias ? dx.p : dy.p);
-    ops::resident_causal_conv_packed(static_cast<float*>(dx.p), weight.view,
+    if (typed) {
+        Tensor input(dx.p, DType::BF16, {channels, offsets.back()});
+        Tensor result(output, DType::BF16, {channels, offsets.back()});
+        ops::resident_causal_conv_packed(input, weight.view, static_cast<float*>(ds.p),
+            static_cast<int*>(selectors.p), static_cast<int*>(bounds.p), result, rows, ctx.stream);
+    } else ops::resident_causal_conv_packed(static_cast<float*>(dx.p), weight.view,
                                      static_cast<float*>(ds.p), static_cast<int*>(selectors.p),
                                      static_cast<int*>(bounds.p), output, channels, rows, ctx.stream);
     ctx.synchronize();
     auto after = download(ds);
-    const auto y = download(alias ? dx : dy);
+    const auto y = typed ? download_bf16(alias ? dx : dy) : download(alias ? dx : dy);
     for (int slot = 0; slot < slots; ++slot) {
         const auto found = std::find(ids.begin(), ids.end(), slot);
         for (int c = 0; c < channels; ++c) {
@@ -264,6 +292,19 @@ void elementwise(DeviceContext& ctx, int n, float limit) {
     ctx.synchronize();
     y = download(da);
     for (int i = 0; i < n; ++i) check(y[i], double(a[i]) + b[i], true, "residual add");
+}
+
+void typed_swiglu(DeviceContext& ctx) {
+    std::vector<float> a(1025), b(a.size());
+    for (unsigned j = 0; j < a.size(); ++j) { a[j] = value(j); b[j] = value(j + 7); }
+    auto da = upload_bf16(a), db = upload_bf16(b);
+    Tensor x(da.p, DType::BF16, {1025}), y(db.p, DType::BF16, {1025});
+    ops::resident_swiglu(x, y, x, 10.f, ctx.stream); ctx.synchronize();
+    const auto result = download_bf16(da);
+    for (unsigned j = 0; j < a.size(); ++j) {
+        const auto g = std::min<double>(a[j], 10), u = std::clamp<double>(b[j], -10, 10);
+        check(result[j], bf(g * sig(g)) * u, true, "typed SwiGLU FP64");
+    }
 }
 
 void router(DeviceContext& ctx, int experts, int active, int rows, int mode) {
@@ -372,15 +413,18 @@ void metadata(DeviceContext& ctx, int rows) {
     }
 }
 void tensor_sums(DeviceContext& ctx) {
-    for (int tokens : {1, 8, 33}) {
+    for (int tokens : {1, 8, 33}) for (bool physical : {false, true}) {
         constexpr int hidden = 4096, active = 8;
         std::vector<float> experts(tokens * active * hidden), weights(tokens * active);
         for (unsigned i = 0; i < experts.size(); ++i) experts[i] = value(i + 71);
         for (unsigned i = 0; i < weights.size(); ++i)
             weights[i] = .05f + static_cast<float>(i % 13) / 97.f;
-        auto dx = upload(experts), dw = upload(weights);
+        auto dx = physical ? upload_bf16(experts) : upload(experts); auto dw = upload(weights);
         DeviceBuffer result(tokens * hidden * sizeof(float));
-        ops::resident_moe_partial(static_cast<float*>(dx.p), static_cast<float*>(dw.p),
+        Tensor expert_tensor(dx.p, DType::BF16, {hidden, active, tokens});
+        if (physical) ops::resident_moe_partial(expert_tensor, static_cast<const float*>(dw.p),
+            static_cast<float*>(result.p), hidden, active, tokens, ctx.stream);
+        else ops::resident_moe_partial(static_cast<float*>(dx.p), static_cast<float*>(dw.p),
             static_cast<float*>(result.p), hidden, active, tokens, ctx.stream);
         ctx.synchronize();
         const auto observed = download(result);
@@ -443,6 +487,12 @@ void tensor_sums(DeviceContext& ctx) {
 int main() {
     try {
         DeviceContext ctx;
+        typed_swiglu(ctx);
+        norm(ctx, 128, 20, false, true, true, true, true, 1);
+        norm(ctx, 128, 3, true, false, true, true, true, 1);
+        for (int storage : {1, 2, 3}) for (bool center : {false, true}) for (bool gate : {false, true})
+            norm(ctx, 4096, 3, center, gate, storage != 3, true, false, storage);
+        for (bool alias : {false, true}) pooled_conv(ctx, 129, alias, true, true);
         unsigned cases = 0;
         for (int n : {1, 128, 4096, 16384})
             for (bool center : {false, true})
