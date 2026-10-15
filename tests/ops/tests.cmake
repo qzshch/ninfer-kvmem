@@ -135,3 +135,5 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 ninfer_add_op_test(ninfer_span_accumulate_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_span_accumulate.cpp"
   LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_kda_chunk_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kda_chunk_plan.cpp")

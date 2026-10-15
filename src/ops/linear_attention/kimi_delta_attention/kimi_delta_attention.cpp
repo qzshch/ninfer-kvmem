@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
+#include "ops/linear_attention/kimi_delta_attention/chunked_dtk.h"
 
 #include <cuda_bf16.h>
 
@@ -287,10 +288,18 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
         args, static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
 }
 
+std::size_t kimi_delta_attention_packed_workspace_capacity_bytes(
+    std::int32_t qk_heads, std::int32_t value_heads, std::int32_t sequences, std::int32_t rows) {
+    namespace kda = detail::kimi_delta_attention;
+    if (!kda::valid_heads(qk_heads, value_heads))
+        throw std::invalid_argument("kimi_delta_attention: packed workspace heads");
+    return kda::dtk_packed_workspace_bytes(value_heads, rows, sequences);
+}
+
 void kimi_delta_attention_packed_update(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
     const Tensor& a_log, const Tensor& dt_bias, float lower_bound, float scale,
-    Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
+    WorkspaceArena& workspace, Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
     cudaStream_t stream, KdaDecayParameter decay_parameter) {
     require_dtype(states, DType::FP32, "states must be FP32");
     require_contiguous_nonnull(states, "states");
@@ -315,9 +324,16 @@ void kimi_delta_attention_packed_update(
     auto args = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out);
     args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
     args.sequence_offsets = static_cast<const std::int32_t*>(offsets.data);
-    detail::kimi_delta_attention::launch_batch_update(
-        args, static_cast<const std::int32_t*>(slots.data), count, stream);
+    const auto bytes = kimi_delta_attention_packed_workspace_capacity_bytes(q.ne[1], v.ne[1], count, q.ne[2]);
+    if (bytes) {
+        auto scope = workspace.scope();
+        auto storage = workspace.alloc_bytes(bytes);
+        detail::kimi_delta_attention::launch_packed_chunks(
+            args, static_cast<const std::int32_t*>(slots.data), count, storage.data, stream);
+    } else detail::kimi_delta_attention::launch_batch_update(
+            args, static_cast<const std::int32_t*>(slots.data), count, stream);
 #else
+    (void)workspace;
     (void)stream;
     throw std::invalid_argument("kimi_delta_attention: packed temporal update requires DTK");
 #endif

@@ -95,7 +95,7 @@ double check(const std::vector<double>& actual, const std::vector<double>& expec
 }
 
 void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float lower, bool alias,
-         bool negative = false) {
+         bool negative = false, bool packed = false) {
     auto a = inputs(qheads, heads, tokens, mode);
     if (negative) {
         for (auto& x : a.a_log) x = -std::exp(x);
@@ -117,10 +117,18 @@ void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float 
     Tensor so(alias ? initial.data.p : static_cast<std::byte*>(published.p) + 16, DType::FP32,
               {128, 128, heads});
     Tensor out(static_cast<std::byte*>(result.p) + 16, DType::BF16, {128, heads, tokens});
-    WorkspaceArena work(256);
-    require(ops::kimi_delta_attention_workspace_capacity_bytes(qheads, heads, 1, tokens) == 0,
-            "DTK KDA unexpectedly needs workspace");
-    ops::kimi_delta_attention(
+    WorkspaceArena work(packed ? std::max<std::size_t>(256, ops::kimi_delta_attention_packed_workspace_capacity_bytes(qheads, heads, 1, tokens)) : 256);
+    DeviceBuffer selectors, bounds;
+    if (packed) {
+        require(alias, "packed KDA publishes directly into the selected state");
+        selectors = DeviceBuffer(4); bounds = DeviceBuffer(8);
+        const int slot = 0, offsets[2]{0, tokens};
+        selectors.copy_from_host(&slot, 4); bounds.copy_from_host(offsets, 8);
+        Tensor pool(si.data, DType::FP32, {128, 128, heads, 1}), ids(selectors.p, DType::I32, {1}), ranges(bounds.p, DType::I32, {2});
+        ops::kimi_delta_attention_packed_update(qt, kt, vt, gt, bt, at, dtb, lower, scale,
+            work, pool, ids, ranges, out, ctx.stream,
+            negative ? ops::KdaDecayParameter::NegativeRate : ops::KdaDecayParameter::LogRate);
+    } else ops::kimi_delta_attention(
         qt, kt, vt, gt, bt, at, dtb, lower, scale, work, si, so, out, ctx.execution_view(),
         negative ? ops::KdaDecayParameter::NegativeRate : ops::KdaDecayParameter::LogRate);
     ctx.synchronize();
@@ -200,10 +208,11 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
     Tensor out(result.p, DType::BF16, {128, heads, packed ? total : 1, packed ? 1 : batch});
     const auto parameter = negative ? ops::KdaDecayParameter::NegativeRate
                                     : ops::KdaDecayParameter::LogRate;
+    WorkspaceArena work(packed ? std::max<std::size_t>(256, ops::kimi_delta_attention_packed_workspace_capacity_bytes(qheads, heads, batch, total)) : 256);
     if (packed) {
         Tensor ranges(bounds.p, DType::I32, {batch + 1});
         ops::kimi_delta_attention_packed_update(qt, kt, vt, gt, bt, at, dtb, -5, scale,
-                                                states, ids, ranges, out, ctx.stream, parameter);
+                                                work, states, ids, ranges, out, ctx.stream, parameter);
     } else
         ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dtb, -5, scale,
                                                states, ids, out, ctx.stream, parameter);
@@ -268,8 +277,20 @@ int main() try {
         run_batch(ctx, 64, 64, negative, true);
         cases += 2;
     }
+    for (int heads : {20, 24}) for (int tokens : {15, 16, 17, 33}) {
+        run(ctx, heads, heads, tokens, 0, -5, true, true, true);
+        ++cases;
+    }
+    for (int mode : {1, 2, 3}) {
+        run(ctx, 1, 5, 65, mode, -5, true, true, true);
+        ++cases;
+    }
+    for (float lower : {-5.f, 0.f}) {
+        run(ctx, 1, 5, 1024, 0, lower, true, true, true);
+        ++cases;
+    }
     std::printf("PASS: %u KDA cases; independent full FP64 output/state oracle; H64; K7 width8; "
-                "distinct/alias state; guards; zero workspace\n",
+                "distinct/alias state; guards; ragged FP32 time tiles and recurrent routes\n",
                 cases);
     return 0;
 } catch (const std::exception& e) {

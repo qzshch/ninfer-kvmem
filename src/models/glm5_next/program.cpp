@@ -279,7 +279,7 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
             Tensor ranges(const_cast<int*>(offsets), DType::I32, {sequences_ + 1});
             ops::kimi_delta_attention_packed_update(
                 qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
-                1.f / std::sqrt(128.f), image, ids, ranges, yb, s,
+                1.f / std::sqrt(128.f), w, image, ids, ranges, yb, s,
                 ops::KdaDecayParameter::NegativeRate);
         }
         ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result, channels * t, s);

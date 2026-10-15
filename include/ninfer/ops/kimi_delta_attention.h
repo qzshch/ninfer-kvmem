@@ -54,9 +54,10 @@ enum class KdaDecayParameter : std::uint8_t { LogRate, NegativeRate };
  * small matrix products use TF32 MMA; Q readout and state updates use BF16 MMA with FP32
  * accumulators. State snapshots and Delta stay FP32, converting only their BF16 MMA operands.
  * Transcendental approximations and reduction association are implementation details.
- * The experimental Hygon DTK implementation uses scratch-free FP32 recurrence for every T,
- * including pooled one-token updates. Its shared-memory reductions have no CUDA warp-width
- * dependency; the CUDA chunked dispatch described above remains unchanged.
+ * The Hygon DTK ordinary overload and pooled one-token updates use scratch-free FP32 recurrence.
+ * The packed temporal overload below supplies a separate caller-owned-workspace route.
+ * These shared-memory reductions have no CUDA warp-width dependency; CUDA chunked dispatch
+ * described above remains unchanged.
  *
  * workspace supplies the capacity query above and is scoped to the call; the Op allocates no
  * device storage. execution supplies the stream and physical SM count for launch decomposition.
@@ -102,12 +103,18 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
  * states[slots[r]]. Unselected states are unchanged. Both decay parameterizations
  * are explicit. Other operands follow the ordinary overload's dtype, alias,
  * numerical and represented-input rules. No allocation or host metadata readback.
- * Non-DTK implementations reject this entry before launching.
+ * M<=32768. DTK uses FP32 time tiles for M>=16, with cumulative diagonal
+ * decays, a block-local triangular solve and FP32 state prediction/update.
+ * Q/K, solves and delta remain FP32; only the public output rounds to BF16.
+ * workspace is caller-owned, disjoint call-scoped storage sized by the query
+ * below. Smaller M retains scratch-free recurrence. Non-DTK rejects execution.
  */
+std::size_t kimi_delta_attention_packed_workspace_capacity_bytes(
+    std::int32_t qk_heads, std::int32_t value_heads, std::int32_t sequences, std::int32_t rows);
 void kimi_delta_attention_packed_update(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
     const Tensor& A_log, const Tensor& dt_bias, float lower_bound, float scale,
-    Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
+    WorkspaceArena& workspace, Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
     cudaStream_t stream, KdaDecayParameter decay_parameter);
 
 } // namespace ninfer::ops

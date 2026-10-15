@@ -55,6 +55,7 @@ target_include_directories(ninfer_k100_projection PRIVATE "${NINFER_ROOT}/third_
 
 add_library(ninfer_k100_kda STATIC
   "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/kimi_delta_attention.cpp"
+  "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/chunked_hip.hip"
   "${NINFER_ROOT}/src/ops/linear_attention/kimi_delta_attention/recurrent_hip.hip")
 target_link_libraries(ninfer_k100_kda PUBLIC ninfer_k100_physical_core)
 
@@ -109,6 +110,9 @@ if(BUILD_TESTING)
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}" RUN_SERIAL TRUE TIMEOUT 120)
   endforeach()
   add_executable(k100_token_batch_test "${NINFER_ROOT}/tests/runtime/test_token_batch.cpp")
+  add_executable(k100_kda_chunk_plan_test "${NINFER_ROOT}/tests/ops/test_kda_chunk_plan.cpp")
+  target_include_directories(k100_kda_chunk_plan_test PRIVATE "${NINFER_ROOT}/src")
+  add_test(NAME k100_kda_chunk_plan COMMAND k100_kda_chunk_plan_test)
   target_include_directories(k100_token_batch_test PRIVATE "${NINFER_ROOT}/src")
   add_test(NAME k100_token_batch COMMAND k100_token_batch_test)
   # Real artifact qualification is opt-in, never an implicit 145-GiB CTest load.
