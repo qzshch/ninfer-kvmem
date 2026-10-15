@@ -57,7 +57,9 @@ __device__ float4 represented_four(const void* weights, std::int64_t row, int co
 // four columns independently before the final two additions, retaining the
 // original row's reduction tree rather than changing its arithmetic grouping.
 template <QType Format, bool Bf16>
-__device__ float dot_wave64(const void* input, const void* weights, std::int64_t row, int k) {
+__device__ float dot_wave64(const void* input, const void* weights, std::int64_t row, int k,
+                            int parent_k = 0, int begin = 0) {
+    if (!parent_k) parent_k = k;
     const int lane = threadIdx.x & 63;
     float a = 0.f, b = 0.f, c = 0.f, d = 0.f;
     for (int base = 0; base < k; base += 256) {
@@ -76,7 +78,7 @@ __device__ float dot_wave64(const void* input, const void* weights, std::int64_t
             x2            = x[2];
             x3            = x[3];
         }
-        const float4 weights4 = represented_four<Format>(weights, row, column, k);
+        const float4 weights4 = represented_four<Format>(weights, row, begin + column, parent_k);
         a += weights4.x * x0;
         b += weights4.y * x1;
         c += weights4.z * x2;

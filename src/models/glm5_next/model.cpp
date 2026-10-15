@@ -16,15 +16,15 @@ void require(bool condition, const char* message) {
 Weight rows(const Weight& source, int begin, int count) {
     require(begin >= 0 && count > 0 && count <= source.n && begin <= source.n - count,
             "GLM local weight row interval");
-    const auto block = interleaved_block_geometry(source.qtype);
     require(source.layout == QuantLayout::Contiguous || source.layout == QuantLayout::BlockInterleaved,
             "GLM TP requires direct or interleaved stored rows");
-    const auto stride = block.values ? static_cast<std::size_t>(source.k / block.values) * block.bytes :
-        static_cast<std::size_t>(source.k) * (source.qtype == QType::FP32 ? 4 : 2);
-    auto result = source;
-    result.qdata = static_cast<const std::byte*>(source.qdata) + begin * stride;
-    result.n = result.shape[0] = result.padded_shape[0] = count;
-    return result;
+    const std::array<std::uint64_t, 2> shape{static_cast<unsigned>(source.n), static_cast<unsigned>(source.k)};
+    WeightParent parent{weight_geometry(source.qtype, source.layout, shape),
+                         static_cast<const std::byte*>(source.qdata), source.weight_scale_divisor};
+    return native_weight({{static_cast<unsigned>(count), static_cast<unsigned>(source.k)},
+                          {{&parent, static_cast<std::uint64_t>(begin) * source.k,
+                            static_cast<std::uint64_t>(begin + count) * source.k}}},
+                         source.input_scale_divisor);
 }
 
 void shard_parameters(Parameters& p, int rank) {

@@ -94,11 +94,11 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
 // Tails are masked; there is no padding request or duplicated mutable state.
 template <QType Format, bool Bf16>
 __global__ void projection_columns4(const void* x, const void* w, void* out, int n, int k,
-                                    int tokens, bool rounded) {
+                                    int tokens, bool rounded, int parent_k, int begin) {
     const int row = blockIdx.x, base = blockIdx.y * 4, lane = threadIdx.x;
     float sum[4]{};
     for (int column = lane; column < k; column += 256) {
-        const float weight = load_weight<Format>(w, row, column, k);
+        const float weight = load_weight<Format>(w, row, begin + column, parent_k);
         for (int t = 0; t < 4; ++t)
             if (base + t < tokens) {
                 float value;
@@ -137,7 +137,7 @@ template <QType Format>
 void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, bool bf16_output) {
 #ifdef NINFER_HYGON_DTK
     if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
-        if (w.n >= 128 && w.k >= 512 && (x.ne[1] == 1 || x.ne[1] >= 16)) {
+        if (w.n >= 128 && ((w.k >= 512 && x.ne[1] == 1) || x.ne[1] >= 16)) {
             const auto invoke = [&]<bool B>() {
                 if (x.ne[1] == 1)
                     q8_decode_tile<B><<<(w.n + 3) / 4, 256, 0, stream>>>(
@@ -156,14 +156,14 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream, 
         const dim3 grid(w.n, (x.ne[1] + 3) / 4);
         if (x.dtype == DType::BF16)
             projection_columns4<Format, true><<<grid, 256, 0, stream>>>(
-                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output);
+                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output, w.k, 0);
         else
             projection_columns4<Format, false><<<grid, 256, 0, stream>>>(
-                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output);
+                x.data, w.qdata, out.data, w.n, w.k, x.ne[1], bf16_output, w.k, 0);
         return;
     }
-    // Small row counts retain the wider row to expose enough parallel columns.
-    // Dense Q8 also retains it: warm native-shape A/B regressed with wave64.
+    // Small problems retain wider rows. Q8 uses its separate blocked route
+    // above; this wave route preserves the represented-four dequantization.
     if (Format != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && w.k % 256 == 0) {
         const dim3 grouped((static_cast<unsigned>(w.n) + 3) / 4, static_cast<unsigned>(x.ne[1]));
         if (x.dtype == DType::BF16)
@@ -203,11 +203,23 @@ __global__ void partial_projection(const float* x, const void* w, float* out, in
     if (!lane) out[static_cast<long long>(t) * n + row] = partial[0];
 }
 
+#ifdef NINFER_HYGON_DTK
+template <QType F>
+__global__ void partial_wave64(const float* x, const void* weights, float* out, int n,
+                               int parent_k, int begin, int k) {
+    const int row = blockIdx.x * 4 + threadIdx.x / 64, t = blockIdx.y;
+    if (row >= n) return;
+    const float value = dot_wave64<F, false>(x + static_cast<long long>(t) * k, weights,
+                                            row, k, parent_k, begin);
+    if (!(threadIdx.x & 63)) out[static_cast<long long>(t) * n + row] = value;
+}
+#endif
+
 template <QType F>
 void partial_launch(const float* x, const Weight& w, float* out, int begin, int k, int t,
                      cudaStream_t s) {
     if constexpr (F == QType::Q8_G32_FP16_BLOCK) {
-        if (w.n >= 128 && k >= 512 && (t == 1 || t >= 16)) {
+        if (w.n >= 128 && ((k >= 512 && t == 1) || t >= 16)) {
             if (t == 1)
                 q8_decode_tile<false><<<(w.n + 3) / 4, 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k, false);
             else
@@ -216,6 +228,17 @@ void partial_launch(const float* x, const Weight& w, float* out, int begin, int 
             return;
         }
     }
+#ifdef NINFER_HYGON_DTK
+    if (t > 1 && (F == QType::Q8_G32_FP16_BLOCK || F == QType::Q6_K_G256_BLOCK) && w.n >= 128) {
+        projection_columns4<F, false><<<dim3(w.n, (t + 3) / 4), 256, 0, s>>>(
+            x, w.qdata, out, w.n, k, t, false, w.k, begin);
+        return;
+    }
+    if (F != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && k % 256 == 0 && begin % 256 == 0) {
+        partial_wave64<F><<<dim3((w.n + 3) / 4, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
+        return;
+    }
+#endif
     partial_projection<F><<<dim3(w.n, t), 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k);
 }
 } // namespace

@@ -226,6 +226,11 @@ int main(int argc, char** argv) try {
     ninfer::DeviceContext ctx;
     unsigned cases = 0;
     double worst   = 0;
+    for (int tokens : {16, 17, 65}) for (int n : {2560, 8192})
+        for (bool bf16_io : {false, true}) {
+            worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, n, 128, tokens, bf16_io));
+            ++cases;
+        }
     for (int tokens : {1, 15, 16, 17, 33})
         for (int k : {544, 4096, 8192, 16384}) {
             for (bool bf16_io : {false, true}) {
