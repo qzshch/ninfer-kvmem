@@ -8,8 +8,8 @@ struct alignas(16) DtkPrepared {
     float q[128], k[128], alpha[128], beta;
 };
 struct alignas(256) DtkChunk {
-    float kd[16][128], qd[16][128], prefix[16][128], kr[16][128];
-    float gamma[128], beta[16], solve[16][16], mqk[16][16];
+    float kd[16][128], qd[16][128], kr[16][128];
+    float gamma[128], solve[16][16], mqk[16][16];
 };
 inline constexpr std::size_t kDtkChunkDataBytes = offsetof(DtkChunk, mqk) + sizeof(DtkChunk::mqk);
 static_assert(kDtkChunkDataBytes % 16 == 0);

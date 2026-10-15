@@ -19,111 +19,76 @@ __device__ long long packet_index(Arguments a, int sequence, int chunk, int head
     return (static_cast<long long>(dtk_packet_base(a.sequence_offsets[sequence], sequence) + chunk) * a.value_heads) + head;
 }
 
-__global__ void prepare_vectors(Arguments a, DtkChunk* packets, int sequences) {
+__global__ void prepare_chunks(Arguments a, DtkChunk* packets, int sequences) {
     const int h = blockIdx.x, tid = threadIdx.x;
     const int seq = dtk_packet_sequence(a.sequence_offsets, sequences, blockIdx.y);
     if (seq < 0) return;
     const int chunk = blockIdx.y - dtk_packet_base(a.sequence_offsets[seq], seq);
     const int start = a.sequence_offsets[seq] + chunk * 16;
-    const int end = a.sequence_offsets[seq + 1];
-    if (start >= end) return;
-    const int length = min(16, end - start), row = tid / 16, lane = tid % 16;
-    const int qh = h / (a.value_heads / a.qk_heads);
+    const int length = min(16, a.sequence_offsets[seq + 1] - start);
+    const int row = tid / 16, lane = tid % 16, qh = h / (a.value_heads / a.qk_heads);
     auto& p = packets[packet_index(a, seq, chunk, h)];
-    __shared__ float prefix[16][128], qr[16][16], kr[16][16];
+    __shared__ float prefix[16][128], q[16][128], k[16][128];
+    __shared__ float qr[16][16], kr[16][16], beta[16], lower[16][16], inverse[16][16];
     if (tid < 128) {
         const float rate = a.negative_rate ? -a.a_log[h] : expf(a.a_log[h]);
         float sum = 0.f;
         for (int t = 0; t < 16; ++t) {
             if (t < length) {
-                const auto index = (static_cast<long long>(start + t) * a.value_heads + h) * 128 + tid;
-                sum += a.lower_bound * sigmoid(rate * (bf_value(a.g, index) + a.dt_bias[h * 128 + tid]));
+                const auto at = (static_cast<long long>(start + t) * a.value_heads + h) * 128 + tid;
+                sum += a.lower_bound * sigmoid(rate * (bf_value(a.g, at) + a.dt_bias[h * 128 + tid]));
             }
             prefix[t][tid] = sum;
         }
         p.gamma[tid] = expf(sum);
     }
-    if (tid < 16) p.beta[tid] = tid < length
+    if (tid < 16) beta[tid] = tid < length
         ? sigmoid(bf_value(a.beta, static_cast<long long>(start + tid) * a.value_heads + h)) : 0.f;
-    float q[8]{}, k[8]{}, qs = 0.f, ks = 0.f;
+    float qv[8]{}, kv[8]{}, qs = 0.f, ks = 0.f;
     for (int j = 0; j < 8; ++j) {
         if (row < length) {
-            const auto index = (static_cast<long long>(start + row) * a.qk_heads + qh) * 128 + lane * 8 + j;
-            q[j] = bf_value(a.q, index); k[j] = bf_value(a.k, index);
+            const auto at = (static_cast<long long>(start + row) * a.qk_heads + qh) * 128 + lane * 8 + j;
+            qv[j] = bf_value(a.q, at); kv[j] = bf_value(a.k, at);
         }
-        qs += q[j] * q[j]; ks += k[j] * k[j];
+        qs += qv[j] * qv[j]; ks += kv[j] * kv[j];
     }
     qr[row][lane] = qs; kr[row][lane] = ks;
     __syncthreads();
     for (int distance = 8; distance; distance /= 2) {
-        if (lane < distance) {
-            qr[row][lane] += qr[row][lane + distance]; kr[row][lane] += kr[row][lane + distance];
-        }
+        if (lane < distance) { qr[row][lane] += qr[row][lane + distance]; kr[row][lane] += kr[row][lane + distance]; }
         __syncthreads();
     }
     const float iq = rsqrtf(qr[row][0] + kQkL2NormEps), ik = rsqrtf(kr[row][0] + kQkL2NormEps);
     for (int j = 0; j < 8; ++j) {
         const int c = lane * 8 + j;
-        const float g = prefix[row][c], decay = expf(g), qv = q[j] * iq, kv = k[j] * ik;
-        p.kd[row][c] = kv * decay; p.qd[row][c] = qv * decay;
-        p.prefix[row][c] = g;
-        p.kr[row][c] = kv * expf(prefix[length - 1][c] - g);
-    }
-}
-
-__global__ void prepare_solve(Arguments a, DtkChunk* packets, int sequences) {
-    const int h = blockIdx.x, tid = threadIdx.x;
-    const int seq = dtk_packet_sequence(a.sequence_offsets, sequences, blockIdx.y);
-    if (seq < 0) return;
-    const int chunk = blockIdx.y - dtk_packet_base(a.sequence_offsets[seq], seq);
-    if (a.sequence_offsets[seq] + chunk * 16 >= a.sequence_offsets[seq + 1]) return;
-    auto& p = packets[packet_index(a, seq, chunk, h)];
-    const int start = a.sequence_offsets[seq] + chunk * 16;
-    const int length = min(16, a.sequence_offsets[seq + 1] - start);
-    const int time = tid / 16, lane = tid % 16;
-    const int qh = h / (a.value_heads / a.qk_heads);
-    __shared__ float q[16][128], k[16][128], qr[16][16], kr[16][16];
-    float qv[8]{}, kv[8]{}, qs = 0.f, ks = 0.f;
-    for (int j = 0; j < 8; ++j) {
-        if (time < length) {
-            const auto at = (static_cast<long long>(start + time) * a.qk_heads + qh) * 128 + lane * 8 + j;
-            qv[j] = bf_value(a.q, at); kv[j] = bf_value(a.k, at);
-        }
-        qs += qv[j] * qv[j]; ks += kv[j] * kv[j];
-    }
-    qr[time][lane] = qs; kr[time][lane] = ks;
-    __syncthreads();
-    for (int distance = 8; distance; distance /= 2) {
-        if (lane < distance) { qr[time][lane] += qr[time][lane + distance]; kr[time][lane] += kr[time][lane + distance]; }
-        __syncthreads();
-    }
-    const float iq = rsqrtf(qr[time][0] + kQkL2NormEps), ik = rsqrtf(kr[time][0] + kQkL2NormEps);
-    for (int j = 0; j < 8; ++j) {
-        q[time][lane * 8 + j] = qv[j] * iq; k[time][lane * 8 + j] = kv[j] * ik;
+        q[row][c] = qv[j] * iq; k[row][c] = kv[j] * ik;
+        if (row < length) {
+            const float g = prefix[row][c], decay = expf(g);
+            p.kd[row][c] = k[row][c] * decay; p.qd[row][c] = q[row][c] * decay;
+            p.kr[row][c] = k[row][c] * expf(prefix[length - 1][c] - g);
+        } else p.kd[row][c] = p.qd[row][c] = p.kr[row][c] = 0.f;
     }
     __syncthreads();
-    const int row = tid / 16, col = tid % 16;
-    __shared__ float lower[16][16], inverse[16][16];
+    const int col = lane;
     float kk = 0.f, qk = 0.f;
     if (row < length && row >= col) for (int c = 0; c < 128; ++c) {
-        // Evaluate the causal diagonal ratio directly. Reciprocal cumulative
-        // decays would amplify private underflow even for the unit diagonal.
-        const float decay = expf(p.prefix[row][c] - p.prefix[col][c]);
+        // Direct causal ratios retain the unit diagonal under strong decay.
+        const float decay = expf(prefix[row][c] - prefix[col][c]);
         kk += (k[row][c] * k[col][c]) * decay;
         qk += (q[row][c] * k[col][c]) * decay;
     }
-    lower[row][col] = row > col ? p.beta[row] * kk : 0.f;
+    lower[row][col] = row > col ? beta[row] * kk : 0.f;
     p.mqk[row][col] = row >= col ? qk : 0.f;
     __syncthreads();
-    for (int r = 0; r < length; ++r) {
+    for (int time = 0; time < length; ++time) {
         if (tid < 16) {
-            float value = r == tid ? 1.f : 0.f;
-            for (int j = 0; j < r; ++j) value -= lower[r][j] * inverse[j][tid];
-            inverse[r][tid] = value;
+            float v = time == tid ? 1.f : 0.f;
+            for (int j = 0; j < time; ++j) v -= lower[time][j] * inverse[j][tid];
+            inverse[time][tid] = v;
         }
         __syncthreads();
     }
-    p.solve[row][col] = row < length && col < length ? inverse[row][col] * p.beta[col] : 0.f;
+    p.solve[row][col] = row < length && col < length ? inverse[row][col] * beta[col] : 0.f;
 }
 
 __global__ void consume_chunks(Arguments a, const DtkChunk* packets, const std::int32_t* slots) {
@@ -185,8 +150,7 @@ void launch_packed_chunks(const Arguments& args, const std::int32_t* slots, int 
                            void* storage, cudaStream_t stream) {
     auto* packets = static_cast<DtkChunk*>(storage);
     const dim3 prepare(args.value_heads, (args.tokens + 15) / 16 + sequences - 1);
-    prepare_vectors<<<prepare, 256, 0, stream>>>(args, packets, sequences);
-    prepare_solve<<<prepare, 256, 0, stream>>>(args, packets, sequences);
+    prepare_chunks<<<prepare, 256, 0, stream>>>(args, packets, sequences);
     consume_chunks<<<dim3(args.value_heads, 16, sequences), 256, 0, stream>>>(args, packets, slots);
     CUDA_CHECK(cudaGetLastError());
 }
