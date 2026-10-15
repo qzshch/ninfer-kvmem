@@ -64,7 +64,7 @@ void config_contract(const artifact::Json& c, const artifact::Json& d) {
 } // namespace
 
 Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devices,
-             const StartupObserver* observer)
+             const StartupObserver* observer, bool dflash, bool mtp)
     : devices_(devices) {
     const auto& dir = reader.directory();
     config_         = dir.component("text").config;
@@ -95,6 +95,25 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
         add(m.up, p + "up", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
         add(m.down, p + "down",
             {static_cast<unsigned>(banks * 4096), static_cast<unsigned>(intermediate)}, dev);
+    };
+    auto bind_mla = [&](MlaParameters& a, const std::string& m, int dev) {
+        add(a.query_lowrank, m + "query_lowrank", {1536, 4096}, dev);
+        norm(a.query_norm, m + "query_norm", 1536, dev, QType::FP32);
+        add(a.query_heads, m + "query_heads", {16384, 1536}, dev);
+        add(a.kv_latent, m + "kv_latent", {512, 4096}, dev);
+        norm(a.kv_norm, m + "kv_norm", 512, dev, QType::FP32);
+        add(a.key_absorb, m + "key_absorb", {32768, 256}, dev);
+        add(a.value_expand, m + "value_expand", {16384, 512}, dev);
+        add(a.output, m + "output", {4096, 16384}, dev);
+        auto& x      = a.index;
+        const auto z = m + "index/";
+        add(x.query, z + "query", {4096, 1536}, dev);
+        add(x.key, z + "key", {128, 4096}, dev);
+        norm(x.key_norm, z + "key_norm", 128, dev, QType::FP32);
+        norm(x.key_norm_bias, z + "key_norm_bias", 128, dev, QType::FP32);
+        add(x.head_weights, z + "head_weights", {32, 4096}, dev, QType::FP32);
+        add(x.position_bias, z + "position_bias", {4, 128}, dev, QType::FP32);
+        add(x.pool_gate, z + "pool_gate", {128, 4096}, dev);
     };
     add(parameters_.embedding, "text/token_embedding", {154880, 4096}, 0);
     add(parameters_.output_head, "text/output_head", {154880, 4096}, 0);
@@ -137,23 +156,7 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
         } else {
             auto& a      = l.mla;
             const auto m = p + "mla/";
-            add(a.query_lowrank, m + "query_lowrank", {1536, 4096}, dev);
-            norm(a.query_norm, m + "query_norm", 1536, dev, QType::FP32);
-            add(a.query_heads, m + "query_heads", {16384, 1536}, dev);
-            add(a.kv_latent, m + "kv_latent", {512, 4096}, dev);
-            norm(a.kv_norm, m + "kv_norm", 512, dev, QType::FP32);
-            add(a.key_absorb, m + "key_absorb", {32768, 256}, dev);
-            add(a.value_expand, m + "value_expand", {16384, 512}, dev);
-            add(a.output, m + "output", {4096, 16384}, dev);
-            auto& x      = a.index;
-            const auto z = m + "index/";
-            add(x.query, z + "query", {4096, 1536}, dev);
-            add(x.key, z + "key", {128, 4096}, dev);
-            norm(x.key_norm, z + "key_norm", 128, dev, QType::FP32);
-            norm(x.key_norm_bias, z + "key_norm_bias", 128, dev, QType::FP32);
-            add(x.head_weights, z + "head_weights", {32, 4096}, dev, QType::FP32);
-            add(x.position_bias, z + "position_bias", {4, 128}, dev, QType::FP32);
-            add(x.pool_gate, z + "pool_gate", {128, 4096}, dev);
+            bind_mla(a, m, dev);
         }
         if (l.dense)
             mlp(l.ffn, p + "ffn/dense/", 12288, dev);
@@ -164,32 +167,55 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
             norm(l.router_bias, p + "ffn/router_bias", 288, dev, QType::FP32);
         }
     }
-    auto& d             = parameters_.draft;
-    const std::string p = "dflash2/";
-    add(d.feature_projection, p + "feature_projection", {4096, 20480}, 2, QType::BF16);
-    norm(d.context_norm, p + "context_norm", 4096, 2, QType::BF16);
-    norm(d.final_norm, p + "final_norm", 4096, 2, QType::BF16);
-    add(d.selector_projection, p + "selector/hidden_projection", {256, 4096}, 2, QType::BF16);
-    add(d.predecessor, p + "selector/predecessor_codebook", {154880, 256}, 2, QType::BF16);
-    add(d.successor, p + "selector/successor_codebook", {154880, 256}, 2, QType::BF16);
-    for (int i = 0; i < 5; ++i) {
-        auto& l      = d.layers[i];
-        const auto z = p + "layers/" + std::to_string(i) + "/";
-        norm(l.attention_norm, z + "attention_norm", 4096, 2, QType::BF16);
-        norm(l.ffn_norm, z + "ffn_norm", 4096, 2, QType::BF16);
-        add(l.query, z + "attention/query", {4096, 4096}, 2, QType::BF16);
-        add(l.key, z + "attention/key", {1024, 4096}, 2, QType::BF16);
-        add(l.value, z + "attention/value", {1024, 4096}, 2, QType::BF16);
-        add(l.output, z + "attention/output", {4096, 4096}, 2, QType::BF16);
-        norm(l.query_norm, z + "attention/query_norm", 128, 2, QType::BF16);
-        norm(l.key_norm, z + "attention/key_norm", 128, 2, QType::BF16);
-        mlp(l.ffn, z + "ffn/", 12288, 2);
-        for (auto pair : {std::pair{&l.attention_conv, "attention_conv/"},
-                          std::pair{&l.mlp_conv, "mlp_conv/"}}) {
-            add(pair.first->base_kernel, z + pair.second + "base_kernel", {2, 2, 4096}, 2,
-                QType::BF16);
-            add(pair.first->kernel_projection, z + pair.second + "kernel_projection", {1024, 4096},
-                2, QType::BF16);
+    if (mtp) {
+        require(dir.component("mtp").config.at("num_hidden_layers") == 1 &&
+                    config_.at("num_nextn_predict_layers") == 1,
+                "GLM native MTP layer config mismatch");
+        auto& p = parameters_.mtp;
+        add(p.fusion, "mtp/fusion", {4096, 8192}, 2);
+        norm(p.embedding_norm, "mtp/embedding_norm", 4096, 2, QType::FP32);
+        norm(p.hidden_norm, "mtp/hidden_norm", 4096, 2, QType::FP32);
+        norm(p.output_norm, "mtp/output_norm", 4096, 2, QType::FP32);
+        auto& l  = p.layer;
+        l.device = 2;
+        l.linear = false;
+        l.dense  = false;
+        norm(l.attention_norm, "mtp/attention_norm", 4096, 2, QType::FP32);
+        norm(l.ffn_norm, "mtp/ffn_norm", 4096, 2, QType::FP32);
+        bind_mla(l.mla, "mtp/mla/", 2);
+        mlp(l.ffn, "mtp/ffn/shared/", 2048, 2);
+        mlp(l.experts, "mtp/ffn/experts/", 2048, 2, 288);
+        add(l.router, "mtp/ffn/router", {288, 4096}, 2, QType::FP32);
+        norm(l.router_bias, "mtp/ffn/router_bias", 288, 2, QType::FP32);
+    }
+    if (dflash) {
+        auto& d             = parameters_.draft;
+        const std::string p = "dflash2/";
+        add(d.feature_projection, p + "feature_projection", {4096, 20480}, 2, QType::BF16);
+        norm(d.context_norm, p + "context_norm", 4096, 2, QType::BF16);
+        norm(d.final_norm, p + "final_norm", 4096, 2, QType::BF16);
+        add(d.selector_projection, p + "selector/hidden_projection", {256, 4096}, 2, QType::BF16);
+        add(d.predecessor, p + "selector/predecessor_codebook", {154880, 256}, 2, QType::BF16);
+        add(d.successor, p + "selector/successor_codebook", {154880, 256}, 2, QType::BF16);
+        for (int i = 0; i < 5; ++i) {
+            auto& l      = d.layers[i];
+            const auto z = p + "layers/" + std::to_string(i) + "/";
+            norm(l.attention_norm, z + "attention_norm", 4096, 2, QType::BF16);
+            norm(l.ffn_norm, z + "ffn_norm", 4096, 2, QType::BF16);
+            add(l.query, z + "attention/query", {4096, 4096}, 2, QType::BF16);
+            add(l.key, z + "attention/key", {1024, 4096}, 2, QType::BF16);
+            add(l.value, z + "attention/value", {1024, 4096}, 2, QType::BF16);
+            add(l.output, z + "attention/output", {4096, 4096}, 2, QType::BF16);
+            norm(l.query_norm, z + "attention/query_norm", 128, 2, QType::BF16);
+            norm(l.key_norm, z + "attention/key_norm", 128, 2, QType::BF16);
+            mlp(l.ffn, z + "ffn/", 12288, 2);
+            for (auto pair : {std::pair{&l.attention_conv, "attention_conv/"},
+                              std::pair{&l.mlp_conv, "mlp_conv/"}}) {
+                add(pair.first->base_kernel, z + pair.second + "base_kernel", {2, 2, 4096}, 2,
+                    QType::BF16);
+                add(pair.first->kernel_projection, z + pair.second + "kernel_projection",
+                    {1024, 4096}, 2, QType::BF16);
+            }
         }
     }
     const auto tokenizer = binders[0]->resource("text", "gguf_tokenizer");

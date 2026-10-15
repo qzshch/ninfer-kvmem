@@ -21,12 +21,12 @@ include(CTest)
 get_filename_component(NINFER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
 # Compile current v3/KVMem physical storage code directly; Ops/Model/Program/Engine
-# are separate consumers below. Graph execution remains outside this profile.
+# are separate consumers below. Core owns real HIP device Graph resources.
 set(core_sources
   arena.cu device.cu dtype.cpp tensor.cpp layout.cpp weight_view.cpp
   host_worker_pool.cpp gdn_replay_records.cpp cyclic_kv_cache.cpp
   host_context_arena.cpp host_kv_arena.cpp paged_kv_cache.cpp
-  linear_attention_state.cpp)
+  linear_attention_state.cpp decode_graph.cpp indexed_transfer.hip)
 list(TRANSFORM core_sources PREPEND "${NINFER_ROOT}/src/core/")
 set_source_files_properties("${NINFER_ROOT}/src/core/arena.cu"
   "${NINFER_ROOT}/src/core/device.cu" PROPERTIES LANGUAGE CXX)
@@ -97,6 +97,15 @@ add_executable(ninfer_k100_generate ninfer_generate.cpp)
 target_link_libraries(ninfer_k100_generate PRIVATE ninfer_k100_engine)
 
 if(BUILD_TESTING)
+  # Real artifact qualification is opt-in, never an implicit 145-GiB CTest load.
+  add_executable(ninfer_k100_engine_check tests/engine_batch.cpp)
+  target_link_libraries(ninfer_k100_engine_check PRIVATE ninfer_k100_engine)
+  add_executable(k100_resident_batch_test tests/resident_batch.cpp)
+  target_link_libraries(k100_resident_batch_test PRIVATE ninfer_k100_sparse_latent kvmem_core)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_resident_batch_device${device} COMMAND k100_resident_batch_test)
+    set_tests_properties(k100_resident_batch_device${device} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}" RUN_SERIAL TRUE TIMEOUT 180)
+  endforeach()
   add_executable(k100_tokenizer_test tests/tokenizer.cpp)
   target_link_libraries(k100_tokenizer_test PRIVATE ninfer_k100_glm_frontend)
   set(NINFER_K100_TOKENIZER_FIXTURE "" CACHE FILEPATH "Pinned official CPU tokenizer/Jinja parity fixture")

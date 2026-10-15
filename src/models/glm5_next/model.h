@@ -64,11 +64,18 @@ struct DraftParameters {
     std::array<DraftLayerParameters, 5> layers;
 };
 
+struct MtpParameters {
+    Weight fusion;
+    Tensor embedding_norm, hidden_norm, output_norm;
+    LayerParameters layer;
+};
+
 struct Parameters {
     Weight embedding, output_head;
     Tensor output_norm;
     std::array<LayerParameters, 45> layers;
     DraftParameters draft;
+    MtpParameters mtp;
 };
 
 // Immutable model owns original encoded device backing and tokenizer metadata.
@@ -77,7 +84,7 @@ struct Parameters {
 class Model {
 public:
     Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devices,
-          const StartupObserver* observer = nullptr);
+          const StartupObserver* observer = nullptr, bool dflash = true, bool mtp = false);
     ~Model();
     Model(const Model&)            = delete;
     Model& operator=(const Model&) = delete;

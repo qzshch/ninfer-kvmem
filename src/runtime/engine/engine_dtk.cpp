@@ -109,25 +109,32 @@ public:
     std::condition_variable ready;
     std::deque<std::shared_ptr<Job>> pending;
     std::shared_ptr<Job> active;
+    std::array<std::shared_ptr<Job>, 8> active_lanes;
     bool stopping = false;
     std::thread worker;
     std::uint64_t next_id = 1;
 
     explicit Impl(EngineOptions input) : options(std::move(input)) {
-        if (options.device != 0 || options.max_concurrency != 1 || options.max_context < 1 ||
-            options.max_context > 32768 || options.max_pending_requests < 1 ||
-            options.use_cuda_graph || options.enable_vision ||
+        if (options.device != 0 || (options.max_concurrency < 1 || options.max_concurrency > 8) ||
+            options.max_context < 1 || options.max_context > 32768 ||
+            options.max_pending_requests < 1 || options.enable_vision ||
             options.purpose != EnginePurpose::Generation ||
             options.kv_cache != KvCacheStorage::BFloat16 ||
             options.kv_capacity.mode != KvCapacityMode::Explicit ||
             options.kv_capacity.explicit_tokens != options.max_context)
             throw std::invalid_argument(
-                "DTK resident GLM requires devices 0,1,2; one lane; explicit BF16 "
-                "KV=context<=32768; generation; graphs/vision disabled");
+                "DTK resident GLM requires devices 0,1,2; 1..8 lanes; explicit BF16 "
+                "KV=context<=32768; generation; vision disabled");
         if (options.speculative.backend != SpeculativeBackend::None &&
-            (options.speculative.backend != SpeculativeBackend::DFlash2 ||
-             options.speculative.draft_tokens != 7))
-            throw std::invalid_argument("DTK GLM speculation requires its DFlash2 K7 companion");
+            !((options.speculative.backend == SpeculativeBackend::DFlash2 &&
+               options.speculative.draft_tokens == 7) ||
+              (options.speculative.backend == SpeculativeBackend::Mtp &&
+               options.speculative.draft_tokens == 1)))
+            throw std::invalid_argument("DTK GLM speculation supports DFlash2 K7 or native MTP K1");
+        if (options.speculative.backend != SpeculativeBackend::None && options.max_concurrency != 1)
+            throw std::invalid_argument("DTK speculative execution requires one resident lane");
+        if (options.speculative.backend == SpeculativeBackend::DFlash2 && options.use_cuda_graph)
+            throw std::invalid_argument("DFlash profile requires eager execution");
         const auto start = Clock::now();
         int count        = 0;
         CUDA_CHECK(cudaGetDeviceCount(&count));
@@ -139,17 +146,23 @@ public:
             pointers[d] = devices[d].get();
         }
         artifact::Reader reader(options.artifact_path);
-        model =
-            std::make_unique<models::glm5_next::Model>(reader, pointers, &options.startup_observer);
+        model = std::make_unique<models::glm5_next::Model>(
+            reader, pointers, &options.startup_observer,
+            options.speculative.backend == SpeculativeBackend::DFlash2,
+            options.speculative.backend == SpeculativeBackend::Mtp);
         frontend = std::make_unique<models::glm5_next::Frontend>(model->tokenizer());
         program  = std::make_unique<models::glm5_next::Program>(
             *model, pointers,
-            models::glm5_next::ProgramOptions{static_cast<int>(options.max_context),
-                                              options.kvmem_window_pages});
-        load.architecture       = "Glm5NextForConditionalGeneration";
-        load.model_name         = "GLM-5.3-Flash UD-IQ4_XS with DFlash2";
-        load.cuda_sync_mode     = devices[0]->sync_mode();
-        load.prefill_signature  = "DTK; three resident layer stages; one lane; greedy";
+            models::glm5_next::ProgramOptions{
+                static_cast<int>(options.max_context), options.kvmem_window_pages,
+                static_cast<int>(options.max_concurrency), options.use_cuda_graph,
+                options.speculative.backend == SpeculativeBackend::DFlash2,
+                options.speculative.backend == SpeculativeBackend::Mtp});
+        load.architecture   = "Glm5NextForConditionalGeneration";
+        load.model_name     = "GLM-5.3-Flash UD-IQ4_XS";
+        load.cuda_sync_mode = devices[0]->sync_mode();
+        load.prefill_signature =
+            "DTK; three resident layer stages; compact independent rows; greedy";
         load.load_seconds       = seconds(start);
         memory.device           = 0;
         memory.max_context      = options.max_context;
@@ -172,7 +185,7 @@ public:
         memory.sequence.used_bytes = memory.sequence.peak_used_bytes =
             memory.sequence.capacity_bytes;
         memory.workspace.capacity_bytes = 6ULL * 1024 * 1024 * 1024;
-        runtime.lane_count              = 1;
+        runtime.lane_count              = options.max_concurrency;
         worker                          = std::thread([this] { run(); });
     }
 
@@ -182,12 +195,45 @@ public:
             stopping = true;
             for (auto& j : pending) j->cancel = true;
             if (active) active->cancel = true;
+            for (auto& job : active_lanes)
+                if (job) job->cancel = true;
         }
         ready.notify_all();
         if (worker.joinable()) worker.join();
         program.reset();
         frontend.reset();
         model.reset();
+    }
+
+    bool append_token(const std::shared_ptr<Job>& job, GenerationResult& result, TokenId token,
+                      unsigned limit) {
+        result.generated_token_ids.push_back(token);
+        auto output = frontend->output(result.generated_token_ids, job->summary.starts_in_reasoning,
+                                       job->options.output.preserve_special_tokens);
+        result.content          = std::move(output.content);
+        result.reasoning        = std::move(output.reasoning);
+        result.reasoning_tokens = output.reasoning_tokens;
+        const auto& stop        = job->options.stop;
+        if ((stop.include_model_defaults && frontend->default_stop(token)) ||
+            std::find(stop.token_ids.begin(), stop.token_ids.end(), token) !=
+                stop.token_ids.end()) {
+            result.finish_reason = FinishReason::StopToken;
+            return false;
+        }
+        for (const auto& s : stop.strings) {
+            const auto at = result.content.find(s.text);
+            if (at != std::string::npos) {
+                result.content.resize(at + (s.include_in_output ? s.text.size() : 0));
+                result.matched_stop_string = s.text;
+                result.finish_reason       = FinishReason::StopString;
+                return false;
+            }
+        }
+        if (result.generated_token_ids.size() >= limit) {
+            result.finish_reason = FinishReason::OutputLimit;
+            return false;
+        }
+        return true;
     }
 
     GenerationResult execute(const std::shared_ptr<Job>& job) {
@@ -199,18 +245,23 @@ public:
         result.engine_timing.queue_wait_seconds =
             std::chrono::duration<double>(started - job->submitted).count();
         result.speculative.backend = options.speculative.backend;
-        result.speculative.enabled = options.speculative.backend == SpeculativeBackend::DFlash2;
-        result.speculative.draft_window = result.speculative.enabled ? 7 : 0;
-        result.speculative.accepted_per_position.assign(result.speculative.enabled ? 7 : 0, 0);
+        result.speculative.enabled = options.speculative.backend != SpeculativeBackend::None;
+        result.speculative.draft_window =
+            result.speculative.enabled ? options.speculative.draft_tokens : 0;
+        result.speculative.accepted_per_position.assign(result.speculative.draft_window, 0);
         program->reset();
         auto before    = program->stats();
         TokenId anchor = 0;
-        for (auto token : job->prompt) {
+        for (std::size_t index = 0; index < job->prompt.size(); ++index) {
+            const auto token = job->prompt[index];
             if (job->cancel) {
                 result.finish_reason = FinishReason::Cancelled;
                 break;
             }
             anchor = program->target(token);
+            if (options.speculative.backend == SpeculativeBackend::Mtp &&
+                index + 1 < job->prompt.size())
+                program->mtp_forward(job->prompt[index + 1], false);
             ++result.computed_prefill_tokens;
         }
         result.timings.prefill_seconds     = seconds(started);
@@ -221,37 +272,8 @@ public:
             job->options.execution.requested_output_tokens
                 ? job->options.execution.requested_output_tokens
                 : std::min<std::uint32_t>(128, options.max_context - job->prompt.size());
-        auto append = [&](TokenId token) {
-            result.generated_token_ids.push_back(token);
-            auto output =
-                frontend->output(result.generated_token_ids, job->summary.starts_in_reasoning,
-                                 job->options.output.preserve_special_tokens);
-            result.content          = std::move(output.content);
-            result.reasoning        = std::move(output.reasoning);
-            result.reasoning_tokens = output.reasoning_tokens;
-            const auto& stop        = job->options.stop;
-            if ((stop.include_model_defaults && frontend->default_stop(token)) ||
-                std::find(stop.token_ids.begin(), stop.token_ids.end(), token) !=
-                    stop.token_ids.end()) {
-                result.finish_reason = FinishReason::StopToken;
-                return false;
-            }
-            for (const auto& s : stop.strings) {
-                const auto at = result.content.find(s.text);
-                if (at != std::string::npos) {
-                    result.content.resize(at + (s.include_in_output ? s.text.size() : 0));
-                    result.matched_stop_string = s.text;
-                    result.finish_reason       = FinishReason::StopString;
-                    return false;
-                }
-            }
-            if (result.generated_token_ids.size() >= limit) {
-                result.finish_reason = FinishReason::OutputLimit;
-                return false;
-            }
-            return true;
-        };
-        bool keep = result.finish_reason != FinishReason::Cancelled && limit > 0;
+        auto append = [&](TokenId token) { return append_token(job, result, token, limit); };
+        bool keep   = result.finish_reason != FinishReason::Cancelled && limit > 0;
         if (keep) keep = append(anchor);
         while (keep) {
             if (job->cancel) {
@@ -266,6 +288,27 @@ public:
             if (!result.speculative.enabled) {
                 anchor = program->target(anchor);
                 keep   = append(anchor);
+                continue;
+            }
+            if (options.speculative.backend == SpeculativeBackend::Mtp) {
+                // K1 proposal with exact greedy validation. This first native
+                // implementation verifies target transitions serially. It does
+                // not claim the throughput of a temporally batched verifier.
+                const auto proposal = program->mtp_forward(anchor, true);
+                anchor              = program->target(anchor);
+                ++result.speculative.rounds;
+                ++result.speculative.drafted_tokens;
+                if (proposal == anchor) {
+                    ++result.speculative.accepted_tokens;
+                    ++result.speculative.accepted_per_position[0];
+                    keep = append(proposal);
+                    if (keep && room > 1) {
+                        program->mtp_forward(proposal, false);
+                        anchor = program->target(proposal);
+                        keep   = append(anchor);
+                    }
+                } else
+                    keep = append(anchor);
                 continue;
             }
             const int width = std::min<int>(
@@ -315,7 +358,177 @@ public:
         return result;
     }
 
+    struct Lane {
+        std::shared_ptr<Job> job;
+        GenerationResult result;
+        Clock::time_point started, decode_start;
+        std::size_t prompt_offset = 0;
+        unsigned limit            = 0;
+        TokenId anchor            = 0;
+        std::uint64_t selections = 0, restrictions = 0;
+    };
+
+    void publish(Lane& lane) {
+        auto& result = lane.result;
+        if (lane.decode_start != Clock::time_point{})
+            result.timings.decode_seconds = seconds(lane.decode_start);
+        else
+            result.timings.prefill_seconds = seconds(lane.started);
+        result.timings.total_seconds                    = seconds(lane.started);
+        result.timings.generation_wall_seconds          = result.timings.decode_seconds;
+        result.timings.prompt_wall_seconds              = result.timings.prefill_seconds;
+        result.timings.kvmem.enabled                    = options.kvmem_window_pages != 0;
+        result.timings.kvmem.selection_calls            = lane.selections;
+        result.timings.kvmem.selection_restricted_calls = lane.restrictions;
+        {
+            std::lock_guard lock(mutex);
+            runtime.prompt_tokens += result.prompt.prompt_tokens;
+            runtime.generated_tokens += result.generated_token_ids.size();
+            runtime.computed_prefill_tokens += result.computed_prefill_tokens;
+            memory.workspace.peak_used_bytes = 0;
+            for (auto peak : program->stats().workspace_peak)
+                memory.workspace.peak_used_bytes += peak;
+            memory.workspace_logical_peak_bytes = memory.workspace.peak_used_bytes;
+            runtime.device_graph_captures       = program->stats().graph_captures;
+            runtime.device_graph_replays        = program->stats().graph_replays;
+        }
+        lane.job->result.set_value(std::move(result));
+    }
+
+    void run_batched() {
+        std::array<std::unique_ptr<Lane>, 8> lanes;
+        for (;;) {
+            {
+                std::unique_lock lock(mutex);
+                const auto idle = [&] {
+                    return std::none_of(lanes.begin(), lanes.end(),
+                                        [](const auto& x) { return bool(x); });
+                };
+                if (idle() && pending.empty())
+                    ready.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (stopping && pending.empty() && idle()) return;
+                for (unsigned slot = 0; slot < options.max_concurrency && !pending.empty();
+                     ++slot) {
+                    if (lanes[slot]) continue;
+                    auto job = pending.front();
+                    pending.pop_front();
+                    if (!available ||
+                        (job->deadline != Clock::time_point{} && Clock::now() >= job->deadline)) {
+                        job->result.set_exception(std::make_exception_ptr(std::runtime_error(
+                            !available ? "DTK Engine unavailable"
+                                       : "DTK request pending deadline exceeded")));
+                        continue;
+                    }
+                    auto lane                            = std::make_unique<Lane>();
+                    lane->job                            = job;
+                    lane->started                        = Clock::now();
+                    lane->result.engine_request_id       = job->id;
+                    lane->result.prompt                  = job->summary;
+                    lane->result.timings.prepare_seconds = job->preparation.seconds;
+                    lane->result.engine_timing.queue_wait_seconds =
+                        std::chrono::duration<double>(lane->started - job->submitted).count();
+                    lane->limit =
+                        job->options.execution.requested_output_tokens
+                            ? job->options.execution.requested_output_tokens
+                            : std::min<unsigned>(128, options.max_context - job->prompt.size());
+                    active_lanes[slot] = job;
+                    lanes[slot]        = std::move(lane);
+                    try {
+                        program->reset_lane(slot);
+                    } catch (...) {
+                        available = false;
+                        job->result.set_exception(std::current_exception());
+                        lanes[slot].reset();
+                        active_lanes[slot].reset();
+                    }
+                }
+            }
+            try {
+                std::vector<int> tokens, slots;
+                std::vector<bool> prefill;
+                for (unsigned slot = 0; slot < options.max_concurrency; ++slot) {
+                    if (!lanes[slot]) continue;
+                    auto& lane = *lanes[slot];
+                    if (lane.job->cancel)
+                        lane.result.finish_reason = FinishReason::Cancelled;
+                    else if (program->frontier(slot) >= static_cast<int>(options.max_context))
+                        lane.result.finish_reason = FinishReason::ContextCapacity;
+                    if (lane.result.finish_reason != FinishReason::None) continue;
+                    const bool initial = lane.prompt_offset < lane.job->prompt.size();
+                    tokens.push_back(initial ? lane.job->prompt[lane.prompt_offset] : lane.anchor);
+                    slots.push_back(slot);
+                    prefill.push_back(initial);
+                }
+                if (!tokens.empty()) {
+                    auto result                = program->target_batch(tokens, slots);
+                    std::uint64_t prefill_rows = 0, decode_rows = 0, committed_rows = 0;
+                    for (unsigned row = 0; row < slots.size(); ++row) {
+                        auto& lane = *lanes[slots[row]];
+                        if (options.kvmem_window_pages) {
+                            lane.selections += 11;
+                            if ((program->frontier(slots[row]) + 127) / 128 >
+                                static_cast<int>(options.kvmem_window_pages / 2))
+                                lane.restrictions += 11;
+                        }
+                        lane.anchor = result[row];
+                        if (prefill[row]) {
+                            ++prefill_rows;
+                            ++lane.prompt_offset;
+                            ++lane.result.computed_prefill_tokens;
+                            if (lane.prompt_offset != lane.job->prompt.size()) continue;
+                            lane.result.timings.prefill_seconds = seconds(lane.started);
+                            lane.result.timings.first_token_seconds =
+                                lane.result.timings.prefill_seconds;
+                            lane.decode_start = Clock::now();
+                            if (!lane.limit) {
+                                lane.result.finish_reason = FinishReason::OutputLimit;
+                                continue;
+                            }
+                        } else
+                            ++decode_rows;
+                        if (lane.job->cancel)
+                            lane.result.finish_reason = FinishReason::Cancelled;
+                        else {
+                            append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                            if (!prefill[row]) ++committed_rows;
+                        }
+                    }
+                    std::lock_guard lock(mutex);
+                    if (prefill_rows && slots.size() > 1) {
+                        ++runtime.packed_prefill_batches;
+                        runtime.packed_prefill_tokens += prefill_rows;
+                    }
+                    if (decode_rows) {
+                        ++runtime.decode_rounds;
+                        runtime.decode_row_rounds += decode_rows;
+                        runtime.committed_decode_tokens += committed_rows;
+                    }
+                }
+                for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
+                    if (lanes[slot] && lanes[slot]->result.finish_reason != FinishReason::None) {
+                        publish(*lanes[slot]);
+                        lanes[slot].reset();
+                        std::lock_guard lock(mutex);
+                        active_lanes[slot].reset();
+                    }
+            } catch (...) {
+                available = false;
+                for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
+                    if (lanes[slot]) {
+                        lanes[slot]->job->result.set_exception(std::current_exception());
+                        lanes[slot].reset();
+                        std::lock_guard lock(mutex);
+                        active_lanes[slot].reset();
+                    }
+            }
+        }
+    }
+
     void run() {
+        if (options.speculative.backend == SpeculativeBackend::None) {
+            run_batched();
+            return;
+        }
         for (;;) {
             std::shared_ptr<Job> job;
             {
@@ -348,6 +561,8 @@ public:
                     for (auto peak : program->stats().workspace_peak)
                         memory.workspace.peak_used_bytes += peak;
                     memory.workspace_logical_peak_bytes = memory.workspace.peak_used_bytes;
+                    runtime.device_graph_captures       = program->stats().graph_captures;
+                    runtime.device_graph_replays        = program->stats().graph_replays;
                 }
                 job->result.set_value(std::move(result));
             } catch (...) {

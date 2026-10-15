@@ -3,6 +3,46 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+// Compact independent sequences. slots/positions are device arrays [tokens];
+// persistent caches are [resident_lanes, capacity, width]. Positions are the
+// append frontier before this transition. C=capacity in 1..32768, B=tokens in
+// 1..8. Caller supplies distinct valid physical slots and positions in [0,C).
+// Buffers are device-resident, naturally aligned and disjoint. No allocation or
+// host metadata round trip; values outside each declared write region survive.
+// Append latent [B,512], key/gate [B,128] FP32 to BF16 caches; bias [4,128].
+// The pooling formula and BF16 boundaries are identical to index_pool_append.
+void resident_index_append(const float* latent, const float* key, const float* gate,
+                           const float* bias, std::uint16_t* latents, std::uint16_t* keys,
+                           std::uint16_t* gates, std::uint16_t* pools, const std::int32_t* slots,
+                           const std::int32_t* positions, int capacity, int tokens,
+                           cudaStream_t stream);
+// Retrieval state means [lanes,ceil(C/128),128] stores FP32 arithmetic means
+// of each completed 128-token BF16 key block. At a newly completed block, update
+// only that mean with an ordered FP32 sum. query [B,32,128] sums heads in FP32;
+// score each full block by FP64 cosine, cast score FP32 (zero norm -> zero).
+// Select one sink, one most recent block (including partial), then remaining
+// budget by descending score/lower block-id ties. NaN scores are unranked.
+// allowed [B,ceil(C/64)] marks those blocks' pages. Prior full means must be
+// initialized. No request lifetime or sequence frontier is changed by this Op.
+void resident_retrieval(const float* query, const std::uint16_t* keys, float* means,
+                        std::uint8_t* allowed, const std::int32_t* slots,
+                        const std::int32_t* positions, int capacity, int tokens, int budget_blocks,
+                        cudaStream_t stream);
+// Batch form of index_pool_scores + index_pool_select: query [B,32,128],
+// weights [B,32], cache pools [lanes,ceil(C/4),128]. tier in 4..32768 must cover
+// every visible frontier; it sizes masked work only. Scratch scores [B,8192],
+// ids [B,2051]. Optional allowed [B,ceil(C/64)] uses the same mask semantics.
+void resident_pool_select(const float* query, const float* weights, const std::uint16_t* pools,
+                          const std::uint8_t* allowed, float* scores, std::int32_t* ids,
+                          const std::int32_t* slots, const std::int32_t* positions, int capacity,
+                          int tier, int tokens, cudaStream_t stream);
+// Batch MLA: query/output [B,64,512], cache [lanes,C,512] BF16,
+// ids [B,2051] distinct visible offsets or -1; probabilities [B,64,2051].
+// Complete softmax(Q*KV^T/16)*KV, FP32 score/probability/value accumulation.
+void resident_sparse_attention(const float* query, const std::uint16_t* latents,
+                               const std::int32_t* ids, float* probabilities, float* out,
+                               const std::int32_t* slots, int capacity, int tokens,
+                               cudaStream_t stream);
 // GLM DSA index mathematics. All cache arrays are caller-owned device buffers.
 // Append one BF16-represented key/gate [128] into full-position BF16 arrays and
 // publish a complete four-token pool when position%4==3. Position bias [4,128]

@@ -1092,6 +1092,9 @@ struct RuntimeStats {
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
     // Decode batch executions and the sum of their batch sizes.
+    // Actual device graph definitions instantiated and executions replayed.
+    std::uint64_t device_graph_captures = 0;
+    std::uint64_t device_graph_replays = 0;
     std::uint64_t decode_rounds             = 0;
     std::uint64_t decode_row_rounds         = 0;
     std::uint32_t running_requests          = 0;

@@ -6,6 +6,7 @@
 #include "ninfer/ops/resident_transform.h"
 #include "ninfer/ops/sparse_latent_attention.h"
 #include "ninfer/ops/dflash_block.h"
+#include "core/indexed_transfer.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -21,11 +22,15 @@ const float* fp(const Tensor& x) { return static_cast<const float*>(x.data); }
 
 Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, ProgramOptions options)
     : model_(model), parameters_(model.parameters()), devices_(devices), options_(options) {
-    if (options.max_context < 1 || options.max_context > 32768 ||
+    if (options.max_lanes < 1 || options.max_lanes > 8 ||
+        (options.draft && (options.max_lanes != 1 || options.graph)) || options.max_context < 1 ||
+        options.max_context > 32768 ||
         (options.kvmem_window_pages &&
          (options.kvmem_window_pages < 4 || options.kvmem_window_pages % 2)))
         throw std::invalid_argument(
             "GLM resident Program requires context 1..32768 and even KVMem window >=4 pages");
+    if (options.mtp && (options.draft || options.max_lanes != 1))
+        throw std::invalid_argument("native MTP requires one compact target lane");
     std::array<std::size_t, 3> counts{};
     for (const auto& l : parameters_.layers)
         if (l.linear) ++counts[l.device];
@@ -39,11 +44,17 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 auto e = hipDeviceEnablePeerAccess(p, 0);
                 if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) CUDA_CHECK(e);
             }
-        const auto bytes = counts[d] * (StateFloats + ConvFloats) * 4;
-        for (auto& state : state_[d].recurrent) state = DeviceBuffer(bytes);
-        state_[d].streams          = DeviceBuffer(4 * H * 4);
+        const auto bytes     = counts[d] * (StateFloats + ConvFloats) * 4;
+        recurrent_stride_[d] = bytes;
+        for (int slot = 0; slot < (options.draft ? 9 : 1); ++slot)
+            state_[d].recurrent[slot] = DeviceBuffer(bytes * options.max_lanes);
+        state_[d].streams          = DeviceBuffer(4 * H * 4 * options.max_lanes);
+        state_[d].metadata         = DeviceBuffer(32 * 4);
+        state_[d].hidden           = DeviceBuffer(H * 4 * options.max_lanes);
         state_[d].workspace        = std::make_unique<WorkspaceArena>(2ULL * 1024 * 1024 * 1024);
-        stats_.persistent_bytes[d] = bytes * 9 + 4 * H * 4;
+        stats_.persistent_bytes[d] = bytes * (options.draft ? 9 : options.max_lanes) +
+                                     state_[d].streams.bytes + state_[d].metadata.bytes +
+                                     state_[d].hidden.bytes;
     }
     std::array<std::size_t, 3> cursor{};
     for (int i = 0; i < 45; ++i) {
@@ -57,23 +68,40 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
             for (int j = 0; j < 3; ++j) l.conv[j] = base + StateFloats + j * 8192 * 3;
             cursor[d] += StateFloats + ConvFloats;
         } else {
-            const auto context = options_.max_context;
+            const auto context = options_.max_context * options_.max_lanes;
             l.latent           = DeviceBuffer(static_cast<std::size_t>(context) * 512 * 2);
             l.keys             = DeviceBuffer(static_cast<std::size_t>(context) * 128 * 2);
             l.gates            = DeviceBuffer(l.keys.bytes);
-            l.pools     = DeviceBuffer(static_cast<std::size_t>((context + 3) / 4) * 128 * 2);
-            l.retrieval = std::make_unique<kvmem::RetrievalIndex>(128, 1, 1, 128);
+            l.pools = DeviceBuffer(static_cast<std::size_t>((options_.max_context + 3) / 4) *
+                                   options_.max_lanes * 128 * 2);
+            l.means = DeviceBuffer(static_cast<std::size_t>((options_.max_context + 127) / 128) *
+                                   options_.max_lanes * 128 * 4);
+            if (options_.draft)
+                l.retrieval = std::make_unique<kvmem::RetrievalIndex>(128, 1, 1, 128);
             stats_.persistent_bytes[d] +=
-                l.latent.bytes + l.keys.bytes + l.gates.bytes + l.pools.bytes;
+                l.latent.bytes + l.keys.bytes + l.gates.bytes + l.pools.bytes + l.means.bytes;
         }
     }
     devices_[2]->bind_to_current_thread();
-    features_ = DeviceBuffer(static_cast<std::size_t>(FeatureSlots) * Features * 2);
+    if (options.draft)
+        features_ = DeviceBuffer(static_cast<std::size_t>(FeatureSlots) * Features * 2);
     stats_.persistent_bytes[2] += features_.bytes;
-    for (auto& c : draft_cache_) {
-        c.key   = DeviceBuffer(static_cast<std::size_t>(FeatureSlots) * 1024 * 2);
-        c.value = DeviceBuffer(c.key.bytes);
-        stats_.persistent_bytes[2] += c.key.bytes + c.value.bytes;
+    if (options.draft)
+        for (auto& c : draft_cache_) {
+            c.key   = DeviceBuffer(static_cast<std::size_t>(FeatureSlots) * 1024 * 2);
+            c.value = DeviceBuffer(c.key.bytes);
+            stats_.persistent_bytes[2] += c.key.bytes + c.value.bytes;
+        }
+    if (options.mtp) {
+        auto& l  = mtp_state_;
+        l.latent = DeviceBuffer(static_cast<std::size_t>(options.max_context) * 512 * 2);
+        l.keys   = DeviceBuffer(static_cast<std::size_t>(options.max_context) * 128 * 2);
+        l.gates  = DeviceBuffer(l.keys.bytes);
+        l.pools  = DeviceBuffer(static_cast<std::size_t>((options.max_context + 3) / 4) * 128 * 2);
+        l.means =
+            DeviceBuffer(static_cast<std::size_t>((options.max_context + 127) / 128) * 128 * 4);
+        stats_.persistent_bytes[2] +=
+            l.latent.bytes + l.keys.bytes + l.gates.bytes + l.pools.bytes + l.means.bytes;
     }
     reset();
 }
@@ -90,12 +118,20 @@ Program::~Program() {
                 layers_[i].keys   = {};
                 layers_[i].gates  = {};
                 layers_[i].pools  = {};
+                layers_[i].means  = {};
             }
+        for (auto& [key, family] : graphs_) {
+            family[d].reset();
+            if (d == 0) family[3].reset();
+        }
         state_[d].workspace.reset();
-        state_[d].streams = {};
+        state_[d].streams  = {};
+        state_[d].metadata = {};
+        state_[d].hidden   = {};
         for (auto& s : state_[d].recurrent) s = {};
         if (d == 2) {
-            features_ = {};
+            mtp_state_ = {};
+            features_  = {};
             for (auto& c : draft_cache_) {
                 c.key   = {};
                 c.value = {};
@@ -128,53 +164,76 @@ void Program::mlp(const float* x, const MlpParameters& p, float* out, int interm
 }
 
 void Program::hyper_prepare(const float* residual, const HyperParameters& p, float* coeff,
-                            float* out, int d) {
+                            float* out, int d, int t) {
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
-    auto* norm   = floats(w, 4 * H);
-    auto* mix    = floats(w, 24);
+    auto* norm   = floats(w, 4 * H * t);
+    auto* mix    = floats(w, 24 * t);
     const auto s = devices_[d]->stream;
-    ops::resident_norm(residual, nullptr, nullptr, nullptr, norm, 4 * H, 1, 1e-5f, false, false, s);
-    projection(norm, p.projection, mix, 1, d, false);
-    ops::hyper_connection_coefficients(mix, fp(p.base), fp(p.scale), coeff, 1, 20, 1e-6f, s);
-    ops::hyper_connection_collapse(residual, coeff, out, H, 1, s);
+    ops::resident_norm(residual, nullptr, nullptr, nullptr, norm, 4 * H, t, 1e-5f, false, false, s);
+    projection(norm, p.projection, mix, t, d, false);
+    ops::hyper_connection_coefficients(mix, fp(p.base), fp(p.scale), coeff, t, 20, 1e-6f, s);
+    ops::hyper_connection_collapse(residual, coeff, out, H, t, s);
 }
 
-void Program::kda(const float* x, const KdaParameters& p, LayerState& state, float* out, int d) {
+void Program::kda(const float* x, const KdaParameters& p, LayerState& state, float* out, int d,
+                  int t) {
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
-    float *q = floats(w, 8192), *k = floats(w, 8192), *v = floats(w, 8192), *g = floats(w, 8192),
-          *gate = floats(w, 8192), *small = floats(w, 128), *beta = floats(w, 64),
-          *result = floats(w, 8192);
-    projection(x, p.query, q, 1, d);
-    projection(x, p.key, k, 1, d);
-    projection(x, p.value, v, 1, d);
-    ops::resident_causal_conv(q, p.query_conv, state.conv[0], q, 8192, 1, s);
-    ops::resident_causal_conv(k, p.key_conv, state.conv[1], k, 8192, 1, s);
-    ops::resident_causal_conv(v, p.value_conv, state.conv[2], v, 8192, 1, s);
-    projection(x, p.forget_in, small, 1, d);
-    projection(small, p.forget_out, g, 1, d);
-    projection(x, p.output_gate_in, small, 1, d);
-    projection(small, p.output_gate_out, gate, 1, d);
-    projection(x, p.input_gate, beta, 1, d);
-    auto qb = w.alloc(DType::BF16, {128, 64, 1}), kb = w.alloc(DType::BF16, {128, 64, 1}),
-         vb = w.alloc(DType::BF16, {128, 64, 1}), gb = w.alloc(DType::BF16, {128, 64, 1}),
-         bb = w.alloc(DType::BF16, {64, 1}), yb = w.alloc(DType::BF16, {128, 64, 1});
-    ops::pack_bf16(q, static_cast<std::uint16_t*>(qb.data), 8192, s);
-    ops::pack_bf16(k, static_cast<std::uint16_t*>(kb.data), 8192, s);
-    ops::pack_bf16(v, static_cast<std::uint16_t*>(vb.data), 8192, s);
-    ops::pack_bf16(g, static_cast<std::uint16_t*>(gb.data), 8192, s);
-    ops::pack_bf16(beta, static_cast<std::uint16_t*>(bb.data), 64, s);
-    Tensor recurrent(state.recurrent, DType::FP32, {128, 128, 64}),
-        bias = p.decay_bias.reshape({128, 64});
-    ops::kimi_delta_attention(qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
-                              1.f / std::sqrt(128.f), w, recurrent, yb,
-                              devices_[d]->execution_view(), ops::KdaDecayParameter::NegativeRate);
-    ops::unpack_bf16(static_cast<std::uint16_t*>(yb.data), result, 8192, s);
-    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, 64, 1e-5f, false, true,
-                       s);
-    projection(result, p.output, out, 1, d);
+    float *q = floats(w, 8192 * t), *k = floats(w, 8192 * t), *v = floats(w, 8192 * t),
+          *g = floats(w, 8192 * t), *gate = floats(w, 8192 * t), *small = floats(w, 128 * t),
+          *beta = floats(w, 64 * t), *result = floats(w, 8192 * t);
+    const bool compact_state = !options_.draft && options_.max_lanes > 1;
+    auto* recurrent          = state.recurrent;
+    if (compact_state) {
+        recurrent = floats(w, t * (StateFloats + ConvFloats));
+        indexed_transfer(recurrent, state.recurrent,
+                         static_cast<const int*>(state_[d].metadata.p) + 8,
+                         (StateFloats + ConvFloats) * 4, recurrent_stride_[d], t, false, s);
+    }
+    projection(x, p.query, q, t, d);
+    projection(x, p.key, k, t, d);
+    projection(x, p.value, v, t, d);
+    for (int row = 0; row < t; ++row) {
+        auto* base = compact_state ? recurrent + row * (StateFloats + ConvFloats) : state.recurrent;
+        ops::resident_causal_conv(q + row * 8192, p.query_conv, base + StateFloats, q + row * 8192,
+                                  8192, 1, s);
+        ops::resident_causal_conv(k + row * 8192, p.key_conv, base + StateFloats + 8192 * 3,
+                                  k + row * 8192, 8192, 1, s);
+        ops::resident_causal_conv(v + row * 8192, p.value_conv, base + StateFloats + 8192 * 6,
+                                  v + row * 8192, 8192, 1, s);
+    }
+    projection(x, p.forget_in, small, t, d);
+    projection(small, p.forget_out, g, t, d);
+    projection(x, p.output_gate_in, small, t, d);
+    projection(small, p.output_gate_out, gate, t, d);
+    projection(x, p.input_gate, beta, t, d);
+    for (int row = 0; row < t; ++row) {
+        auto temp = w.scope();
+        auto qb = w.alloc(DType::BF16, {128, 64, 1}), kb = w.alloc(DType::BF16, {128, 64, 1}),
+             vb = w.alloc(DType::BF16, {128, 64, 1}), gb = w.alloc(DType::BF16, {128, 64, 1}),
+             bb = w.alloc(DType::BF16, {64, 1}), yb = w.alloc(DType::BF16, {128, 64, 1});
+        ops::pack_bf16(q + row * 8192, static_cast<std::uint16_t*>(qb.data), 8192, s);
+        ops::pack_bf16(k + row * 8192, static_cast<std::uint16_t*>(kb.data), 8192, s);
+        ops::pack_bf16(v + row * 8192, static_cast<std::uint16_t*>(vb.data), 8192, s);
+        ops::pack_bf16(g + row * 8192, static_cast<std::uint16_t*>(gb.data), 8192, s);
+        ops::pack_bf16(beta + row * 64, static_cast<std::uint16_t*>(bb.data), 64, s);
+        Tensor image(recurrent + (compact_state ? row * (StateFloats + ConvFloats) : 0),
+                     DType::FP32, {128, 128, 64});
+        auto bias = p.decay_bias.reshape({128, 64});
+        ops::kimi_delta_attention(
+            qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f, 1.f / std::sqrt(128.f), w, image,
+            yb, devices_[d]->execution_view(), ops::KdaDecayParameter::NegativeRate);
+        ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result + row * 8192, 8192, s);
+    }
+    if (compact_state)
+        indexed_transfer(recurrent, state.recurrent,
+                         static_cast<const int*>(state_[d].metadata.p) + 8,
+                         (StateFloats + ConvFloats) * 4, recurrent_stride_[d], t, true, s);
+    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, 64 * t, 1e-5f, false,
+                       true, s);
+    projection(result, p.output, out, t, d);
 }
 
 void Program::publish_retrieval_mean(LayerState& layer, int block, int d) {
@@ -189,94 +248,122 @@ void Program::publish_retrieval_mean(LayerState& layer, int block, int d) {
     layer.retrieval->write_block_mean(block, 0, mean);
 }
 
-void Program::mla(const float* x, const MlaParameters& p, LayerState& state, float* out, int d) {
+void Program::mla(const float* x, const MlaParameters& p, LayerState& state, float* out, int d,
+                  int t) {
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
-    auto *low = floats(w, 1536), *query = floats(w, 16384), *latent = floats(w, 512),
-         *absorbed = floats(w, 64 * 512), *attended = floats(w, 64 * 512),
-         *expanded = floats(w, 16384), *iq = floats(w, 4096), *ik = floats(w, 128),
-         *ig = floats(w, 128), *ih = floats(w, 32), *scores = floats(w, 8192),
-         *prob = floats(w, 64 * 2051);
-    auto* ids  = static_cast<std::int32_t*>(w.alloc_bytes(2051 * 4).data);
-    projection(x, p.query_lowrank, low, 1, d);
-    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, 1, 1e-5f, false, true, s);
-    projection(low, p.query_heads, query, 1, d);
-    projection(x, p.kv_latent, latent, 1, d);
-    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, 512, 1, 1e-5f, false, true, s);
-    ops::pack_bf16(latent, static_cast<std::uint16_t*>(state.latent.p) + position_ * 512, 512, s);
-    projection(low, p.index.query, iq, 1, d);
-    projection(x, p.index.key, ik, 1, d);
-    ops::resident_norm(ik, &p.index.key_norm, &p.index.key_norm_bias, nullptr, ik, 128, 1, 1e-6f,
+    auto *low = floats(w, (1536) * t), *query = floats(w, (16384) * t),
+         *latent = floats(w, (512) * t), *absorbed = floats(w, (64 * 512) * t),
+         *attended = floats(w, (64 * 512) * t), *expanded = floats(w, (16384) * t),
+         *iq = floats(w, (4096) * t), *ik = floats(w, (128) * t), *ig = floats(w, (128) * t),
+         *ih = floats(w, (32) * t), *scores = floats(w, (8192) * t),
+         *prob = floats(w, (64 * 2051) * t);
+    auto* ids  = static_cast<std::int32_t*>(w.alloc_bytes(2051 * 4 * t).data);
+    projection(x, p.query_lowrank, low, t, d);
+    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, t, 1e-5f, false, true, s);
+    projection(low, p.query_heads, query, t, d);
+    projection(x, p.kv_latent, latent, t, d);
+    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, 512, t, 1e-5f, false, true, s);
+    if (options_.draft)
+        ops::pack_bf16(latent, static_cast<std::uint16_t*>(state.latent.p) + position_ * 512, 512,
+                       s);
+    projection(low, p.index.query, iq, t, d);
+    projection(x, p.index.key, ik, t, d);
+    ops::resident_norm(ik, &p.index.key_norm, &p.index.key_norm_bias, nullptr, ik, 128, t, 1e-6f,
                        true, true, s);
-    projection(x, p.index.pool_gate, ig, 1, d);
-    projection(x, p.index.head_weights, ih, 1, d, false);
-    ops::index_pool_append(ik, ig, fp(p.index.position_bias),
-                           static_cast<std::uint16_t*>(state.keys.p),
-                           static_cast<std::uint16_t*>(state.gates.p),
-                           static_cast<std::uint16_t*>(state.pools.p), position_, s);
-    const std::uint8_t* allowed = nullptr;
-    if (options_.kvmem_window_pages) {
-        auto full = state.retrieval->append(1);
-        for (const auto& block : full) publish_retrieval_mean(state, block.block_id, d);
-        auto* feature = floats(w, 128);
-        ops::resident_sum_rows(iq, feature, 128, 32, s);
-        devices_[d]->synchronize();
-        std::array<float, 128> q{};
-        CUDA_CHECK(cudaMemcpy(q.data(), feature, sizeof(q), cudaMemcpyDeviceToHost));
-        std::vector<float> rank(state.retrieval->block_count(),
-                                std::numeric_limits<float>::quiet_NaN());
-        const std::array<std::uint32_t, 1> count{1};
-        for (unsigned b = 0; b < rank.size(); ++b)
-            if (state.retrieval->block(b).full)
-                (void)state.retrieval->score(b, q, count, rank[b]);
-        kvmem::BlockSelectionConfig config{128, options_.kvmem_window_pages / 2, 1, 1, 0};
-        auto selection = kvmem::select_blocks(*state.retrieval, rank, config);
-        std::vector<std::uint8_t> pages((options_.max_context + 63) / 64);
-        for (auto b : selection.selected)
-            for (int j = 0; j < 2; ++j)
-                if (b * 2 + j < pages.size()) pages[b * 2 + j] = 1;
-        auto mask = w.alloc_bytes(pages.size());
-        CUDA_CHECK(cudaMemcpy(mask.data, pages.data(), pages.size(), cudaMemcpyHostToDevice));
-        allowed = static_cast<const std::uint8_t*>(mask.data);
-        ++stats_.kvmem_selections;
-        if (selection.selected.size() < state.retrieval->block_count())
-            ++stats_.kvmem_restricted_steps;
+    projection(x, p.index.pool_gate, ig, t, d);
+    projection(x, p.index.head_weights, ih, t, d, false);
+    const auto* slots     = static_cast<const int*>(state_[d].metadata.p) + 8;
+    const auto* positions = static_cast<const int*>(state_[d].metadata.p) + 16;
+    if (options_.draft) {
+        ops::index_pool_append(ik, ig, fp(p.index.position_bias),
+                               static_cast<std::uint16_t*>(state.keys.p),
+                               static_cast<std::uint16_t*>(state.gates.p),
+                               static_cast<std::uint16_t*>(state.pools.p), position_, s);
+        const std::uint8_t* allowed = nullptr;
+        if (options_.kvmem_window_pages) {
+            auto full = state.retrieval->append(1);
+            for (const auto& block : full) publish_retrieval_mean(state, block.block_id, d);
+            auto* feature = floats(w, (128) * t);
+            ops::resident_sum_rows(iq, feature, 128, 32, s);
+            devices_[d]->synchronize();
+            std::array<float, 128> q{};
+            CUDA_CHECK(cudaMemcpy(q.data(), feature, sizeof(q), cudaMemcpyDeviceToHost));
+            std::vector<float> rank(state.retrieval->block_count(),
+                                    std::numeric_limits<float>::quiet_NaN());
+            const std::array<std::uint32_t, 1> count{1};
+            for (unsigned b = 0; b < rank.size(); ++b)
+                if (state.retrieval->block(b).full)
+                    (void)state.retrieval->score(b, q, count, rank[b]);
+            kvmem::BlockSelectionConfig config{128, options_.kvmem_window_pages / 2, 1, 1, 0};
+            auto selection = kvmem::select_blocks(*state.retrieval, rank, config);
+            std::vector<std::uint8_t> pages((options_.max_context + 63) / 64);
+            for (auto b : selection.selected)
+                for (int j = 0; j < 2; ++j)
+                    if (b * 2 + j < pages.size()) pages[b * 2 + j] = 1;
+            auto mask = w.alloc_bytes(pages.size());
+            CUDA_CHECK(cudaMemcpy(mask.data, pages.data(), pages.size(), cudaMemcpyHostToDevice));
+            allowed = static_cast<const std::uint8_t*>(mask.data);
+            ++stats_.kvmem_selections;
+            if (selection.selected.size() < state.retrieval->block_count())
+                ++stats_.kvmem_restricted_steps;
+        }
+        ops::index_pool_scores(iq, ih, static_cast<const std::uint16_t*>(state.pools.p), allowed,
+                               scores, (position_ + 1) / 4, s);
+        ops::index_pool_select(scores, ids, position_ + 1, s);
+    } else {
+        ops::resident_index_append(
+            latent, ik, ig, fp(p.index.position_bias), static_cast<std::uint16_t*>(state.latent.p),
+            static_cast<std::uint16_t*>(state.keys.p), static_cast<std::uint16_t*>(state.gates.p),
+            static_cast<std::uint16_t*>(state.pools.p), slots, positions, options_.max_context, t,
+            s);
+        auto* allowed =
+            static_cast<std::uint8_t*>(w.alloc_bytes(t * ((options_.max_context + 63) / 64)).data);
+        if (options_.kvmem_window_pages)
+            ops::resident_retrieval(iq, static_cast<const std::uint16_t*>(state.keys.p),
+                                    static_cast<float*>(state.means.p), allowed, slots, positions,
+                                    options_.max_context, t, options_.kvmem_window_pages / 2, s);
+        ops::resident_pool_select(iq, ih, static_cast<const std::uint16_t*>(state.pools.p),
+                                  options_.kvmem_window_pages ? allowed : nullptr, scores, ids,
+                                  slots, positions, options_.max_context, tier_, t, s);
     }
-    ops::index_pool_scores(iq, ih, static_cast<const std::uint16_t*>(state.pools.p), allowed,
-                           scores, (position_ + 1) / 4, s);
-    ops::index_pool_select(scores, ids, position_ + 1, s);
-    ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, 64, 1, false, s);
-    ops::sparse_latent_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p), ids,
-                                 prob, attended, 64, 512, 1, 2051, 1.f / 16, s);
-    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, 64, 1, false, s);
-    ops::round_bf16(expanded, 16384, s);
-    projection(expanded, p.output, out, 1, d);
+    ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, 64, t, false, s);
+    if (options_.draft) {
+        ops::sparse_latent_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
+                                     ids, prob, attended, 64, 512, t, 2051, 1.f / 16, s);
+    } else
+        ops::resident_sparse_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
+                                       ids, prob, attended, slots, options_.max_context, t, s);
+    ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, 64, t, false, s);
+    ops::round_bf16(expanded, 16384 * t, s);
+    projection(expanded, p.output, out, t, d);
 }
 
-void Program::feed_forward(const float* x, const LayerParameters& p, float* out) {
+void Program::feed_forward(const float* x, const LayerParameters& p, float* out, int t) {
     const int d  = p.device;
     auto& w      = *state_[d].workspace;
     auto scope   = w.scope();
     const auto s = devices_[d]->stream;
     if (p.dense) {
-        mlp(x, p.ffn, out, 12288, 1, d, 10.f);
+        mlp(x, p.ffn, out, 12288, t, d, 10.f);
         return;
     }
-    auto *logits = floats(w, 288), *weights = floats(w, 8), *g = floats(w, 8 * 2048),
-         *u = floats(w, 8 * 2048), *experts = floats(w, 8 * H), *shared = floats(w, H);
-    auto* ids = static_cast<std::int32_t*>(w.alloc_bytes(8 * 4).data);
-    projection(x, p.router, logits, 1, d, false);
-    ops::resident_router(logits, fp(p.router_bias), ids, weights, 288, 8, 1, 2.5f, s);
-    ops::indexed_linear_fp32(x, p.experts.gate, ids, g, 2048, 8, 1, true, s);
-    ops::indexed_linear_fp32(x, p.experts.up, ids, u, 2048, 8, 1, true, s);
-    ops::round_bf16(g, 8 * 2048, s);
-    ops::round_bf16(u, 8 * 2048, s);
-    ops::resident_swiglu(g, u, g, 8 * 2048, 10.f, s);
-    ops::indexed_linear_fp32(g, p.experts.down, ids, experts, H, 8, 1, false, s);
-    ops::round_bf16(experts, 8 * H, s);
-    mlp(x, p.ffn, shared, 2048, 1, d, 10.f);
-    ops::resident_moe_sum(experts, weights, shared, out, H, 8, 1, s);
+    auto *logits = floats(w, (288) * t), *weights = floats(w, (8) * t),
+         *g = floats(w, (8 * 2048) * t), *u = floats(w, (8 * 2048) * t),
+         *experts = floats(w, (8 * H) * t), *shared = floats(w, (H)*t);
+    auto* ids = static_cast<std::int32_t*>(w.alloc_bytes(8 * 4 * t).data);
+    projection(x, p.router, logits, t, d, false);
+    ops::resident_router(logits, fp(p.router_bias), ids, weights, 288, 8, t, 2.5f, s);
+    ops::indexed_linear_fp32(x, p.experts.gate, ids, g, 2048, 8, t, true, s);
+    ops::indexed_linear_fp32(x, p.experts.up, ids, u, 2048, 8, t, true, s);
+    ops::round_bf16(g, 8 * 2048 * t, s);
+    ops::round_bf16(u, 8 * 2048 * t, s);
+    ops::resident_swiglu(g, u, g, 8 * 2048 * t, 10.f, s);
+    ops::indexed_linear_fp32(g, p.experts.down, ids, experts, H, 8, t, false, s);
+    ops::round_bf16(experts, 8 * H * t, s);
+    mlp(x, p.ffn, shared, 2048, t, d, 10.f);
+    ops::resident_moe_sum(experts, weights, shared, out, H, 8, t, s);
 }
 
 void Program::peer(void* dst, int d, const void* src, int source, std::size_t bytes) {
@@ -314,6 +401,11 @@ void Program::capture(const float* streams, int layer, int d) {
 }
 
 std::int32_t Program::target(std::int32_t token, int snapshot) {
+    if (!options_.draft) {
+        if (snapshot) throw std::invalid_argument("ordinary compact Program has no draft snapshot");
+        const int lane = 0;
+        return target_batch({&token, 1}, {&lane, 1})[0];
+    }
     if (token < 0 || token >= 154880 || position_ >= options_.max_context || snapshot < 0 ||
         snapshot > 8)
         throw std::invalid_argument("GLM target token/frontier/snapshot");
@@ -380,6 +472,218 @@ std::int32_t Program::target(std::int32_t token, int snapshot) {
     ++position_;
     ++stats_.target_steps;
     return next;
+}
+
+// Native checkpoint NextN: concatenate independently normalized next-token
+// embedding and target post-output-norm hidden, fuse, one plain MLA/MoE block,
+// then its own output norm and the resident target head. The MTP cache advances
+// only on actual/greedily accepted input tokens; no rejected proposal owns state.
+std::int32_t Program::mtp_forward(std::int32_t token, bool proposal) {
+    if (!options_.mtp || token < 0 || token >= 154880 || position_ != mtp_frontier_ + 1)
+        throw std::invalid_argument("native MTP token/teacher frontier");
+    const auto& p = parameters_.mtp;
+    for (auto& state : state_) state.workspace->reset();
+    devices_[0]->bind_to_current_thread();
+    auto& first = *state_[0].workspace;
+    auto* id    = static_cast<int*>(first.alloc_bytes(4).data);
+    CUDA_CHECK(cudaMemcpy(id, &token, 4, cudaMemcpyHostToDevice));
+    auto* embedded = floats(first, H);
+    ops::embedding_fp32(parameters_.embedding, id, embedded, 1, devices_[0]->stream);
+    auto& work   = *state_[2].workspace;
+    auto* joined = floats(work, 2 * H);
+    peer(joined, 2, embedded, 0, H * 4);
+    peer(joined + H, 2, state_[0].hidden.p, 0, H * 4);
+    const auto stream = devices_[2]->stream;
+    ops::resident_norm(joined, &p.embedding_norm, nullptr, nullptr, joined, H, 1, 1e-5f, false,
+                       true, stream);
+    ops::resident_norm(joined + H, &p.hidden_norm, nullptr, nullptr, joined + H, H, 1, 1e-5f, false,
+                       true, stream);
+    auto* residual = floats(work, H);
+    auto* x        = floats(work, H);
+    auto* y        = floats(work, H);
+    projection(joined, p.fusion, residual, 1, 2);
+    ops::resident_norm(residual, &p.layer.attention_norm, nullptr, nullptr, x, H, 1, 1e-5f, false,
+                       true, stream);
+    mla(x, p.layer.mla, mtp_state_, y, 2, 1);
+    ops::resident_add(residual, y, residual, H, stream);
+    ops::resident_norm(residual, &p.layer.ffn_norm, nullptr, nullptr, x, H, 1, 1e-5f, false, true,
+                       stream);
+    feed_forward(x, p.layer, y, 1);
+    ops::resident_add(residual, y, residual, H, stream);
+    ++mtp_frontier_;
+    if (options_.kvmem_window_pages) {
+        ++stats_.kvmem_selections;
+        if ((mtp_frontier_ + 127) / 128 > static_cast<int>(options_.kvmem_window_pages / 2))
+            ++stats_.kvmem_restricted_steps;
+    }
+    if (!proposal) {
+        devices_[2]->synchronize();
+        return -1;
+    }
+    ops::resident_norm(residual, &p.output_norm, nullptr, nullptr, residual, H, 1, 1e-5f, false,
+                       true, stream);
+    auto* input = floats(first, H);
+    peer(input, 0, residual, 2, H * 4);
+    auto* logits = floats(first, 154880);
+    projection(input, parameters_.output_head, logits, 1, 0, false);
+    auto* output = static_cast<int*>(first.alloc_bytes(4).data);
+    ops::resident_argmax(logits, output, 154880, 1, devices_[0]->stream);
+    devices_[0]->synchronize();
+    int result;
+    CUDA_CHECK(cudaMemcpy(&result, output, 4, cudaMemcpyDeviceToHost));
+    if (result < 0) throw std::runtime_error("native MTP nonfinite logits");
+    ++stats_.draft_calls;
+    ++stats_.drafted_tokens;
+    return result;
+}
+
+void Program::reset_lane(int lane) {
+    if (lane < 0 || lane >= options_.max_lanes || options_.draft)
+        throw std::invalid_argument("compact Program lane reset");
+    frontiers_[lane] = 0;
+    for (int d = 0; d < 3; ++d) {
+        devices_[d]->bind_to_current_thread();
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(state_[d].recurrent[0].p) +
+                                       lane * recurrent_stride_[d],
+                                   0, recurrent_stride_[d], devices_[d]->stream));
+    }
+    // KV, pools and derived means are overwritten before every visible read.
+}
+
+void Program::batch_stage(int d) {
+    auto& work = *state_[d].workspace;
+    work.reset();
+    const auto stream = devices_[d]->stream;
+    auto* residual    = static_cast<float*>(state_[d].streams.p);
+    if (d == 0) {
+        auto scope      = work.scope();
+        auto* embedding = floats(work, H * batch_);
+        ops::embedding_fp32(parameters_.embedding, static_cast<const int*>(state_[0].metadata.p),
+                            embedding, batch_, stream);
+        ops::replicate_streams(embedding, residual, H, batch_, stream);
+    }
+    for (int i = 0; i < 45; ++i) {
+        const auto& p = parameters_.layers[i];
+        if (p.device != d) continue;
+        auto scope  = work.scope();
+        auto* coeff = floats(work, 24 * batch_);
+        auto* x     = floats(work, H * batch_);
+        auto* y     = floats(work, H * batch_);
+        hyper_prepare(residual, p.attention_hc, coeff, x, d, batch_);
+        ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, batch_, 1e-5f, false, true,
+                           stream);
+        if (p.linear)
+            kda(x, p.kda, layers_[i], y, d, batch_);
+        else
+            mla(x, p.mla, layers_[i], y, d, batch_);
+        ops::hyper_connection_expand(residual, y, coeff, residual, H, batch_, stream);
+        hyper_prepare(residual, p.ffn_hc, coeff, x, d, batch_);
+        ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, batch_, 1e-5f, false, true,
+                           stream);
+        feed_forward(x, p, y, batch_);
+        ops::hyper_connection_expand(residual, y, coeff, residual, H, batch_, stream);
+    }
+    if (d == 2)
+        ops::mean_streams(residual, static_cast<float*>(state_[2].hidden.p), H, batch_, stream);
+    stats_.workspace_peak[d] = std::max(stats_.workspace_peak[d], work.peak_used());
+}
+
+void Program::batch_head() {
+    auto& work = *state_[0].workspace;
+    work.reset();
+    const auto stream = devices_[0]->stream;
+    auto* final       = static_cast<float*>(state_[0].hidden.p);
+    ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, batch_, 1e-5f,
+                       false, true, stream);
+    auto* logits = floats(work, 154880 * batch_);
+    projection(final, parameters_.output_head, logits, batch_, 0, false);
+    ops::resident_argmax(logits, static_cast<int*>(state_[0].metadata.p) + 24, 154880, batch_,
+                         stream);
+    stats_.workspace_peak[0] = std::max(stats_.workspace_peak[0], work.peak_used());
+}
+
+std::vector<std::int32_t> Program::target_batch(std::span<const int> tokens,
+                                                std::span<const int> lanes) {
+    if (options_.draft || tokens.empty() ||
+        tokens.size() > static_cast<unsigned>(options_.max_lanes) || tokens.size() != lanes.size())
+        throw std::invalid_argument("compact Program batch geometry");
+    std::array<int, 24> metadata{};
+    std::array<bool, 8> seen{};
+    batch_ = tokens.size();
+    tier_  = 128;
+    for (int row = 0; row < batch_; ++row) {
+        const int slot = lanes[row];
+        if (slot < 0 || slot >= options_.max_lanes || seen[slot] || tokens[row] < 0 ||
+            tokens[row] >= 154880 || frontiers_[slot] >= options_.max_context)
+            throw std::invalid_argument("compact Program token/lane/frontier");
+        seen[slot]         = true;
+        metadata[row]      = tokens[row];
+        metadata[8 + row]  = slot;
+        metadata[16 + row] = frontiers_[slot];
+        while (tier_ < frontiers_[slot] + 1) tier_ *= 2;
+    }
+    for (int d = 0; d < 3; ++d) {
+        devices_[d]->bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(state_[d].metadata.p, metadata.data(), sizeof(metadata),
+                                   cudaMemcpyHostToDevice, devices_[d]->stream));
+        devices_[d]->synchronize();
+    }
+    const int key = batch_ * 65536 + tier_;
+    if (options_.graph && !graphs_.contains(key)) {
+        auto& family = graphs_[key];
+        for (int g = 0; g < 4; ++g) {
+            const int d = g == 3 ? 0 : g;
+            devices_[d]->bind_to_current_thread();
+            DecodeGraphDefinition definition;
+            definition.capture(devices_[d]->stream, [&] {
+                if (g == 3)
+                    batch_head();
+                else
+                    batch_stage(d);
+            });
+            family[g].instantiate(definition);
+            family[g].upload(devices_[d]->stream);
+            devices_[d]->synchronize();
+            ++stats_.graph_captures;
+        }
+    }
+    for (int d = 0; d < 3; ++d) {
+        if (d)
+            peer(state_[d].streams.p, d, state_[d - 1].streams.p, d - 1,
+                 static_cast<std::size_t>(4 * H * 4) * batch_);
+        devices_[d]->bind_to_current_thread();
+        if (options_.graph) {
+            graphs_.at(key)[d].launch(devices_[d]->stream);
+            ++stats_.graph_replays;
+        } else
+            batch_stage(d);
+    }
+    peer(state_[0].hidden.p, 0, state_[2].hidden.p, 2, static_cast<std::size_t>(H * 4) * batch_);
+    devices_[0]->bind_to_current_thread();
+    if (options_.graph) {
+        graphs_.at(key)[3].launch(devices_[0]->stream);
+        ++stats_.graph_replays;
+    } else
+        batch_head();
+    devices_[0]->synchronize();
+    std::vector<int> result(batch_);
+    CUDA_CHECK(cudaMemcpy(result.data(), static_cast<const int*>(state_[0].metadata.p) + 24,
+                          batch_ * 4, cudaMemcpyDeviceToHost));
+    for (int row = 0; row < batch_; ++row) {
+        if (result[row] < 0) throw std::runtime_error("compact Program nonfinite logits");
+        const int blocks = (frontiers_[lanes[row]] + 128) / 128;
+        if (options_.kvmem_window_pages) {
+            stats_.kvmem_selections += 11;
+            if (blocks > static_cast<int>(options_.kvmem_window_pages / 2))
+                stats_.kvmem_restricted_steps += 11;
+        }
+        ++frontiers_[lanes[row]];
+    }
+    position_ = frontiers_[0];
+    stats_.target_steps += batch_;
+    ++stats_.batch_rounds;
+    stats_.projection_columns += batch_;
+    return result;
 }
 
 std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
@@ -504,6 +808,8 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
 }
 
 void Program::reset() {
+    mtp_frontier_ = 0;
+    frontiers_.fill(0);
     position_       = 0;
     draft_frontier_ = 0;
     for (int d = 0; d < 3; ++d) {

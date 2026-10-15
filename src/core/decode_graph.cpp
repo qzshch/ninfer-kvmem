@@ -1,7 +1,9 @@
 #include "core/decode_graph.h"
 
 #include "core/device.h"
-#include "core/nvtx.h"
+#ifndef NINFER_HYGON_DTK
+#    include "core/nvtx.h"
+#endif
 
 #include <cstdio>
 #include <stdexcept>
@@ -57,7 +59,9 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
 }
 
 void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
+#ifndef NINFER_HYGON_DTK
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
+#endif
     reset();
 
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
@@ -101,14 +105,20 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
 }
 
 void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition) {
+#ifndef NINFER_HYGON_DTK
     nvtx::ScopedRange instantiate_range(nvtx::Name::CudaGraphInstantiate, nvtx::Category::Graph);
+#endif
     if (!definition.ready()) {
         throw std::logic_error("cannot instantiate an empty CUDA Graph definition");
     }
     reset();
 
-    cudaGraphExec_t exec  = nullptr;
+    cudaGraphExec_t exec = nullptr;
+#ifdef NINFER_HYGON_DTK
+    const cudaError_t err = hipGraphInstantiate(&exec, definition.graph_, nullptr, nullptr, 0);
+#else
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
+#endif
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
         CUDA_CHECK(err);
@@ -117,11 +127,21 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
 }
 
 void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+#ifndef NINFER_HYGON_DTK
     nvtx::ScopedRange update_range(nvtx::Name::CudaGraphUpdate, nvtx::Category::Graph);
+#endif
     if (!ready() || !definition.ready()) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");
     }
 
+#ifdef NINFER_HYGON_DTK
+    hipGraphNode_t error_node = nullptr;
+    hipGraphExecUpdateResult result{};
+    const auto err = hipGraphExecUpdate(exec_, definition.graph_, &error_node, &result);
+    if (err != hipSuccess || result != hipGraphExecUpdateSuccess)
+        throw std::runtime_error("HIP Graph executable update failed: " +
+                                 std::string(hipGetErrorName(err)));
+#else
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
@@ -129,17 +149,22 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
             " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
     }
+#endif
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
+#ifndef NINFER_HYGON_DTK
     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
+#endif
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
     CUDA_CHECK(cudaGraphUpload(exec_, stream));
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {
     // This range executes for every replay; ranges in the captured body execute only at capture.
+#ifndef NINFER_HYGON_DTK
     nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
+#endif
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
     CUDA_CHECK(cudaGraphLaunch(exec_, stream));
 }

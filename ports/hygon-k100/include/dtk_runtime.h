@@ -65,3 +65,12 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEventElapsedTime hipEventElapsedTime
 #define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaGraph_t hipGraph_t
+#define cudaGraphExec_t hipGraphExec_t
+#define cudaGraphDestroy hipGraphDestroy
+#define cudaGraphExecDestroy hipGraphExecDestroy
+#define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphUpload hipGraphUpload
+#define cudaStreamBeginCapture hipStreamBeginCapture
+#define cudaStreamEndCapture hipStreamEndCapture
+#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal
