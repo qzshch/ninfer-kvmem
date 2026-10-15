@@ -200,16 +200,17 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
         xb[i] = bf16(x[i]);
         if (bf) x[i] = static_cast<float>(unbf16(xb[i]));
     }
-    const auto word = bf ? 2 : 4;
-    DeviceBuffer input(x.size() * word), output(static_cast<std::size_t>(n) * tokens * word + 32);
+    require(!partial || !rounded, "K-partial must retain unrounded FP32 sums");
+    const bool output_bf16 = bf && !partial;
+    const auto word = output_bf16 ? 2 : 4;
+    DeviceBuffer input(x.size() * (bf ? 2 : 4)), output(static_cast<std::size_t>(n) * tokens * word + 32);
     input.copy_from_host(bf ? static_cast<const void*>(xb.data()) : x.data(), input.bytes);
     output.fill(0xa5);
     const auto dtype = bf ? DType::BF16 : DType::FP32;
     Tensor a(input.p, dtype, {input_k, tokens}),
-        y(static_cast<std::byte*>(output.p) + 16, dtype, {n, tokens});
+        y(static_cast<std::byte*>(output.p) + 16, output_bf16 ? DType::BF16 : DType::FP32, {n, tokens});
     if (partial)
-        ops::linear_partial_fp32(static_cast<const float*>(a.data), w, static_cast<float*>(y.data),
-                                 k_begin, input_k, tokens, ctx.stream);
+        ops::linear_partial(a, w, y, k_begin, ctx.stream);
     else if (bf)
         ops::linear(a, w, y, ctx.stream);
     else
@@ -249,7 +250,7 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
             }
             double value, floor = 0;
             const auto offset = 16 + (static_cast<std::size_t>(t) * n + row) * word;
-            if (bf) {
+            if (output_bf16) {
                 std::uint16_t v;
                 std::memcpy(&v, observed.data() + offset, 2);
                 value = unbf16(v);
@@ -258,7 +259,7 @@ double run(DeviceContext& ctx, const std::filesystem::path& root, const nlohmann
                 std::memcpy(&v, observed.data() + offset, 4);
                 value = v;
             }
-            if (bf || rounded) {
+            if (output_bf16 || rounded) {
                 const auto approx = static_cast<int>(bf16(static_cast<float>(expected)));
                 floor             = std::abs(unbf16(approx) - expected);
                 for (int d : {-1, 1})
@@ -301,8 +302,8 @@ int main(int argc, char** argv) try {
                 }
             }
     for (const auto& item : cases) if (item.at("k").get<int>() % 512 == 0)
-        for (int tokens : {1, 8, 17}) {
-            worst = std::max(worst, run(ctx, root, item, tokens, false, false, true));
+        for (int tokens : {1, 8, 17}) for (bool bf : {false, true}) {
+            worst = std::max(worst, run(ctx, root, item, tokens, bf, false, true));
             ++count;
         }
     unsigned indexed = 0;
