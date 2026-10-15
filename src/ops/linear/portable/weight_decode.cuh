@@ -2,19 +2,14 @@
 #pragma once
 
 __device__ float decode_half(std::uint16_t word) {
+#ifdef NINFER_HYGON_DTK
+    // Finite binary16 values have an exact binary32 representation; use the device
+    // conversion rather than reconstructing the exponent for every operand.
+    return static_cast<float>(__builtin_bit_cast(_Float16, word));
+#else
     const auto exponent = (word >> 10) & 31;
     const auto mantissa = word & 1023;
-#ifdef NINFER_HYGON_DTK
-    const auto sign = static_cast<std::uint32_t>(word & 0x8000) << 16;
-    if (exponent == 0) {
-        // Every binary16 subnormal is an exactly represented normal binary32.
-        const auto bits = __float_as_uint(static_cast<float>(mantissa) * 0x1p-24f);
-        return __uint_as_float(sign | bits);
-    }
-    if (exponent == 31) return __uint_as_float(sign | (mantissa ? 0x7fc00000u : 0x7f800000u));
-    return __uint_as_float(sign | ((exponent + 112u) << 23) | (mantissa << 13));
-#else
-    const float sign = word & 0x8000 ? -1.0f : 1.0f;
+    const float sign    = word & 0x8000 ? -1.0f : 1.0f;
     if (exponent == 0) { return sign * ldexpf(static_cast<float>(mantissa), -24); }
     if (exponent == 31) { return sign * __uint_as_float(mantissa ? 0x7fc00000u : 0x7f800000u); }
     return sign * ldexpf(1.0f + mantissa / 1024.0f, exponent - 15);

@@ -52,10 +52,25 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
     }
     partial[tid] = sum;
     __syncthreads();
-    for (unsigned distance = 128; distance != 0; distance /= 2) {
-        if (tid < distance) { partial[tid] += partial[tid + distance]; }
+#ifdef NINFER_HYGON_DTK
+    if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
+        // Preserve the 256-column accumulation and reduction tree. Only its
+        // first two joins cross wave64 boundaries; finish inside the first
+        // wave instead of synchronizing the whole block after every join.
+        if (tid < 128) partial[tid] += partial[tid + 128];
         __syncthreads();
-    }
+        if (tid < 64) {
+            float reduced = partial[tid] + partial[tid + 64];
+            for (int distance = 32; distance; distance /= 2)
+                reduced += __shfl_down(reduced, distance, 64);
+            if (tid == 0) partial[0] = reduced;
+        }
+    } else
+#endif
+        for (unsigned distance = 128; distance != 0; distance /= 2) {
+            if (tid < distance) { partial[tid] += partial[tid + distance]; }
+            __syncthreads();
+        }
     if (tid == 0) {
         if constexpr (Bf16) {
             static_cast<std::uint16_t*>(out)[token * n + row] = encode_bf16(partial[0]);

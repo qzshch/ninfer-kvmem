@@ -14,6 +14,8 @@ problems=[(name,19,4096,1,17) for name in BLOCK256_FORMATS]
 problems += [('iq3_s_g256_block',2048,4096,0,2048),('iq4_xs_g256_block',4096,2048,0,4096)]
 problems += [(name,1030,1024,1,1025) for name in BLOCK256_FORMATS]
 problems += [('q8_g32_fp16_block',1030,1024,1,1025)]
+problems += [('q8_g32_fp16_block',515,4096,1,513),
+             ('q8_g32_fp16_block',8192,128,0,8192)]
 for index,(name,parent_rows,k,row_begin,n) in enumerate(problems):
     q8=name=='q8_g32_fp16_block'
     block_values=32 if q8 else 256
