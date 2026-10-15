@@ -63,10 +63,8 @@ void Program::tensor_phase(int layer, int d, bool ffn) {
 void Program::tensor_reduce(bool routed) {
     const auto count = static_cast<std::size_t>(H) * frame_->batch;
     const auto bytes = count * sizeof(float) * (routed ? 2 : 1);
-    for (int d = 0; d < 3; ++d) {
-        frame_->devices[d]->bind_to_current_thread();
-        frame_->state[d].ready->record(frame_->devices[d]->stream);
-    }
+    // Producers recorded readiness on their already-bound device immediately
+    // after enqueueing the phase. Only the root gather needs a context switch.
     frame_->devices[0]->bind_to_current_thread();
     auto* received = static_cast<float*>(frame_->state[0].received.p);
     for (int d = 1; d < 3; ++d) {
@@ -154,6 +152,7 @@ void Program::tensor_execute() {
             for (int d = 0; d < 3; ++d) {
                 frame_->devices[d]->bind_to_current_thread();
                 tensor_launch(layer, ffn * 3 + d, [&] { tensor_phase(layer, d, ffn); });
+                frame_->state[d].ready->record(frame_->devices[d]->stream);
             }
             tensor_reduce(ffn && !parameters_.layers[layer].dense);
         }
