@@ -23,7 +23,7 @@ void indexed_linear_owned_fp32(const float* x, const Weight& bank, const std::in
                                 float* out, int rows, int choices, int tokens, bool shared_input,
                                 int bank_begin, cudaStream_t stream, bool bf16_output = false);
 // Matrix form of the owned-bank projection. Group global ids on device, reuse
-// encoded weight tiles across up to eight assignments, scatter each result to
+// encoded weight tiles across assignments, scatter each result to
 // its original [token,choice] row. tokens<=1024, choices<=32, banks<=288.
 // The complete-dot ideal and output boundary match the owned GEMV form.
 // Caller-owned call-scoped workspace; no host routing read or persistent repack.
