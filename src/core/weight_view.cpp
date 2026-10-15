@@ -1,6 +1,7 @@
 #include "core/weight_view.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 
@@ -167,6 +168,16 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.bytes          = add(out.bytes, 4);
     }
     return out;
+}
+
+WeightGeometry weight_row_slice_geometry(const WeightGeometry& parent, std::uint64_t begin,
+                                          std::uint64_t count) {
+    if (parent.shape.size() != 2 || !count || count > parent.shape[0] ||
+        begin > parent.shape[0] - count ||
+        (parent.layout != QuantLayout::Contiguous && parent.layout != QuantLayout::BlockInterleaved))
+        throw std::invalid_argument("weight row upload requires a complete direct/interleaved interval");
+    const std::array<std::uint64_t, 2> shape{count, parent.shape[1]};
+    return weight_geometry(parent.format, parent.layout, shape);
 }
 
 WeightRegion contiguous_weight_region(const WeightView& view) {

@@ -53,6 +53,10 @@ struct WeightGeometry {
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
                                              std::span<const std::uint64_t> shape);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
+// Complete encoded rows are byte-contiguous; this is an upload interval,
+// never a codec conversion or a repacking operation.
+[[nodiscard]] WeightGeometry weight_row_slice_geometry(const WeightGeometry& parent,
+                                                       std::uint64_t begin, std::uint64_t count);
 
 struct WeightParent {
     WeightGeometry geometry;

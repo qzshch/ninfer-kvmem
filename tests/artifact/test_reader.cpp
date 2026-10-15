@@ -52,6 +52,36 @@ void file_set_and_bindings() {
             "selected parent deduplication or residency failed");
 }
 
+void row_upload_plan() {
+    Fixture fixture;
+    auto& object = fixture.root["objects"][1];
+    object["shape"] = {16, 32}; object["format"] = "q8_g32_fp16_block";
+    object["layout"] = "block_interleaved_v1"; object["bytes"] = 544;
+    fixture.root["bindings"].erase("row"); fixture.root["uses"] = Json::array();
+    fixture.write(true);
+    Reader reader(fixture.entry);
+    Binder binder(reader);
+    const auto ref = binder.parameter_rows("matrix", {16, 32}, 5, 9);
+    require(ref.shape == Shape({9, 32}) && ref.binding.parts.front().begin == 160 &&
+                ref.binding.parts.front().end == 448, "row upload lost logical source origin");
+    rejects<std::invalid_argument>([&] { (void)binder.parameter_rows("matrix", {16, 32}, 16, 1); },
+                                   "out-of-range row upload accepted");
+    const auto plan = std::move(binder).finish();
+    require(plan.device_capacity_bytes == 306 && plan.device_objects.size() == 1 &&
+                plan.device_objects[0].row_begin == 5 && plan.device_objects[0].row_count == 9,
+            "row upload allocated or selected the complete expert bank");
+    Binder merged(reader);
+    (void)merged.parameter_rows("matrix", {16, 32}, 5, 3);
+    (void)merged.parameter_rows("matrix", {16, 32}, 8, 6);
+    require(std::move(merged).finish().device_capacity_bytes == 306,
+            "overlapping row demands duplicated storage");
+    Binder full(reader);
+    (void)full.parameter_rows("matrix", {16, 32}, 5, 9);
+    (void)full.parameter("matrix", {16, 32});
+    require(std::move(full).finish().device_capacity_bytes == 544,
+            "full-parent alias failed to promote a prior slice");
+}
+
 void geometry_and_views() {
     const std::array<std::uint16_t, 12> direct_words{
         0, 0x8000, 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100, 0x4110, 0x4120};
@@ -157,6 +187,7 @@ void invalid_directories() {
 int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
+        row_upload_plan();
         geometry_and_views();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.

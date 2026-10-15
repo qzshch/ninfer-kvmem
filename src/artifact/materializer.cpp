@@ -129,6 +129,11 @@ const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) con
     return *objects_[handle.index].device;
 }
 
+std::uint64_t MaterializedArtifact::device_element_begin(ObjectHandle handle) const {
+    (void)device_parent(handle);
+    return objects_[handle.index].device_begin;
+}
+
 const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || !objects_[handle.index].host) {
         throw ArtifactError("object has no Host weight backing");
@@ -201,7 +206,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {
-        const auto& geometry = reader.geometry(placement.object);
+        const auto& parent_geometry = reader.geometry(placement.object);
+        const auto geometry = placement.row_count ?
+            weight_row_slice_geometry(parent_geometry, placement.row_begin, placement.row_count) : parent_geometry;
         auto& object         = out.objects_.at(placement.object.index);
         if (object.device || !out.arena_ || geometry.bytes != placement.bytes) {
             throw ArtifactError("invalid or duplicate device placement");
@@ -218,8 +225,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                  : read_divisor(reader, placement.object, geometry, {}, out.stats_);
         object.device =
             WeightParent{geometry, static_cast<const std::byte*>(storage.data), divisor};
+        object.device_begin = placement.row_count ? placement.row_begin * parent_geometry.shape[1] : 0;
         const auto& descriptor = reader.directory().tensor(placement.object);
-        for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
+        const auto source_offset = checked_add(descriptor.offset,
+            checked_mul(placement.row_begin, parent_geometry.code_bytes_per_row, "row upload origin"),
+            "row upload offset");
+        for (const auto& segment : reader.segments(source_offset, geometry.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,
                               checked_add(segment.file_offset, segment.bytes, "copy range"),
                               static_cast<std::byte*>(storage.data) + segment.destination_offset});

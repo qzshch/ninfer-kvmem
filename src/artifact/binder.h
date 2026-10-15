@@ -41,6 +41,9 @@ public:
                                              Residency residency,
                                              std::optional<QType> exact_format = {});
     [[nodiscard]] const Use& use(std::string_view parameter, std::string_view input) const;
+    // Only complete direct/interleaved rows of a whole stored matrix are legal.
+    [[nodiscard]] ParameterReference parameter_rows(std::string_view name, Shape parent_shape,
+                                                    std::uint64_t begin, std::uint64_t count);
     [[nodiscard]] bool contains(std::string_view parameter) const;
 
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
@@ -54,6 +57,8 @@ public:
 private:
     struct Demand {
         bool device             = false;
+        bool whole_device       = false;
+        std::uint64_t row_begin = 0, row_end = 0;
         bool host               = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;

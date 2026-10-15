@@ -19,6 +19,7 @@ struct DevicePlacement {
     std::uint64_t offset    = 0;
     std::uint64_t bytes     = 0;
     std::uint64_t alignment = 256;
+    std::uint64_t row_begin = 0, row_count = 0; // zero count means the complete stored object
 };
 
 struct HostPlacement {
@@ -60,6 +61,7 @@ public:
     MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
 
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle) const;
+    [[nodiscard]] std::uint64_t device_element_begin(ObjectHandle handle) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
@@ -72,6 +74,7 @@ private:
 
     struct ObjectStorage {
         std::optional<WeightParent> device;
+        std::uint64_t device_begin = 0;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
     };

@@ -82,7 +82,34 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     }
     auto& demand     = demands_.at(object.index);
     demand.device    = true;
+    demand.whole_device = true;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+}
+
+ParameterReference Binder::parameter_rows(std::string_view name, Shape shape,
+                                            std::uint64_t begin, std::uint64_t count) {
+    const auto found = reader_.directory().bindings.find(name);
+    if (found == reader_.directory().bindings.end() || !found->second.whole_object ||
+        found->second.parts.size() != 1)
+        throw ArtifactError(std::string(name) + ": row upload requires one whole stored matrix");
+    const auto handle = found->second.parts.front().object;
+    const auto& geometry = reader_.geometry(handle);
+    if (shape != geometry.shape)
+        throw ArtifactError(std::string(name) + ": row upload parent shape mismatch");
+    (void)weight_row_slice_geometry(geometry, begin, count);
+    auto& demand = demands_.at(handle.index);
+    if (!demand.device) {
+        demand.row_begin = begin;
+        demand.row_end = begin + count;
+    } else {
+        demand.row_begin = std::min(demand.row_begin, begin);
+        demand.row_end = std::max(demand.row_end, begin + count);
+    }
+    demand.device = true;
+    demand.alignment = std::max(demand.alignment, geometry.alignment);
+    const auto k = shape[1];
+    Binding slice{false, {{handle, begin * k, (begin + count) * k}}, count * k};
+    return {std::string(name), {count, k}, std::move(slice), Residency::Device};
 }
 
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
@@ -164,10 +191,14 @@ MaterializationPlan Binder::finish() && {
         auto& demand = demands_[i];
         if (demand.device) {
             const ObjectHandle handle{i};
-            const auto& geometry = reader_.geometry(handle);
+            const auto& parent = reader_.geometry(handle);
+            const auto geometry = demand.whole_device ? parent :
+                weight_row_slice_geometry(parent, demand.row_begin, demand.row_end - demand.row_begin);
             const auto offset =
                 align_up(plan.device_capacity_bytes, demand.alignment, "device offset");
-            plan.device_objects.push_back({handle, offset, geometry.bytes, demand.alignment});
+            plan.device_objects.push_back({handle, offset, geometry.bytes, demand.alignment,
+                                           demand.whole_device ? 0 : demand.row_begin,
+                                           demand.whole_device ? 0 : demand.row_end - demand.row_begin});
             plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
         }
         if (demand.host) {

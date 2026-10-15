@@ -14,11 +14,13 @@ WeightView bind_view(const ParameterReference& reference,
         const auto& parent = reference.residency == Residency::Device
                                  ? materialized.device_parent(part.object)
                                  : materialized.host_parent(part.object);
-        if (part.begin >= part.end || part.end > parent.geometry.elements) {
+        const auto origin = reference.residency == Residency::Device
+            ? materialized.device_element_begin(part.object) : 0;
+        if (part.begin < origin || part.begin >= part.end || part.end - origin > parent.geometry.elements) {
             throw ArtifactError(reference.name + ": invalid materialized region");
         }
         covered = checked_add(covered, part.end - part.begin, reference.name);
-        out.parts.push_back({&parent, part.begin, part.end});
+        out.parts.push_back({&parent, part.begin - origin, part.end - origin});
     }
     if (covered != weight_element_count(out.shape)) {
         throw ArtifactError(reference.name + ": materialized coverage differs from logical shape");
