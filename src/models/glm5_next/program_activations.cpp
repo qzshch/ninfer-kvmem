@@ -132,6 +132,7 @@ void Program::mla(const Tensor& x, const MlaParameters& p, LayerState& state,
     auto* scores = floats(work, 8192ULL * tokens);
     auto* prob = floats(work, 2051ULL * heads * tokens);
     auto* ids = static_cast<int*>(work.alloc_bytes(2051ULL * tokens * sizeof(int)).data);
+    auto* selected_counts = static_cast<int*>(work.alloc_bytes(2ULL * tokens * sizeof(int)).data);
     projection(x, p.query_lowrank, low, d);
     ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1e-6f, false, stream);
     projection(low, p.query_heads, query, d);
@@ -156,11 +157,11 @@ void Program::mla(const Tensor& x, const MlaParameters& p, LayerState& state,
             tokens, options_.kvmem_window_pages / 2, stream);
     ops::resident_pool_select(bf(iq), static_cast<const float*>(ih.data), static_cast<const std::uint16_t*>(state.pools.p),
         options_.kvmem_window_pages ? allowed : nullptr, scores, ids, slots, positions,
-        options_.max_context, frame_->tier, tokens, stream);
+        options_.max_context, frame_->tier, tokens, stream, selected_counts);
     auto query_heads = query.reshape({256, heads * tokens});
     ops::indexed_linear_mixed(query_heads, p.key_absorb, nullptr, absorbed, 512, heads, tokens, false, 0, stream);
     ops::resident_sparse_attention(static_cast<const float*>(absorbed.data), static_cast<const std::uint16_t*>(state.latent.p),
-        ids, prob, static_cast<float*>(attended.data), slots, options_.max_context, tokens, stream, heads);
+        ids, prob, static_cast<float*>(attended.data), slots, options_.max_context, tokens, stream, heads, selected_counts);
     ops::indexed_linear_mixed(attended, p.value_expand, nullptr, expanded, 256, heads, tokens, false, 0, stream);
     output_projection(expanded, p.output, out, p.head_begin * 256, d, tokens);
 }

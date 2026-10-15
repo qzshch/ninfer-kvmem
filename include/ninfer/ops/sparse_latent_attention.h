@@ -37,10 +37,12 @@ void resident_retrieval(const float* query, const std::uint16_t* keys, float* me
 // weights [B,32], cache pools [lanes,ceil(C/4),128]. tier in 4..32768 must cover
 // every visible frontier; it sizes masked work only. Scratch scores [B,8192],
 // ids [B,2051]. Optional allowed [B,ceil(C/64)] uses the same mask semantics.
+// Optional selected_counts [B,2] receives the number of valid prefix token IDs
+// (0..2048) and tail IDs (0..3). Other IDs remain -1; no host readback.
 void resident_pool_select(const float* query, const float* weights, const std::uint16_t* pools,
                           const std::uint8_t* allowed, float* scores, std::int32_t* ids,
                           const std::int32_t* slots, const std::int32_t* positions, int capacity,
-                          int tier, int tokens, cudaStream_t stream);
+                          int tier, int tokens, cudaStream_t stream, std::int32_t* selected_counts = nullptr);
 // Same append/retrieval/selection ideals with physical BF16 latent/key/gate/query
 // inputs. Head weights, bias, means, scores and reductions retain FP32.
 void resident_index_append(const std::uint16_t* latent, const std::uint16_t* key, const std::uint16_t* gate,
@@ -55,14 +57,17 @@ void resident_retrieval(const std::uint16_t* query, const std::uint16_t* keys, f
 void resident_pool_select(const std::uint16_t* query, const float* weights, const std::uint16_t* pools,
                           const std::uint8_t* allowed, float* scores, std::int32_t* ids,
                           const std::int32_t* slots, const std::int32_t* positions, int capacity,
-                          int tier, int tokens, cudaStream_t stream);
+                          int tier, int tokens, cudaStream_t stream, std::int32_t* selected_counts = nullptr);
 // Batch MLA: query/output [B,heads,512], cache [lanes,C,512] BF16,
 // ids [B,2051] distinct visible offsets or -1; probabilities [B,heads,2051].
 // Complete softmax(Q*KV^T/16)*KV, FP32 score/probability/value accumulation.
+// When supplied, selected_counts is the matching selector output: valid prefix
+// at IDs[0..prefix), tail at IDs[2048..2048+tail); all other IDs are -1.
+// Without counts, arbitrary valid/-1 ID ordering remains supported.
 void resident_sparse_attention(const float* query, const std::uint16_t* latents,
                                const std::int32_t* ids, float* probabilities, float* out,
                                const std::int32_t* slots, int capacity, int tokens,
-                               cudaStream_t stream, int heads = 64);
+                               cudaStream_t stream, int heads = 64, const std::int32_t* selected_counts = nullptr);
 // GLM DSA index mathematics. All cache arrays are caller-owned device buffers.
 // Append one BF16-represented key/gate [128] into full-position BF16 arrays and
 // publish a complete four-token pool when position%4==3. Position bias [4,128]

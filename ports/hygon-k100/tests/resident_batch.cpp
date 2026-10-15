@@ -132,6 +132,8 @@ void attention_transition(DeviceContext& device, bool temporal = false, int mask
         upload_words(dq, query); upload_words(dnk, newkey);
         upload_words(dng, newgate); upload_words(dnl, newlatent);
     }
+    DeviceBuffer selection_counts(lanes * 2 * sizeof(int) + 32); selection_counts.fill(0xa5);
+    auto* counts = reinterpret_cast<int*>(static_cast<std::byte*>(selection_counts.p) + 16);
     DecodeGraphDefinition definition;
     definition.capture(device.stream, [&] {
         const auto index = [&]<class T>() {
@@ -146,19 +148,25 @@ void attention_transition(DeviceContext& device, bool temporal = false, int mask
                                   mask_mode ? static_cast<unsigned char*>(allowed_device.p) : nullptr,
                                   static_cast<float*>(scores.p), static_cast<int*>(ids.p),
                                   static_cast<int*>(ds.p), static_cast<int*>(dpos.p), cap, 256,
-                                  lanes, device.stream);
+                                  lanes, device.stream, counts);
         };
         if (physical_bf16) index.template operator()<unsigned short>();
         else index.template operator()<float>();
         ops::resident_sparse_attention(static_cast<float*>(dquery.p),
                                        static_cast<unsigned short*>(dl.p), static_cast<int*>(ids.p),
                                        static_cast<float*>(prob.p), static_cast<float*>(out.p),
-                                       static_cast<int*>(ds.p), cap, lanes, device.stream);
+                                       static_cast<int*>(ds.p), cap, lanes, device.stream, 64, counts);
     });
     DecodeGraphExecutable graph;
     graph.instantiate(definition);
     graph.launch(device.stream);
     device.synchronize();
+    std::vector<int> count_words(lanes * 2 + 8);
+    selection_counts.copy_to_host(count_words.data(), selection_counts.bytes);
+    for (int i = 0; i < 4; ++i)
+        require(count_words[i] == static_cast<int>(0xa5a5a5a5u) && count_words[count_words.size()-1-i] == static_cast<int>(0xa5a5a5a5u), "selection count guards");
+    std::vector<float> actual_probability(lanes * 64 * count);
+    prob.copy_to_host(actual_probability.data(), prob.bytes);
     std::vector<int> actual_ids(lanes * count);
     ids.copy_to_host(actual_ids.data(), ids.bytes);
     std::vector<unsigned short> actual_pools(pools.size());
@@ -195,6 +203,12 @@ void attention_transition(DeviceContext& device, bool temporal = false, int mask
         for (int j = 0; j < static_cast<int>(order.size()); ++j)
             for (int c = 0; c < 4; ++c) selected[j * 4 + c] = order[j] * 4 + c;
         for (int c = 0; c < visible % 4; ++c) selected[2048 + c] = complete * 4 + c;
+        const auto prefix = std::count_if(selected.begin(), selected.begin() + 2048, [](int id) { return id >= 0; });
+        require(count_words[4 + row * 2] == prefix && count_words[5 + row * 2] == visible % 4,
+                "device selection extents disagree with independent visible/masked candidates");
+        for (int h = 0; h < 64; ++h) for (int j = 0; j < count; ++j)
+            if (selected[j] < 0) require(actual_probability[(row * 64 + h) * count + j] == 0.f,
+                                        "inactive probability retained stale storage");
         for (int j = 0; j < count; ++j)
             require(actual_ids[row * count + j] == selected[j],
                     "batched pool ranking/tails FP64 oracle");

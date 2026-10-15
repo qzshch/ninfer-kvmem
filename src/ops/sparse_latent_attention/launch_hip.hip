@@ -122,7 +122,7 @@ __device__ void pool_sort(float* value, int* index, int offset, int width, bool 
 }
 
 __global__ void pool_select(float* scores, std::int32_t* ids, int visible,
-                            const int* positions = nullptr) {
+                            const int* positions = nullptr, int* selected_counts = nullptr) {
     if (positions) {
         visible = positions[blockIdx.x] + 1;
         scores += blockIdx.x * 8192;
@@ -189,6 +189,10 @@ __global__ void pool_select(float* scores, std::int32_t* ids, int visible,
             scores[p] = -INFINITY;
         }
     }
+    if (selected_counts && !lane) {
+        selected_counts[blockIdx.x * 2] = poison ? 0 : kept * 4;
+        selected_counts[blockIdx.x * 2 + 1] = visible % 4;
+    }
     if (lane < visible % 4) ids[2048 + lane] = complete * 4 + lane;
 }
 
@@ -244,10 +248,13 @@ __global__ void attention_scores(const float* q, const std::uint16_t* kv, const 
 // reuse that represented latent load. Queries and dot accumulators stay FP32.
 __global__ void attention_scores_tiled(const float* q, const std::uint16_t* kv, const int* ids,
                                        float* p, int heads, int count, float scale,
-                                       const int* slots, int capacity) {
+                                       const int* slots, int capacity, const int* selected_counts) {
     const int lane = threadIdx.x % 64, wave = threadIdx.x / 64;
-    const int i = blockIdx.x * 4 + wave, head = blockIdx.y * 4, t = blockIdx.z;
-    if (i >= count) return;
+    const int at = blockIdx.x * 4 + wave, head = blockIdx.y * 4, t = blockIdx.z;
+    const int prefix = selected_counts ? selected_counts[t * 2] : count;
+    const int total = selected_counts ? prefix + selected_counts[t * 2 + 1] : count;
+    if (at >= total) return;
+    const int i = at < prefix ? at : 2048 + at - prefix;
     if (slots) kv += static_cast<long long>(slots[t]) * capacity * 512;
     const int pos = ids[t * count + i];
     float sum[4]{};
@@ -264,12 +271,19 @@ __global__ void attention_scores_tiled(const float* q, const std::uint16_t* kv, 
     }
 }
 
-__global__ void attention_softmax(float* p, int count) {
+__global__ void attention_softmax(float* p, int count, int heads, const int* selected_counts) {
     const int lane = threadIdx.x;
     auto* prob = p + static_cast<long long>(blockIdx.x) * count;
+    const int t = blockIdx.x / heads;
+    const int prefix = selected_counts ? selected_counts[t * 2] : count;
+    const int tail = selected_counts ? selected_counts[t * 2 + 1] : 0;
+    const int total = prefix + tail;
     __shared__ float red[256];
     float maximum = -INFINITY;
-    for (int i = lane; i < count; i += 256) maximum = fmaxf(maximum, prob[i]);
+    for (int at = lane; at < total; at += 256) {
+        const int i = at < prefix ? at : 2048 + at - prefix;
+        maximum = fmaxf(maximum, prob[i]);
+    }
     red[lane] = maximum; __syncthreads();
     for (int distance = 128; distance; distance /= 2) {
         if (lane < distance) red[lane] = fmaxf(red[lane], red[lane + distance]);
@@ -277,7 +291,8 @@ __global__ void attention_softmax(float* p, int count) {
     }
     maximum = red[0]; __syncthreads();
     float sum = 0.f;
-    for (int i = lane; i < count; i += 256) {
+    for (int at = lane; at < total; at += 256) {
+        const int i = at < prefix ? at : 2048 + at - prefix;
         const float v = isfinite(maximum) ? expf(prob[i] - maximum) : 0.f;
         prob[i] = v; sum += v;
     }
@@ -287,18 +302,25 @@ __global__ void attention_softmax(float* p, int count) {
         __syncthreads();
     }
     sum = red[0]; __syncthreads();
-    for (int i = lane; i < count; i += 256) prob[i] = sum > 0 ? prob[i] / sum : 0.f;
+    for (int at = lane; at < total; at += 256) {
+        const int i = at < prefix ? at : 2048 + at - prefix;
+        prob[i] = sum > 0 ? prob[i] / sum : 0.f;
+    }
+    if (selected_counts) {
+        for (int i = prefix + lane; i < 2048; i += 256) prob[i] = 0.f;
+        for (int i = 2048 + tail + lane; i < count; i += 256) prob[i] = 0.f;
+    }
 }
 #endif
 
 void launch_attention_scores(const float* q, const std::uint16_t* kv, const int* ids,
                              float* p, int heads, int dim, int tokens, int count, float scale,
-                             cudaStream_t stream, const int* slots = nullptr, int capacity = 0) {
+                             cudaStream_t stream, const int* slots = nullptr, int capacity = 0, const int* selected_counts = nullptr) {
 #ifdef NINFER_HYGON_DTK
     if (dim == 512 && heads >= 8 && count >= 128) {
         attention_scores_tiled<<<dim3((count + 3) / 4, (heads + 3) / 4, tokens), 256, 0, stream>>>(
-            q, kv, ids, p, heads, count, scale, slots, capacity);
-        attention_softmax<<<heads * tokens, 256, 0, stream>>>(p, count);
+            q, kv, ids, p, heads, count, scale, slots, capacity, selected_counts);
+        attention_softmax<<<heads * tokens, 256, 0, stream>>>(p, count, heads, selected_counts);
         return;
     }
 #endif
@@ -307,13 +329,16 @@ void launch_attention_scores(const float* q, const std::uint16_t* kv, const int*
 
 __global__ void attention_values(const std::uint16_t* kv, const std::int32_t* ids, const float* p,
                                  float* out, int heads, int dim, int count,
-                                 const int* slots = nullptr, int capacity = 0) {
+                                 const int* slots = nullptr, int capacity = 0, const int* selected_counts = nullptr) {
     if (slots) kv += static_cast<long long>(slots[blockIdx.z]) * capacity * dim;
     const int h = blockIdx.y, t = blockIdx.z, c = blockIdx.x * 256 + threadIdx.x;
     if (c >= dim) return;
     const auto* prob = p + (static_cast<long long>(t) * heads + h) * count;
-    float sum        = 0;
-    for (int i = 0; i < count; ++i) {
+    float sum = 0;
+    const int prefix = selected_counts ? selected_counts[t * 2] : count;
+    const int total = selected_counts ? prefix + selected_counts[t * 2 + 1] : count;
+    for (int at = 0; at < total; ++at) {
+        const int i = at < prefix ? at : 2048 + at - prefix;
         int pos = ids[t * count + i];
         if (pos >= 0) sum += prob[i] * ub(kv[static_cast<long long>(pos) * dim + c]);
     }
@@ -472,13 +497,13 @@ void resident_retrieval(const float* query, const std::uint16_t* keys, float* me
 void resident_pool_select(const float* query, const float* weights, const std::uint16_t* pools,
                           const std::uint8_t* allowed, float* scores, int* ids, const int* slots,
                           const int* positions, int capacity, int tier, int tokens,
-                          cudaStream_t s) {
+                          cudaStream_t s, int* selected_counts) {
     if (!query || !weights || !pools || !scores || !ids || !slots || !positions || capacity < 1 ||
         capacity > 32768 || tier < 4 || tier > 32768 || tokens < 1 || tokens > 32768)
         throw std::invalid_argument("resident pool selection geometry");
     pool_scores<<<dim3((tier + 3) / 4, tokens), 64, 0, s>>>(query, weights, pools, allowed, scores,
                                                             slots, positions, capacity);
-    pool_select<<<tokens, 256, 0, s>>>(scores, ids, 0, positions);
+    pool_select<<<tokens, 256, 0, s>>>(scores, ids, 0, positions, selected_counts);
     CUDA_CHECK(cudaGetLastError());
     return;
 }
@@ -516,27 +541,27 @@ void resident_retrieval(const std::uint16_t* query, const std::uint16_t* keys, f
 void resident_pool_select(const std::uint16_t* query, const float* weights, const std::uint16_t* pools,
                           const std::uint8_t* allowed, float* scores, int* ids, const int* slots,
                           const int* positions, int capacity, int tier, int tokens,
-                          cudaStream_t s) {
+                          cudaStream_t s, int* selected_counts) {
     if (!query || !weights || !pools || !scores || !ids || !slots || !positions || capacity < 1 ||
         capacity > 32768 || tier < 4 || tier > 32768 || tokens < 1 || tokens > 32768)
         throw std::invalid_argument("resident pool selection geometry");
     pool_scores<<<dim3((tier + 3) / 4, tokens), 64, 0, s>>>(query, weights, pools, allowed, scores,
                                                             slots, positions, capacity);
-    pool_select<<<tokens, 256, 0, s>>>(scores, ids, 0, positions);
+    pool_select<<<tokens, 256, 0, s>>>(scores, ids, 0, positions, selected_counts);
     CUDA_CHECK(cudaGetLastError());
     return;
 }
 
 void resident_sparse_attention(const float* query, const std::uint16_t* latents, const int* ids,
                                float* probabilities, float* out, const int* slots, int capacity,
-                               int tokens, cudaStream_t s, int heads) {
+                               int tokens, cudaStream_t s, int heads, const int* selected_counts) {
     if (!query || !latents || !ids || !probabilities || !out || !slots || capacity < 1 ||
         capacity > 32768 || tokens < 1 || tokens > 32768 || heads < 1 || heads > 64)
         throw std::invalid_argument("resident sparse attention operands/geometry");
     launch_attention_scores(query, latents, ids, probabilities, heads, 512, tokens, 2051,
-                            1.f / 16, s, slots, capacity);
+                            1.f / 16, s, slots, capacity, selected_counts);
     attention_values<<<dim3(2, heads, tokens), 256, 0, s>>>(latents, ids, probabilities, out, heads, 512,
-                                                         2051, slots, capacity);
+                                                         2051, slots, capacity, selected_counts);
     CUDA_CHECK(cudaGetLastError());
     return;
 }

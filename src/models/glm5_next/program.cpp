@@ -350,6 +350,7 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
          *ih = floats(w, (32) * t), *scores = floats(w, (8192) * t),
          *prob = floats(w, (heads * 2051) * t);
     auto* ids  = static_cast<std::int32_t*>(w.alloc_bytes(2051 * 4 * t).data);
+    auto* selected_counts = options_.draft ? nullptr : static_cast<int*>(w.alloc_bytes(2ULL * t * sizeof(int)).data);
     projection(x, p.query_lowrank, low, t, d);
     ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, t, 1e-5f, false, true, s);
     projection(low, p.query_heads, query, t, d);
@@ -416,7 +417,7 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
                                     options_.max_context, t, options_.kvmem_window_pages / 2, s);
         ops::resident_pool_select(iq, ih, static_cast<const std::uint16_t*>(state.pools.p),
                                   options_.kvmem_window_pages ? allowed : nullptr, scores, ids,
-                                  slots, positions, options_.max_context, frame_->tier, t, s);
+                                  slots, positions, options_.max_context, frame_->tier, t, s, selected_counts);
     }
     ops::indexed_linear_fp32(query, p.key_absorb, nullptr, absorbed, 512, heads, t, false, s);
     if (options_.draft) {
@@ -424,7 +425,7 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
                                      ids, prob, attended, heads, 512, t, 2051, 1.f / 16, s);
     } else
         ops::resident_sparse_attention(absorbed, static_cast<const std::uint16_t*>(state.latent.p),
-                                       ids, prob, attended, slots, options_.max_context, t, s, heads);
+                                       ids, prob, attended, slots, options_.max_context, t, s, heads, selected_counts);
     ops::indexed_linear_fp32(attended, p.value_expand, nullptr, expanded, 256, heads, t, false, s,
                              true);
     if (tensor_parallel_)
