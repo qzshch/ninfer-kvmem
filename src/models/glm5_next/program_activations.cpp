@@ -1,3 +1,4 @@
+#include "models/glm5_next/math.h"
 #include "models/glm5_next/program.h"
 #include "ninfer/ops/indexed_linear.h"
 #include "ninfer/ops/kimi_delta_attention.h"
@@ -109,7 +110,7 @@ void Program::kda(const Tensor& x, const KdaParameters& p, LayerState& state,
         p.decay_bias.reshape({128, heads}), -5.f, 1.f / std::sqrt(128.f), work, image, ids, ranges,
         result, stream, ops::KdaDecayParameter::NegativeRate);
     auto gates = gate.reshape({128, heads, tokens});
-    ops::resident_norm(result, &p.output_norm, nullptr, &gates, result, 1e-5f, false, stream);
+    ops::resident_norm(result, &p.output_norm, nullptr, &gates, result, rms_norm_epsilon, false, stream);
     output_projection(result, p.output, out, p.head_begin * 128, d, tokens);
 }
 
@@ -134,10 +135,10 @@ void Program::mla(const Tensor& x, const MlaParameters& p, LayerState& state,
     auto* ids = static_cast<int*>(work.alloc_bytes(2051ULL * tokens * sizeof(int)).data);
     auto* selected_counts = static_cast<int*>(work.alloc_bytes(2ULL * tokens * sizeof(int)).data);
     projection(x, p.query_lowrank, low, d);
-    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1e-6f, false, stream);
+    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, rms_norm_epsilon, false, stream);
     projection(low, p.query_heads, query, d);
     projection(x, p.kv_latent, latent, d);
-    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, 1e-6f, false, stream);
+    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, rms_norm_epsilon, false, stream);
     projection(low, p.index.query, iq, d);
     projection(x, p.index.key, ik, d);
     ops::resident_norm(ik, &p.index.key_norm, &p.index.key_norm_bias, nullptr, ik, 1e-6f, true, stream);

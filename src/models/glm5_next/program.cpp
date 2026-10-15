@@ -1,3 +1,4 @@
+#include "models/glm5_next/math.h"
 #include "models/glm5_next/program.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/indexed_linear.h"
@@ -251,7 +252,7 @@ void Program::hyper_prepare(const float* residual, const HyperParameters& p, flo
     auto* norm   = floats(w, 4 * H * t);
     auto* mix    = floats(w, 24 * t);
     const auto s = frame_->devices[d]->stream;
-    ops::resident_norm(residual, nullptr, nullptr, nullptr, norm, 4 * H, t, 1e-5f, false, false, s);
+    ops::resident_norm(residual, nullptr, nullptr, nullptr, norm, 4 * H, t, rms_norm_epsilon, false, false, s);
     projection(norm, p.projection, mix, t, d, false);
     ops::hyper_connection_coefficients(mix, fp(p.base), fp(p.scale), coeff, t, 20, 1e-6f, s);
     ops::hyper_connection_collapse(residual, coeff, out, H, t, s);
@@ -318,7 +319,7 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
         }
         ops::unpack_bf16(static_cast<const std::uint16_t*>(yb.data), result, channels * t, s);
     }
-    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, heads * t, 1e-5f, false,
+    ops::resident_norm(result, &p.output_norm, nullptr, gate, result, 128, heads * t, rms_norm_epsilon, false,
                        true, s);
     if (tensor_parallel_)
         ops::linear_partial_fp32(result, p.output, out, p.head_begin * 128, channels, t, s);
@@ -352,10 +353,10 @@ void Program::mla(const float* x, const MlaParameters& p, LayerState& state, flo
     auto* ids  = static_cast<std::int32_t*>(w.alloc_bytes(2051 * 4 * t).data);
     auto* selected_counts = options_.draft ? nullptr : static_cast<int*>(w.alloc_bytes(2ULL * t * sizeof(int)).data);
     projection(x, p.query_lowrank, low, t, d);
-    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, t, 1e-5f, false, true, s);
+    ops::resident_norm(low, &p.query_norm, nullptr, nullptr, low, 1536, t, rms_norm_epsilon, false, true, s);
     projection(low, p.query_heads, query, t, d);
     projection(x, p.kv_latent, latent, t, d);
-    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, 512, t, 1e-5f, false, true, s);
+    ops::resident_norm(latent, &p.kv_norm, nullptr, nullptr, latent, 512, t, rms_norm_epsilon, false, true, s);
     if (options_.draft)
         ops::pack_bf16(latent, static_cast<std::uint16_t*>(state.latent.p) + position_ * 512, 512,
                        s);
@@ -553,14 +554,14 @@ std::int32_t Program::target(std::int32_t token, int snapshot) {
         auto* residual = static_cast<float*>(frame_->state[d].streams.p);
         const auto s   = frame_->devices[d]->stream;
         hyper_prepare(residual, p.attention_hc, coeff, x, d);
-        ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, 1, 1e-5f, false, true, s);
+        ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false, true, s);
         if (p.linear)
             kda(x, p.kda, layers_[i], y, d);
         else
             mla(x, p.mla, layers_[i], y, d);
         ops::hyper_connection_expand(residual, y, coeff, residual, H, 1, s);
         hyper_prepare(residual, p.ffn_hc, coeff, x, d);
-        ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, 1, 1e-5f, false, true, s);
+        ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false, true, s);
         feed_forward(x, p, y);
         ops::hyper_connection_expand(residual, y, coeff, residual, H, 1, s);
         capture(residual, i, d);
@@ -573,7 +574,7 @@ std::int32_t Program::target(std::int32_t token, int snapshot) {
     auto& first = *frame_->state[0].workspace;
     auto* final = floats(first, H);
     peer(final, 0, hidden, 2, H * 4);
-    ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, 1, 1e-5f, false,
+    ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, 1, rms_norm_epsilon, false,
                        true, frame_->devices[0]->stream);
     auto* logits = floats(first, 154880);
     projection(final, parameters_.output_head, logits, 1, 0, false);
@@ -617,19 +618,19 @@ std::int32_t Program::mtp_forward(std::int32_t token, bool proposal) {
     peer(joined, 2, embedded, 0, H * 4);
     peer(joined + H, 2, frame_->state[0].hidden.p, 0, H * 4);
     const auto stream = frame_->devices[2]->stream;
-    ops::resident_norm(joined, &p.embedding_norm, nullptr, nullptr, joined, H, 1, 1e-5f, false,
+    ops::resident_norm(joined, &p.embedding_norm, nullptr, nullptr, joined, H, 1, rms_norm_epsilon, false,
                        true, stream);
-    ops::resident_norm(joined + H, &p.hidden_norm, nullptr, nullptr, joined + H, H, 1, 1e-5f, false,
+    ops::resident_norm(joined + H, &p.hidden_norm, nullptr, nullptr, joined + H, H, 1, rms_norm_epsilon, false,
                        true, stream);
     auto* residual = floats(work, H);
     auto* x        = floats(work, H);
     auto* y        = floats(work, H);
     projection(joined, p.fusion, residual, 1, 2);
-    ops::resident_norm(residual, &p.layer.attention_norm, nullptr, nullptr, x, H, 1, 1e-5f, false,
+    ops::resident_norm(residual, &p.layer.attention_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false,
                        true, stream);
     mla(x, p.layer.mla, mtp_state_, y, 2, 1);
     ops::resident_add(residual, y, residual, H, stream);
-    ops::resident_norm(residual, &p.layer.ffn_norm, nullptr, nullptr, x, H, 1, 1e-5f, false, true,
+    ops::resident_norm(residual, &p.layer.ffn_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false, true,
                        stream);
     feed_forward(x, p.layer, y, 1);
     ops::resident_add(residual, y, residual, H, stream);
@@ -643,7 +644,7 @@ std::int32_t Program::mtp_forward(std::int32_t token, bool proposal) {
         frame_->devices[2]->synchronize();
         return -1;
     }
-    ops::resident_norm(residual, &p.output_norm, nullptr, nullptr, residual, H, 1, 1e-5f, false,
+    ops::resident_norm(residual, &p.output_norm, nullptr, nullptr, residual, H, 1, rms_norm_epsilon, false,
                        true, stream);
     auto* input = floats(first, H);
     peer(input, 0, residual, 2, H * 4);
@@ -712,23 +713,23 @@ void Program::batch_stage(int d) {
         auto normalized = work.alloc(DType::BF16, {H, frame_->batch});
         hyper_prepare(residual, p.attention_hc, coeff, x, d, frame_->batch);
         if (options_.bf16_activations) {
-            ops::resident_norm(collapsed, &p.attention_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+            ops::resident_norm(collapsed, &p.attention_norm, nullptr, nullptr, normalized, rms_norm_epsilon, false, stream);
             if (p.linear)
                 kda(normalized, p.kda, layers_[i], y, d, frame_->batch);
             else
                 mla(normalized, p.mla, layers_[i], y, d, frame_->batch);
         } else {
-            ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true, stream);
+            ops::resident_norm(x, &p.attention_norm, nullptr, nullptr, x, H, frame_->batch, rms_norm_epsilon, false, true, stream);
             if (p.linear) kda(x, p.kda, layers_[i], y, d, frame_->batch);
             else mla(x, p.mla, layers_[i], y, d, frame_->batch);
         }
         ops::hyper_connection_expand(residual, y, coeff, residual, H, frame_->batch, stream);
         hyper_prepare(residual, p.ffn_hc, coeff, x, d, frame_->batch);
         if (options_.bf16_activations) {
-            ops::resident_norm(collapsed, &p.ffn_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+            ops::resident_norm(collapsed, &p.ffn_norm, nullptr, nullptr, normalized, rms_norm_epsilon, false, stream);
             feed_forward(normalized, p, y, frame_->batch);
         } else {
-            ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, frame_->batch, 1e-5f, false, true, stream);
+            ops::resident_norm(x, &p.ffn_norm, nullptr, nullptr, x, H, frame_->batch, rms_norm_epsilon, false, true, stream);
             feed_forward(x, p, y, frame_->batch);
         }
         ops::hyper_connection_expand(residual, y, coeff, residual, H, frame_->batch, stream);
@@ -755,9 +756,9 @@ void Program::batch_head() {
     Tensor final_input(final, DType::FP32, {H, frame_->outputs});
     auto normalized = work.alloc(DType::BF16, {H, frame_->outputs});
     if (options_.bf16_activations)
-        ops::resident_norm(final_input, &parameters_.output_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+        ops::resident_norm(final_input, &parameters_.output_norm, nullptr, nullptr, normalized, rms_norm_epsilon, false, stream);
     else {
-        ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, 1e-5f, false, true, stream);
+        ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, rms_norm_epsilon, false, true, stream);
         normalized = final_input;
     }
     auto* logits = floats(work, 154880 * frame_->outputs);
@@ -971,7 +972,7 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
                              context_begin, context, s);
         projection(feature, p.feature_projection, normalized_context, context, 2);
         ops::resident_norm(normalized_context, &p.context_norm, nullptr, nullptr,
-                           normalized_context, H, context, 1e-5f, false, true, s);
+                           normalized_context, H, context, rms_norm_epsilon, false, true, s);
     }
     for (int layer = 0; layer < 5; ++layer) {
         const auto& l    = p.layers[layer];
@@ -981,7 +982,7 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
             auto *k = floats(w, context * 1024), *v = floats(w, context * 1024);
             projection(normalized_context, l.key, k, context, 2);
             projection(normalized_context, l.value, v, context, 2);
-            ops::resident_norm(k, &l.key_norm, nullptr, nullptr, k, 128, context * 8, 1e-5f, false,
+            ops::resident_norm(k, &l.key_norm, nullptr, nullptr, k, 128, context * 8, rms_norm_epsilon, false,
                                true, s);
             ops::dflash_rope(k, 8, context, context_begin, s);
             ops::dflash_cache_append(k, v, static_cast<std::uint16_t*>(draft_cache_[layer].key.p),
@@ -991,7 +992,7 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
         auto *normalized = floats(w, t * H), *prepared = floats(w, t * H),
              *dynamic = floats(w, t * 1024), *output = floats(w, t * H),
              *finished = floats(w, t * H);
-        ops::resident_norm(hidden, &l.attention_norm, nullptr, nullptr, normalized, H, t, 1e-5f,
+        ops::resident_norm(hidden, &l.attention_norm, nullptr, nullptr, normalized, H, t, rms_norm_epsilon,
                            false, true, s);
         projection(normalized, l.attention_conv.kernel_projection, dynamic, t, 2);
         ops::dflash_dynamic_conv(
@@ -1006,9 +1007,9 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
             projection(prepared, l.query, q, t, 2);
             projection(prepared, l.key, k, t, 2);
             projection(prepared, l.value, v, t, 2);
-            ops::resident_norm(q, &l.query_norm, nullptr, nullptr, q, 128, t * 32, 1e-5f, false,
+            ops::resident_norm(q, &l.query_norm, nullptr, nullptr, q, 128, t * 32, rms_norm_epsilon, false,
                                true, s);
-            ops::resident_norm(k, &l.key_norm, nullptr, nullptr, k, 128, t * 8, 1e-5f, false, true,
+            ops::resident_norm(k, &l.key_norm, nullptr, nullptr, k, 128, t * 8, rms_norm_epsilon, false, true,
                                s);
             ops::dflash_rope(q, 32, t, position_, s);
             ops::dflash_rope(k, 8, t, position_, s);
@@ -1021,7 +1022,7 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
             output, dynamic, static_cast<const std::uint16_t*>(l.attention_conv.base_kernel.data),
             finished, t, 1, s);
         ops::resident_add(hidden, finished, hidden, static_cast<std::size_t>(t) * H, s);
-        ops::resident_norm(hidden, &l.ffn_norm, nullptr, nullptr, normalized, H, t, 1e-5f, false,
+        ops::resident_norm(hidden, &l.ffn_norm, nullptr, nullptr, normalized, H, t, rms_norm_epsilon, false,
                            true, s);
         projection(normalized, l.mlp_conv.kernel_projection, dynamic, t, 2);
         ops::dflash_dynamic_conv(normalized, dynamic,
@@ -1033,7 +1034,7 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
                                  finished, t, 1, s);
         ops::resident_add(hidden, finished, hidden, static_cast<std::size_t>(t) * H, s);
     }
-    ops::resident_norm(hidden, &p.final_norm, nullptr, nullptr, hidden, H, t, 1e-5f, false, true,
+    ops::resident_norm(hidden, &p.final_norm, nullptr, nullptr, hidden, H, t, rms_norm_epsilon, false, true,
                        s);
     auto* rank = floats(w, (t - 1) * 256);
     projection(hidden + H, p.selector_projection, rank, t - 1, 2);

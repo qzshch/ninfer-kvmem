@@ -217,6 +217,13 @@ if(BUILD_TESTING)
       ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}"
       ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:" RUN_SERIAL TRUE TIMEOUT 180)
   endforeach()
+  add_executable(k100_activation_layout_test tests/activation_layout.cpp)
+  target_link_libraries(k100_activation_layout_test PRIVATE ninfer_k100_resident_transform)
+  foreach(device RANGE 0 2)
+    add_test(NAME k100_activation_layout_device${device} COMMAND k100_activation_layout_test)
+    set_tests_properties(k100_activation_layout_device${device} PROPERTIES
+      ENVIRONMENT "HIP_VISIBLE_DEVICES=${device}" RUN_SERIAL TRUE TIMEOUT 120)
+  endforeach()
   add_executable(k100_resident_transform_test tests/resident_transform.cpp)
   target_link_libraries(k100_resident_transform_test PRIVATE ninfer_k100_resident_transform)
   foreach(device RANGE 0 2)

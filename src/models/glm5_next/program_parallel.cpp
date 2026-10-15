@@ -1,3 +1,4 @@
+#include "models/glm5_next/math.h"
 #include "models/glm5_next/program.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/indexed_linear.h"
@@ -45,13 +46,13 @@ void Program::tensor_phase(int layer, int d, bool ffn) {
     hyper_prepare(residual, ffn ? p.ffn_hc : p.attention_hc, coeff, collapsed, d, frame_->batch);
     const auto& norm = ffn ? p.ffn_norm : p.attention_norm;
     if (options_.bf16_activations) {
-        ops::resident_norm(source, &norm, nullptr, nullptr, x, 1e-5f, false, stream);
+        ops::resident_norm(source, &norm, nullptr, nullptr, x, rms_norm_epsilon, false, stream);
         if (ffn) feed_forward(x, p, partial, frame_->batch);
         else if (p.linear) kda(x, p.kda, layer_state(d, layer), partial, d, frame_->batch);
         else mla(x, p.mla, layer_state(d, layer), partial, d, frame_->batch);
     } else {
         auto* input = static_cast<float*>(x.data);
-        ops::resident_norm(collapsed, &norm, nullptr, nullptr, input, H, frame_->batch, 1e-5f, false, true, stream);
+        ops::resident_norm(collapsed, &norm, nullptr, nullptr, input, H, frame_->batch, rms_norm_epsilon, false, true, stream);
         if (ffn) feed_forward(input, p, partial, frame_->batch);
         else if (p.linear) kda(input, p.kda, layer_state(d, layer), partial, d, frame_->batch);
         else mla(input, p.mla, layer_state(d, layer), partial, d, frame_->batch);
@@ -109,9 +110,9 @@ void Program::tensor_finalize(int d) {
     Tensor source(frame_->state[0].hidden.p, DType::FP32, {H, frame_->outputs});
     Tensor normalized(frame_->state[0].normalized.p, options_.bf16_activations ? DType::BF16 : DType::FP32, {H, frame_->outputs});
     if (options_.bf16_activations)
-        ops::resident_norm(source, &parameters_.output_norm, nullptr, nullptr, normalized, 1e-5f, false, stream);
+        ops::resident_norm(source, &parameters_.output_norm, nullptr, nullptr, normalized, rms_norm_epsilon, false, stream);
     else ops::resident_norm(static_cast<const float*>(source.data), &parameters_.output_norm,
-        nullptr, nullptr, static_cast<float*>(normalized.data), H, frame_->outputs, 1e-5f, false, true, stream);
+        nullptr, nullptr, static_cast<float*>(normalized.data), H, frame_->outputs, rms_norm_epsilon, false, true, stream);
 }
 
 void Program::tensor_execute() {

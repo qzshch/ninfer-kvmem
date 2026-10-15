@@ -1,3 +1,4 @@
+#include "models/glm5_next/math.h"
 #include "models/glm5_next/model.h"
 #include "models/glm5_next/parallel_layout.h"
 #include "artifact/binder.h"
@@ -55,7 +56,7 @@ void config_contract(const artifact::Json& c, const artifact::Json& d) {
                 c.at("index_kpool_compress") == true &&
                 c.at("index_kpool_always_select_tail") == true,
             "GLM DSA config mismatch");
-    require(c.at("rms_norm_eps") == 1e-5 && c.at("scoring_func") == "sigmoid" &&
+    require(c.at("rms_norm_eps") == rms_norm_epsilon && c.at("scoring_func") == "sigmoid" &&
                 c.at("n_group") == 1 && c.at("norm_topk_prob") == true &&
                 c.at("routed_scaling_factor") == 2.5 && c.at("swiglu_limit") == 10.0 &&
                 c.at("moe_intermediate_size") == 2048 && c.at("intermediate_size") == 12288,
