@@ -372,6 +372,29 @@ void metadata(DeviceContext& ctx, int rows) {
     }
 }
 void tensor_sums(DeviceContext& ctx) {
+    for (int tokens : {1, 8, 33}) {
+        constexpr int hidden = 4096, active = 8;
+        std::vector<float> experts(tokens * active * hidden), weights(tokens * active);
+        for (unsigned i = 0; i < experts.size(); ++i) experts[i] = value(i + 71);
+        for (unsigned i = 0; i < weights.size(); ++i)
+            weights[i] = .05f + static_cast<float>(i % 13) / 97.f;
+        auto dx = upload(experts), dw = upload(weights);
+        DeviceBuffer result(tokens * hidden * sizeof(float));
+        ops::resident_moe_partial(static_cast<float*>(dx.p), static_cast<float*>(dw.p),
+            static_cast<float*>(result.p), hidden, active, tokens, ctx.stream);
+        ctx.synchronize();
+        const auto observed = download(result);
+        for (int t = 0; t < tokens; ++t) for (int c = 0; c < hidden; ++c) {
+            double ideal = 0, absolute = 0;
+            for (int j = 0; j < active; ++j) {
+                const double product = static_cast<double>(experts[(t * active + j) * hidden + c]) * weights[t * active + j];
+                ideal += product; absolute += std::abs(product);
+            }
+            require(std::isfinite(observed[t * hidden + c]) &&
+                        std::abs(observed[t * hidden + c] - ideal) <= 4e-6 * absolute + 1e-30,
+                    "local EP weighted sum complete FP64 oracle");
+        }
+    }
     constexpr int count = 4096 * 3;
     for (bool routed : {false, true}) {
         std::vector<float> a(count * (routed ? 2 : 1)), b(a.size()), c(a.size());
