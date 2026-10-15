@@ -82,6 +82,24 @@ void row_upload_plan() {
             "full-parent alias failed to promote a prior slice");
 }
 
+void block_row_uploads() {
+    for (bool q6 : {false, true}) {
+        Fixture fixture;
+        const int n = q6 ? 3 : 5, begin = q6 ? 1 : 2, count = q6 ? 2 : 3, row_bytes = q6 ? 210 : 136;
+        auto& object = fixture.root["objects"][1];
+        object["shape"] = {n, 256}; object["format"] = q6 ? "q6_k_g256_block" : "iq4_xs_g256_block";
+        object["layout"] = "block_interleaved_v1"; object["bytes"] = n * row_bytes;
+        fixture.root["bindings"].erase("row"); fixture.root["uses"] = Json::array(); fixture.write(true);
+        Reader reader(fixture.entry); Binder binder(reader);
+        const auto ref = binder.parameter_rows("matrix", {static_cast<unsigned>(n), 256}, begin, count);
+        const auto plan = std::move(binder).finish();
+        require(plan.device_capacity_bytes == static_cast<std::uint64_t>(count) * row_bytes && plan.device_objects.size() == 1 &&
+                plan.device_objects[0].row_begin == static_cast<unsigned>(begin) && plan.device_objects[0].row_count == static_cast<unsigned>(count) &&
+                ref.binding.parts[0].begin == begin * 256ULL && ref.binding.parts[0].end == (begin + count) * 256ULL,
+                "block256 local rows lost original logical origins or allocated a full parent");
+    }
+}
+
 void geometry_and_views() {
     const std::array<std::uint16_t, 12> direct_words{
         0, 0x8000, 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100, 0x4110, 0x4120};
@@ -188,6 +206,7 @@ int main(int argc, char** argv) {
     try {
         file_set_and_bindings();
         row_upload_plan();
+        block_row_uploads();
         geometry_and_views();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.

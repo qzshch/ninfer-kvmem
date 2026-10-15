@@ -1,4 +1,5 @@
 #include "models/glm5_next/model.h"
+#include "models/glm5_next/parallel_layout.h"
 #include "artifact/binder.h"
 #include "artifact/views.h"
 #include <memory>
@@ -13,34 +14,14 @@ void require(bool condition, const char* message) {
     if (!condition) throw artifact::ArtifactError(message);
 }
 
-Weight rows(const Weight& source, int begin, int count) {
-    require(begin >= 0 && count > 0 && count <= source.n && begin <= source.n - count,
-            "GLM local weight row interval");
-    require(source.layout == QuantLayout::Contiguous || source.layout == QuantLayout::BlockInterleaved,
-            "GLM TP requires direct or interleaved stored rows");
-    const std::array<std::uint64_t, 2> shape{static_cast<unsigned>(source.n), static_cast<unsigned>(source.k)};
-    WeightParent parent{weight_geometry(source.qtype, source.layout, shape),
-                         static_cast<const std::byte*>(source.qdata), source.weight_scale_divisor};
-    return native_weight({{static_cast<unsigned>(count), static_cast<unsigned>(source.k)},
-                          {{&parent, static_cast<std::uint64_t>(begin) * source.k,
-                            static_cast<std::uint64_t>(begin + count) * source.k}}},
-                         source.input_scale_divisor);
-}
-
 void shard_parameters(Parameters& p, int rank) {
-    constexpr int vocabulary_starts[3]{0, 51712, 103424}, vocabulary_rows[3]{51712, 51712, 51456};
-    p.output_begin = vocabulary_starts[rank];
-    p.output_head = rows(p.output_head, p.output_begin, vocabulary_rows[rank]);
-    constexpr int heads[3]{24, 20, 20}, starts[3]{0, 24, 44};
-    constexpr int shared[3]{768, 768, 512}, shared_starts[3]{0, 768, 1536};
-    const int h = heads[rank], first = starts[rank], channels = h * 128;
+    p.output_begin = vocabulary_partition(rank).begin;
+    const auto partition = head_partition(rank);
+    const int h = partition.count, first = partition.begin, channels = h * 128;
     for (auto& l : p.layers) {
         if (l.linear) {
             auto& a = l.kda;
             a.head_begin = first;
-            for (auto* w : {&a.query, &a.key, &a.value, &a.forget_out, &a.output_gate_out})
-                *w = rows(*w, first * 128, channels);
-            a.input_gate = rows(a.input_gate, first, h);
             for (auto* conv : {&a.query_conv, &a.key_conv, &a.value_conv})
                 *conv = Tensor(static_cast<float*>(conv->data) + first * 128 * 4,
                                DType::FP32, {4, 1, channels});
@@ -51,15 +32,8 @@ void shard_parameters(Parameters& p, int rank) {
         } else {
             auto& a = l.mla;
             a.head_begin = first;
-            a.query_heads = rows(a.query_heads, first * 256, h * 256);
-            a.key_absorb = rows(a.key_absorb, first * 512, h * 512);
-            a.value_expand = rows(a.value_expand, first * 256, h * 256);
         }
-        const int intermediate = l.dense ? 4096 : shared[rank];
-        const int offset = l.dense ? rank * 4096 : shared_starts[rank];
-        l.ffn.column_begin = offset;
-        l.ffn.gate = rows(l.ffn.gate, offset, intermediate);
-        l.ffn.up = rows(l.ffn.up, offset, intermediate);
+        l.ffn.column_begin = mlp_partition(l.dense ? 12288 : 2048, rank).begin;
     }
 }
 
@@ -141,6 +115,18 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
     auto norm = [&](Tensor& w, const std::string& name, int size, int dev, QType type) {
         add(w, name, {static_cast<unsigned>(size)}, dev, type);
     };
+    const auto row_weight = [&](Weight& destination, const std::string& name,
+                                 int n, int k, RowPartition part, int dev) {
+        demands.push_back({dev, &destination, binders[dev]->parameter_rows(name,
+            {static_cast<unsigned>(n), static_cast<unsigned>(k)}, part.begin, part.count)});
+    };
+    const auto head_weight = [&](Weight& destination, const std::string& name,
+                                  int n, int k, int per_head, int dev) {
+        if (parallelism == Parallelism::TensorExpert) {
+            const auto part = head_partition(dev);
+            row_weight(destination, name, n, k, {part.begin * per_head, part.count * per_head}, dev);
+        } else add(destination, name, {static_cast<unsigned>(n), static_cast<unsigned>(k)}, dev);
+    };
     auto mlp = [&](MlpParameters& m, const std::string& p, int intermediate, int dev,
                    int banks = 1) {
         if (parallelism == Parallelism::TensorExpert && banks == 288) {
@@ -155,19 +141,25 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
             bind(m.down, p + "down", banks * 4096, intermediate, 4096);
             return;
         }
-        add(m.gate, p + "gate", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
-        add(m.up, p + "up", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
+        if (parallelism == Parallelism::TensorExpert) {
+            const auto part = mlp_partition(intermediate, dev);
+            row_weight(m.gate, p + "gate", intermediate, 4096, part, dev);
+            row_weight(m.up, p + "up", intermediate, 4096, part, dev);
+        } else {
+            add(m.gate, p + "gate", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
+            add(m.up, p + "up", {static_cast<unsigned>(banks * intermediate), 4096}, dev);
+        }
         add(m.down, p + "down",
             {static_cast<unsigned>(banks * 4096), static_cast<unsigned>(intermediate)}, dev);
     };
     auto bind_mla = [&](MlaParameters& a, const std::string& m, int dev) {
         add(a.query_lowrank, m + "query_lowrank", {1536, 4096}, dev);
         norm(a.query_norm, m + "query_norm", 1536, dev, QType::FP32);
-        add(a.query_heads, m + "query_heads", {16384, 1536}, dev);
+        head_weight(a.query_heads, m + "query_heads", 16384, 1536, 256, dev);
         add(a.kv_latent, m + "kv_latent", {512, 4096}, dev);
         norm(a.kv_norm, m + "kv_norm", 512, dev, QType::FP32);
-        add(a.key_absorb, m + "key_absorb", {32768, 256}, dev);
-        add(a.value_expand, m + "value_expand", {16384, 512}, dev);
+        head_weight(a.key_absorb, m + "key_absorb", 32768, 256, 512, dev);
+        head_weight(a.value_expand, m + "value_expand", 16384, 512, 256, dev);
         add(a.output, m + "output", {4096, 16384}, dev);
         auto& x      = a.index;
         const auto z = m + "index/";
@@ -182,7 +174,9 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
     for (int rank = 0; rank < (parallelism == Parallelism::TensorExpert ? 3 : 1); ++rank) {
     auto& local = rank == 0 ? parameters_ : replicas_[rank - 1];
     if (rank == 0) add(local.embedding, "text/token_embedding", {154880, 4096}, 0);
-    add(local.output_head, "text/output_head", {154880, 4096}, rank);
+    if (parallelism == Parallelism::TensorExpert)
+        row_weight(local.output_head, "text/output_head", 154880, 4096, vocabulary_partition(rank), rank);
+    else add(local.output_head, "text/output_head", {154880, 4096}, rank);
     norm(local.output_norm, "text/output_norm", 4096, rank, QType::FP32);
     for (int i = 0; i < 45; ++i) {
         auto& l       = local.layers[i];
@@ -205,19 +199,19 @@ Model::Model(const artifact::Reader& reader, std::array<DeviceContext*, 3> devic
         if (l.linear) {
             auto& a      = l.kda;
             const auto k = p + "kda/";
-            add(a.query, k + "query", {8192, 4096}, dev);
-            add(a.key, k + "key", {8192, 4096}, dev);
-            add(a.value, k + "value", {8192, 4096}, dev);
+            head_weight(a.query, k + "query", 8192, 4096, 128, dev);
+            head_weight(a.key, k + "key", 8192, 4096, 128, dev);
+            head_weight(a.value, k + "value", 8192, 4096, 128, dev);
             add(a.query_conv, k + "query_conv", {8192, 1, 4}, dev, QType::FP32);
             add(a.key_conv, k + "key_conv", {8192, 1, 4}, dev, QType::FP32);
             add(a.value_conv, k + "value_conv", {8192, 1, 4}, dev, QType::FP32);
             norm(a.negative_decay_rate, k + "negative_decay_rate", 64, dev, QType::FP32);
             norm(a.decay_bias, k + "decay_bias", 8192, dev, QType::FP32);
-            add(a.input_gate, k + "input_gate", {64, 4096}, dev);
+            head_weight(a.input_gate, k + "input_gate", 64, 4096, 1, dev);
             add(a.forget_in, k + "forget_in", {128, 4096}, dev);
-            add(a.forget_out, k + "forget_out", {8192, 128}, dev);
+            head_weight(a.forget_out, k + "forget_out", 8192, 128, 128, dev);
             add(a.output_gate_in, k + "output_gate_in", {128, 4096}, dev);
-            add(a.output_gate_out, k + "output_gate_out", {8192, 128}, dev);
+            head_weight(a.output_gate_out, k + "output_gate_out", 8192, 128, 128, dev);
             norm(a.output_norm, k + "output_norm", 128, dev, QType::FP32);
             add(a.output, k + "output", {4096, 8192}, dev);
         } else {
