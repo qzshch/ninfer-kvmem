@@ -153,13 +153,18 @@ def main():
     p.add_argument("--database", required=True)
     p.add_argument("--api-names", help="Optional HIP API-name map for analysis away from DTK")
     p.add_argument("--run", required=True)
-    p.add_argument("--baseline", required=True)
+    p.add_argument("--baseline", required=True,
+                   help="Unprofiled native CLI JSON or qualification record with measurements")
     p.add_argument("--output", required=True)
     args = p.parse_args()
     data = load(args.database, args.api_names)
     all_frames = frames(data["kernel"])
     run = json.loads(Path(args.run).read_text(encoding="utf-8"))
-    baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))["measurements"]
+    baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+    baseline = baseline.get("measurements", baseline)
+    if "ordinary" not in baseline:
+        assert baseline["speculative"] == "ordinary", "Expected an ordinary native baseline"
+        baseline = {"ordinary": baseline}
     result = {"method": "Unmodified native GLM Engine under DTK hipprof --hip-trace --no-export. Windows delimited by target embedding and argmax kernels; host API time includes GPU waits and overlaps GPU duration.", "modes": {}}
     cursor = 0
     if "ordinary" not in run:
