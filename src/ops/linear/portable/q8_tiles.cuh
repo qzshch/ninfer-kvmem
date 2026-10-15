@@ -5,10 +5,11 @@ __device__ float tile_input(const void* x, long long i) {
     if constexpr (Bf16) return decode_bf16(static_cast<const std::uint16_t*>(x)[i]);
     else return static_cast<const float*>(x)[i];
 }
-template <bool Bf16, bool OutputBf16 = Bf16>
+template <bool Bf16, bool OutputBf16 = Bf16, int Rows = 4>
 __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
                                int n, int parent_k, int begin, int k, bool rounded) {
-    constexpr int Rows = 4, TileK = 512;
+    constexpr int TileK = 512;
+    static_assert(Rows == 1 || Rows == 4);
     const int lane = threadIdx.x, group = lane / 16, pair = lane % 16;
     const int first_row = blockIdx.x * Rows;
     const auto* bytes = static_cast<const unsigned char*>(weight);
@@ -84,6 +85,14 @@ __global__ void q8_decode_tile(const void* x, const void* weight, void* out,
         else static_cast<float*>(out)[first_row + lane] = projection_output(v, rounded);
     }
 #endif
+}
+
+template <bool InputBf16, bool OutputBf16>
+void q8_decode_launch(const void* x, const void* weights, void* out, int n,
+                       int parent_k, int begin, int k, bool rounded, cudaStream_t stream) {
+    if (n < 512)
+        q8_decode_tile<InputBf16, OutputBf16, 1><<<n, 256, 0, stream>>>(x, weights, out, n, parent_k, begin, k, rounded);
+    else q8_decode_tile<InputBf16, OutputBf16, 4><<<(n + 3) / 4, 256, 0, stream>>>(x, weights, out, n, parent_k, begin, k, rounded);
 }
 
 template <bool Bf16, bool OutputBf16 = Bf16>

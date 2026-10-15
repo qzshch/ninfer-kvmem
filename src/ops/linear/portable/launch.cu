@@ -148,8 +148,8 @@ void launch_typed(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     if constexpr (Format == QType::Q8_G32_FP16_BLOCK) {
         if (w.n >= 128 && ((w.k >= 512 && x.ne[1] == 1) || x.ne[1] >= 16)) {
             if (x.ne[1] == 1)
-                q8_decode_tile<InputBf16, OutputBf16><<<(w.n + 3) / 4, 256, 0, stream>>>(
-                    x.data, w.qdata, out.data, w.n, w.k, 0, w.k, rounded);
+                q8_decode_launch<InputBf16, OutputBf16>(x.data, w.qdata, out.data,
+                    w.n, w.k, 0, w.k, rounded, stream);
             else
                 q8_matrix_tile<InputBf16, OutputBf16><<<dim3((w.n + 7) / 8, (x.ne[1] + 7) / 8), 256, 0, stream>>>(
                     x.data, w.qdata, out.data, w.n, w.k, 0, w.k, x.ne[1], rounded);
@@ -225,7 +225,7 @@ void partial_launch(const void* x, const Weight& w, float* out, int begin, int k
     if constexpr (F == QType::Q8_G32_FP16_BLOCK) {
         if (w.n >= 128 && ((k >= 512 && t == 1) || t >= 16)) {
             if (t == 1)
-                q8_decode_tile<InputBf16, false><<<(w.n + 3) / 4, 256, 0, s>>>(x, w.qdata, out, w.n, w.k, begin, k, false);
+                q8_decode_launch<InputBf16, false>(x, w.qdata, out, w.n, w.k, begin, k, false, s);
             else
                 q8_matrix_tile<InputBf16, false><<<dim3((w.n + 7) / 8, (t + 7) / 8), 256, 0, s>>>(
                     x, w.qdata, out, w.n, w.k, begin, k, t, false);

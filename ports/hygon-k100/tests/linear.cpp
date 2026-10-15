@@ -288,7 +288,7 @@ int main(int argc, char** argv) try {
     }
     // Real small/TP output extents and nonzero parent K intervals; guards
     // and the independent represented-input FP64 oracle apply to each call.
-    for (int n : {128, 512, 2560, 3072}) for (bool bf : {false, true}) {
+    for (int n : {128, 255, 512, 2560, 3072}) for (bool bf : {false, true}) {
         worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, n, 4096, 1, bf));
         worst = std::max(worst, run(ctx, QType::Q8_G32_FP16_BLOCK, n, 8192, 1, bf,
                                     nullptr, false, 256, 2560));
