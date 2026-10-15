@@ -219,14 +219,14 @@ int main(int argc, char** argv) try {
     unsigned count = 0;
     double worst   = 0;
     for (const auto& item : cases)
-        for (int tokens : {1, 8})
+        for (int tokens : {1, 3, 8})
             for (bool bf : {false, true}) {
                 worst = std::max(worst, run(ctx, root, item, tokens, bf));
                 ++count;
             }
     unsigned indexed = 0;
     for (const auto& item : cases)
-        for (int tokens : {1, 8})
+        for (int tokens : {1, 3, 8})
             for (bool shared : {false, true})
                 for (bool implicit : {false, true}) {
                     run_indexed(ctx, root, item, tokens, shared, implicit);

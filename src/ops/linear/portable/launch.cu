@@ -81,9 +81,65 @@ __global__ void projection(const void* x, const void* w, void* out, int n, int k
     return;
 }
 
+
+#ifdef NINFER_HYGON_DTK
+// Four independent activation columns share every represented weight load and
+// decode. Each column retains the existing 256-lane accumulation/reduction tree.
+// Tails are masked; there is no padding request or duplicated mutable state.
+template <QType Format, bool Bf16>
+__global__ void projection_columns4(const void* x, const void* w, void* out, int n, int k,
+                                    int tokens) {
+    const int row = blockIdx.x, base = blockIdx.y * 4, lane = threadIdx.x;
+    float sum[4]{};
+    for (int column = lane; column < k; column += 256) {
+        const float weight = load_weight<Format>(w, row, column, k);
+        for (int t = 0; t < 4; ++t)
+            if (base + t < tokens) {
+                float value;
+                if constexpr (Bf16)
+                    value =
+                        decode_bf16(static_cast<const std::uint16_t*>(x)[(base + t) * k + column]);
+                else
+                    value = static_cast<const float*>(x)[(base + t) * k + column];
+                sum[t] += weight * value;
+            }
+    }
+    __shared__ float partial[4][256];
+    for (int t = 0; t < 4; ++t) partial[t][lane] = sum[t];
+    __syncthreads();
+    if (lane < 128)
+        for (int t = 0; t < 4; ++t) partial[t][lane] += partial[t][lane + 128];
+    __syncthreads();
+    if (lane < 64)
+        for (int t = 0; t < 4; ++t) {
+            float value = partial[t][lane] + partial[t][lane + 64];
+            for (int distance = 32; distance; distance /= 2)
+                value += __shfl_down(value, distance, 64);
+            if (!lane && base + t < tokens) {
+                if constexpr (Bf16)
+                    static_cast<std::uint16_t*>(out)[(base + t) * n + row] = encode_bf16(value);
+                else
+                    static_cast<float*>(out)[(base + t) * n + row] = value;
+            }
+        }
+    return;
+}
+#endif
+
 template <QType Format>
 void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
 #ifdef NINFER_HYGON_DTK
+    if (x.ne[1] > 1 && (Format == QType::Q8_G32_FP16_BLOCK || Format == QType::Q6_K_G256_BLOCK) &&
+        w.n >= 128) {
+        const dim3 grid(w.n, (x.ne[1] + 3) / 4);
+        if (x.dtype == DType::BF16)
+            projection_columns4<Format, true>
+                <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, x.ne[1]);
+        else
+            projection_columns4<Format, false>
+                <<<grid, 256, 0, stream>>>(x.data, w.qdata, out.data, w.n, w.k, x.ne[1]);
+        return;
+    }
     // Small row counts retain the wider row to expose enough parallel columns.
     // Dense Q8 also retains it: warm native-shape A/B regressed with wave64.
     if (Format != QType::Q8_G32_FP16_BLOCK && w.n >= 512 && w.k % 256 == 0) {
