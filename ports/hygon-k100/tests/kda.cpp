@@ -158,9 +158,11 @@ void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float 
 }
 
 void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
-                bool packed = false, bool short_spans = false) {
-    constexpr int batch = 3, slot_count = 6;
-    const std::vector<std::int32_t> slots{4, 1, 5};
+                bool packed = false, bool short_spans = false, const std::vector<int>& lengths = {}) {
+    const int batch = lengths.empty() ? 3 : static_cast<int>(lengths.size());
+    constexpr int slot_count = 10;
+    const std::array<int, 8> mapping{8, 2, 6, 0, 9, 4, 1, 7};
+    const std::vector<std::int32_t> slots(mapping.begin(), mapping.begin() + batch);
     const std::size_t state_size = 128 * 128 * heads, vector_size = 128 * heads;
     std::vector<float> pool(slot_count * state_size);
     for (std::size_t i = 0; i < pool.size(); ++i) pool[i] = .001f * (static_cast<int>(i % 31) - 15);
@@ -168,7 +170,7 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
     std::vector<float> q, k, v, g, b;
     std::vector<int> offsets{0};
     for (int row = 0; row < batch; ++row) {
-        const int length = packed ? (short_spans ? std::array{1, 2, 5}[row] : std::array{1, 8, 33}[row]) : 1;
+        const int length = packed ? (!lengths.empty() ? lengths[row] : (short_spans ? std::array{1, 2, 5}[row] : std::array{1, 8, 33}[row])) : 1;
         auto a = inputs(qheads, heads, length, row);
         offsets.push_back(offsets.back() + length);
         a.negative_rate = negative;
@@ -288,6 +290,11 @@ int main() try {
             run(ctx, heads, heads, 1, 2, -5, true, negative, true);
             ++cases;
         }
+    }
+    for (const auto& spans : {std::vector<int>(8, 16), std::vector<int>{1,2,3,4,8,16,17,65},
+                               std::vector<int>{1,1,1,1,1,1,1,128}}) {
+        run_batch(ctx, 2, 4, true, true, false, spans);
+        ++cases;
     }
     for (int mode : {1, 2, 3}) {
         run(ctx, 1, 5, 65, mode, -5, true, true, true);

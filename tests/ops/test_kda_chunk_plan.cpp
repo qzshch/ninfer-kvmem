@@ -9,7 +9,7 @@ int main() try {
     for (int sequences = 1; sequences <= 8; ++sequences)
         for (int rows = sequences; rows <= 1024; ++rows) {
             const auto bytes = dtk_packed_workspace_bytes(24, rows, sequences);
-            if (rows < 16) {
+            if (!dtk_use_chunks(rows, sequences)) {
                 if (bytes < static_cast<std::size_t>(rows) * 24 * (3 * 128 + 1) * sizeof(float) ||
                     bytes % alignof(DtkPrepared))
                     throw std::runtime_error("prepared recurrence exceeds its workspace quote");
@@ -18,6 +18,7 @@ int main() try {
             for (int sample = 0; sample < 16; ++sample) {
                 std::vector<bool> used(bytes / sizeof(DtkChunk) / 24);
                 int begin = 0;
+                std::vector<int> offsets{0}, owner(used.size(), -1);
                 for (int seq = 0; seq < sequences; ++seq) {
                     const int remaining = rows - begin - (sequences - seq - 1);
                     const int count = seq == sequences - 1 ? rows - begin : 1 + rng() % remaining;
@@ -25,10 +26,13 @@ int main() try {
                         const auto index = static_cast<unsigned>(dtk_packet_base(begin, seq) + t / 16);
                         if (index >= used.size() || used[index])
                             throw std::runtime_error("ragged sequence packets overlap or exceed the resource quote");
-                        used[index] = true;
+                        used[index] = true; owner[index] = seq;
                     }
-                    begin += count;
+                    begin += count; offsets.push_back(begin);
                 }
+                for (unsigned packet = 0; packet < used.size(); ++packet)
+                    if (dtk_packet_sequence(offsets.data(), sequences, packet) != owner[packet])
+                        throw std::runtime_error("compact packet grid chose another sequence or a hole");
                 if (begin != rows) throw std::runtime_error("incomplete test span partition");
             }
         }

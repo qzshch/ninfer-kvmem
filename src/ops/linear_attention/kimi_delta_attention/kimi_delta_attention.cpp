@@ -327,7 +327,7 @@ void kimi_delta_attention_packed_update(
     const auto bytes = kimi_delta_attention_packed_workspace_capacity_bytes(q.ne[1], v.ne[1], count, q.ne[2]);
     auto scope = workspace.scope();
     auto storage = workspace.alloc_bytes(bytes);
-    if (args.tokens >= detail::kimi_delta_attention::kDtkTimeTile)
+    if (detail::kimi_delta_attention::dtk_use_chunks(args.tokens, count))
         detail::kimi_delta_attention::launch_packed_chunks(
             args, static_cast<const std::int32_t*>(slots.data), count, storage.data, stream);
     else detail::kimi_delta_attention::launch_prepared_update(

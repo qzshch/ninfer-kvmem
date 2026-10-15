@@ -103,11 +103,12 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
  * states[slots[r]]. Unselected states are unchanged. Both decay parameterizations
  * are explicit. Other operands follow the ordinary overload's dtype, alias,
  * numerical and represented-input rules. No allocation or host metadata readback.
- * M<=32768. DTK uses FP32 time tiles for M>=16, with cumulative diagonal
+ * M<=32768. DTK selects FP32 time tiles from the rows/sequence execution
+ * geometry, with cumulative diagonal
  * decays, a block-local triangular solve and FP32 state prediction/update.
  * Q/K, solves and delta remain FP32; only the public output rounds to BF16.
  * workspace is caller-owned, disjoint call-scoped storage sized by the query
- * below. Smaller M prepares head-only FP32 vectors once before the value-row
+ * below. Short-span geometry prepares head-only FP32 vectors once before the value-row
  * recurrence. Non-DTK rejects execution.
  */
 std::size_t kimi_delta_attention_packed_workspace_capacity_bytes(

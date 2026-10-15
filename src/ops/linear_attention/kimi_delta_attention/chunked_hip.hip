@@ -19,8 +19,11 @@ __device__ long long packet_index(Arguments a, int sequence, int chunk, int head
     return (static_cast<long long>(dtk_packet_base(a.sequence_offsets[sequence], sequence) + chunk) * a.value_heads) + head;
 }
 
-__global__ void prepare_vectors(Arguments a, DtkChunk* packets) {
-    const int h = blockIdx.x, chunk = blockIdx.y, seq = blockIdx.z, tid = threadIdx.x;
+__global__ void prepare_vectors(Arguments a, DtkChunk* packets, int sequences) {
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const int seq = dtk_packet_sequence(a.sequence_offsets, sequences, blockIdx.y);
+    if (seq < 0) return;
+    const int chunk = blockIdx.y - dtk_packet_base(a.sequence_offsets[seq], seq);
     const int start = a.sequence_offsets[seq] + chunk * 16;
     const int end = a.sequence_offsets[seq + 1];
     if (start >= end) return;
@@ -68,8 +71,11 @@ __global__ void prepare_vectors(Arguments a, DtkChunk* packets) {
     }
 }
 
-__global__ void prepare_solve(Arguments a, DtkChunk* packets) {
-    const int h = blockIdx.x, chunk = blockIdx.y, seq = blockIdx.z, tid = threadIdx.x;
+__global__ void prepare_solve(Arguments a, DtkChunk* packets, int sequences) {
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const int seq = dtk_packet_sequence(a.sequence_offsets, sequences, blockIdx.y);
+    if (seq < 0) return;
+    const int chunk = blockIdx.y - dtk_packet_base(a.sequence_offsets[seq], seq);
     if (a.sequence_offsets[seq] + chunk * 16 >= a.sequence_offsets[seq + 1]) return;
     auto& p = packets[packet_index(a, seq, chunk, h)];
     const int start = a.sequence_offsets[seq] + chunk * 16;
@@ -99,7 +105,7 @@ __global__ void prepare_solve(Arguments a, DtkChunk* packets) {
     const int row = tid / 16, col = tid % 16;
     __shared__ float lower[16][16], inverse[16][16];
     float kk = 0.f, qk = 0.f;
-    if (row >= col) for (int c = 0; c < 128; ++c) {
+    if (row < length && row >= col) for (int c = 0; c < 128; ++c) {
         // Evaluate the causal diagonal ratio directly. Reciprocal cumulative
         // decays would amplify private underflow even for the unit diagonal.
         const float decay = expf(p.prefix[row][c] - p.prefix[col][c]);
@@ -109,7 +115,7 @@ __global__ void prepare_solve(Arguments a, DtkChunk* packets) {
     lower[row][col] = row > col ? p.beta[row] * kk : 0.f;
     p.mqk[row][col] = row >= col ? qk : 0.f;
     __syncthreads();
-    for (int r = 0; r < 16; ++r) {
+    for (int r = 0; r < length; ++r) {
         if (tid < 16) {
             float value = r == tid ? 1.f : 0.f;
             for (int j = 0; j < r; ++j) value -= lower[r][j] * inverse[j][tid];
@@ -117,7 +123,7 @@ __global__ void prepare_solve(Arguments a, DtkChunk* packets) {
         }
         __syncthreads();
     }
-    p.solve[row][col] = inverse[row][col] * p.beta[col];
+    p.solve[row][col] = row < length && col < length ? inverse[row][col] * p.beta[col] : 0.f;
 }
 
 __global__ void consume_chunks(Arguments a, const DtkChunk* packets, const std::int32_t* slots) {
@@ -178,9 +184,9 @@ __global__ void consume_chunks(Arguments a, const DtkChunk* packets, const std::
 void launch_packed_chunks(const Arguments& args, const std::int32_t* slots, int sequences,
                            void* storage, cudaStream_t stream) {
     auto* packets = static_cast<DtkChunk*>(storage);
-    const dim3 prepare(args.value_heads, (args.tokens + 15) / 16, sequences);
-    prepare_vectors<<<prepare, 256, 0, stream>>>(args, packets);
-    prepare_solve<<<prepare, 256, 0, stream>>>(args, packets);
+    const dim3 prepare(args.value_heads, (args.tokens + 15) / 16 + sequences - 1);
+    prepare_vectors<<<prepare, 256, 0, stream>>>(args, packets, sequences);
+    prepare_solve<<<prepare, 256, 0, stream>>>(args, packets, sequences);
     consume_chunks<<<dim3(args.value_heads, 16, sequences), 256, 0, stream>>>(args, packets, slots);
     CUDA_CHECK(cudaGetLastError());
 }
