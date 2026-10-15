@@ -24,6 +24,7 @@ int main(int argc, char** argv) try {
     options.use_cuda_graph     = true;
     options.kvmem_window_pages = 6;
     options.pending_timeout_ms = 0;
+    options.prefill_pack_projections = true;
     Engine engine(options);
     std::vector<std::vector<TokenId>> prompts;
     for (const auto* text :

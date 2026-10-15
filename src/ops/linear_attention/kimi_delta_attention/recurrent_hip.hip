@@ -28,11 +28,13 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots) {
     float state[V];
     for (int v = 0; v < V; ++v) state[v] = a.state_in[state_base + v * D];
     const float rate = a.negative_rate ? -a.a_log[h] : expf(a.a_log[h]);
-    for (int t = 0; t < a.tokens; ++t) {
+    const int begin = a.sequence_offsets ? a.sequence_offsets[batch] : batch * a.tokens;
+    const int end = a.sequence_offsets ? a.sequence_offsets[batch + 1] : begin + a.tokens;
+    for (int t = begin; t < end; ++t) {
         const std::int64_t qbase =
-            ((static_cast<std::int64_t>(batch) * a.tokens + t) * a.qk_heads + qh) * D;
+            (static_cast<std::int64_t>(t) * a.qk_heads + qh) * D;
         const std::int64_t vstart =
-            ((static_cast<std::int64_t>(batch) * a.tokens + t) * a.value_heads + h) * D;
+            (static_cast<std::int64_t>(t) * a.value_heads + h) * D;
         const float qi = from_bf16(a.q[qbase + c]), ki = from_bf16(a.k[qbase + c]);
         reduce[0][c] = qi * qi;
         reduce[1][c] = ki * ki;
@@ -48,7 +50,7 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots) {
             inv_q = rsqrtf(reduce[0][0] + kQkL2NormEps);
             inv_k = rsqrtf(reduce[1][0] + kQkL2NormEps);
             beta  = sigmoid(from_bf16(
-                a.beta[(static_cast<std::int64_t>(batch) * a.tokens + t) * a.value_heads + h]));
+                a.beta[static_cast<std::int64_t>(t) * a.value_heads + h]));
         }
         __syncthreads();
         q[c]              = qi * inv_q;

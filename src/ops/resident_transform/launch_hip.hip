@@ -111,13 +111,16 @@ __global__ void streams_kernel(const float* x, float* y, int h) {
 }
 
 __global__ void conv_kernel(const float* x, const void* weight, DType type, float* state, float* o,
-                            int channels, int t, const std::int32_t* slots = nullptr) {
+                            int channels, int t, const std::int32_t* slots = nullptr,
+                            const std::int32_t* offsets = nullptr) {
     const int c = blockIdx.x * 256 + threadIdx.x;
     if (c >= channels) return;
     if (slots) {
         state += static_cast<long long>(slots[blockIdx.y]) * channels * 3;
-        x += static_cast<long long>(blockIdx.y) * channels;
-        o += static_cast<long long>(blockIdx.y) * channels;
+        const int begin = offsets[blockIdx.y];
+        t = offsets[blockIdx.y + 1] - begin;
+        x += static_cast<long long>(begin) * channels;
+        o += static_cast<long long>(begin) * channels;
     }
     float s0 = state[c * 3], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
     const float w0 = direct(weight, type, c * 4), w1 = direct(weight, type, c * 4 + 1),
@@ -150,6 +153,13 @@ __global__ void conv_kernel(const float* x, const void* weight, DType type, floa
     state[c * 3]     = s0;
     state[c * 3 + 1] = s1;
     state[c * 3 + 2] = s2;
+}
+
+__global__ void gather_rows(const float* input, const int* ids, float* output, int width) {
+    const int c = blockIdx.x * 256 + threadIdx.x, row = blockIdx.y;
+    if (c < width)
+        output[static_cast<long long>(row) * width + c] =
+            input[static_cast<long long>(ids[row]) * width + c];
 }
 
 __global__ void router_serial_kernel(const float* logits, const float* bias, std::int32_t* ids,
@@ -335,7 +345,9 @@ void unpack_bf16(const std::uint16_t* x, float* o, std::size_t n, cudaStream_t s
 
 void resident_norm(const float* x, const Tensor* g, const Tensor* b, const float* gate, float* o,
                    int n, int rows, float eps, bool center, bool round, cudaStream_t s) {
-    shape(n, rows);
+    // Norm uses grid.x, unlike the two-dimensional row transforms. In
+    // particular 1024 time rows times 64 KDA heads is a legal 65536-row norm.
+    if (n < 1 || rows < 1) throw std::invalid_argument("resident_norm: dimensions");
     direct_weight(g, n);
     direct_weight(b, n);
     if (!x || !o || !(eps > 0) || !std::isfinite(eps))
@@ -386,15 +398,24 @@ void resident_causal_conv(const float* x, const Tensor& w, float* state, float* 
     return;
 }
 
-void resident_causal_conv_batch(const float* x, const Tensor& w, float* state,
-                                const std::int32_t* slots, float* o, int c, int rows,
-                                cudaStream_t s) {
-    shape(c, rows);
+void resident_causal_conv_packed(const float* x, const Tensor& w, float* state,
+                                 const std::int32_t* slots, const std::int32_t* offsets,
+                                 float* o, int c, int sequences, cudaStream_t s) {
+    shape(c, sequences);
     direct_weight(&w, c * 4);
-    if (!x || !o || !state || !slots)
-        throw std::invalid_argument("resident_conv_batch: operands");
-    conv_kernel<<<dim3((c + 255) / 256, rows), 256, 0, s>>>(
-        x, w.data, w.dtype, state, o, c, 1, slots);
+    if (!x || !o || !state || !slots || !offsets)
+        throw std::invalid_argument("resident_conv_packed: operands");
+    conv_kernel<<<dim3((c + 255) / 256, sequences), 256, 0, s>>>(
+        x, w.data, w.dtype, state, o, c, 1, slots, offsets);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void resident_gather_rows(const float* x, const std::int32_t* ids, float* out,
+                          int width, int rows, cudaStream_t s) {
+    shape(width, rows);
+    if (!x || !ids || !out || x == out)
+        throw std::invalid_argument("resident_gather_rows: operands");
+    gather_rows<<<dim3((width + 255) / 256, rows), 256, 0, s>>>(x, ids, out, width);
     CUDA_CHECK(cudaGetLastError());
 }
 

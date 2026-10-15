@@ -97,7 +97,12 @@ add_executable(ninfer_k100_generate ninfer_generate.cpp)
 target_link_libraries(ninfer_k100_generate PRIVATE ninfer_k100_engine)
 
 if(BUILD_TESTING)
+  add_executable(k100_token_batch_test "${NINFER_ROOT}/tests/runtime/test_token_batch.cpp")
+  target_include_directories(k100_token_batch_test PRIVATE "${NINFER_ROOT}/src")
+  add_test(NAME k100_token_batch COMMAND k100_token_batch_test)
   # Real artifact qualification is opt-in, never an implicit 145-GiB CTest load.
+  add_executable(ninfer_k100_prefill_check tests/program_prefill.cpp)
+  target_link_libraries(ninfer_k100_prefill_check PRIVATE ninfer_k100_glm_program ninfer_k100_glm_frontend)
   add_executable(ninfer_k100_engine_check tests/engine_batch.cpp)
   target_link_libraries(ninfer_k100_engine_check PRIVATE ninfer_k100_engine)
   add_executable(k100_resident_batch_test tests/resident_batch.cpp)

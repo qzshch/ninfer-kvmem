@@ -2,6 +2,7 @@
 #include "models/glm5_next/model.h"
 #include "core/arena.h"
 #include "core/decode_graph.h"
+#include "runtime/contract/token_batch.h"
 #include <map>
 #include <span>
 #include "kvmem/block_retrieval.h"
@@ -17,12 +18,14 @@ struct ProgramOptions {
     bool graph                  = false;
     bool draft                  = true;
     bool mtp                    = false;
+    unsigned prefill_chunk      = 1024;
 };
 
 struct ProgramStats {
     std::uint64_t target_steps = 0, kvmem_selections = 0, kvmem_restricted_steps = 0,
                   graph_captures = 0, graph_replays = 0, batch_rounds = 0, projection_columns = 0,
-                  peer_bytes = 0, draft_calls = 0, drafted_tokens = 0, draft_context_tokens = 0;
+                  peer_bytes = 0, draft_calls = 0, drafted_tokens = 0, draft_context_tokens = 0,
+                  predicted_rows = 0;
     std::array<std::size_t, 3> persistent_bytes{}, workspace_peak{};
 };
 
@@ -41,6 +44,8 @@ public:
     std::int32_t mtp_forward(std::int32_t next_token, bool proposal);
     std::vector<std::int32_t> target_batch(std::span<const std::int32_t> tokens,
                                            std::span<const std::int32_t> lanes);
+    std::vector<std::int32_t> execute(const runtime::TokenBatch& batch);
+    int input_capacity() const noexcept { return max_rows_; }
 
     int frontier(int lane) const { return frontiers_.at(lane); }
 
@@ -70,7 +75,11 @@ private:
     int position_ = 0;
     std::array<int, 8> frontiers_{};
     std::map<int, std::array<DecodeGraphExecutable, 4>> graphs_;
-    int batch_ = 1, tier_ = 128;
+    int max_rows_ = 1, batch_ = 1, sequences_ = 1, outputs_ = 1, tier_ = 128;
+    runtime::TokenBatchKind kind_ = runtime::TokenBatchKind::Decode;
+    enum MetadataField { TokenIds, StateSlots, Positions, OutputRows, PredictedIds, SequenceOffsets };
+    std::vector<int> host_metadata_;
+    int* metadata(int device, MetadataField field) const noexcept;
     void batch_stage(int device);
     void batch_head();
     ProgramStats stats_;

@@ -93,4 +93,21 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
                                        cudaStream_t stream,
                                        KdaDecayParameter decay_parameter = KdaDecayParameter::LogRate);
 
+/**
+ * DTK packed temporal form of the same recurrence for R independent state slots.
+ * q/k BF16 [128,Hqk,M], v/g/out BF16 [128,Hv,M], beta BF16 [Hv,M]. States are
+ * FP32 [128,128,Hv,Slots]. Device I32 slots[R] are valid and distinct, R=1..8.
+ * Device I32 offsets[R+1] start at zero, end at M and increase strictly. Sequence
+ * r consumes input rows [offsets[r],offsets[r+1]) in time order and only updates
+ * states[slots[r]]. Unselected states are unchanged. Both decay parameterizations
+ * are explicit. Other operands follow the ordinary overload's dtype, alias,
+ * numerical and represented-input rules. No allocation or host metadata readback.
+ * Non-DTK implementations reject this entry before launching.
+ */
+void kimi_delta_attention_packed_update(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+    const Tensor& A_log, const Tensor& dt_bias, float lower_bound, float scale,
+    Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
+    cudaStream_t stream, KdaDecayParameter decay_parameter);
+
 } // namespace ninfer::ops

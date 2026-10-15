@@ -23,6 +23,7 @@ struct Arguments {
     int qk_heads, value_heads, tokens;
     float lower_bound, scale;
     bool negative_rate = false;
+    const std::int32_t* sequence_offsets = nullptr;
 };
 
 inline bool valid_heads(int qk, int value) { return qk > 0 && value >= qk && value % qk == 0; }

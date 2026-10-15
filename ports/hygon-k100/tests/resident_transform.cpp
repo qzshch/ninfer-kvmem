@@ -163,21 +163,24 @@ void conv(DeviceContext& ctx, int channels, int t, bool alias) {
     }
 }
 
-void pooled_conv(DeviceContext& ctx, int channels, bool alias) {
+void pooled_conv(DeviceContext& ctx, int channels, bool alias, bool packed = false) {
     constexpr int rows = 3, slots = 5;
     const std::vector<int> ids{4, 0, 2};
-    std::vector<float> x(rows * channels), s(slots * channels * 3), w(channels * 4);
+    const std::vector<int> offsets = packed ? std::vector{0, 1, 4, 12} : std::vector{0, 1, 2, 3};
+    std::vector<float> x(offsets.back() * channels), s(slots * channels * 3), w(channels * 4);
     for (std::size_t i = 0; i < x.size(); ++i) x[i] = value(i + 319);
     for (std::size_t i = 0; i < s.size(); ++i) s[i] = value(i + 91);
     for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(i * 1.7) * .23;
     WeightData weight(w, {static_cast<unsigned>(channels), 1, 4}, false);
     auto dx = upload(x), ds = upload(s);
-    DeviceBuffer selectors(ids.size() * sizeof(int)), dy(x.size() * sizeof(float));
+    DeviceBuffer selectors(ids.size() * sizeof(int)), bounds(offsets.size() * sizeof(int)),
+        dy(x.size() * sizeof(float));
     selectors.copy_from_host(ids.data(), selectors.bytes);
+    bounds.copy_from_host(offsets.data(), bounds.bytes);
     auto* output = static_cast<float*>(alias ? dx.p : dy.p);
-    ops::resident_causal_conv_batch(static_cast<float*>(dx.p), weight.view,
-                                    static_cast<float*>(ds.p), static_cast<int*>(selectors.p),
-                                    output, channels, rows, ctx.stream);
+    ops::resident_causal_conv_packed(static_cast<float*>(dx.p), weight.view,
+                                     static_cast<float*>(ds.p), static_cast<int*>(selectors.p),
+                                     static_cast<int*>(bounds.p), output, channels, rows, ctx.stream);
     ctx.synchronize();
     auto after = download(ds);
     const auto y = download(alias ? dx : dy);
@@ -191,17 +194,48 @@ void pooled_conv(DeviceContext& ctx, int channels, bool alias) {
                 continue;
             }
             const int row = found - ids.begin();
-            const double input = x[row * channels + c];
-            const double sum = double(s[base]) * w[c * 4] +
-                               double(s[base + 1]) * w[c * 4 + 1] +
-                               double(s[base + 2]) * w[c * 4 + 2] + input * w[c * 4 + 3];
-            const auto pre = bf(sum);
-            check(y[row * channels + c], pre * sig(pre), true, "pooled conv FP64");
-            require(after[base] == s[base + 1] && after[base + 1] == s[base + 2] &&
-                        after[base + 2] == input,
+            double a = s[base], b = s[base + 1], d = s[base + 2];
+            for (int t = offsets[row]; t < offsets[row + 1]; ++t) {
+                const double input = x[t * channels + c];
+                const double sum = a * w[c * 4] + b * w[c * 4 + 1] +
+                                   d * w[c * 4 + 2] + input * w[c * 4 + 3];
+                const auto pre = bf(sum);
+                check(y[t * channels + c], pre * sig(pre), true, "pooled conv FP64");
+                a = b;
+                b = d;
+                d = input;
+            }
+            require(after[base] == a && after[base + 1] == b && after[base + 2] == d,
                     "pooled conv final state");
         }
     }
+}
+
+void row_gather(DeviceContext& ctx) {
+    constexpr int width = 16384, source_rows = 5;
+    const std::vector<int> ids{4, 0, 2};
+    std::vector<float> x(width * source_rows);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = value(i + 137);
+    auto input = upload(x);
+    DeviceBuffer selectors(ids.size() * sizeof(int)), out(ids.size() * width * 4 + 32);
+    selectors.copy_from_host(ids.data(), selectors.bytes);
+    out.fill(0xa5);
+    auto* data = reinterpret_cast<float*>(static_cast<std::byte*>(out.p) + 16);
+    ops::resident_gather_rows(static_cast<float*>(input.p), static_cast<int*>(selectors.p),
+                              data, width, ids.size(), ctx.stream);
+    ctx.synchronize();
+    std::vector<unsigned char> bytes(out.bytes);
+    out.copy_to_host(bytes.data(), bytes.size());
+    for (int i = 0; i < 16; ++i)
+        require(bytes[i] == 0xa5 && bytes[bytes.size() - 1 - i] == 0xa5,
+                "row gather output guard");
+    std::vector<float> y(ids.size() * width);
+    out.copy_to_host(y.data(), y.size() * 4, 16);
+    for (std::size_t r = 0; r < ids.size(); ++r)
+        for (int c = 0; c < width; ++c)
+            require(std::bit_cast<unsigned>(y[r * width + c]) ==
+                        std::bit_cast<unsigned>(x[ids[r] * width + c]), "row gather exact value");
+    require(download(input) == x, "row gather changed input");
 }
 
 void elementwise(DeviceContext& ctx, int n, float limit) {
@@ -358,11 +392,15 @@ int main() {
                     conv(ctx, c, t, alias);
                     ++cases;
                 }
+        norm(ctx, 128, 65536, false, true, true, false, false);
+        row_gather(ctx);
+        cases += 2;
         for (int c : {7, 8192})
-            for (bool alias : {false, true}) {
-                pooled_conv(ctx, c, alias);
-                ++cases;
-            }
+            for (bool alias : {false, true})
+                for (bool packed : {false, true}) {
+                    pooled_conv(ctx, c, alias, packed);
+                    ++cases;
+                }
         for (int n : {17, 4096, 131072})
             for (float limit : {0.f, 10.f}) {
                 elementwise(ctx, n, limit);

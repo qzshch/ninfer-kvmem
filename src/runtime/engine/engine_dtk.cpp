@@ -117,7 +117,7 @@ public:
     explicit Impl(EngineOptions input) : options(std::move(input)) {
         if (options.device != 0 || (options.max_concurrency < 1 || options.max_concurrency > 8) ||
             options.max_context < 1 || options.max_context > 32768 ||
-            options.max_pending_requests < 1 || options.enable_vision ||
+            options.max_pending_requests < 1 || !options.prefill_chunk || options.enable_vision ||
             options.purpose != EnginePurpose::Generation ||
             options.kv_cache != KvCacheStorage::BFloat16 ||
             options.kv_capacity.mode != KvCapacityMode::Explicit ||
@@ -157,12 +157,13 @@ public:
                 static_cast<int>(options.max_context), options.kvmem_window_pages,
                 static_cast<int>(options.max_concurrency), options.use_cuda_graph,
                 options.speculative.backend == SpeculativeBackend::DFlash2,
-                options.speculative.backend == SpeculativeBackend::Mtp});
+                options.speculative.backend == SpeculativeBackend::Mtp, options.prefill_chunk});
         load.architecture   = "Glm5NextForConditionalGeneration";
         load.model_name     = "GLM-5.3-Flash UD-IQ4_XS";
         load.cuda_sync_mode = devices[0]->sync_mode();
-        load.prefill_signature =
-            "DTK; three resident layer stages; compact independent rows; greedy";
+        load.prefill_signature = options.speculative.backend == SpeculativeBackend::None
+            ? "DTK; three resident layer stages; packed causal time spans; greedy"
+            : "DTK; three resident layer stages; single-input companion profile; greedy";
         load.load_seconds       = seconds(start);
         memory.device           = 0;
         memory.max_context      = options.max_context;
@@ -397,6 +398,24 @@ public:
 
     void run_batched() {
         std::array<std::unique_ptr<Lane>, 8> lanes;
+        unsigned prefill_cursor = 0;
+        double prefill_seconds_per_token = 0;
+        const auto settle = [&] {
+            for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
+                if (lanes[slot] && lanes[slot]->result.finish_reason != FinishReason::None) {
+                    publish(*lanes[slot]);
+                    lanes[slot].reset();
+                    std::lock_guard lock(mutex);
+                    active_lanes[slot].reset();
+                }
+        };
+        const auto observe_input = [&](Lane& lane, unsigned base, unsigned count) {
+            if (!options.kvmem_window_pages) return;
+            lane.selections += 11 * count;
+            for (unsigned t = 0; t < count; ++t)
+                if ((base + t + 128) / 128 > options.kvmem_window_pages / 2)
+                    lane.restrictions += 11;
+        };
         for (;;) {
             {
                 std::unique_lock lock(mutex);
@@ -444,8 +463,8 @@ public:
                 }
             }
             try {
-                std::vector<int> tokens, slots;
-                std::vector<bool> prefill;
+                std::vector<int> tokens, outputs;
+                std::vector<runtime::TokenSpan> spans;
                 for (unsigned slot = 0; slot < options.max_concurrency; ++slot) {
                     if (!lanes[slot]) continue;
                     auto& lane = *lanes[slot];
@@ -454,63 +473,110 @@ public:
                     else if (program->frontier(slot) >= static_cast<int>(options.max_context))
                         lane.result.finish_reason = FinishReason::ContextCapacity;
                     if (lane.result.finish_reason != FinishReason::None) continue;
-                    const bool initial = lane.prompt_offset < lane.job->prompt.size();
-                    tokens.push_back(initial ? lane.job->prompt[lane.prompt_offset] : lane.anchor);
-                    slots.push_back(slot);
-                    prefill.push_back(initial);
+                    if (lane.prompt_offset < lane.job->prompt.size()) continue;
+                    const auto row = static_cast<unsigned>(tokens.size());
+                    tokens.push_back(lane.anchor);
+                    outputs.push_back(row);
+                    spans.push_back({slot, static_cast<unsigned>(program->frontier(slot)), row, 1});
                 }
+                const bool had_decode = !tokens.empty();
                 if (!tokens.empty()) {
-                    auto result                = program->target_batch(tokens, slots);
-                    std::uint64_t prefill_rows = 0, decode_rows = 0, committed_rows = 0;
-                    for (unsigned row = 0; row < slots.size(); ++row) {
-                        auto& lane = *lanes[slots[row]];
-                        if (options.kvmem_window_pages) {
-                            lane.selections += 11;
-                            if ((program->frontier(slots[row]) + 127) / 128 >
-                                static_cast<int>(options.kvmem_window_pages / 2))
-                                lane.restrictions += 11;
-                        }
+                    auto result = program->execute({runtime::TokenBatchKind::Decode, tokens, spans, outputs});
+                    std::uint64_t committed = 0;
+                    for (unsigned row = 0; row < spans.size(); ++row) {
+                        auto& lane = *lanes[spans[row].lane];
+                        observe_input(lane, spans[row].input_frontier, 1);
                         lane.anchor = result[row];
-                        if (prefill[row]) {
-                            ++prefill_rows;
-                            ++lane.prompt_offset;
-                            ++lane.result.computed_prefill_tokens;
-                            if (lane.prompt_offset != lane.job->prompt.size()) continue;
-                            lane.result.timings.prefill_seconds = seconds(lane.started);
-                            lane.result.timings.first_token_seconds =
-                                lane.result.timings.prefill_seconds;
-                            lane.decode_start = Clock::now();
-                            if (!lane.limit) {
-                                lane.result.finish_reason = FinishReason::OutputLimit;
-                                continue;
-                            }
-                        } else
-                            ++decode_rows;
                         if (lane.job->cancel)
                             lane.result.finish_reason = FinishReason::Cancelled;
                         else {
                             append_token(lane.job, lane.result, lane.anchor, lane.limit);
-                            if (!prefill[row]) ++committed_rows;
+                            ++committed;
                         }
                     }
                     std::lock_guard lock(mutex);
-                    if (prefill_rows && slots.size() > 1) {
-                        ++runtime.packed_prefill_batches;
-                        runtime.packed_prefill_tokens += prefill_rows;
+                    ++runtime.decode_rounds;
+                    runtime.decode_row_rounds += spans.size();
+                    runtime.committed_decode_tokens += committed;
+                }
+                // Publish completed decode requests before spending a prefill
+                // slice. Do not make their consumers wait for another unit.
+                settle();
+                std::vector<unsigned> prefill_lanes;
+                for (unsigned step = 0; step < options.max_concurrency; ++step) {
+                    const unsigned slot = (prefill_cursor + step) % options.max_concurrency;
+                    if (lanes[slot] && lanes[slot]->prompt_offset < lanes[slot]->job->prompt.size())
+                        prefill_lanes.push_back(slot);
+                }
+                if (!prefill_lanes.empty()) {
+                    unsigned budget = std::min(options.prefill_chunk,
+                                                static_cast<unsigned>(program->input_capacity()));
+                    if (had_decode) {
+                        // Start with one token until an actual unit gives a
+                        // cost estimate, then bound prefill by a 10-ms service
+                        // slice. This is an estimate; cancellation is at unit completion.
+                        unsigned estimated = 1;
+                        if (prefill_seconds_per_token > 0)
+                            estimated = static_cast<unsigned>(std::min<double>(budget,
+                                std::max(1., .010 / prefill_seconds_per_token)));
+                        budget = std::min(budget, estimated);
                     }
-                    if (decode_rows) {
-                        ++runtime.decode_rounds;
-                        runtime.decode_row_rounds += decode_rows;
-                        runtime.committed_decode_tokens += committed_rows;
+                    if (!options.prefill_pack_projections) prefill_lanes.resize(1);
+                    if (prefill_lanes.size() > budget) prefill_lanes.resize(budget);
+                    const unsigned per_lane = std::max(1u, budget / static_cast<unsigned>(prefill_lanes.size()));
+                    tokens.clear();
+                    spans.clear();
+                    outputs.clear();
+                    for (auto slot : prefill_lanes) {
+                        auto& lane = *lanes[slot];
+                        if (lane.job->cancel) {
+                            lane.result.finish_reason = FinishReason::Cancelled;
+                            continue;
+                        }
+                        const auto remaining = lane.job->prompt.size() - lane.prompt_offset;
+                        const unsigned count = std::min<std::size_t>(per_lane, remaining);
+                        const auto begin = static_cast<unsigned>(tokens.size());
+                        spans.push_back({slot, static_cast<unsigned>(program->frontier(slot)), begin, count});
+                        tokens.insert(tokens.end(), lane.job->prompt.begin() + lane.prompt_offset,
+                                      lane.job->prompt.begin() + lane.prompt_offset + count);
+                        if (count == remaining && lane.limit) outputs.push_back(begin + count - 1);
+                    }
+                    prefill_cursor = (prefill_lanes.back() + 1) % options.max_concurrency;
+                    if (!tokens.empty()) {
+                        const auto start = Clock::now();
+                        auto result = program->execute({runtime::TokenBatchKind::Prefill, tokens, spans, outputs});
+                        const double cost = seconds(start) / tokens.size();
+                        prefill_seconds_per_token = prefill_seconds_per_token > 0
+                            ? .75 * prefill_seconds_per_token + .25 * cost : cost;
+                        std::size_t output = 0;
+                        for (const auto& span : spans) {
+                            auto& lane = *lanes[span.lane];
+                            observe_input(lane, span.input_frontier, span.count);
+                            lane.prompt_offset += span.count;
+                            lane.result.computed_prefill_tokens += span.count;
+                            const bool complete = lane.prompt_offset == lane.job->prompt.size();
+                            if (complete && lane.limit) lane.anchor = result[output++];
+                            if (lane.job->cancel) {
+                                lane.result.finish_reason = FinishReason::Cancelled;
+                                continue;
+                            }
+                            if (!complete) continue;
+                            lane.result.timings.prefill_seconds = seconds(lane.started);
+                            lane.result.timings.first_token_seconds = lane.result.timings.prefill_seconds;
+                            lane.decode_start = Clock::now();
+                            if (!lane.limit)
+                                lane.result.finish_reason = FinishReason::OutputLimit;
+                            else
+                                append_token(lane.job, lane.result, lane.anchor, lane.limit);
+                        }
+                        if (spans.size() > 1) {
+                            std::lock_guard lock(mutex);
+                            ++runtime.packed_prefill_batches;
+                            runtime.packed_prefill_tokens += tokens.size();
+                        }
                     }
                 }
-                for (unsigned slot = 0; slot < options.max_concurrency; ++slot)
-                    if (lanes[slot] && lanes[slot]->result.finish_reason != FinishReason::None) {
-                        publish(*lanes[slot]);
-                        lanes[slot].reset();
-                        std::lock_guard lock(mutex);
-                        active_lanes[slot].reset();
-                    }
+                settle();
             } catch (...) {
                 available = false;
                 for (unsigned slot = 0; slot < options.max_concurrency; ++slot)

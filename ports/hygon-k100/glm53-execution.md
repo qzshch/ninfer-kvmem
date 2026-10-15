@@ -23,14 +23,17 @@ Host input/output staging does not provide an offload fallback.
 The implemented profile is Aggregate greedy text generation, with one to eight
 resident request lanes, independent state and context frontiers, and a maximum
 context capacity of 32768 tokens. Ordinary batches use actual compact request
-columns. Current prompt consumption advances one token per request per round;
-the public prefill_chunk option is not implemented by this DTK route.
+columns. Ordinary prompt consumption uses bounded temporal chunks controlled by
+prefill_chunk, with at most 1024 total input rows per unit. The native launcher
+exposes --prefill-chunk and --pack-prefill for ordinary generation. Intermediate
+prompt rows advance context without requesting a next-token prediction.
 
 Graph families cover actual request count and bounded context tiers. Program
 captures device stages and the output head lazily. Request slots, token IDs and
 frontiers are metadata inputs. Graph mode and eager mode implement the same
 mathematics. Graph resources consume device memory and must fit the resource
-budget. Graph replay does not imply overlapping pipeline execution.
+budget. Temporal prefill currently executes eagerly; Graph replay applies to
+ordinary Decode and does not imply overlapping pipeline execution.
 
 KVMem block means, selection and restrictions execute on the devices in the
 ordinary route. Request lanes own their respective recurrent and KV histories.

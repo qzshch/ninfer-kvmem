@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/kda_ref.h"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -148,7 +149,8 @@ void run(DeviceContext& ctx, int qheads, int heads, int tokens, int mode, float 
     check(std::vector<double>(state.begin(), state.end()), oracle.final_state, true);
 }
 
-void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false) {
+void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
+                bool packed = false) {
     constexpr int batch = 3, slot_count = 6;
     const std::vector<std::int32_t> slots{4, 1, 5};
     const std::size_t state_size = 128 * 128 * heads, vector_size = 128 * heads;
@@ -156,8 +158,11 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false)
     for (std::size_t i = 0; i < pool.size(); ++i) pool[i] = .001f * (static_cast<int>(i % 31) - 15);
     std::vector<Inputs> rows;
     std::vector<float> q, k, v, g, b;
+    std::vector<int> offsets{0};
     for (int row = 0; row < batch; ++row) {
-        auto a = inputs(qheads, heads, 1, row);
+        const int length = packed ? std::array{1, 8, 33}[row] : 1;
+        auto a = inputs(qheads, heads, length, row);
+        offsets.push_back(offsets.back() + length);
         a.negative_rate = negative;
         if (negative && !row)
             for (auto& x : a.a_log) x = -std::exp(x);
@@ -179,25 +184,33 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false)
     }
     Input qi(q, true), ki(k, true), vi(v, true), gi(g, true), bi(b, true), al(rows[0].a_log, false),
         dt(rows[0].dt_bias, false), state(pool, false);
-    DeviceBuffer selectors(slots.size() * 4), result(batch * vector_size * 2);
+    const int total = offsets.back();
+    DeviceBuffer selectors(slots.size() * 4), bounds(offsets.size() * 4), result(v.size() * 2);
     selectors.copy_from_host(slots.data(), selectors.bytes);
-    Tensor qt(qi.data.p, DType::BF16, {128, qheads, 1, batch}),
-        kt(ki.data.p, DType::BF16, {128, qheads, 1, batch});
-    Tensor vt(vi.data.p, DType::BF16, {128, heads, 1, batch}),
-        gt(gi.data.p, DType::BF16, {128, heads, 1, batch});
-    Tensor bt(bi.data.p, DType::BF16, {heads, 1, batch}), at(al.data.p, DType::FP32, {heads}),
+    bounds.copy_from_host(offsets.data(), bounds.bytes);
+    Tensor qt(qi.data.p, DType::BF16, {128, qheads, packed ? total : 1, packed ? 1 : batch}),
+        kt(ki.data.p, DType::BF16, {128, qheads, packed ? total : 1, packed ? 1 : batch});
+    Tensor vt(vi.data.p, DType::BF16, {128, heads, packed ? total : 1, packed ? 1 : batch}),
+        gt(gi.data.p, DType::BF16, {128, heads, packed ? total : 1, packed ? 1 : batch});
+    Tensor bt(bi.data.p, DType::BF16, {heads, packed ? total : 1, packed ? 1 : batch}),
+        at(al.data.p, DType::FP32, {heads}),
         dtb(dt.data.p, DType::FP32, {128, heads});
     Tensor states(state.data.p, DType::FP32, {128, 128, heads, slot_count}),
         ids(selectors.p, DType::I32, {batch});
-    Tensor out(result.p, DType::BF16, {128, heads, 1, batch});
-    ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dtb, -5, scale, states, ids, out,
-                                           ctx.stream,
-                                           negative ? ops::KdaDecayParameter::NegativeRate
-                                                    : ops::KdaDecayParameter::LogRate);
+    Tensor out(result.p, DType::BF16, {128, heads, packed ? total : 1, packed ? 1 : batch});
+    const auto parameter = negative ? ops::KdaDecayParameter::NegativeRate
+                                    : ops::KdaDecayParameter::LogRate;
+    if (packed) {
+        Tensor ranges(bounds.p, DType::I32, {batch + 1});
+        ops::kimi_delta_attention_packed_update(qt, kt, vt, gt, bt, at, dtb, -5, scale,
+                                                states, ids, ranges, out, ctx.stream, parameter);
+    } else
+        ops::kimi_delta_attention_batch_update(qt, kt, vt, gt, bt, at, dtb, -5, scale,
+                                               states, ids, out, ctx.stream, parameter);
     ctx.synchronize();
     std::vector<float> after(pool.size());
     state.data.copy_to_host(after.data(), state.data.bytes);
-    std::vector<std::uint16_t> y(batch * vector_size);
+    std::vector<std::uint16_t> y(v.size());
     result.copy_to_host(y.data(), result.bytes);
     for (int slot = 0; slot < slot_count; ++slot) {
         auto found = std::find(slots.begin(), slots.end(), slot);
@@ -210,8 +223,8 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false)
             const auto row = found - slots.begin();
             auto oracle    = ninfer::test::kda_ref::evaluate(rows[row], -5, scale);
             std::vector<double> output;
-            for (std::size_t i = 0; i < vector_size; ++i)
-                output.push_back(decode(y[row * vector_size + i]));
+            for (std::size_t i = 0; i < rows[row].v.size(); ++i)
+                output.push_back(decode(y[offsets[row] * vector_size + i]));
             check(output, oracle.out, false);
             check(std::vector<double>(after.begin() + slot * state_size,
                                       after.begin() + (slot + 1) * state_size),
@@ -235,6 +248,8 @@ int main() try {
         }
         run(ctx, 1, 5, 65, 0, 0, alias);
         ++cases;
+        run(ctx, 1, 5, 1024, 0, -5, alias, true);
+        ++cases;
         for (int tokens : {1, 8, 33}) {
             run(ctx, 64, 64, tokens, 0, -5, alias, true);
             ++cases;
@@ -248,6 +263,11 @@ int main() try {
     ++cases;
     run_batch(ctx, 64, 64, true);
     ++cases;
+    for (bool negative : {false, true}) {
+        run_batch(ctx, 2, 4, negative, true);
+        run_batch(ctx, 64, 64, negative, true);
+        cases += 2;
+    }
     std::printf("PASS: %u KDA cases; independent full FP64 output/state oracle; H64; K7 width8; "
                 "distinct/alias state; guards; zero workspace\n",
                 cases);

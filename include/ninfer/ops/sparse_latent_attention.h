@@ -3,10 +3,14 @@
 #include <cstdint>
 
 namespace ninfer::ops {
-// Compact independent sequences. slots/positions are device arrays [tokens];
+// Packed query rows. slots/positions are device arrays [tokens];
 // persistent caches are [resident_lanes, capacity, width]. Positions are the
 // append frontier before this transition. C=capacity in 1..32768, B=tokens in
-// 1..8. Caller supplies distinct valid physical slots and positions in [0,C).
+// 1..32768. Caller supplies valid slots and positions in [0,C). A slot may
+// repeat for a temporal span, but each (slot,position) written by append is
+// unique and all preceding history is initialized. Input writes complete before
+// a completed four-token pool reads any of them. Each query sees only pools
+// completed at its own position; physically written future rows stay invisible.
 // Buffers are device-resident, naturally aligned and disjoint. No allocation or
 // host metadata round trip; values outside each declared write region survive.
 // Append latent [B,512], key/gate [B,128] FP32 to BF16 caches; bias [4,128].
@@ -23,7 +27,8 @@ void resident_index_append(const float* latent, const float* key, const float* g
 // Select one sink, one most recent block (including partial), then remaining
 // budget by descending score/lower block-id ties. NaN scores are unranked.
 // allowed [B,ceil(C/64)] marks those blocks' pages. Prior full means must be
-// initialized. No request lifetime or sequence frontier is changed by this Op.
+// initialized. Means completed by later rows in the same packed call are not
+// eligible for an earlier query. No request lifetime/frontier changes in this Op.
 void resident_retrieval(const float* query, const std::uint16_t* keys, float* means,
                         std::uint8_t* allowed, const std::int32_t* slots,
                         const std::int32_t* positions, int capacity, int tokens, int budget_blocks,

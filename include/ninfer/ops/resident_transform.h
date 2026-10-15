@@ -30,13 +30,19 @@ void mean_streams(const float* input, float* out, int hidden, int tokens, cudaSt
 // Kernel is a direct vector [channels,1,4]. T processed in order on device.
 void resident_causal_conv(const float* input, const Tensor& kernel, float* state, float* output,
                           int channels, int tokens, cudaStream_t stream);
-// The same one-token transition for independent rows [rows,channels]. State is
-// [slot_count,channels,3]; device slots[rows] are valid, distinct physical slots.
-// Only selected slots change. Input/output may alias exactly; all other operands
-// are disjoint. The caller owns state, selectors and their lifetime through stream completion.
-void resident_causal_conv_batch(const float* input, const Tensor& kernel, float* states,
-                                const std::int32_t* slots, float* output, int channels,
-                                int rows, cudaStream_t stream);
+// Packed temporal form of the same transition. FP32 state is
+// [slot_count,channels,3]. Input/output may alias exactly; all other operands
+// are disjoint. Offsets[sequences+1] partition [0,M) into nonempty
+// ordered spans; slots[sequences] select valid distinct states. Input/output
+// are [M,channels]. The same mathematical state transition runs in increasing
+// time within each span, without copying state to compact execution rows.
+void resident_causal_conv_packed(const float* input, const Tensor& kernel, float* states,
+                                 const std::int32_t* slots, const std::int32_t* offsets,
+                                 float* output, int channels, int sequences, cudaStream_t stream);
+// Exact FP32 row gather, output [rows,width] = input[indices[row],:]. Device
+// indices are valid for the input extent. Input, indices and output are disjoint.
+void resident_gather_rows(const float* input, const std::int32_t* indices, float* output,
+                          int width, int rows, cudaStream_t stream);
 // Sigmoid top-k with bias for selection only; normalized original scores times
 // routed_scale. Deterministic lower-id ties. Single router group is explicit.
 void resident_router(const float* logits, const float* bias, std::int32_t* ids, float* weights,

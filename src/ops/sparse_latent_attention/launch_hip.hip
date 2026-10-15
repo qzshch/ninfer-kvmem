@@ -17,7 +17,8 @@ __device__ float bf(float v) { return ub(bw(v)); }
 __global__ void pool_append(const float* key, const float* gate, const float* bias,
                             std::uint16_t* keys, std::uint16_t* gates, std::uint16_t* pools,
                             int position, const int* slots = nullptr,
-                            const int* positions = nullptr, int capacity = 0) {
+                            const int* positions = nullptr, int capacity = 0,
+                            bool inputs_stored = false) {
     if (slots) {
         const int t = blockIdx.x;
         position    = positions[t];
@@ -28,8 +29,10 @@ __global__ void pool_append(const float* key, const float* gate, const float* bi
         pools += static_cast<long long>(slots[t]) * ((capacity + 3) / 4) * 128;
     }
     const int c               = threadIdx.x;
-    keys[position * 128 + c]  = bw(key[c]);
-    gates[position * 128 + c] = bw(gate[c]);
+    if (!inputs_stored) {
+        keys[position * 128 + c]  = bw(key[c]);
+        gates[position * 128 + c] = bw(gate[c]);
+    }
     if (position % 4 != 3) return;
     const int begin = position - 3;
     float a[4], m = -INFINITY, sum = 0;
@@ -45,6 +48,15 @@ __global__ void pool_append(const float* key, const float* gate, const float* bi
     for (int j = 0; j < 4; ++j) value += bf(bf(a[j] / sum) * ub(keys[(begin + j) * 128 + c]));
     pools[(position / 4) * 128 + c] = bw(value);
     return;
+}
+
+__global__ void store_index_inputs(const float* key, const float* gate,
+                                   std::uint16_t* keys, std::uint16_t* gates,
+                                   const int* slots, const int* positions, int capacity) {
+    const int row = blockIdx.x, c = threadIdx.x;
+    const auto dst = (static_cast<long long>(slots[row]) * capacity + positions[row]) * 128 + c;
+    keys[dst] = bw(key[row * 128 + c]);
+    gates[dst] = bw(gate[row * 128 + c]);
 }
 
 __global__ void pool_scores(const float* query, const float* weights, const std::uint16_t* pools,
@@ -308,11 +320,14 @@ void resident_index_append(const float* latent, const float* key, const float* g
                            std::uint16_t* gates, std::uint16_t* pools, const int* slots,
                            const int* positions, int capacity, int tokens, cudaStream_t s) {
     if (!latent || !key || !gate || !bias || !latents || !keys || !gates || !pools || !slots ||
-        !positions || capacity < 1 || capacity > 32768 || tokens < 1 || tokens > 8)
+        !positions || capacity < 1 || capacity > 32768 || tokens < 1 || tokens > 32768)
         throw std::invalid_argument("resident index append operands/geometry");
     append_latent<<<dim3(2, tokens), 256, 0, s>>>(latent, latents, slots, positions, capacity);
+    // A temporal span can contain several rows for one slot. Complete all
+    // represented writes before a pool reads keys produced by other CTAs.
+    store_index_inputs<<<tokens, 128, 0, s>>>(key, gate, keys, gates, slots, positions, capacity);
     pool_append<<<tokens, 128, 0, s>>>(key, gate, bias, keys, gates, pools, 0, slots, positions,
-                                       capacity);
+                                       capacity, true);
     CUDA_CHECK(cudaGetLastError());
     return;
 }
@@ -321,7 +336,7 @@ void resident_retrieval(const float* query, const std::uint16_t* keys, float* me
                         std::uint8_t* allowed, const int* slots, const int* positions, int capacity,
                         int tokens, int budget, cudaStream_t s) {
     if (!query || !keys || !means || !allowed || !slots || !positions || capacity < 1 ||
-        capacity > 32768 || tokens < 1 || tokens > 8 || budget < 1)
+        capacity > 32768 || tokens < 1 || tokens > 32768 || budget < 1)
         throw std::invalid_argument("resident retrieval geometry");
     retrieval_means<<<tokens, 128, 0, s>>>(keys, means, slots, positions, capacity);
     retrieval_mask<<<tokens, 256, 0, s>>>(query, means, allowed, slots, positions, capacity,
@@ -335,7 +350,7 @@ void resident_pool_select(const float* query, const float* weights, const std::u
                           const int* positions, int capacity, int tier, int tokens,
                           cudaStream_t s) {
     if (!query || !weights || !pools || !scores || !ids || !slots || !positions || capacity < 1 ||
-        capacity > 32768 || tier < 4 || tier > 32768 || tokens < 1 || tokens > 8)
+        capacity > 32768 || tier < 4 || tier > 32768 || tokens < 1 || tokens > 32768)
         throw std::invalid_argument("resident pool selection geometry");
     pool_scores<<<dim3((tier + 3) / 4, tokens), 64, 0, s>>>(query, weights, pools, allowed, scores,
                                                             slots, positions, capacity);
@@ -348,7 +363,7 @@ void resident_sparse_attention(const float* query, const std::uint16_t* latents,
                                float* probabilities, float* out, const int* slots, int capacity,
                                int tokens, cudaStream_t s) {
     if (!query || !latents || !ids || !probabilities || !out || !slots || capacity < 1 ||
-        capacity > 32768 || tokens < 1 || tokens > 8)
+        capacity > 32768 || tokens < 1 || tokens > 32768)
         throw std::invalid_argument("resident sparse attention operands/geometry");
     attention_scores<<<dim3(64, tokens), 256, 0, s>>>(query, latents, ids, probabilities, 64, 512,
                                                       2051, 1.f / 16, slots, capacity);

@@ -10,7 +10,8 @@
 32K 上限和 Aggregate greedy，通过公共 Engine 的独立平台实现调用原生 Model/Program/Ops。
 普通解码按层组成跨请求矩阵列；Program 按实际批量和上下文档位持有三个 stage 与输出 head 的
 设备 Graph，lane 身份和前沿是设备输入；这些平台特定 Graph 按实际 family 惰性捕获，
-首次成本计入请求 prefill。KVMem 派生均值与选择在设备上执行。DFlash2 K7 保留
+捕获成本按实际执行阶段计入请求时间；普通时间分块 Prefill 当前使用 eager 执行。
+KVMem 派生均值与选择在设备上执行。DFlash2 K7 保留
 单 lane eager 验证；原生 MTP K1 的首版仍串行验证主模型转换，不承诺投机加速。
 其权重、状态、KV、KVMem 元数据、草稿回滚边界和未完成的通用产品功能，见
 [GLM/DTK 执行合同](../../ports/hygon-k100/glm53-execution.md)。

@@ -287,4 +287,40 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
         args, static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
 }
 
+void kimi_delta_attention_packed_update(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+    const Tensor& a_log, const Tensor& dt_bias, float lower_bound, float scale,
+    Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
+    cudaStream_t stream, KdaDecayParameter decay_parameter) {
+    require_dtype(states, DType::FP32, "states must be FP32");
+    require_contiguous_nonnull(states, "states");
+    if (states.ne[0] != kStateDim || states.ne[1] != kStateDim ||
+        states.ne[2] != v.ne[1] || states.ne[3] < 1)
+        throw std::invalid_argument("kimi_delta_attention: packed state shape");
+    Tensor first(states.data, states.dtype, {kStateDim, kStateDim, v.ne[1]});
+    validate(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, first, first, out);
+    require_dtype(slots, DType::I32, "slots must be I32");
+    require_dtype(offsets, DType::I32, "offsets must be I32");
+    require_contiguous_nonnull(slots, "slots");
+    require_contiguous_nonnull(offsets, "offsets");
+    const int count = slots.ne[0];
+    if (count < 1 || count > 8)
+        throw std::invalid_argument("kimi_delta_attention: packed sequence count");
+    require_shape(slots, count, 1, 1, 1, "slots");
+    require_shape(offsets, count + 1, 1, 1, 1, "offsets");
+    if (decay_parameter != KdaDecayParameter::LogRate &&
+        decay_parameter != KdaDecayParameter::NegativeRate)
+        throw std::invalid_argument("kimi_delta_attention: invalid decay parameterization");
+#if defined(NINFER_HYGON_DTK)
+    auto args = arguments(q, k, v, g, beta, a_log, dt_bias, lower_bound, scale, states, states, out);
+    args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
+    args.sequence_offsets = static_cast<const std::int32_t*>(offsets.data);
+    detail::kimi_delta_attention::launch_batch_update(
+        args, static_cast<const std::int32_t*>(slots.data), count, stream);
+#else
+    (void)stream;
+    throw std::invalid_argument("kimi_delta_attention: packed temporal update requires DTK");
+#endif
+}
+
 } // namespace ninfer::ops

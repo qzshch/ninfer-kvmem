@@ -1,3 +1,6 @@
+ninfer_add_test(ninfer_token_batch_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_token_batch.cpp")
+
 ninfer_add_test(ninfer_scheduler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_scheduler.cpp"
   LIBRARIES ninfer_runtime_support)

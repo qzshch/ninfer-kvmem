@@ -26,9 +26,10 @@ unsigned short bf(float x) {
 
 float ub(unsigned short x) { return std::bit_cast<float>(static_cast<unsigned>(x) << 16); }
 
-void attention_transition(DeviceContext& device) {
+void attention_transition(DeviceContext& device, bool temporal = false) {
     constexpr int cap = 129, lanes = 3, pools_count = (cap + 3) / 4, count = 2051;
-    const std::array<int, lanes> slots{2, 0, 1}, positions{3, 6, 128};
+    const std::array<int, lanes> slots = temporal ? std::array{2, 2, 2} : std::array{2, 0, 1};
+    const std::array<int, lanes> positions = temporal ? std::array{126, 127, 128} : std::array{3, 6, 128};
     std::vector<unsigned short> keys(lanes * cap * 128), gates(keys.size()),
         pools(lanes * pools_count * 128), latent(lanes * cap * 512);
     std::vector<float> bias(512), query(lanes * 4096), weights(lanes * 32), q(lanes * 64 * 512),
@@ -68,6 +69,36 @@ void attention_transition(DeviceContext& device) {
         }
         for (int c = 0; c < 512; ++c)
             newlatent[row * 512 + c] = ub(latent[(slots[row] * cap + positions[row]) * 512 + c]);
+    }
+    auto expected_pools = pools;
+    auto expected_latent = latent;
+    if (temporal) {
+        auto expected_keys = keys, expected_gates = gates;
+        for (int row = 0; row < lanes; ++row) {
+            for (int c = 0; c < 128; ++c) {
+                newkey[row * 128 + c] = ub(bf(std::cos((row * 128 + c) * .117) * .4));
+                newgate[row * 128 + c] = ub(bf(std::sin((row * 128 + c) * .131) * .8));
+                expected_keys[(slots[row] * cap + positions[row]) * 128 + c] = bf(newkey[row * 128 + c]);
+                expected_gates[(slots[row] * cap + positions[row]) * 128 + c] = bf(newgate[row * 128 + c]);
+            }
+            for (int c = 0; c < 512; ++c) {
+                newlatent[row * 512 + c] = ub(bf(std::cos((row * 512 + c) * .063) * .3));
+                expected_latent[(slots[row] * cap + positions[row]) * 512 + c] = bf(newlatent[row * 512 + c]);
+            }
+        }
+        // Position 127 completes pool31 using the newly written position126.
+        // This detects a missing inter-kernel dependency between append and pool.
+        for (int c = 0; c < 128; ++c) {
+            double a[4], maximum = -INFINITY, total = 0, value = 0;
+            for (int j = 0; j < 4; ++j) {
+                a[j] = ub(expected_gates[(slots[0] * cap + 124 + j) * 128 + c]) + double(bias[j * 128 + c]);
+                maximum = std::max(maximum, a[j]);
+            }
+            for (auto& x : a) { x = std::exp(x - maximum); total += x; }
+            for (int j = 0; j < 4; ++j)
+                value += ub(bf(ub(bf(a[j] / total)) * ub(expected_keys[(slots[0] * cap + 124 + j) * 128 + c])));
+            expected_pools[(slots[0] * pools_count + 31) * 128 + c] = bf(value);
+        }
     }
     DeviceBuffer dk(keys.size() * 2), dg(gates.size() * 2), dp(pools.size() * 2),
         dl(latent.size() * 2), db(bias.size() * 4), dq(query.size() * 4), dw(weights.size() * 4),
@@ -113,10 +144,11 @@ void attention_transition(DeviceContext& device) {
     ids.copy_to_host(actual_ids.data(), ids.bytes);
     std::vector<unsigned short> actual_pools(pools.size());
     dp.copy_to_host(actual_pools.data(), dp.bytes);
+    const int pool_index = temporal ? (slots[1] * pools_count + 31) : slots[0] * pools_count;
     for (int c = 0; c < 128; ++c)
-        require(std::abs(ub(actual_pools[(slots[0] * pools_count) * 128 + c]) -
-                         ub(pools[(slots[0] * pools_count) * 128 + c])) <=
-                    .008 * (1 + std::abs(ub(pools[(slots[0] * pools_count) * 128 + c]))),
+        require(std::abs(ub(actual_pools[pool_index * 128 + c]) -
+                         ub(expected_pools[pool_index * 128 + c])) <=
+                    .008 * (1 + std::abs(ub(expected_pools[pool_index * 128 + c]))),
                 "batched pool append FP64 cast oracle");
     std::vector<float> actual(q.size());
     out.copy_to_host(actual.data(), out.bytes);
@@ -153,7 +185,7 @@ void attention_transition(DeviceContext& device) {
                     double dot = 0;
                     for (int c = 0; c < 512; ++c)
                         dot += double(q[(row * 64 + h) * 512 + c]) *
-                               ub(latent[(slots[row] * cap + selected[j]) * 512 + c]);
+                               ub(expected_latent[(slots[row] * cap + selected[j]) * 512 + c]);
                     probability[j] = dot / 16.;
                     maximum        = std::max(maximum, probability[j]);
                 }
@@ -167,7 +199,7 @@ void attention_transition(DeviceContext& device) {
                 for (int j = 0; j < count; ++j)
                     if (selected[j] >= 0) {
                         double term = probability[j] / total *
-                                      ub(latent[(slots[row] * cap + selected[j]) * 512 + c]);
+                                      ub(expected_latent[(slots[row] * cap + selected[j]) * 512 + c]);
                         ideal += term;
                         absolute += std::abs(term);
                     }
@@ -183,6 +215,7 @@ int main() {
     try {
         DeviceContext device(0);
         attention_transition(device);
+        attention_transition(device, true);
         constexpr int capacity = 513, lanes = 3, blocks = (capacity + 127) / 128,
                       pages = (capacity + 63) / 64;
         std::vector<unsigned short> keys(lanes * capacity * 128);
