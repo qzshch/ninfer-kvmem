@@ -566,20 +566,10 @@ public:
                     else if (retired_decode) free_frames = 0;
                 }
                 if (!tokens.empty() && free_frames) {
-                    const auto count = std::min<unsigned>(free_frames, spans.size());
-                    const auto per_frame = (spans.size() + count - 1) / count;
-                    for (std::size_t begin = 0; begin < spans.size(); begin += per_frame) {
-                        const auto end = std::min(spans.size(), begin + per_frame);
-                        std::vector<runtime::TokenSpan> selected(spans.begin() + begin, spans.begin() + end);
-                        std::vector<int> selected_rows(end - begin);
-                        for (unsigned row = 0; row < selected.size(); ++row) {
-                            selected[row].begin = row;
-                            selected_rows[row] = row;
-                        }
-                        auto ticket = program->submit({runtime::TokenBatchKind::Decode,
-                            {tokens.data() + begin, end - begin}, selected, selected_rows});
-                        flights.push_back({ticket, std::move(selected)});
-                    }
+                    // Preserve weight reuse among rows already ready together.
+                    // Independent arrivals can fill the other owning frame.
+                    auto ticket = program->submit({runtime::TokenBatchKind::Decode, tokens, spans, outputs});
+                    flights.push_back({ticket, std::move(spans)});
                 }
                 // Publish completed decode requests before spending a prefill
                 // slice. Do not make their consumers wait for another unit.

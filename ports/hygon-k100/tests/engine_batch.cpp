@@ -15,14 +15,22 @@ void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
 int main(int argc, char** argv) try {
-    require(argc == 3 || (argc == 4 && std::string(argv[3]) == "--tp-ep"), "artifact and report required; optional --tp-ep");
+    require(argc >= 3, "artifact and report required; optional --tp-ep --frames 1|2");
     EngineOptions options;
     options.artifact_path      = argv[1];
     options.max_context        = 1024;
     options.kv_capacity        = KvCapacityPolicy::explicit_capacity(1024);
     options.max_concurrency    = 8;
     options.decode_frames      = 2;
-    options.tensor_expert_parallel = argc == 4;
+    for (int i = 3; i < argc; ++i) {
+        const std::string flag(argv[i]);
+        if (flag == "--tp-ep") options.tensor_expert_parallel = true;
+        else if (flag == "--frames" && i + 1 < argc) {
+            const auto value = std::stoi(argv[++i]);
+            require(value == 1 || value == 2, "frame count must be1 or2");
+            options.decode_frames = value;
+        } else throw std::invalid_argument("unknown Engine qualification option");
+    }
     options.use_cuda_graph     = true;
     options.kvmem_window_pages = 6;
     options.pending_timeout_ms = 0;
@@ -140,6 +148,8 @@ int main(int argc, char** argv) try {
             "unexpected host KV/state offload");
     nlohmann::json report = {
         {"passed", true},
+        {"decode_frames", options.decode_frames},
+        {"tensor_expert_parallel", options.tensor_expert_parallel},
         {"cases",
          {"serial independent references", "eight mixed length requests", "varying output budgets",
           "pending deadline", "active cancellation", "abandoned handle", "lane reuse",

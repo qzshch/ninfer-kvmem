@@ -38,10 +38,12 @@ captures device stages and the output head lazily. Request slots, token IDs and
 frontiers are metadata inputs. Graph mode and eager mode implement the same
 mathematics. Graph resources consume device memory and must fit the resource
 budget. Temporal prefill currently executes eagerly; Graph replay applies to
-ordinary Decode. `--decode-frames 2 --lanes N` (N>=2, ordinary only) splits
-Decode requests across two independent frames, each with its own streams,
+ordinary Decode. `--decode-frames 2 --lanes N` (N>=2, ordinary only) permits
+independent units in two frames, each with its own streams,
 activations, scratch, pinned metadata/results and Graphs. The second frame is
-Decode-only. A sequence cannot have two pending writers. Runtime publishes a
+Decode-only. Requests ready together remain one compact Decode batch; later
+independent arrivals can fill the other frame. A sequence cannot have two
+pending writers. Runtime publishes a
 completed Prefill or Decode frame independently, and can refill a Decode frame
 while another request is still prefilling; cancellation drains its device writes before
 releasing the lane. Extra frame scratch is included in the memory summary.
