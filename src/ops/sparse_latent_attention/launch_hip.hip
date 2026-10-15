@@ -239,6 +239,72 @@ __global__ void attention_scores(const float* q, const std::uint16_t* kv, const 
     return;
 }
 
+#ifdef NINFER_HYGON_DTK
+// Each wave cooperates over contiguous latent dimensions; four query heads
+// reuse that represented latent load. Queries and dot accumulators stay FP32.
+__global__ void attention_scores_tiled(const float* q, const std::uint16_t* kv, const int* ids,
+                                       float* p, int heads, int count, float scale,
+                                       const int* slots, int capacity) {
+    const int lane = threadIdx.x % 64, wave = threadIdx.x / 64;
+    const int i = blockIdx.x * 4 + wave, head = blockIdx.y * 4, t = blockIdx.z;
+    if (i >= count) return;
+    if (slots) kv += static_cast<long long>(slots[t]) * capacity * 512;
+    const int pos = ids[t * count + i];
+    float sum[4]{};
+    if (pos >= 0)
+        for (int c = lane; c < 512; c += 64) {
+            const float v = ub(kv[static_cast<long long>(pos) * 512 + c]);
+            for (int j = 0; j < 4; ++j) if (head + j < heads)
+                sum[j] += q[(static_cast<long long>(t) * heads + head + j) * 512 + c] * v;
+        }
+    for (int j = 0; j < 4; ++j) if (head + j < heads) {
+        float dot = sum[j];
+        for (int distance = 32; distance; distance /= 2) dot += __shfl_down(dot, distance, 64);
+        if (!lane) p[(static_cast<long long>(t) * heads + head + j) * count + i] = pos >= 0 ? dot * scale : -INFINITY;
+    }
+}
+
+__global__ void attention_softmax(float* p, int count) {
+    const int lane = threadIdx.x;
+    auto* prob = p + static_cast<long long>(blockIdx.x) * count;
+    __shared__ float red[256];
+    float maximum = -INFINITY;
+    for (int i = lane; i < count; i += 256) maximum = fmaxf(maximum, prob[i]);
+    red[lane] = maximum; __syncthreads();
+    for (int distance = 128; distance; distance /= 2) {
+        if (lane < distance) red[lane] = fmaxf(red[lane], red[lane + distance]);
+        __syncthreads();
+    }
+    maximum = red[0]; __syncthreads();
+    float sum = 0.f;
+    for (int i = lane; i < count; i += 256) {
+        const float v = isfinite(maximum) ? expf(prob[i] - maximum) : 0.f;
+        prob[i] = v; sum += v;
+    }
+    red[lane] = sum; __syncthreads();
+    for (int distance = 128; distance; distance /= 2) {
+        if (lane < distance) red[lane] += red[lane + distance];
+        __syncthreads();
+    }
+    sum = red[0]; __syncthreads();
+    for (int i = lane; i < count; i += 256) prob[i] = sum > 0 ? prob[i] / sum : 0.f;
+}
+#endif
+
+void launch_attention_scores(const float* q, const std::uint16_t* kv, const int* ids,
+                             float* p, int heads, int dim, int tokens, int count, float scale,
+                             cudaStream_t stream, const int* slots = nullptr, int capacity = 0) {
+#ifdef NINFER_HYGON_DTK
+    if (dim == 512 && heads >= 8 && count >= 128) {
+        attention_scores_tiled<<<dim3((count + 3) / 4, (heads + 3) / 4, tokens), 256, 0, stream>>>(
+            q, kv, ids, p, heads, count, scale, slots, capacity);
+        attention_softmax<<<heads * tokens, 256, 0, stream>>>(p, count);
+        return;
+    }
+#endif
+    attention_scores<<<dim3(heads, tokens), 256, 0, stream>>>(q, kv, ids, p, heads, dim, count, scale, slots, capacity);
+}
+
 __global__ void attention_values(const std::uint16_t* kv, const std::int32_t* ids, const float* p,
                                  float* out, int heads, int dim, int count,
                                  const int* slots = nullptr, int capacity = 0) {
@@ -366,7 +432,7 @@ void sparse_latent_attention(const float* q, const std::uint16_t* kv, const std:
     if (!q || !kv || !ids || !p || !out || h < 1 || h > 128 || dim < 1 || dim > 512 || t < 1 ||
         t > 8 || count < 1 || count > 32768 || !std::isfinite(scale) || scale <= 0)
         throw std::invalid_argument("sparse_latent_attention: operands/geometry");
-    attention_scores<<<dim3(h, t), 256, 0, s>>>(q, kv, ids, p, h, dim, count, scale);
+    launch_attention_scores(q, kv, ids, p, h, dim, t, count, scale, s);
     CUDA_CHECK(cudaGetLastError());
     attention_values<<<dim3((dim + 255) / 256, h, t), 256, 0, s>>>(kv, ids, p, out, h, dim, count);
     CUDA_CHECK(cudaGetLastError());
@@ -467,8 +533,8 @@ void resident_sparse_attention(const float* query, const std::uint16_t* latents,
     if (!query || !latents || !ids || !probabilities || !out || !slots || capacity < 1 ||
         capacity > 32768 || tokens < 1 || tokens > 32768 || heads < 1 || heads > 64)
         throw std::invalid_argument("resident sparse attention operands/geometry");
-    attention_scores<<<dim3(heads, tokens), 256, 0, s>>>(query, latents, ids, probabilities, heads, 512,
-                                                      2051, 1.f / 16, slots, capacity);
+    launch_attention_scores(query, latents, ids, probabilities, heads, 512, tokens, 2051,
+                            1.f / 16, s, slots, capacity);
     attention_values<<<dim3(2, heads, tokens), 256, 0, s>>>(latents, ids, probabilities, out, heads, 512,
                                                          2051, slots, capacity);
     CUDA_CHECK(cudaGetLastError());

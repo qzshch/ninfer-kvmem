@@ -66,7 +66,7 @@ void compare(const std::vector<float>& observed, const std::vector<double>& orac
     }
 }
 
-void latent(DeviceContext& ctx, int heads, int dim, int t, int count, bool saturated) {
+void latent(DeviceContext& ctx, int heads, int dim, int t, int count, bool saturated, bool empty = false) {
     constexpr int context = 4096;
     std::vector<float> q(static_cast<std::size_t>(t) * heads * dim);
     std::vector<std::uint16_t> kv(context * dim);
@@ -75,7 +75,7 @@ void latent(DeviceContext& ctx, int heads, int dim, int t, int count, bool satur
     for (std::size_t i = 0; i < kv.size(); ++i) kv[i] = bw(val(i + 71));
     for (int token = 0; token < t; ++token)
         for (int j = 0; j < count; ++j)
-            ids[token * count + j] = j % 13 == 0 ? -1 : (j * 31 + token * 17) % context;
+            ids[token * count + j] = empty || j % 13 == 0 ? -1 : (j * 31 + token * 17) % context;
     auto dq = upload(q), dk = upload(kv), di = upload(ids);
     DeviceBuffer p(static_cast<std::size_t>(t) * heads * count * 4), out(q.size() * 4);
     const float scale = 1.f / 16;
@@ -101,14 +101,14 @@ void latent(DeviceContext& ctx, int heads, int dim, int t, int count, bool satur
                 maximum  = std::max(maximum, s);
             }
             for (auto& x : score) {
-                x = std::exp(x - maximum);
+                x = std::isfinite(maximum) ? std::exp(x - maximum) : 0;
                 sum += x;
             }
             for (int c = 0; c < dim; ++c) {
                 double value = 0;
                 for (int j = 0; j < count; ++j)
                     if (ids[token * count + j] >= 0)
-                        value += score[j] / sum * ub(kv[ids[token * count + j] * dim + c]);
+                        value += (sum > 0 ? score[j] / sum : 0) * ub(kv[ids[token * count + j] * dim + c]);
                 oracle[(token * heads + h) * dim + c] = value;
             }
         }
@@ -318,6 +318,11 @@ int main() {
         ++cases;
         latent(ctx, 64, 512, 8, 33, false);
         ++cases;
+        for (int heads : {20, 21, 24}) {
+            latent(ctx, heads, 512, 1, 513, false);
+            latent(ctx, heads, 512, 1, 513, false, true);
+            cases += 2;
+        }
         latent(ctx, 2, 128, 8, 65, true);
         ++cases;
         for (int first : {0, 1, 2048, 2058, 32760})
