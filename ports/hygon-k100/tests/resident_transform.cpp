@@ -308,10 +308,11 @@ void typed_swiglu(DeviceContext& ctx) {
     }
 }
 
-void owned_swiglu(DeviceContext& ctx) {
-    constexpr int width = 129, rows = 8;
-    const std::array<int, rows> owner{95, 96, 191, 192, 287, 0, 120, -1};
-    DeviceBuffer ids(sizeof(owner)); ids.copy_from_host(owner.data(), ids.bytes);
+void owned_swiglu(DeviceContext& ctx, int width = 129, int rows = 8) {
+    const std::array<int, 8> pattern{95, 96, 191, 192, 287, 0, 120, -1};
+    std::vector<int> owner(rows);
+    for (int row = 0; row < rows; ++row) owner[row] = pattern[row % pattern.size()];
+    DeviceBuffer ids(owner.size() * sizeof(int)); ids.copy_from_host(owner.data(), ids.bytes);
     for (bool bf16 : {false, true}) for (bool alias : {false, true}) {
         std::vector<float> g(width * rows), u(g.size());
         for (int row = 0; row < rows; ++row) for (int c = 0; c < width; ++c) {
@@ -529,6 +530,7 @@ int main() {
         DeviceContext ctx;
         typed_swiglu(ctx);
         owned_swiglu(ctx);
+        owned_swiglu(ctx, 1, 65537);
         norm(ctx, 128, 20, false, true, true, true, true, 1);
         norm(ctx, 128, 3, true, false, true, true, true, 1);
         for (int storage : {1, 2, 3}) for (bool center : {false, true}) for (bool gate : {false, true})
