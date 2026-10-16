@@ -38,8 +38,9 @@ __global__ void prepare_heads(Arguments a, DtkPrepared* prepared) {
     if (!c) p.beta = sigmoid(from_bf16(a.beta[static_cast<long long>(t) * a.value_heads + h]));
 }
 
-template <bool Pooled, bool Prepared = false>
-__global__ void recurrence(Arguments a, const std::int32_t* slots, const DtkPrepared* prepared = nullptr) {
+template <bool Pooled, bool Prepared = false, bool VerifyK1 = false>
+__global__ void recurrence(Arguments a, const std::int32_t* slots, const DtkPrepared* prepared = nullptr,
+                            float* factors = nullptr) {
     constexpr int D = 128, V = 8;
     const int h = blockIdx.x, vbase = blockIdx.y * V, batch = blockIdx.z, c = threadIdx.x;
     const int qh                  = h / (a.value_heads / a.qk_heads);
@@ -100,6 +101,11 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots, const DtkPrep
         float delta[V];
         for (int v = 0; v < V; ++v)
             delta[v] = beta * (from_bf16(a.v[vstart + vbase + v]) - reduce[v][0]);
+        if constexpr (VerifyK1) {
+            auto* record = factors + (static_cast<long long>(t) * a.value_heads + h) * 3 * D;
+            if (!vbase) { record[c] = alpha; record[D + c] = k[c]; }
+            if (!c) for (int v = 0; v < V; ++v) record[2 * D + vbase + v] = delta[v];
+        }
         __syncthreads();
         for (int v = 0; v < V; ++v) {
             state[v] += k[c] * delta[v];
@@ -114,10 +120,43 @@ __global__ void recurrence(Arguments a, const std::int32_t* slots, const DtkPrep
         if (c < V) a.out[vstart + vbase + c] = to_bf16(reduce[c][0] * a.scale);
         __syncthreads();
     }
-    for (int v = 0; v < V; ++v) a.state_out[state_base + v * D] = state[v];
+    if constexpr (!VerifyK1)
+        for (int v = 0; v < V; ++v) a.state_out[state_base + v * D] = state[v];
     return;
 }
+
+__global__ void commit_k1(float* state, const float* factors, int heads, const int* prefix) {
+    const int count = *prefix;
+    if (!count) return;
+    const int h = blockIdx.x, value0 = blockIdx.y * 8, c = threadIdx.x;
+    const auto at = (static_cast<long long>(h) * 128 + value0) * 128 + c;
+    float values[8];
+    for (int v = 0; v < 8; ++v) values[v] = state[at + v * 128];
+    for (int t = 0; t < count; ++t) {
+        const auto* record = factors + (static_cast<long long>(t) * heads + h) * 384;
+        for (int v = 0; v < 8; ++v) {
+            // The verifier materializes decay before computing innovation. Keep
+            // that FP32 boundary; only the following outer product may contract.
+            volatile float decayed = values[v] * record[c];
+            values[v] = decayed + record[128 + c] * record[256 + value0 + v];
+        }
+    }
+    for (int v = 0; v < 8; ++v) state[at + v * 128] = values[v];
+}
 } // namespace
+
+void launch_verify_k1(const Arguments& args, float* factors, void* storage, cudaStream_t stream) {
+    auto* prepared = static_cast<DtkPrepared*>(storage);
+    prepare_heads<<<dim3(args.value_heads, 2), 128, 0, stream>>>(args, prepared);
+    recurrence<false, true, true><<<dim3(args.value_heads, 16), 128, 0, stream>>>(args, nullptr, prepared, factors);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_commit_k1(float* state, const float* factors, int heads,
+                       const std::int32_t* prefix, cudaStream_t stream) {
+    commit_k1<<<dim3(heads, 16), 128, 0, stream>>>(state, factors, heads, prefix);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void launch_prepared_update(const Arguments& args, const std::int32_t* slots, int sequences,
                             void* storage, cudaStream_t stream) {

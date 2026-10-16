@@ -7,7 +7,7 @@
 
 namespace ninfer::runtime {
 
-enum class TokenBatchKind : std::uint8_t { Decode, Prefill };
+enum class TokenBatchKind : std::uint8_t { Decode, Prefill, VerifyK1 };
 
 // A contiguous span of known input tokens for one logical resident lane. Lane
 // identity is independent of the compact token row and Program's physical state.
@@ -20,7 +20,9 @@ struct TokenSpan {
 
 // Borrowed for one Program call. Stateful consumers follow spans in time order;
 // stateless projections may process all input rows together. Each output row
-// requests the next-token prediction after the last input of its span. Spans
+// requests the next-token prediction after the last input of its span. VerifyK1
+// is one two-position temporal span requesting both predictions, held pending
+// until its accepted input prefix is committed. Spans
 // without an output row only advance input state and do not execute the head.
 struct TokenBatch {
     TokenBatchKind kind;
@@ -32,8 +34,13 @@ struct TokenBatch {
                   std::uint32_t row_capacity) const {
         if (lanes < 1 || lanes > 8 || spans.empty() || spans.size() > lanes ||
             tokens.empty() || tokens.size() > row_capacity ||
-            (kind != TokenBatchKind::Decode && kind != TokenBatchKind::Prefill))
+            (kind != TokenBatchKind::Decode && kind != TokenBatchKind::Prefill &&
+             kind != TokenBatchKind::VerifyK1))
             throw std::invalid_argument("token batch capacity/kind");
+        if (kind == TokenBatchKind::VerifyK1 &&
+            (spans.size() != 1 || tokens.size() != 2 || output_rows.size() != 2 ||
+             output_rows[0] != 0 || output_rows[1] != 1))
+            throw std::invalid_argument("K1 verification requires one two-position span");
         std::array<bool, 8> used{};
         std::size_t end = 0;
         for (const auto& span : spans) {
@@ -51,7 +58,7 @@ struct TokenBatch {
             bool last = false;
             for (const auto& span : spans)
                 last |= row >= 0 && static_cast<std::uint32_t>(row) == span.begin + span.count - 1;
-            if (row <= previous || !last)
+            if (row <= previous || (!last && kind != TokenBatchKind::VerifyK1))
                 throw std::invalid_argument("token batch output row");
             previous = row;
         }

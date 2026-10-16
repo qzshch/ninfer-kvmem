@@ -68,5 +68,24 @@ int main() try {
     ledger.fail();
     rejects([&] { ledger.reserve(batch(c)); });
     rejects([&] { ledger.reset(); });
+    FrameLedger speculative(1, 1);
+    const std::array<int, 2> pair{12, 34}, rows{0, 1};
+    for (unsigned count : {0u, 1u, 2u, 0u, 2u}) {
+        const unsigned before = speculative.frontier(0);
+        const runtime::TokenSpan span{0, before, 0, 2};
+        const runtime::TokenBatch verify{runtime::TokenBatchKind::VerifyK1, pair, {&span, 1}, rows};
+        verify.validate(1, 128, 2);
+        const auto ticket = speculative.reserve(verify);
+        require(speculative.busy(0) && speculative.frontier(0) == static_cast<int>(before));
+        rejects([&] { speculative.reset(); });
+        rejects([&] { speculative.complete(ticket); });
+        rejects([&] { speculative.reserve(verify); });
+        rejects([&] { other.complete_prefix(ticket, 1); });
+        rejects([&] { speculative.complete_prefix(ticket, 3); });
+        require(speculative.busy(0) && speculative.frontier(0) == static_cast<int>(before));
+        speculative.complete_prefix(ticket, count);
+        require(!speculative.busy(0) && speculative.frontier(0) == static_cast<int>(before + count));
+        rejects([&] { speculative.complete_prefix(ticket, count); });
+    }
     std::cout << "PASS: independent frames, write exclusion, completion order, cancellation drain, generations\n";
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

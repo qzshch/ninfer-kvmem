@@ -26,6 +26,7 @@ int main() try {
     NativeProfile mtp;
     mtp.select(Companion::Mtp); mtp.verify = mtp.graph = true; mtp.validate();
     require(mtp.kvmem_window_pages == 0);
+    rejects([&] { auto p = mtp; p.kvmem_window_pages = 4; p.validate(); });
     rejects([&] { mtp.select(Companion::DFlash2); });
     rejects([&] { auto p = mtp; p.tensor_parallel = true; p.validate(); });
     rejects([&] { auto p = mtp; p.lanes = 2; p.decode_frames = 2; p.validate(); });

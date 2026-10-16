@@ -246,9 +246,99 @@ void attention_transition(DeviceContext& device, bool temporal = false, int mask
     }
 }
 
+void suffix_visibility(DeviceContext& device, int base, int accepted, bool physical) {
+    constexpr int capacity = 132, count = 2051;
+    DeviceBuffer latent(capacity * 512 * 2), keys(capacity * 128 * 2), gates(keys.bytes),
+        pools(((capacity + 3) / 4) * 128 * 2), bias(512 * 4), input_latent(capacity * 512 * 4),
+        input_key(capacity * 128 * 4), input_gate(input_key.bytes), slots(capacity * 4),
+        positions(capacity * 4), index_query(4096 * 4), index_weight(32 * 4), scores(8192 * 4),
+        ids(count * 4), query(512 * 4), probability(count * 4), out(512 * 4);
+    latent.fill(0xff); keys.fill(0xff); gates.fill(0xff); pools.fill(0xff);
+    bias.fill(0); slots.fill(0);
+    std::vector<float> iq(4096, .125f), iw(32, .25f), q(512);
+    for (int c = 0; c < 512; ++c) q[c] = ub(bf(std::cos(c * .031) * .2));
+    query.copy_from_host(q.data(), query.bytes); index_weight.copy_from_host(iw.data(), index_weight.bytes);
+    const auto upload = [&](DeviceBuffer& d, const std::vector<float>& x) {
+        if (physical) {
+            std::vector<unsigned short> words; for (float v : x) words.push_back(bf(v));
+            d.copy_from_host(words.data(), words.size() * 2);
+        } else d.copy_from_host(x.data(), x.size() * 4);
+    };
+    upload(index_query, iq);
+    std::vector<float> expected(capacity * 512);
+    const auto append = [&](int first, int rows, int salt) {
+        std::vector<float> l(rows * 512), k(rows * 128), g(k.size());
+        std::vector<int> pos(rows);
+        for (int r = 0; r < rows; ++r) {
+            pos[r] = first + r;
+            for (int c = 0; c < 512; ++c) {
+                l[r * 512 + c] = ub(bf(std::sin((pos[r] * 512 + c + salt) * .077) * .3));
+                expected[pos[r] * 512 + c] = l[r * 512 + c];
+            }
+            for (int c = 0; c < 128; ++c) {
+                k[r * 128 + c] = ub(bf(std::cos((pos[r] * 128 + c + salt) * .119) * .2));
+                g[r * 128 + c] = ub(bf(std::sin((pos[r] * 128 + c + salt) * .131) * .8));
+            }
+        }
+        upload(input_latent, l); upload(input_key, k); upload(input_gate, g);
+        positions.copy_from_host(pos.data(), pos.size() * 4);
+        const auto call = [&]<class T>() {
+            ops::resident_index_append(static_cast<const T*>(input_latent.p), static_cast<const T*>(input_key.p),
+                static_cast<const T*>(input_gate.p), static_cast<const float*>(bias.p),
+                static_cast<unsigned short*>(latent.p), static_cast<unsigned short*>(keys.p),
+                static_cast<unsigned short*>(gates.p), static_cast<unsigned short*>(pools.p),
+                static_cast<const int*>(slots.p), static_cast<const int*>(positions.p), capacity, rows, device.stream);
+        };
+        if (physical) call.template operator()<unsigned short>(); else call.template operator()<float>();
+        device.synchronize();
+    };
+    const auto select = [&](int visible) {
+        const int pos = visible - 1;
+        positions.copy_from_host(&pos, 4);
+        const auto call = [&]<class T>() {
+            ops::resident_pool_select(static_cast<const T*>(index_query.p), static_cast<const float*>(index_weight.p),
+                static_cast<const unsigned short*>(pools.p), nullptr, static_cast<float*>(scores.p),
+                static_cast<int*>(ids.p), static_cast<const int*>(slots.p), static_cast<const int*>(positions.p),
+                capacity, 256, 1, device.stream);
+        };
+        if (physical) call.template operator()<unsigned short>(); else call.template operator()<float>();
+        ops::resident_sparse_attention(static_cast<const float*>(query.p), static_cast<const unsigned short*>(latent.p),
+            static_cast<const int*>(ids.p), static_cast<float*>(probability.p), static_cast<float*>(out.p),
+            static_cast<const int*>(slots.p), capacity, 1, device.stream, 1);
+        device.synchronize();
+        std::vector<int> actual_ids(count), occurrences(visible);
+        ids.copy_to_host(actual_ids.data(), ids.bytes);
+        for (int id : actual_ids) if (id >= 0) {
+            require(id < visible, "rejected MLA/index suffix became visible"); ++occurrences[id];
+        }
+        require(std::all_of(occurrences.begin(), occurrences.end(), [](int n) { return n == 1; }), "visible MLA prefix lost or duplicated");
+        std::vector<double> p(visible); double maximum = -INFINITY, total = 0;
+        for (int r = 0; r < visible; ++r) {
+            double dot = 0; for (int c = 0; c < 512; ++c) dot += double(q[c]) * expected[r * 512 + c];
+            p[r] = dot / 16.; maximum = std::max(maximum, p[r]);
+        }
+        for (auto& v : p) { v = std::exp(v - maximum); total += v; }
+        std::vector<float> actual(512); out.copy_to_host(actual.data(), out.bytes);
+        for (int c = 0; c < 512; ++c) {
+            double ideal = 0, absolute = 0;
+            for (int r = 0; r < visible; ++r) {
+                const double term = p[r] / total * expected[r * 512 + c]; ideal += term; absolute += std::abs(term);
+            }
+            require(std::abs(actual[c] - ideal) <= 2e-6 + 5e-5 * absolute, "MLA suffix rollback/replacement FP64 oracle");
+        }
+    };
+    append(0, base, 0);
+    append(base, 2, 61); // speculative cache writes precede the prefix decision
+    select(base + accepted);
+    append(base + accepted, 1, 197); // replacement must overwrite before visibility
+    select(base + accepted + 1);
+}
+
 int main() {
     try {
         DeviceContext device(0);
+        for (bool physical : {false, true}) for (int base : {2, 3, 4, 126, 127, 128})
+            for (int accepted : {0, 1, 2}) suffix_visibility(device, base, accepted, physical);
         attention_transition(device);
         attention_transition(device, true, 1, true);
         attention_transition(device, false, 0, true);

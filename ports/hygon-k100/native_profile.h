@@ -25,6 +25,8 @@ struct NativeProfile {
             throw std::invalid_argument("native companions currently require one lane/frame and PP execution");
         if (companion == Companion::DFlash2 && (graph || repeat != 1))
             throw std::invalid_argument("DFlash2 currently requires eager single-run execution");
+        if (companion == Companion::Mtp && kvmem_window_pages)
+            throw std::invalid_argument("native MTP prefix transactions require KVMem disabled");
         if (verify && (companion == Companion::None || repeat != 1))
             throw std::invalid_argument("greedy verification requires --mtp or --dflash2 and --repeat 1");
     }

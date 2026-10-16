@@ -339,4 +339,58 @@ void kimi_delta_attention_packed_update(
 #endif
 }
 
+void kimi_delta_attention_verify_k1(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+    const Tensor& rate, const Tensor& bias, float lower_bound, float scale,
+    WorkspaceArena& workspace, const Tensor& state, Tensor& factors, Tensor& out,
+    cudaStream_t stream, KdaDecayParameter decay_parameter) {
+    validate(q, k, v, g, beta, rate, bias, lower_bound, scale, state, state, out);
+    if (q.ne[2] != 2 || (decay_parameter != KdaDecayParameter::LogRate &&
+                        decay_parameter != KdaDecayParameter::NegativeRate))
+        throw std::invalid_argument("KDA K1 requires two positions and a valid decay parameter");
+    require_dtype(factors, DType::FP32, "KDA K1 factors must be FP32");
+    require_shape(factors, 128, 3, v.ne[1], 2, "KDA K1 factors");
+    require_contiguous_nonnull(factors, "KDA K1 factors");
+    for (const auto* input : {&q, &k, &v, &g, &beta, &rate, &bias, &state})
+        if (overlaps(out, *input))
+            throw std::invalid_argument("KDA K1 output must be disjoint from read-only operands");
+    for (const auto* input : {&q, &k, &v, &g, &beta, &rate, &bias, &state, static_cast<const Tensor*>(&out)})
+        if (overlaps(factors, *input))
+            throw std::invalid_argument("KDA K1 factors must be disjoint from operands");
+#if defined(NINFER_HYGON_DTK)
+    auto args = arguments(q, k, v, g, beta, rate, bias, lower_bound, scale, state, factors, out);
+    args.state_out = nullptr;
+    args.negative_rate = decay_parameter == KdaDecayParameter::NegativeRate;
+    auto scope = workspace.scope();
+    auto storage = workspace.alloc_bytes(kimi_delta_attention_packed_workspace_capacity_bytes(q.ne[1], v.ne[1], 1, 2));
+    detail::kimi_delta_attention::launch_verify_k1(args, static_cast<float*>(factors.data), storage.data, stream);
+#else
+    (void)workspace; (void)stream;
+    throw std::invalid_argument("KDA K1 verification requires DTK");
+#endif
+}
+
+void kimi_delta_attention_commit_k1(Tensor& state, const Tensor& factors,
+                                     const Tensor& prefix, cudaStream_t stream) {
+    require_dtype(state, DType::FP32, "KDA K1 state must be FP32");
+    require_dtype(factors, DType::FP32, "KDA K1 factors must be FP32");
+    require_dtype(prefix, DType::I32, "KDA K1 prefix must be I32");
+    require_contiguous_nonnull(state, "KDA K1 state");
+    require_contiguous_nonnull(factors, "KDA K1 factors");
+    require_contiguous_nonnull(prefix, "KDA K1 prefix");
+    if (state.ne[2] < 1) throw std::invalid_argument("KDA K1 heads");
+    require_shape(state, 128, 128, state.ne[2], 1, "KDA K1 state");
+    require_shape(factors, 128, 3, state.ne[2], 2, "KDA K1 factors");
+    require_shape(prefix, 1, 1, 1, 1, "KDA K1 prefix");
+    if (overlaps(state, factors) || overlaps(state, prefix) || overlaps(factors, prefix))
+        throw std::invalid_argument("KDA K1 commit operands must be disjoint");
+#if defined(NINFER_HYGON_DTK)
+    detail::kimi_delta_attention::launch_commit_k1(static_cast<float*>(state.data),
+        static_cast<const float*>(factors.data), state.ne[2], static_cast<const int*>(prefix.data), stream);
+#else
+    (void)stream;
+    throw std::invalid_argument("KDA K1 commit requires DTK");
+#endif
+}
+
 } // namespace ninfer::ops

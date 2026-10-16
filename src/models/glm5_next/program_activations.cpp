@@ -83,16 +83,28 @@ void Program::kda(const Tensor& x, const KdaParameters& p, LayerState& state,
     const auto* slots = metadata(d, SequenceOffsets) + options_.max_lanes + 1;
     const auto* offsets = metadata(d, SequenceOffsets);
     projection(x, p.query, q, d); projection(x, p.key, k, d); projection(x, p.value, v, d);
-    ops::resident_causal_conv_packed(q, p.query_conv, state.conv[0], slots, offsets, q, frame_->sequences, stream);
-    ops::resident_causal_conv_packed(k, p.key_conv, state.conv[1], slots, offsets, k, frame_->sequences, stream);
-    ops::resident_causal_conv_packed(v, p.value_conv, state.conv[2], slots, offsets, v, frame_->sequences, stream);
+    if (frame_->kind == runtime::TokenBatchKind::VerifyK1) {
+        ops::resident_causal_conv_verify_k1(q, p.query_conv, state.conv[0], static_cast<float*>(state.k1_conv[0].p), q, stream);
+        ops::resident_causal_conv_verify_k1(k, p.key_conv, state.conv[1], static_cast<float*>(state.k1_conv[1].p), k, stream);
+        ops::resident_causal_conv_verify_k1(v, p.value_conv, state.conv[2], static_cast<float*>(state.k1_conv[2].p), v, stream);
+    } else {
+        ops::resident_causal_conv_packed(q, p.query_conv, state.conv[0], slots, offsets, q, frame_->sequences, stream);
+        ops::resident_causal_conv_packed(k, p.key_conv, state.conv[1], slots, offsets, k, frame_->sequences, stream);
+        ops::resident_causal_conv_packed(v, p.value_conv, state.conv[2], slots, offsets, v, frame_->sequences, stream);
+    }
     projection(x, p.forget_in, small, d); projection(small, p.forget_out, g, d);
     projection(x, p.output_gate_in, small, d); projection(small, p.output_gate_out, gate, d);
     projection(x, p.input_gate, beta, d);
     Tensor image(state.recurrent, DType::FP32, {128, 128, heads, options_.max_lanes});
     Tensor ids(const_cast<int*>(slots), DType::I32, {frame_->sequences});
     Tensor ranges(const_cast<int*>(offsets), DType::I32, {frame_->sequences + 1});
-    ops::kimi_delta_attention_packed_update(q.reshape({128, heads, tokens}), k.reshape({128, heads, tokens}),
+    if (frame_->kind == runtime::TokenBatchKind::VerifyK1) {
+        Tensor factors(state.k1_factors.p, DType::FP32, {128, 3, heads, 2});
+        ops::kimi_delta_attention_verify_k1(q.reshape({128, heads, tokens}), k.reshape({128, heads, tokens}),
+            v.reshape({128, heads, tokens}), g.reshape({128, heads, tokens}), beta, p.negative_decay_rate,
+            p.decay_bias.reshape({128, heads}), -5.f, 1.f / std::sqrt(128.f), work, image, factors,
+            result, stream, ops::KdaDecayParameter::NegativeRate);
+    } else ops::kimi_delta_attention_packed_update(q.reshape({128, heads, tokens}), k.reshape({128, heads, tokens}),
         v.reshape({128, heads, tokens}), g.reshape({128, heads, tokens}), beta, p.negative_decay_rate,
         p.decay_bias.reshape({128, heads}), -5.f, 1.f / std::sqrt(128.f), work, image, ids, ranges,
         result, stream, ops::KdaDecayParameter::NegativeRate);

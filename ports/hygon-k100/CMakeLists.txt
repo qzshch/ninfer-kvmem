@@ -97,6 +97,7 @@ target_link_libraries(ninfer_k100_glm_frontend PUBLIC ninfer_k100_glm_model ninf
 
 add_subdirectory("${NINFER_ROOT}/kvmem" "${CMAKE_CURRENT_BINARY_DIR}/kvmem")
 add_library(ninfer_k100_glm_program STATIC "${NINFER_ROOT}/src/models/glm5_next/program.cpp"
+  "${NINFER_ROOT}/src/models/glm5_next/program_mtp.cpp"
   "${NINFER_ROOT}/src/models/glm5_next/program_parallel.cpp"
   "${NINFER_ROOT}/src/models/glm5_next/program_activations.cpp")
 target_link_libraries(ninfer_k100_glm_program PUBLIC ninfer_k100_glm_model ninfer_k100_projection
@@ -143,6 +144,8 @@ if(BUILD_TESTING)
   target_link_libraries(ninfer_k100_engine_check PRIVATE ninfer_k100_engine)
   add_executable(ninfer_k100_mtp_check tests/engine_mtp.cpp)
   target_link_libraries(ninfer_k100_mtp_check PRIVATE ninfer_k100_engine)
+  add_executable(ninfer_k100_mtp_transaction_check tests/program_mtp.cpp)
+  target_link_libraries(ninfer_k100_mtp_transaction_check PRIVATE ninfer_k100_glm_program ninfer_k100_glm_frontend)
   add_executable(k100_resident_batch_test tests/resident_batch.cpp)
   target_link_libraries(k100_resident_batch_test PRIVATE ninfer_k100_sparse_latent kvmem_core)
   foreach(device RANGE 0 2)

@@ -68,6 +68,9 @@ void launch_batch_update(const Arguments& args, const std::int32_t* slots, int b
                          cudaStream_t stream);
 void launch_prepared_update(const Arguments& args, const std::int32_t* slots, int sequences,
                             void* storage, cudaStream_t stream);
+void launch_verify_k1(const Arguments& args, float* factors, void* prepared, cudaStream_t stream);
+void launch_commit_k1(float* state, const float* factors, int heads,
+                       const std::int32_t* prefix, cudaStream_t stream);
 void launch_packed_chunks(const Arguments& args, const std::int32_t* slots, int sequences,
                            void* storage, cudaStream_t stream);
 void launch_prepare(const Arguments& args, Chunk* workspace, cudaStream_t stream);

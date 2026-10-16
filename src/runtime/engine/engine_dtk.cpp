@@ -138,6 +138,8 @@ public:
             throw std::invalid_argument("DTK TP/EP currently requires ordinary generation");
         if (options.speculative.backend == SpeculativeBackend::DFlash2 && options.use_cuda_graph)
             throw std::invalid_argument("DFlash profile requires eager execution");
+        if (options.speculative.backend == SpeculativeBackend::Mtp && options.kvmem_window_pages)
+            throw std::invalid_argument("native MTP prefix transactions require KVMem disabled");
         const auto start = Clock::now();
         int count        = 0;
         CUDA_CHECK(cudaGetDeviceCount(&count));
@@ -170,6 +172,8 @@ public:
             ? "DTK; three-device tensor/expert parallel; packed causal time spans; greedy"
             : options.speculative.backend == SpeculativeBackend::None
             ? "DTK; three resident layer stages; packed causal time spans; greedy"
+            : options.speculative.backend == SpeculativeBackend::Mtp
+            ? "DTK; PP; packed prefill; two-position K1 verifier with prefix commit; greedy"
             : "DTK; three resident layer stages; single-input companion profile; greedy";
         load.load_seconds       = seconds(start);
         memory.device           = 0;
@@ -260,17 +264,22 @@ public:
         program->reset();
         auto before    = program->stats();
         TokenId anchor = 0;
-        for (std::size_t index = 0; index < job->prompt.size(); ++index) {
-            const auto token = job->prompt[index];
+        for (std::size_t index = 0; index < job->prompt.size();) {
             if (job->cancel) {
                 result.finish_reason = FinishReason::Cancelled;
                 break;
             }
-            anchor = program->target(token);
-            if (options.speculative.backend == SpeculativeBackend::Mtp &&
-                index + 1 < job->prompt.size())
-                program->mtp_forward(job->prompt[index + 1], false);
-            ++result.computed_prefill_tokens;
+            std::size_t count = 1;
+            if (options.speculative.backend == SpeculativeBackend::Mtp) {
+                count = std::min<std::size_t>({static_cast<std::size_t>(program->input_capacity()),
+                    options.prefill_chunk, job->prompt.size() - index});
+                const bool final = index + count == job->prompt.size();
+                const std::span<const TokenId> prompt(job->prompt);
+                anchor = program->mtp_prefill_chunk(prompt.subspan(index, count),
+                    prompt.subspan(index + 1, count - (final ? 1 : 0)), final);
+            } else anchor = program->target(job->prompt[index]);
+            result.computed_prefill_tokens += count;
+            index += count;
         }
         result.timings.prefill_seconds     = seconds(started);
         result.timings.first_token_seconds = result.timings.prefill_seconds;
@@ -281,6 +290,7 @@ public:
                 ? job->options.execution.requested_output_tokens
                 : std::min<std::uint32_t>(128, options.max_context - job->prompt.size());
         auto append = [&](TokenId token) { return append_token(job, result, token, limit); };
+        if (job->cancel) result.finish_reason = FinishReason::Cancelled;
         bool keep   = result.finish_reason != FinishReason::Cancelled && limit > 0;
         if (keep) keep = append(anchor);
         while (keep) {
@@ -299,24 +309,53 @@ public:
                 continue;
             }
             if (options.speculative.backend == SpeculativeBackend::Mtp) {
-                // K1 proposal with exact greedy validation. This first native
-                // implementation verifies target transitions serially. It does
-                // not claim the throughput of a temporally batched verifier.
+                // A final single output/context position uses ordinary C1.
+                // Every speculative round is a real two-position target batch.
+                if (room == 1 || limit - result.generated_token_ids.size() == 1) {
+                    anchor = program->target(anchor);
+                    ++result.speculative.fallback_steps;
+                    if (job->cancel) {
+                        result.finish_reason = FinishReason::Cancelled;
+                        break;
+                    }
+                    keep = append(anchor);
+                    continue;
+                }
                 const auto proposal = program->mtp_forward(anchor, true);
-                anchor              = program->target(anchor);
+                const auto verified = program->verify_mtp(anchor, proposal);
+                if (job->cancel) {
+                    program->commit_mtp(verified.ticket, 0);
+                    result.finish_reason = FinishReason::Cancelled;
+                    break;
+                }
+                // Preview with the same stop-token/string/output-limit policy.
+                // Publication follows durable commit, including first-token stop.
+                auto pending = result;
+                anchor = verified.predictions[0];
+                bool next = append_token(job, pending, anchor, limit);
+                unsigned prefix = 1;
+                const bool accepted = verified.valid_prefix == 2;
+                if (accepted && next) {
+                    prefix = 2;
+                    anchor = verified.predictions[1];
+                    next = append_token(job, pending, anchor, limit);
+                }
+                // A cancellation observed during frontend work also aborts both
+                // target positions, before any result becomes user-visible.
+                if (job->cancel) {
+                    program->commit_mtp(verified.ticket, 0);
+                    result.finish_reason = FinishReason::Cancelled;
+                    break;
+                }
+                program->commit_mtp(verified.ticket, prefix);
+                result = std::move(pending);
                 ++result.speculative.rounds;
                 ++result.speculative.drafted_tokens;
-                if (proposal == anchor) {
+                if (accepted) {
                     ++result.speculative.accepted_tokens;
                     ++result.speculative.accepted_per_position[0];
-                    keep = append(proposal);
-                    if (keep && room > 1) {
-                        program->mtp_forward(proposal, false);
-                        anchor = program->target(proposal);
-                        keep   = append(anchor);
-                    }
-                } else
-                    keep = append(anchor);
+                }
+                keep = next;
                 continue;
             }
             const int width = std::min<int>(

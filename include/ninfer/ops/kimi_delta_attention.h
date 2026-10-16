@@ -119,4 +119,24 @@ void kimi_delta_attention_packed_update(
     WorkspaceArena& workspace, Tensor& states, const Tensor& slots, const Tensor& offsets, Tensor& out,
     cudaStream_t stream, KdaDecayParameter decay_parameter);
 
+/** DTK one-sequence, two-position verifier. Same represented recurrence and oracle.
+ * state FP32 [128,128,Hv] is read-only; both BF16 outputs are produced in time order.
+ * factors FP32 [128,3,Hv,2] records alpha, normalized key and innovation delta.
+ * Factors survive until commit; workspace is call-scoped (the packed query for R=1,M=2).
+ * No full-state snapshot, persistent state write or token replay occurs in verify.
+ * Inputs, output, factors, state and workspace are disjoint, except the usual q/k inputs.
+ */
+void kimi_delta_attention_verify_k1(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g, const Tensor& beta,
+    const Tensor& rate, const Tensor& bias, float lower_bound, float scale,
+    WorkspaceArena& workspace, const Tensor& state, Tensor& factors, Tensor& out,
+    cudaStream_t stream, KdaDecayParameter decay_parameter);
+
+/** Apply only the selected 0/1/2 input prefix using verify's FP32 factors.
+ * state and factors have the shapes above; prefix is device I32 [1], value in [0,2].
+ * Zero leaves state bitwise unchanged. Selection and this call are ordered on stream.
+ */
+void kimi_delta_attention_commit_k1(Tensor& state, const Tensor& factors,
+                                     const Tensor& prefix, cudaStream_t stream);
+
 } // namespace ninfer::ops

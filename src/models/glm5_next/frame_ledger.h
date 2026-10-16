@@ -34,6 +34,7 @@ public:
             auto& slot = slots_[f];
             // Prepare the owning record before changing any reservation.
             slot.spans.assign(batch.spans.begin(), batch.spans.end());
+            slot.kind = batch.kind;
             slot.active = true;
             ++slot.generation;
             for (const auto& span : slot.spans) busy_[span.lane] = true;
@@ -49,10 +50,22 @@ public:
     void complete(FrameTicket ticket) {
         validate(ticket);
         auto& slot = slots_[ticket.slot];
+        if (slot.kind == runtime::TokenBatchKind::VerifyK1)
+            throw std::logic_error("GLM verification requires explicit prefix completion");
         for (const auto& span : slot.spans) {
             frontiers_[span.lane] += span.count;
             busy_[span.lane] = false;
         }
+        slot.active = false;
+    }
+    void complete_prefix(FrameTicket ticket, unsigned count) {
+        validate(ticket);
+        auto& slot = slots_[ticket.slot];
+        if (slot.kind != runtime::TokenBatchKind::VerifyK1 || slot.spans.size() != 1 || count > slot.spans[0].count)
+            throw std::invalid_argument("GLM commit prefix exceeds reserved span");
+        const auto lane = slot.spans[0].lane;
+        frontiers_[lane] += count;
+        busy_[lane] = false;
         slot.active = false;
     }
     bool active(unsigned frame) const { return slots_.at(frame).active; }
@@ -75,6 +88,7 @@ private:
         bool active = false;
         std::uint64_t generation = 0;
         std::vector<runtime::TokenSpan> spans;
+        runtime::TokenBatchKind kind = runtime::TokenBatchKind::Decode;
     };
     unsigned lanes_, frames_;
     bool failed_ = false;

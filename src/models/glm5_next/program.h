@@ -33,6 +33,12 @@ struct ProgramStats {
     std::array<std::size_t, 3> persistent_bytes{}, workspace_peak{};
 };
 
+struct MtpVerification {
+    FrameTicket ticket;
+    std::array<std::int32_t, 2> predictions;
+    unsigned valid_prefix;
+};
+
 class Program {
 public:
     Program(const Model& model, std::array<DeviceContext*, 3> devices, ProgramOptions options);
@@ -46,10 +52,17 @@ public:
     void reset();
     void reset_lane(int lane);
     std::int32_t mtp_forward(std::int32_t next_token, bool proposal);
+    // Native PP K1: both temporal positions execute once per target layer.
+    // No publication or persistent recurrent mutation before commit_mtp.
+    MtpVerification verify_mtp(std::int32_t anchor, std::int32_t proposal);
+    void commit_mtp(FrameTicket ticket, unsigned input_prefix);
+    std::int32_t mtp_prefill_chunk(std::span<const std::int32_t> tokens,
+                                  std::span<const std::int32_t> next_tokens, bool final);
     std::vector<std::int32_t> target_batch(std::span<const std::int32_t> tokens,
                                            std::span<const std::int32_t> lanes);
     std::vector<std::int32_t> execute(const runtime::TokenBatch& batch);
-    // Single host worker; tickets own GPU work until finish() joins and commits.
+    // Single host worker; tickets own GPU work until finish() or commit_mtp()
+    // joins the complete device transaction and retires its write reservation.
     FrameTicket submit(const runtime::TokenBatch& batch);
     bool ready(FrameTicket ticket) const;
     std::vector<std::int32_t> finish(FrameTicket ticket);
@@ -69,7 +82,7 @@ public:
     const ProgramStats& stats() const noexcept { return stats_; }
 private:
     struct DeviceState {
-        DeviceBuffer streams, metadata, hidden;
+        DeviceBuffer streams, metadata, hidden, commit_prefix;
         DeviceBuffer partial, received, coefficients, normalized;
         std::unique_ptr<CudaCompletionEvent> ready, copied, done;
         std::unique_ptr<WorkspaceArena> workspace;
@@ -79,6 +92,8 @@ private:
         float* recurrent = nullptr;
         float* conv[3]{};
         DeviceBuffer latent, keys, gates, pools, means;
+        DeviceBuffer k1_factors;
+        std::array<DeviceBuffer, 3> k1_conv;
         std::unique_ptr<kvmem::RetrievalIndex> retrieval;
     };
 
@@ -104,6 +119,7 @@ private:
         std::unique_ptr<PinnedHostBuffer> upload, result;
         std::unique_ptr<CudaCompletionEvent> completed;
         std::vector<runtime::TokenSpan> spans;
+        int valid_prefix = -1;
     };
     std::array<std::unique_ptr<Frame>, 2> frames_;
     Frame* frame_ = nullptr;
@@ -126,6 +142,10 @@ private:
     DeviceBuffer features_;
     LayerState mtp_state_;
     int mtp_frontier_ = 0;
+    bool mtp_proposal_pending_ = false;
+    int mtp_anchor_ = -1;
+    DeviceBuffer mtp_teacher_backup_;
+    std::int32_t mtp_apply(std::span<const std::int32_t> tokens, const float* teachers, bool proposal);
 
     struct DraftCache {
         DeviceBuffer key, value;

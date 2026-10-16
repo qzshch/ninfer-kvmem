@@ -137,7 +137,7 @@ __global__ void streams_kernel(const float* x, float* y, int h) {
 template <class T>
 __global__ void conv_kernel(const T* x, const void* weight, DType type, float* state, T* o,
                             int channels, int t, const std::int32_t* slots = nullptr,
-                            const std::int32_t* offsets = nullptr) {
+                            const std::int32_t* offsets = nullptr, float* journal = nullptr) {
     const int c = blockIdx.x * 256 + threadIdx.x;
     if (c >= channels) return;
     if (slots) {
@@ -156,6 +156,7 @@ __global__ void conv_kernel(const T* x, const void* weight, DType type, float* s
     for (int j = 0; j < t; ++j) {
         const auto off        = static_cast<long long>(j) * channels + c;
         const float v         = represented(x[off]);
+        if (journal) journal[off] = v;
         const float values[4] = {s0, s1, s2, v}, weights[4] = {w0, w1, w2, w3};
         float sum = 0, correction = 0;
         for (int i = 0; i < 4; ++i) {
@@ -174,9 +175,21 @@ __global__ void conv_kernel(const T* x, const void* weight, DType type, float* s
         s1 = s2;
         s2 = v;
     }
-    state[c * 3]     = s0;
-    state[c * 3 + 1] = s1;
-    state[c * 3 + 2] = s2;
+    if (!journal) {
+        state[c * 3]     = s0;
+        state[c * 3 + 1] = s1;
+        state[c * 3 + 2] = s2;
+    }
+}
+
+__global__ void conv_commit_k1(float* state, const float* journal, int channels, const int* prefix) {
+    const int c = blockIdx.x * 256 + threadIdx.x, count = *prefix;
+    if (c >= channels || count == 0) return;
+    float s0 = state[c * 3], s1 = state[c * 3 + 1], s2 = state[c * 3 + 2];
+    for (int t = 0; t < count; ++t) {
+        s0 = s1; s1 = s2; s2 = journal[t * channels + c];
+    }
+    state[c * 3] = s0; state[c * 3 + 1] = s1; state[c * 3 + 2] = s2;
 }
 
 __global__ void gather_rows(const float* input, const int* ids, float* output, int width) {
@@ -184,6 +197,14 @@ __global__ void gather_rows(const float* input, const int* ids, float* output, i
     if (c < width)
         output[static_cast<long long>(row) * width + c] =
             input[static_cast<long long>(ids[row]) * width + c];
+}
+
+__global__ void concat_rows(const float* a, const float* b, float* output, int width) {
+    const int c = blockIdx.x * 256 + threadIdx.x, row = blockIdx.y;
+    if (c < width) {
+        output[static_cast<long long>(row) * 2 * width + c] = a[static_cast<long long>(row) * width + c];
+        output[(static_cast<long long>(row) * 2 + 1) * width + c] = b[static_cast<long long>(row) * width + c];
+    }
 }
 
 __global__ void router_serial_kernel(const float* logits, const float* bias, std::int32_t* ids,
@@ -436,6 +457,40 @@ void resident_causal_conv_packed(const Tensor& x, const Tensor& kernel, float* s
     };
     if (x.dtype == DType::BF16) launch.template operator()<std::uint16_t>();
     else launch.template operator()<float>();
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void resident_causal_conv_verify_k1(const Tensor& x, const Tensor& kernel, const float* state,
+                                   float* journal, Tensor& out, cudaStream_t stream) {
+    activation(x); activation(out);
+    const int channels = x.ne[0]; shape(channels, 2); direct_weight(&kernel, channels * 4);
+    if (x.numel() != 2LL * channels || out.numel() != x.numel() || out.ne[0] != channels ||
+        x.dtype != out.dtype || !state || !journal || journal == state || journal == x.data ||
+        journal == out.data)
+        throw std::invalid_argument("resident K1 conv: two rows/disjoint journal/state");
+    const auto launch = [&]<class T>() {
+        conv_kernel<<<(channels + 255) / 256, 256, 0, stream>>>(static_cast<const T*>(x.data),
+            kernel.data, kernel.dtype, const_cast<float*>(state), static_cast<T*>(out.data),
+            channels, 2, nullptr, nullptr, journal);
+    };
+    if (x.dtype == DType::BF16) launch.template operator()<std::uint16_t>();
+    else launch.template operator()<float>();
+    CUDA_CHECK(cudaGetLastError());
+}
+void resident_concat_rows(const float* a, const float* b, float* out,
+                          int width, int rows, cudaStream_t stream) {
+    shape(width, rows);
+    if (!a || !b || !out || a == out || b == out)
+        throw std::invalid_argument("resident concat: disjoint operands");
+    concat_rows<<<dim3((width + 255) / 256, rows), 256, 0, stream>>>(a, b, out, width);
+    CUDA_CHECK(cudaGetLastError());
+}
+void resident_causal_conv_commit_k1(float* state, const float* journal, int channels,
+                                   const int* prefix, cudaStream_t stream) {
+    shape(channels, 1);
+    if (!state || !journal || !prefix || state == journal)
+        throw std::invalid_argument("resident K1 conv commit: operands");
+    conv_commit_k1<<<(channels + 255) / 256, 256, 0, stream>>>(state, journal, channels, prefix);
     CUDA_CHECK(cudaGetLastError());
 }
 

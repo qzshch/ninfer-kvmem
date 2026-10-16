@@ -132,7 +132,8 @@ Json run(const std::filesystem::path& artifact, const std::string& input, const 
     report["lanes"] = lanes;
     report["graph"] = graph;
     report["requested_prefill_chunk"] = prefill_chunk;
-    report["prefill_chunk"] = !draft && !mtp ? std::min(prefill_chunk, 1024) : 1;
+    report["prefill_chunk"] = draft ? 1 : std::min(prefill_chunk, 1024);
+    if (mtp) report["target_verification"] = "layer-major temporal K1 with accepted-prefix commit";
     report["pack_prefill"] = pack_prefill && !draft && !mtp;
     for (int iteration = 0; iteration < repeat; ++iteration) {
         auto prepare = [&] {
@@ -280,7 +281,7 @@ int main(int argc, char** argv) {
                        "--dflash2] [--verify-native-greedy (--mtp or --dflash2)] [--report FILE]\n[--graph] [--lanes 1..8] "
                        "[--fp32-activations] [--decode-frames 1|2] [--prefill-chunk N] [--pack-prefill] [--tp-ep (ordinary only)] "
                        "[--repeat N (ordinary/MTP "
-                       "only)]\nPrefill controls apply to ordinary generation; temporal "
+                        "only)]\nPrefill chunking applies to ordinary/MTP; cross-request packing is ordinary only; temporal "
                        "prefill uses eager execution with at most 1024 input rows per unit.\n"
                        "Greedy Aggregate profile; "
                        "ordinary generation and KVMem disabled by default. Native DSA Top-K remains active. "

@@ -240,6 +240,72 @@ void pooled_conv(DeviceContext& ctx, int channels, bool alias, bool packed = fal
     }
 }
 
+void k1_conv(DeviceContext& ctx, int channels, bool typed, bool alias) {
+    std::vector<float> initial(channels * 3), weights(channels * 4);
+    for (int i = 0; i < channels * 3; ++i) initial[i] = value(i + 91);
+    for (int i = 0; i < channels * 4; ++i) weights[i] = std::sin(i * 1.7) * .23;
+    WeightData kernel(weights, {static_cast<unsigned>(channels), 1, 4}, false);
+    auto state = upload(initial);
+    DeviceBuffer journal(2ULL * channels * 4 + 32), prefix(4);
+    journal.fill(0xa5);
+    for (int count : {0, 1, 2, 0, 2}) {
+        std::vector<float> raw(channels * 2);
+        for (int i = 0; i < channels * 2; ++i) raw[i] = value(i + 319 + count * 17);
+        auto x = typed ? upload_bf16(raw) : upload(raw);
+        DeviceBuffer y(x.bytes);
+        Tensor input(x.p, typed ? DType::BF16 : DType::FP32, {channels, 2});
+        Tensor output(alias ? x.p : y.p, input.dtype, {channels, 2});
+        ops::resident_causal_conv_verify_k1(input, kernel.view, static_cast<const float*>(state.p),
+            reinterpret_cast<float*>(static_cast<std::byte*>(journal.p) + 16), output, ctx.stream);
+        ctx.synchronize();
+        const auto unchanged = download(state);
+        require(std::memcmp(unchanged.data(), initial.data(), state.bytes) == 0, "K1 conv verify changed state");
+        const auto actual = typed ? download_bf16(alias ? x : y) : download(alias ? x : y);
+        for (int c = 0; c < channels; ++c) {
+            double a = initial[c * 3], b = initial[c * 3 + 1], d = initial[c * 3 + 2];
+            for (int t = 0; t < 2; ++t) {
+                const float v = raw[t * channels + c];
+                const double pre = bf(a * weights[c * 4] + b * weights[c * 4 + 1] +
+                    d * weights[c * 4 + 2] + double(v) * weights[c * 4 + 3]);
+                check(actual[t * channels + c], pre * sig(pre), true, "K1 conv FP64");
+                a = b; b = d; d = v;
+            }
+            for (int t = 0; t < count; ++t) {
+                initial[c * 3] = initial[c * 3 + 1];
+                initial[c * 3 + 1] = initial[c * 3 + 2];
+                initial[c * 3 + 2] = raw[t * channels + c];
+            }
+        }
+        prefix.copy_from_host(&count, sizeof(count));
+        ops::resident_causal_conv_commit_k1(static_cast<float*>(state.p),
+            reinterpret_cast<const float*>(static_cast<std::byte*>(journal.p) + 16), channels,
+            static_cast<const int*>(prefix.p), ctx.stream);
+        ctx.synchronize();
+        const auto after = download(state);
+        require(std::memcmp(after.data(), initial.data(), state.bytes) == 0, "K1 conv accepted-prefix state");
+        std::vector<float> recorded(raw.size()); journal.copy_to_host(recorded.data(), recorded.size() * 4, 16);
+        require(recorded == raw, "K1 conv journal contains activated rather than raw inputs");
+    }
+    std::vector<unsigned char> guard(journal.bytes); journal.copy_to_host(guard.data(), guard.size());
+    for (int i = 0; i < 16; ++i) require(guard[i] == 0xa5 && guard[guard.size() - 1 - i] == 0xa5, "K1 conv journal guards");
+}
+
+void row_concat(DeviceContext& ctx) {
+    constexpr int width = 4096, rows = 17;
+    std::vector<float> a(width * rows), b(a.size());
+    for (int i = 0; i < width * rows; ++i) { a[i] = value(i); b[i] = value(i + 12); }
+    auto da = upload(a), db = upload(b);
+    DeviceBuffer out(2 * da.bytes);
+    ops::resident_concat_rows(static_cast<const float*>(da.p), static_cast<const float*>(db.p),
+        static_cast<float*>(out.p), width, rows, ctx.stream);
+    ctx.synchronize();
+    const auto actual = download(out);
+    for (int row = 0; row < rows; ++row) for (int c = 0; c < width; ++c) {
+        require(actual[row * 2 * width + c] == a[row * width + c], "MTP embedding rows mixed");
+        require(actual[(row * 2 + 1) * width + c] == b[row * width + c], "MTP teacher rows mixed");
+    }
+}
+
 void row_gather(DeviceContext& ctx) {
     constexpr int width = 16384, source_rows = 5;
     const std::vector<int> ids{4, 0, 2};
@@ -528,6 +594,9 @@ void tensor_sums(DeviceContext& ctx) {
 int main() {
     try {
         DeviceContext ctx;
+        for (int channels : {129, 8192}) for (bool typed : {false, true}) for (bool alias : {false, true})
+            k1_conv(ctx, channels, typed, alias);
+        row_concat(ctx);
         typed_swiglu(ctx);
         owned_swiglu(ctx);
         owned_swiglu(ctx, 1, 65537);

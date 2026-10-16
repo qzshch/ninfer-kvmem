@@ -12,7 +12,8 @@
 设备 Graph，lane 身份和前沿是设备输入；这些平台特定 Graph 按实际 family 惰性捕获，
 捕获成本按实际执行阶段计入请求时间；普通时间分块 Prefill 当前使用 eager 执行。
 KVMem 派生均值与选择在设备上执行。DFlash2 K7 保留
-单 lane eager 验证；原生 MTP K1 的首版仍串行验证主模型转换，不承诺投机加速。
+单 lane eager 验证；原生 MTP K1 在单 lane PP 下按层验证两个时间位置，
+再提交接受的输入前缀。KVMem 关闭，投机收益仍需整模测量。
 其权重、状态、KV、KVMem 元数据、草稿回滚边界和未完成的通用产品功能，见
 [GLM/DTK 执行合同](../../ports/hygon-k100/glm53-execution.md)。
 

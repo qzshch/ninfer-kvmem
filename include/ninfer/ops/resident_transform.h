@@ -34,6 +34,14 @@ void resident_swiglu_owned(const Tensor& gate, const Tensor& up, const std::int3
 void resident_causal_conv_packed(const Tensor& input, const Tensor& kernel, float* states,
                                  const std::int32_t* slots, const std::int32_t* offsets,
                                  Tensor& output, int sequences, cudaStream_t stream);
+// Two temporal rows, read-only initial state. Journal [channels,2] FP32 holds
+// the represented raw inputs, including for in-place convolution. Commit reads
+// a device prefix in [0,2]; zero leaves state bitwise unchanged.
+void resident_causal_conv_verify_k1(const Tensor& input, const Tensor& kernel,
+                                   const float* state, float* journal, Tensor& output,
+                                   cudaStream_t stream);
+void resident_causal_conv_commit_k1(float* state, const float* journal, int channels,
+                                   const std::int32_t* prefix, cudaStream_t stream);
 // gate/up BF16-represented inputs; limit>0 clips gate above limit, up to +/-limit.
 // The SiLU result and subsequent product each have BF16 semantic boundaries.
 void resident_swiglu(const float* gate, const float* up, float* output, std::size_t count,
@@ -59,6 +67,10 @@ void resident_causal_conv_packed(const float* input, const Tensor& kernel, float
 // Exact FP32 row gather, output [rows,width] = input[indices[row],:]. Device
 // indices are valid for the input extent. Input, indices and output are disjoint.
 void resident_gather_rows(const float* input, const std::int32_t* indices, float* output,
+                          int width, int rows, cudaStream_t stream);
+// Row-wise concatenation [width,rows] + [width,rows] -> [2*width,rows].
+// Inputs and output are disjoint; exact FP32 transport without a cast.
+void resident_concat_rows(const float* a, const float* b, float* output,
                           int width, int rows, cudaStream_t stream);
 // Sigmoid top-k with bias for selection only; normalized original scores times
 // routed_scale. Deterministic lower-id ties. Single router group is explicit.

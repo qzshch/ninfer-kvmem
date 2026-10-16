@@ -243,11 +243,71 @@ void run_batch(DeviceContext& ctx, int qheads, int heads, bool negative = false,
         }
     }
 }
+void run_k1(DeviceContext& ctx, int qheads, int heads, bool negative) {
+    auto initial = inputs(qheads, heads, 2, 0).state;
+    Input state(initial, false);
+    DeviceBuffer factors(128ULL * 3 * heads * 2 * 4 + 32), result(128ULL * heads * 2 * 2 + 32), control(4);
+    factors.fill(0xa5); result.fill(0xa5);
+    Tensor image(state.data.p, DType::FP32, {128, 128, heads});
+    Tensor journal(static_cast<std::byte*>(factors.p) + 16, DType::FP32, {128, 3, heads, 2});
+    Tensor out(static_cast<std::byte*>(result.p) + 16, DType::BF16, {128, heads, 2});
+    Tensor prefix(control.p, DType::I32, {1});
+    WorkspaceArena work(ops::kimi_delta_attention_packed_workspace_capacity_bytes(qheads, heads, 1, 2));
+    int mode = 0;
+    for (int count : {0, 1, 2, 0, 2}) {
+        auto a = inputs(qheads, heads, 2, mode++ % 4);
+        a.state = initial;
+        if (negative) { for (auto& x : a.a_log) x = -std::exp(x); a.negative_rate = true; }
+        Input q(a.q, true), k(a.k, true), v(a.v, true), g(a.g, true), b(a.beta, true),
+              rate(a.a_log, false), bias(a.dt_bias, false);
+        Tensor qt(q.data.p, DType::BF16, {128, qheads, 2}), kt(k.data.p, DType::BF16, {128, qheads, 2}),
+            vt(v.data.p, DType::BF16, {128, heads, 2}), gt(g.data.p, DType::BF16, {128, heads, 2}),
+            bt(b.data.p, DType::BF16, {heads, 2}), rt(rate.data.p, DType::FP32, {heads}),
+            dt(bias.data.p, DType::FP32, {128, heads});
+        std::vector<float> before(initial.size()), after(initial.size());
+        state.data.copy_to_host(before.data(), state.data.bytes);
+        ops::kimi_delta_attention_verify_k1(qt, kt, vt, gt, bt, rt, dt, -5.f, scale,
+            work, image, journal, out, ctx.stream,
+            negative ? ops::KdaDecayParameter::NegativeRate : ops::KdaDecayParameter::LogRate);
+        ctx.synchronize();
+        state.data.copy_to_host(after.data(), state.data.bytes);
+        require(std::equal(before.begin(), before.end(), after.begin(),
+            [](float a, float b) { return std::bit_cast<unsigned>(a) == std::bit_cast<unsigned>(b); }),
+            "K1 verify mutated persistent recurrent state");
+        std::vector<std::uint16_t> observed(a.v.size());
+        result.copy_to_host(observed.data(), observed.size() * 2, 16);
+        std::vector<double> decoded; for (auto x : observed) decoded.push_back(decode(x));
+        check(decoded, ninfer::test::kda_ref::evaluate(a, -5.f, scale).out, false);
+        control.copy_from_host(&count, sizeof(count));
+        ops::kimi_delta_attention_commit_k1(image, journal, prefix, ctx.stream);
+        ctx.synchronize();
+        state.data.copy_to_host(after.data(), state.data.bytes);
+        if (!count) require(std::equal(before.begin(), before.end(), after.begin(),
+            [](float a, float b) { return std::bit_cast<unsigned>(a) == std::bit_cast<unsigned>(b); }), "K1 abort changed state");
+        else {
+            a.tokens = count;
+            a.q.resize(128 * qheads * count); a.k.resize(a.q.size());
+            a.v.resize(128 * heads * count); a.g.resize(a.v.size()); a.beta.resize(heads * count);
+            const auto expected = ninfer::test::kda_ref::evaluate(a, -5.f, scale).final_state;
+            check(std::vector<double>(after.begin(), after.end()), expected, true);
+            initial.assign(expected.begin(), expected.end());
+        }
+    }
+    for (const auto* buffer : {&factors, &result}) {
+        std::vector<unsigned char> bytes(buffer->bytes); buffer->copy_to_host(bytes.data(), bytes.size());
+        for (int i = 0; i < 16; ++i)
+            require(bytes[i] == 0xa5 && bytes[bytes.size() - 1 - i] == 0xa5, "K1 factor/output guard changed");
+    }
+}
 } // namespace
 
 int main() try {
     DeviceContext ctx;
     unsigned cases = 0;
+    for (bool negative : {false, true}) for (int heads : {5, 64}) {
+        run_k1(ctx, heads == 5 ? 1 : heads, heads, negative);
+        ++cases;
+    }
     for (bool alias : {false, true}) {
         for (int tokens : {1, 8, 33}) {
             run(ctx, 64, 64, tokens, 0, -5, alias);

@@ -30,7 +30,8 @@ resident request lanes, independent state and context frontiers, and a maximum
 context capacity of 32768 tokens. Ordinary batches use actual compact request
 columns. Ordinary prompt consumption uses bounded temporal chunks controlled by
 prefill_chunk, with at most 1024 total input rows per unit. The native launcher
-exposes --prefill-chunk and --pack-prefill for ordinary generation. Intermediate
+exposes --prefill-chunk for ordinary and MTP generation, and --pack-prefill for
+ordinary cross-request packing. Intermediate
 prompt rows advance context without requesting a next-token prediction.
 
 Graph families cover actual request count and bounded context tiers. Program
@@ -78,15 +79,29 @@ Companions require explicit selection. `--mtp` selects the checkpoint's native
 MTP K1. `--mtp --verify-native-greedy` loads ordinary and MTP serially, compares
 every generated token and records both profiles' end-to-end costs. The target's
 post-output-norm hidden is retained for NextN in both activation storage modes.
-The opt-in `ninfer_k100_mtp_check` also checks short output bounds and repeated
+MTP prompt consumption preserves all normalized teacher rows for bounded,
+batched NextN catch-up. The opt-in `ninfer_k100_mtp_check` checks short output bounds and repeated
 request reuse, with optional `--graph` or `--fp32-activations`. It needs an explicit
 artifact and a local report path; it is not an automatic artifact-loading CTest.
 
 `--dflash2` uses the GLM-specific companion and K7 verification in a single-lane eager
 route. It cannot be combined with the ordinary Graph batch route. Native MTP K1
-uses the target artifact's selected MTP weights, with serial target verification
-and rejection fallback. Availability of either route is not a speedup guarantee.
-TP/EP and temporal target verification are not yet implemented for MTP. The
+uses the target artifact's selected MTP weights. Its target verifier executes
+anchor and proposal together, layer by layer, in one temporal span. Recurrent
+KDA and short convolutions retain their initial persistent state until explicit
+commit of zero, one or two inputs. Candidate MLA/index suffixes remain outside
+the accepted causal frontier and are overwritten before later visibility. NextN
+catch-up consumes the accepted target teacher; stopping after the first output
+commits only the anchor. Cancellation before commit aborts both positions. A
+single remaining output or context input uses ordinary C1. MTP requires KVMem
+disabled and one PP lane/frame. Target Decode and K1 verification have separate
+Graph families; Prefill is eager. Availability is not a speedup guarantee.
+`ninfer_k100_mtp_transaction_check ARTIFACT [--graph] [--fp32-activations]`
+forces acceptance, rejection, abort and short commits around convolution/index
+boundaries, checks continuation against ordinary execution, and reconstructs
+teacher/cache histories. It is an opt-in three-device test, not a benchmark.
+DTK compilation, GPU numerical oracles and whole-model A/B must qualify these
+paths on the deployment hardware. TP/EP is not implemented for MTP. The
 appropriate selected companion must be present in the converted artifact;
 ordinary and MTP loading do not require the DFlash2 component.
 

@@ -43,6 +43,15 @@ int main() try {
     const std::array<TokenSpan, 3> decode{{{7, 127, 0, 1}, {1, 128, 1, 1}, {4, 128, 2, 1}}};
     TokenBatch{TokenBatchKind::Decode, next, decode, all_rows}.validate(8, 256, 8);
     rejects([&] { TokenBatch{TokenBatchKind::Decode, next, decode, {}}.validate(8, 256, 8); });
+    const std::array<int, 2> pair{10, 20}, both{0, 1};
+    const TokenSpan temporal{0, 254, 0, 2};
+    TokenBatch{TokenBatchKind::VerifyK1, pair, {&temporal, 1}, both}.validate(1, 256, 2);
+    rejects([&] { TokenBatch{TokenBatchKind::Prefill, pair, {&temporal, 1}, both}.validate(1, 256, 2); });
+    rejects([&] { TokenBatch{TokenBatchKind::VerifyK1, pair, {&temporal, 1}, {}}.validate(1, 256, 2); });
+    rejects([&] { TokenBatch{TokenBatchKind::VerifyK1, pair, {&temporal, 1}, both}.validate(1, 255, 2); });
+    rejects([&] { TokenBatch{TokenBatchKind::VerifyK1, pair, {&temporal, 1}, both}.validate(1, 256, 1); });
+    const std::array<TokenSpan, 2> independent{{{0, 0, 0, 1}, {1, 0, 1, 1}}};
+    rejects([&] { TokenBatch{TokenBatchKind::VerifyK1, pair, independent, both}.validate(2, 256, 2); });
     std::cout << "PASS token spans: ragged time, independent lanes, causal frontiers, output selection\n";
     return 0;
 } catch (const std::exception& e) {

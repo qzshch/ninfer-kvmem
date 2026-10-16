@@ -33,14 +33,13 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
          (options.kvmem_window_pages < 4 || options.kvmem_window_pages % 2)))
         throw std::invalid_argument(
             "GLM resident Program requires context 1..32768 and even KVMem window >=4 pages");
-    if (options.mtp && (options.draft || options.max_lanes != 1))
-        throw std::invalid_argument("native MTP requires one compact target lane");
+    if (options.mtp && (options.draft || options.max_lanes != 1 || options.kvmem_window_pages))
+        throw std::invalid_argument("native MTP requires one PP lane with KVMem disabled");
     if (!options.prefill_chunk) throw std::invalid_argument("GLM prefill chunk must be positive");
     // The input extent is bounded by this Program's fixed resident workspace.
-    // Speculative profiles retain their one-input execution and resource quote.
-    const int constructor_rows = (options.draft || options.mtp)
-                    ? options.max_lanes
-                    : std::max(options.max_lanes, static_cast<int>(std::min(options.prefill_chunk, 1024u)));
+    const int constructor_rows = options.draft ? options.max_lanes :
+        std::max(options.mtp ? 2 : options.max_lanes,
+                 static_cast<int>(std::min(options.prefill_chunk, 1024u)));
     if (options.decode_frames > 1 && (options.draft || options.mtp))
         throw std::invalid_argument("GLM asynchronous frames require ordinary execution");
     const int primary_rows = constructor_rows;
@@ -105,6 +104,7 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
             local.streams = DeviceBuffer(4ULL * H * 4 * rows);
             local.metadata = DeviceBuffer(frame_->host_metadata.size() * sizeof(int));
             local.hidden = DeviceBuffer(H * 4ULL * rows);
+            if (options.mtp) local.commit_prefix = DeviceBuffer(sizeof(int));
             local.workspace = std::make_unique<WorkspaceArena>(f ? (256ULL << 20) : (2ULL << 30));
             local.ready = std::make_unique<CudaCompletionEvent>(*frame_->devices[d]);
             local.copied = std::make_unique<CudaCompletionEvent>(*frame_->devices[d]);
@@ -116,7 +116,8 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 local.normalized = DeviceBuffer(H * (options.bf16_activations ? 2ULL : 4ULL) * rows);
             }
             stats_.persistent_bytes[d] += local.streams.bytes + local.metadata.bytes + local.hidden.bytes +
-                local.partial.bytes + local.received.bytes + local.coefficients.bytes + local.normalized.bytes;
+                local.partial.bytes + local.received.bytes + local.coefficients.bytes + local.normalized.bytes +
+                local.commit_prefix.bytes;
         }
         frame_ = frames_[0].get();
     }
@@ -138,6 +139,12 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
                 l.conv[j] = base + state_floats * options.max_lanes +
                             j * channels * 3 * options.max_lanes;
             cursor[d] += (state_floats + 9 * channels) * options.max_lanes;
+            if (options.mtp) {
+                l.k1_factors = DeviceBuffer(channels * 3 * 2 * sizeof(float));
+                for (auto& journal : l.k1_conv) journal = DeviceBuffer(channels * 2 * sizeof(float));
+                stats_.persistent_bytes[d] += l.k1_factors.bytes;
+                for (const auto& journal : l.k1_conv) stats_.persistent_bytes[d] += journal.bytes;
+            }
         } else {
             const auto context = options_.max_context * options_.max_lanes;
             l.latent           = DeviceBuffer(static_cast<std::size_t>(context) * 512 * 2);
@@ -165,6 +172,10 @@ Program::Program(const Model& model, std::array<DeviceContext*, 3> devices, Prog
             stats_.persistent_bytes[2] += c.key.bytes + c.value.bytes;
         }
     if (options.mtp) {
+        frame_->devices[0]->bind_to_current_thread();
+        mtp_teacher_backup_ = DeviceBuffer(H * sizeof(float));
+        stats_.persistent_bytes[0] += mtp_teacher_backup_.bytes;
+        frame_->devices[2]->bind_to_current_thread();
         auto& l  = mtp_state_;
         l.latent = DeviceBuffer(static_cast<std::size_t>(options.max_context) * 512 * 2);
         l.keys   = DeviceBuffer(static_cast<std::size_t>(options.max_context) * 128 * 2);
@@ -200,6 +211,7 @@ Program::~Program() {
             if (tensor_parallel_ || parameters_.layers[i].device == d) layer_state(d, i) = {};
         for (auto& s : recurrent_[d]) s = {};
         for (auto& sequence : sequence_ready_) sequence[d].reset();
+        if (!d) mtp_teacher_backup_ = {};
         if (d == 2) { mtp_state_ = {}; features_ = {}; for (auto& c : draft_cache_) c = {}; }
     }
 }
@@ -274,7 +286,15 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
     projection(x, p.query, q, t, d);
     projection(x, p.key, k, t, d);
     projection(x, p.value, v, t, d);
-    if (options_.draft) {
+    if (frame_->kind == runtime::TokenBatchKind::VerifyK1) {
+        const std::array<float*, 3> inputs{q, k, v};
+        const std::array<const Tensor*, 3> kernels{&p.query_conv, &p.key_conv, &p.value_conv};
+        for (int j = 0; j < 3; ++j) {
+            Tensor a(inputs[j], DType::FP32, {channels, t});
+            ops::resident_causal_conv_verify_k1(a, *kernels[j], state.conv[j],
+                static_cast<float*>(state.k1_conv[j].p), a, s);
+        }
+    } else if (options_.draft) {
         ops::resident_causal_conv(q, p.query_conv, state.conv[0], q, channels, 1, s);
         ops::resident_causal_conv(k, p.key_conv, state.conv[1], k, channels, 1, s);
         ops::resident_causal_conv(v, p.value_conv, state.conv[2], v, channels, 1, s);
@@ -306,7 +326,12 @@ void Program::kda(const float* x, const KdaParameters& p, LayerState& state, flo
         ops::pack_bf16(beta, static_cast<std::uint16_t*>(bb.data), heads * t, s);
         Tensor image(state.recurrent, DType::FP32, {128, 128, heads, options_.max_lanes});
         auto bias = p.decay_bias.reshape({128, heads});
-        if (options_.draft) {
+        if (frame_->kind == runtime::TokenBatchKind::VerifyK1) {
+            Tensor factors(state.k1_factors.p, DType::FP32, {128, 3, heads, 2});
+            ops::kimi_delta_attention_verify_k1(qb, kb, vb, gb, bb, p.negative_decay_rate,
+                bias, -5.f, 1.f / std::sqrt(128.f), w, image, factors, yb, s,
+                ops::KdaDecayParameter::NegativeRate);
+        } else if (options_.draft) {
             ops::kimi_delta_attention(
                 qb, kb, vb, gb, bb, p.negative_decay_rate, bias, -5.f,
                 1.f / std::sqrt(128.f), w, image, yb, frame_->devices[d]->execution_view(),
@@ -588,71 +613,8 @@ std::int32_t Program::target(std::int32_t token, int snapshot) {
     return next;
 }
 
-// Native checkpoint NextN: concatenate independently normalized next-token
-// embedding and target post-output-norm hidden, fuse, one plain MLA/MoE block,
-// then its own output norm and the resident target head. The MTP cache advances
-// only on actual/greedily accepted input tokens; no rejected proposal owns state.
-std::int32_t Program::mtp_forward(std::int32_t token, bool proposal) {
-    if (!options_.mtp || token < 0 || token >= 154880 || position_ != mtp_frontier_ + 1)
-        throw std::invalid_argument("native MTP token/teacher frontier");
-    const auto& p = parameters_.mtp;
-    for (auto& state : frame_->state) state.workspace->reset();
-    frame_->devices[0]->bind_to_current_thread();
-    auto& first = *frame_->state[0].workspace;
-    auto* id    = static_cast<int*>(first.alloc_bytes(4).data);
-    CUDA_CHECK(cudaMemcpy(id, &token, 4, cudaMemcpyHostToDevice));
-    auto* embedded = floats(first, H);
-    ops::embedding_fp32(parameters_.embedding, id, embedded, 1, frame_->devices[0]->stream);
-    auto& work   = *frame_->state[2].workspace;
-    auto* joined = floats(work, 2 * H);
-    peer(joined, 2, embedded, 0, H * 4);
-    peer(joined + H, 2, frame_->state[0].hidden.p, 0, H * 4);
-    const auto stream = frame_->devices[2]->stream;
-    ops::resident_norm(joined, &p.embedding_norm, nullptr, nullptr, joined, H, 1, rms_norm_epsilon, false,
-                       true, stream);
-    ops::resident_norm(joined + H, &p.hidden_norm, nullptr, nullptr, joined + H, H, 1, rms_norm_epsilon, false,
-                       true, stream);
-    auto* residual = floats(work, H);
-    auto* x        = floats(work, H);
-    auto* y        = floats(work, H);
-    projection(joined, p.fusion, residual, 1, 2);
-    ops::resident_norm(residual, &p.layer.attention_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false,
-                       true, stream);
-    mla(x, p.layer.mla, mtp_state_, y, 2, 1);
-    ops::resident_add(residual, y, residual, H, stream);
-    ops::resident_norm(residual, &p.layer.ffn_norm, nullptr, nullptr, x, H, 1, rms_norm_epsilon, false, true,
-                       stream);
-    feed_forward(x, p.layer, y, 1);
-    ops::resident_add(residual, y, residual, H, stream);
-    ++mtp_frontier_;
-    if (options_.kvmem_window_pages) {
-        ++stats_.kvmem_selections;
-        if ((mtp_frontier_ + 127) / 128 > static_cast<int>(options_.kvmem_window_pages / 2))
-            ++stats_.kvmem_restricted_steps;
-    }
-    if (!proposal) {
-        frame_->devices[2]->synchronize();
-        return -1;
-    }
-    ops::resident_norm(residual, &p.output_norm, nullptr, nullptr, residual, H, 1, rms_norm_epsilon, false,
-                       true, stream);
-    auto* input = floats(first, H);
-    peer(input, 0, residual, 2, H * 4);
-    auto* logits = floats(first, 154880);
-    projection(input, parameters_.output_head, logits, 1, 0, false);
-    auto* output = static_cast<int*>(first.alloc_bytes(4).data);
-    ops::resident_argmax(logits, output, 154880, 1, frame_->devices[0]->stream);
-    frame_->devices[0]->synchronize();
-    int result;
-    CUDA_CHECK(cudaMemcpy(&result, output, 4, cudaMemcpyDeviceToHost));
-    if (result < 0) throw std::runtime_error("native MTP nonfinite logits");
-    ++stats_.draft_calls;
-    ++stats_.drafted_tokens;
-    return result;
-}
-
 void Program::reset_lane(int lane) {
-    if (lane < 0 || lane >= options_.max_lanes || options_.draft)
+    if (lane < 0 || lane >= options_.max_lanes || options_.draft || options_.mtp)
         throw std::invalid_argument("compact Program lane reset");
     ledger_.reset_lane(lane);
     frame_ = frames_[0].get();
@@ -724,16 +686,17 @@ void Program::batch_stage(int d) {
         }
         ops::hyper_connection_expand(residual, y, coeff, residual, H, frame_->batch, stream);
     }
-    if (d == 2 && frame_->outputs) {
+    if (d == 2 && (frame_->outputs || options_.mtp)) {
         auto scope = work.scope();
         const float* selected = residual;
-        if (frame_->outputs != frame_->batch) {
+        if (!options_.mtp && frame_->outputs != frame_->batch) {
             auto* compact = floats(work, 4 * H * frame_->outputs);
             ops::resident_gather_rows(residual, metadata(d, OutputRows), compact,
                                       4 * H, frame_->outputs, stream);
             selected = compact;
         }
-        ops::mean_streams(selected, static_cast<float*>(frame_->state[2].hidden.p), H, frame_->outputs, stream);
+        ops::mean_streams(selected, static_cast<float*>(frame_->state[2].hidden.p), H,
+                          options_.mtp ? frame_->batch : frame_->outputs, stream);
     }
     stats_.workspace_peak[d] = std::max(stats_.workspace_peak[d], work.peak_used());
 }
@@ -743,19 +706,31 @@ void Program::batch_head() {
     work.reset();
     const auto stream = frame_->devices[0]->stream;
     auto* final       = static_cast<float*>(frame_->state[0].hidden.p);
-    Tensor final_input(final, DType::FP32, {H, frame_->outputs});
-    auto normalized = work.alloc(DType::BF16, {H, frame_->outputs});
+    const int teacher_rows = options_.mtp ? frame_->batch : frame_->outputs;
+    Tensor final_input(final, DType::FP32, {H, teacher_rows});
+    auto normalized = work.alloc(DType::BF16, {H, teacher_rows});
     if (options_.bf16_activations)
         ops::resident_norm(final_input, &parameters_.output_norm, nullptr, nullptr, normalized, rms_norm_epsilon, false, stream);
     else {
-        ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, frame_->outputs, rms_norm_epsilon, false, true, stream);
+        ops::resident_norm(final, &parameters_.output_norm, nullptr, nullptr, final, H, teacher_rows, rms_norm_epsilon, false, true, stream);
         normalized = final_input;
     }
     // NextN consumes the same post-output-norm teacher in both storage modes.
     // Keep it in the persistent hidden buffer before mtp_forward resets scratch.
     if (options_.mtp && options_.bf16_activations)
         ops::unpack_bf16(static_cast<const std::uint16_t*>(normalized.data), final,
-                         static_cast<std::size_t>(H) * frame_->outputs, stream);
+                         static_cast<std::size_t>(H) * teacher_rows, stream);
+    if (!frame_->outputs) return;
+    if (options_.mtp && frame_->outputs != teacher_rows) {
+        auto* selected = floats(work, H * frame_->outputs);
+        ops::resident_gather_rows(final, metadata(0, OutputRows), selected, H, frame_->outputs, stream);
+        normalized = Tensor(selected, DType::FP32, {H, frame_->outputs});
+        if (options_.bf16_activations) {
+            normalized = work.alloc(DType::BF16, {H, frame_->outputs});
+            ops::pack_bf16(selected, static_cast<std::uint16_t*>(normalized.data),
+                            H * frame_->outputs, stream);
+        }
+    }
     auto* logits = floats(work, 154880 * frame_->outputs);
     Tensor scores(logits, DType::FP32, {154880, frame_->outputs});
     projection(normalized, parameters_.output_head, scores, 0);
@@ -783,12 +758,21 @@ std::vector<std::int32_t> Program::target_batch(std::span<const int> tokens,
 }
 
 std::vector<std::int32_t> Program::execute(const runtime::TokenBatch& input) {
+    if (input.kind == runtime::TokenBatchKind::VerifyK1)
+        throw std::invalid_argument("use native MTP verification and prefix commit");
     return finish(submit(input));
 }
 
 FrameTicket Program::submit(const runtime::TokenBatch& input) {
     if (options_.draft) throw std::invalid_argument("async Program excludes draft execution");
     input.validate(options_.max_lanes, options_.max_context, input_capacity());
+    if (mtp_proposal_pending_ && input.kind != runtime::TokenBatchKind::VerifyK1)
+        throw std::logic_error("native MTP proposal requires verification before new target work");
+    if (input.kind == runtime::TokenBatchKind::VerifyK1 &&
+        (!options_.mtp || tensor_parallel_ || options_.kvmem_window_pages ||
+         !mtp_proposal_pending_ || position_ < 1 || mtp_frontier_ != position_ ||
+         input.tokens[0] != mtp_anchor_))
+        throw std::invalid_argument("K1 verifier requires native MTP proposal at current PP frontier");
     for (auto token : input.tokens)
         if (token < 0 || token >= 154880)
             throw std::invalid_argument("packed Program token outside vocabulary");
@@ -796,6 +780,12 @@ FrameTicket Program::submit(const runtime::TokenBatch& input) {
     const auto ticket = ledger_.reserve(input);
     frame_ = frames_[ticket.slot].get();
     try {
+    frame_->valid_prefix = -1;
+    if (input.kind == runtime::TokenBatchKind::VerifyK1) {
+        frame_->devices[0]->bind_to_current_thread();
+        CUDA_CHECK(cudaMemcpyAsync(mtp_teacher_backup_.p, frame_->state[0].hidden.p,
+            H * sizeof(float), cudaMemcpyDeviceToDevice, frame_->devices[0]->stream));
+    }
     frame_->spans.assign(input.spans.begin(), input.spans.end());
     frame_->kind = input.kind;
     frame_->batch = input.tokens.size();
@@ -834,8 +824,9 @@ FrameTicket Program::submit(const runtime::TokenBatch& input) {
     else {
     // Temporal prefill uses the same stage composition eagerly. Decode Graphs
     // retain exact request geometry; no temporal span is relabeled as a lane.
-    const bool graph = options_.graph && frame_->kind == runtime::TokenBatchKind::Decode;
-    const int key = frame_->batch * 65536 + frame_->tier;
+    const bool graph = options_.graph && frame_->kind != runtime::TokenBatchKind::Prefill;
+    const int key = (frame_->kind == runtime::TokenBatchKind::VerifyK1 ? -1 : 1) *
+                    (frame_->batch * 65536 + frame_->tier);
     if (graph && !frame_->graphs.contains(key)) {
         auto& family = frame_->graphs[key];
         for (int g = 0; g < 4; ++g) {
@@ -864,9 +855,9 @@ FrameTicket Program::submit(const runtime::TokenBatch& input) {
         } else
             batch_stage(d);
     }
-    if (frame_->outputs) {
+    if (frame_->outputs || options_.mtp) {
         peer(frame_->state[0].hidden.p, 0, frame_->state[2].hidden.p, 2,
-              static_cast<std::size_t>(H * 4) * frame_->outputs);
+              static_cast<std::size_t>(H * 4) * (options_.mtp ? frame_->batch : frame_->outputs));
         frame_->devices[0]->bind_to_current_thread();
         if (graph) {
             frame_->graphs.at(key)[3].launch(frame_->devices[0]->stream);
@@ -905,6 +896,8 @@ bool Program::ready(FrameTicket ticket) const {
 std::vector<std::int32_t> Program::finish(FrameTicket ticket) {
     ledger_.validate(ticket);
     frame_ = frames_[ticket.slot].get();
+    if (frame_->kind == runtime::TokenBatchKind::VerifyK1)
+        throw std::logic_error("K1 verification needs explicit accepted-prefix commit");
     frame_->devices[0]->bind_to_current_thread();
     frame_->completed->synchronize();
     const auto* ids = static_cast<const int*>(frame_->result->data());
@@ -1060,8 +1053,10 @@ std::vector<std::int32_t> Program::propose(std::int32_t anchor, int t) {
 }
 
 void Program::reset() {
-    mtp_frontier_ = 0;
     ledger_.reset();
+    mtp_frontier_ = 0;
+    mtp_proposal_pending_ = false;
+    mtp_anchor_ = -1;
     frame_ = frames_[0].get();
     position_       = 0;
     draft_frontier_ = 0;
@@ -1080,7 +1075,7 @@ void Program::reset() {
 }
 
 void Program::restore(int frontier, int slot) {
-    if (frontier < 1 || frontier > position_ || slot < 1 || slot > 8)
+    if (!options_.draft || frontier < 1 || frontier > position_ || slot < 1 || slot > 8)
         throw std::invalid_argument("GLM restore frontier/snapshot");
     for (int d = 0; d < 3; ++d) {
         frame_->devices[d]->bind_to_current_thread();
