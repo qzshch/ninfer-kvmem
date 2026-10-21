@@ -1,0 +1,20 @@
+{
+  "pinned_backend_preparation": "passed",
+  "public_evidence_check": "passed",
+  "public_evidence_tests": {
+    "run": 10,
+    "passed": 10
+  },
+  "validation_portability_tests": {
+    "run": 13,
+    "passed": 11,
+    "skipped": 2,
+    "platform": "Windows, Python 3.11"
+  },
+  "ci_changes_tests": {
+    "run": 6,
+    "passed": 6
+  },
+  "gpu_tests_started_for_publication": 0,
+  "full_CI_claimed": false
+}
