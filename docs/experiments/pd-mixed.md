@@ -13,8 +13,12 @@ preparation change submitted as [#160](https://github.com/kvmem/kvmem/pull/160).
 The integration remains in `backends/patches/ninfer-kvmem.patch`; the NInfer
 submodule is pinned to `08fd7019925f43b4b42539400afd461b70f7144a`.
 
-Future comparisons use upstream master after #160. The `main` branch follows
-that official baseline; `experiment/pd-mixed` contains the migrated experiment.
+The `main` branch is now the mixed-compute development baseline, promoted from
+`experiment/pd-mixed`. The `upstream` branch preserves the unmodified official
+baseline after #160 and its follow-up fixes. Future comparisons use that branch
+as the control; synchronize official updates there before integrating them into
+the mixed mainline. This branch promotion does not add GPU acceptance or enable
+the experimental switches in a running process.
 The historical branch is retained so the measurements below remain tied to
 the source that produced them. It does not include later upstream fixes.
 

@@ -2,6 +2,12 @@
 
 # KVMem 0.18.0 · llama.cpp & NInfer
 
+> 本仓库的 `main` 作为 P+D 混合计算的开发基线；
+> [`upstream` 分支](https://github.com/qzshch/ninfer-kvmem/tree/upstream)
+> 保留纯官方源码，用于同步和性能对照。
+> 混合计算的配置及已验证范围见[专项说明](docs/experiments/pd-mixed.md)。
+> 混合路径仍需显式启用；源码主线调整不会改变正在运行的服务。
+
 KVMem 在有限显存中管理长对话与 Agent 工具历史：完整原生 KV 保存在 Host RAM，可选下沉到 SSD；GPU 按当前查询保留所需历史和生成工作空间。`master` 已包含 **0.18.0 多后端源码**，Windows RTX 30/40/50 的 **NInfer 0.18.0 正式运行包**已发布。
 
 **RTX 20 / TITAN RTX 与 Tesla V100：**新的 **[NInfer v0.18.1 RC1](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1)** 实机试用包已经发布，并已内置 Web UI。[下载 RTX 20 / sm75](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) · [下载 V100 / sm70](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip)

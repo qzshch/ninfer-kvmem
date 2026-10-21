@@ -2,6 +2,12 @@
 
 # KVMem 0.18.0 · llama.cpp & NInfer
 
+> This fork's `main` is the P+D mixed-compute development baseline. The
+> [`upstream` branch](https://github.com/qzshch/ninfer-kvmem/tree/upstream)
+> preserves the unmodified official source for synchronization and comparisons.
+> See the [mixed execution configuration and validation scope](docs/experiments/pd-mixed.md).
+> Mixed execution remains opt-in; promoting the source branch does not change a running service.
+
 KVMem manages long conversations and agent tool histories within a bounded GPU working set. Native KV history lives in Host RAM, with optional SSD tiering; retrieval brings selected history onto the GPU. **`master` contains the 0.18.0 multi-backend source**, and **stable NInfer 0.18.0 packages** are available for Windows RTX 30/40/50 GPUs.
 
 **RTX 20 / TITAN RTX and Tesla V100:** the new **[NInfer v0.18.1 RC1](https://github.com/kvmem/kvmem/releases/tag/v0.18.1-ninfer-rc1)** hardware-trial packages are available now, with the Web UI built in. [Download RTX 20 / sm75](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-rtx20-sm75.zip) · [Download V100 / sm70](https://github.com/kvmem/kvmem/releases/download/v0.18.1-ninfer-rc1/kvmem-v0.18.1-ninfer-rc1-windows-v100-sm70.zip)
