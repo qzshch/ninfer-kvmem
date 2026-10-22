@@ -18,15 +18,16 @@ The tested three-lane, one-retained-window, retained-MTP configuration reserves
 23 images, 3,540,948,992 bytes of host memory. This is total pool reservation,
 not incremental memory relative to the previous dynamically allocated images.
 It adds no device KV/workspace allocation; platform pinned-memory limits apply.
-Startup time and host memory are the
-tradeoff; this experiment is not automatically enabled.
+Startup time and host memory are the tradeoff; it is disabled by default.
 
 The standalone `ninfer_checkpoint_buffer_resident_test` checks 23 independent
 leases through 100 churn cycles without hot allocation/free, shared aliases,
 close lifetime, prewarm bounds, and failure cleanup. It keeps checks enabled in
 Release builds. ASan/UBSan and original-request GPU comparisons are recorded
-separately. A paired late-Prefill Nsight ROI removed two 216–219 ms allocations
-and associated 229–233 ms GPU gaps. This does not establish a whole-workload
-throughput increase or complete model-quality acceptance.
+separately. Earlier private paired traces motivated this change; their timing
+results do not qualify this revision or the separate public implementation.
+Exact-head public quality/cache/cancellation and allocation traces are tracked
+in upstream PR #168. No whole-workload throughput increase is claimed.
 
-The sizing and lease helpers are shared with upstream PR #168. Cold-storage materialization keeps its original allocation path. This implementation adds no device KV/workspace buffers; platform-specific pinned-memory limits still apply.
+The sizing and lease helpers are shared with upstream PR #168. Cold-storage
+materialization keeps its original allocation path.
