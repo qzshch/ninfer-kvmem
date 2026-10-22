@@ -111,6 +111,19 @@ class EvidenceTests(unittest.TestCase):
     def test_nan_counter_is_not_fast(self):
         self.receipt["measurements"][0]["value"]=float("nan")
         self.assertFalse(self.result()["performance_gain"])
+    def test_zero_unclaimed_wait_time_is_valid_evidence(self):
+        self.plan["metrics"].append(dict(key="queue_s",availability="required",direction="lower",claim=False))
+        self.plan["collectors"]["ordinary"]["fields"].append("queue_s")
+        for row in list(self.receipt["measurements"]):
+            self.receipt["measurements"].append(dict(row,metric="queue_s",value=0))
+        result=self.result()
+        self.assertTrue(result["evidence_complete"]);self.assertTrue(result["performance_gain"])
+        self.assertIsNone(result["comparisons"][-1]["change_pct"])
+    def test_zero_control_does_not_manufacture_relative_gain(self):
+        self.receipt["measurements"][0]["value"]=0
+        result=self.result()
+        self.assertTrue(result["evidence_complete"]);self.assertFalse(result["performance_gain"])
+        self.assertEqual(result["status"],"inconclusive")
     def test_trace_loss_needs_explicit_limits(self):
         self.receipt["runs"][-1]["trace"]["loss_status"]="qualified"
         self.assertFalse(self.result()["evidence_complete"])

@@ -97,3 +97,8 @@ Cross-domain clock witnesses are mandatory for Host-allocation and engine
 claims. A CUDA-event-only operator claim has no Host-clock join: paired Nsight
 still verifies the actual kernel route, replay count and trace tail. Its node
 spans are diagnostic and do not replace ordinary CUDA-event timings.
+
+Revision 3 retains valid zero-valued queue/wait/allocation observations as
+absolute measurements. If a control repetition is zero, a relative percentage
+is unavailable; it cannot support a gain claim. An unclaimed zero timer does not
+invalidate otherwise complete evidence.

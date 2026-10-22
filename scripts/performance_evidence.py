@@ -12,7 +12,7 @@ import subprocess
 import time
 
 VERSION = 1
-VALIDATOR_REVISION = 2
+VALIDATOR_REVISION = 3
 SHA_LENGTH = 64
 PHASES = {"P", "D", "PP", "DD", "PD"}
 REQUIRED = {
@@ -245,7 +245,15 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
             if min(map(len,arms.values())) < 2 * plan["comparison"]["minimum_blocks"]:
                 errors.append(f"{name}: repeated coverage missing"); continue
             a,b = statistics.median(arms["A"]),statistics.median(arms["B"])
-            if min(arms["A"])<=0: errors.append(f"{name}: zero control denominator"); continue
+            if min(arms["A"])==0:
+                # Zero queue/wait/allocation time is a valid observation. Keep
+                # the absolute result; relative evidence cannot support a gain.
+                comparisons.append({"metric":name,"stratum":key,"A":a,"B":b,
+                    "absolute_change":b-a,"change_pct":None,"improvement_pct":None,
+                    "conservative_improvement_pct":None,"control_spread_pct":None,
+                    "relative_unavailable_reason":"a control repetition is zero"})
+                matched+=1
+                continue
             delta=100*(b/a-1)
             improvement=delta if metric.get("direction") == "higher" else -delta
             # The slowest candidate must beat the fastest control. A drifting
@@ -262,8 +270,10 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
     claimed = [c for c in comparisons if any(m["key"]==c["metric"] and m.get("claim") and
                (not m.get("claim_request_ids") or c["stratum"][0] in m["claim_request_ids"])
                for m in plan["metrics"])]
-    regression = any(c["conservative_improvement_pct"] < -plan["comparison"]["regression_limit_pct"] for c in claimed)
-    gain = bool(claimed) and all(c["conservative_improvement_pct"] > plan["comparison"]["noise_floor_pct"] for c in claimed)
+    regression = any(c["conservative_improvement_pct"] is not None and
+                     c["conservative_improvement_pct"] < -plan["comparison"]["regression_limit_pct"] for c in claimed)
+    gain = bool(claimed) and all(c["conservative_improvement_pct"] is not None and
+                                c["conservative_improvement_pct"] > plan["comparison"]["noise_floor_pct"] for c in claimed)
     complete = not errors and not differences
     status = "evidence_incomplete" if not complete else "quality_failed" if not quality_ok else "regression" if regression else "gain" if gain else "inconclusive"
     return {"version":VERSION,"validator_revision":VALIDATOR_REVISION,"validator_sha256":digest(Path(__file__)),
