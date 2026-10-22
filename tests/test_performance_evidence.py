@@ -63,6 +63,24 @@ class EvidenceTests(unittest.TestCase):
     def test_early_roi_misses_late_allocation(self):
         self.receipt["runs"][-1]["trace"]["target_event_count"]=0
         self.assertTrue(any("ROI missed" in s for s in self.result()["errors"]))
+    def test_operator_elapsed_time_does_not_need_host_clock_join(self):
+        for run in self.receipt["runs"]:
+            run["trace"]["clock_witness_verified"]=False
+        self.assertTrue(self.result()["evidence_complete"])
+    def test_host_claim_still_requires_clock_witness(self):
+        self.plan["claims"]=["host_allocation"]
+        fields=sorted(e.REQUIRED["host_allocation"])
+        self.plan["collectors"]["nsight"]["fields"]+=fields
+        for run in self.receipt["runs"]:
+            run["observed_fields"]+=fields
+            run["trace"]["observed_tables"].append("nvtx")
+            run["trace"]["clock_witness_verified"]=False
+        self.assertTrue(any("trace tail/clock missing" in s for s in self.result()["errors"]))
+    def test_median_gain_cannot_hide_control_drift(self):
+        self.receipt["measurements"][0]["value"]=80
+        result=self.result()
+        self.assertFalse(result["performance_gain"])
+        self.assertGreater(result["comparisons"][0]["control_spread_pct"],20)
     def test_wrong_target_cannot_use_unrelated_trace(self):
         self.receipt["runs"][-1]["trace"]["target_event"]="unrelated allocation"
         self.assertFalse(self.result()["evidence_complete"])

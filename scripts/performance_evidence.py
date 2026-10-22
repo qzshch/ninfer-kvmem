@@ -12,6 +12,7 @@ import subprocess
 import time
 
 VERSION = 1
+VALIDATOR_REVISION = 2
 SHA_LENGTH = 64
 PHASES = {"P", "D", "PP", "DD", "PD"}
 REQUIRED = {
@@ -104,6 +105,7 @@ def seal(plan_path: Path, seal_path: Path) -> dict:
     errors = preflight(plan)
     if errors: raise ValueError("; ".join(errors))
     receipt = {"version": VERSION, "plan_sha256": digest(plan_path), "created_unix": time.time(),
+               "validator_sha256": digest(Path(__file__)), "validator_revision": VALIDATOR_REVISION,
                "preflight": "passed", "observer_failure_policy": "record_only"}
     # Exclusive creation makes a changed plan a new campaign, not a silent retry.
     with seal_path.open("x", encoding="utf8", newline="\n") as stream:
@@ -184,7 +186,7 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
                 errors.append(f"{arm}: ROI missed target event")
             needed = {f.removeprefix("nsight.") for f in REQUIRED_FOR(plan) if f.startswith("nsight.")}
             if not needed <= set(trace.get("observed_tables", [])): errors.append(f"{arm}: trace tables missing")
-            if not trace.get("tail_verified") or not trace.get("clock_witness_verified"):
+            if not trace.get("tail_verified") or ("clock_witness" in REQUIRED_FOR(plan) and not trace.get("clock_witness_verified")):
                 errors.append(f"{arm}: trace tail/clock missing")
             if trace.get("loss_status") not in ("none", "qualified"):
                 errors.append(f"{arm}: trace loss status unknown")
@@ -243,20 +245,29 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
             if min(map(len,arms.values())) < 2 * plan["comparison"]["minimum_blocks"]:
                 errors.append(f"{name}: repeated coverage missing"); continue
             a,b = statistics.median(arms["A"]),statistics.median(arms["B"])
-            if not a: errors.append(f"{name}: zero control denominator"); continue
+            if min(arms["A"])<=0: errors.append(f"{name}: zero control denominator"); continue
             delta=100*(b/a-1)
             improvement=delta if metric.get("direction") == "higher" else -delta
-            comparisons.append({"metric":name,"stratum":key,"A":a,"B":b,"change_pct":delta,"improvement_pct":improvement})
+            # The slowest candidate must beat the fastest control. A drifting
+            # control must not become a median-only gain.
+            if metric.get("direction") == "higher":
+                conservative=100*(min(arms["B"])/max(arms["A"])-1)
+            else:
+                conservative=100*(1-max(arms["B"])/min(arms["A"]))
+            comparisons.append({"metric":name,"stratum":key,"A":a,"B":b,"change_pct":delta,"improvement_pct":improvement,
+                                "conservative_improvement_pct":conservative,
+                                "control_spread_pct":100*(max(arms["A"])/min(arms["A"])-1)})
             matched += 1
         if not matched: errors.append(f"{name}: no matched strata")
     claimed = [c for c in comparisons if any(m["key"]==c["metric"] and m.get("claim") and
                (not m.get("claim_request_ids") or c["stratum"][0] in m["claim_request_ids"])
                for m in plan["metrics"])]
-    regression = any(c["improvement_pct"] < -plan["comparison"]["regression_limit_pct"] for c in claimed)
-    gain = bool(claimed) and all(c["improvement_pct"] > plan["comparison"]["noise_floor_pct"] for c in claimed)
+    regression = any(c["conservative_improvement_pct"] < -plan["comparison"]["regression_limit_pct"] for c in claimed)
+    gain = bool(claimed) and all(c["conservative_improvement_pct"] > plan["comparison"]["noise_floor_pct"] for c in claimed)
     complete = not errors and not differences
     status = "evidence_incomplete" if not complete else "quality_failed" if not quality_ok else "regression" if regression else "gain" if gain else "inconclusive"
-    return {"version":VERSION,"run_completed":receipt.get("run_completed") is True,
+    return {"version":VERSION,"validator_revision":VALIDATOR_REVISION,"validator_sha256":digest(Path(__file__)),
+            "run_completed":receipt.get("run_completed") is True,
             "evidence_complete":complete,"quality_pass":quality_ok,"performance_gain":complete and quality_ok and gain and not regression,
             "status":status,"errors":errors,"unmatched":differences,"comparisons":comparisons,
             "unavailable_metrics":[m for m in plan["metrics"] if m["availability"]=="unavailable"]}

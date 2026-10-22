@@ -82,3 +82,18 @@ The verdict separates `run_completed`, `evidence_complete`, `quality_pass` and
 can still be `inconclusive` or `regression`. No inherited pass from another head,
 workload, recipe or profiler window. Change a frozen plan by creating a new
 campaign, preserving the original and explaining the change.
+
+Validator revision 2 records the evaluator SHA256 and revision in seals and
+verdicts. Preserve the original evaluator and verdict when fixing a validator;
+an offline re-evaluation must identify both versions and its reason. Never alter
+frozen request bytes, measurements or acceptance limits to obtain a pass.
+
+Gain requires the slowest candidate repetition to beat the fastest control by
+the frozen noise floor in every claimed stratum. Report control spread and the
+median difference as well. Retain fallback negative controls even when they
+appear faster through drift; they do not support an operator-change claim.
+
+Cross-domain clock witnesses are mandatory for Host-allocation and engine
+claims. A CUDA-event-only operator claim has no Host-clock join: paired Nsight
+still verifies the actual kernel route, replay count and trace tail. Its node
+spans are diagnostic and do not replace ordinary CUDA-event timings.
