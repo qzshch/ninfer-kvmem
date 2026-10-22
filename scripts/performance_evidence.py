@@ -88,6 +88,7 @@ def preflight(plan: dict) -> list[str]:
     need(plan.get("observer_failure_policy") == "record_only", "observer failure must not control inference")
     if "engine_performance" in claims:
         need(len(requests) >= 30, "engine claim needs at least 30 distinct original requests")
+        need(len({r.get("body_sha256") for r in requests}) >= 30, "repeated bodies are not 30 independent requests")
         need(len({r.get("session") for r in requests}) >= 8, "engine claim needs eight source sessions")
         need(all(r.get("source") == "original" for r in requests), "engine claim cannot substitute derived requests")
         pairs = plan.get("independent_pairs", {})
@@ -212,8 +213,9 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
                 errors.append(f"{arm}: required concurrency phases not observed")
     if trace_arms != {"A", "B"}: errors.append("paired Nsight evidence missing")
     quality = receipt.get("quality", {})
-    quality_ok = quality.get("passed") is True and bool(quality.get("assertions")) and quality.get("exact_heads") is True
-    if not quality_ok: errors.append("quality gate failed/unqualified")
+    quality_qualified = isinstance(quality.get("passed"),bool) and bool(quality.get("assertions")) and quality.get("exact_heads") is True
+    quality_ok = quality_qualified and quality["passed"]
+    if not quality_qualified: errors.append("quality evidence missing/unqualified")
     errors += artifact_errors(receipt.get("artifacts", []), root)
     measurements = receipt.get("measurements", [])
     comparisons = []
@@ -230,6 +232,9 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
             key = (row.get("request_id"),row.get("phase"),row.get("context_band"),row.get("cache_class"),row.get("cache_tokens"))
             if row.get("request_id") not in requests or row.get("phase") not in PHASES:
                 errors.append(f"{name}: request/phase missing"); continue
+            if not row.get("context_band") or row.get("cache_class") not in ("cold","partial","high","none") or \
+                not isinstance(row.get("cache_tokens"),(int,float)) or row["cache_tokens"]<0:
+                errors.append(f"{name}: cache/context stratum missing"); continue
             grouped.setdefault(key, {}).setdefault(row.get("arm"), []).append(value)
         matched = 0
         for key,arms in grouped.items():
@@ -250,9 +255,9 @@ def evaluate(plan: dict, receipt: dict, root: Path, sealed: dict, plan_sha256: s
     regression = any(c["improvement_pct"] < -plan["comparison"]["regression_limit_pct"] for c in claimed)
     gain = bool(claimed) and all(c["improvement_pct"] > plan["comparison"]["noise_floor_pct"] for c in claimed)
     complete = not errors and not differences
-    status = "evidence_incomplete" if not complete else "regression" if regression else "gain" if gain else "inconclusive"
+    status = "evidence_incomplete" if not complete else "quality_failed" if not quality_ok else "regression" if regression else "gain" if gain else "inconclusive"
     return {"version":VERSION,"run_completed":receipt.get("run_completed") is True,
-            "evidence_complete":complete,"quality_pass":quality_ok,"performance_gain":complete and gain and not regression,
+            "evidence_complete":complete,"quality_pass":quality_ok,"performance_gain":complete and quality_ok and gain and not regression,
             "status":status,"errors":errors,"unmatched":differences,"comparisons":comparisons,
             "unavailable_metrics":[m for m in plan["metrics"] if m["availability"]=="unavailable"]}
 
@@ -308,7 +313,7 @@ def main():
         if not args.seal or not args.receipt: parser.error("evaluate needs --seal and --receipt")
         result=evaluate(plan,json.loads(args.receipt.read_bytes()),args.artifact_root,
                         json.loads(args.seal.read_bytes()),digest(args.plan))
-        ok=result["evidence_complete"]
+        ok=result["evidence_complete"] and result["quality_pass"]
     text=json.dumps(result,indent=2,ensure_ascii=True)
     if args.output: args.output.write_text(text+"\n",encoding="utf8")
     print(text)

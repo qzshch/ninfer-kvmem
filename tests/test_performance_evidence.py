@@ -98,7 +98,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertFalse(self.result()["evidence_complete"])
     def test_quality_failure_cannot_hide_under_throughput(self):
         self.receipt["quality"]["passed"]=False
-        self.assertFalse(self.result()["performance_gain"])
+        r=self.result();self.assertFalse(r["performance_gain"])
+        self.assertTrue(r["evidence_complete"]);self.assertEqual(r["status"],"quality_failed")
     def test_nested_scopes_are_not_added_twice(self):
         ledger=e.exclusive_ledger([dict(scope="capture",start=2,end=5),dict(scope="P",start=0,end=8),
                                    dict(scope="PD",start=7,end=9)],0,10,["capture","PD","P"])
