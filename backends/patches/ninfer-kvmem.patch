@@ -11184,10 +11184,18 @@ index 7757b4e0223d81b5bb7f027f8b750b31ea96698c..9f9ac70ad64fd308b5fa11c464f67fed
  
  void validate_fold_records(const GdnReplayRecords& records) {
 diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
-index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f0b2448be 100644
+index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..f487376637bd807922b7121b97843c974c8ddb3b 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
 +++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
-@@ -49,10 +49,17 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
+@@ -11,6 +11,7 @@
+ #include "ops/softmax_attention/dense/causal_cache/launch.h"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/launch.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -49,10 +50,17 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
      return 8;
  }
  
@@ -11206,7 +11214,7 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
          throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
      }
  }
-@@ -491,6 +498,7 @@ int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
+@@ -491,6 +499,7 @@ int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
                                            CausalAttentionExecutionEnvelope envelope,
                                            std::int32_t batch_size, std::int32_t width) {
      require_causal_geometry(geometry, "causal_softmax_attention route family");
@@ -11214,7 +11222,7 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
      switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                     cache_storage, envelope)) {
      case detail::CausalAttentionRoute::SmallT:
-@@ -508,6 +516,7 @@ int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
+@@ -508,6 +517,7 @@ int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
                                                CausalAttentionExecutionEnvelope envelope,
                                                std::int32_t batch_size, std::int32_t width) {
      require_causal_geometry(geometry, "causal_softmax_attention small-T launches");
@@ -11222,7 +11230,7 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
      switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                     cache_storage, envelope)) {
      case detail::CausalAttentionRoute::SmallT:
-@@ -593,6 +602,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
+@@ -593,6 +603,8 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
              "causal_softmax_attention workspace: invalid profile or interval");
      }
  
@@ -11231,7 +11239,19 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
      const auto chunk_capacity = [&](std::int32_t width) {
          const std::int32_t splits = detail::causal_attention_split_capacity(
              q_heads, width, cache_storage, envelope, batch_size);
-@@ -707,6 +718,28 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+@@ -627,6 +639,11 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
+     };
+ 
+     std::size_t maximum = 0;
++    for (int width : {224,240,246,251}) {
++        if (width>=min_width && width<=max_width &&
++            detail::selective_int8_applies(geometry,cache_storage,envelope,batch_size,width))
++            maximum=std::max(maximum,detail::selective_int8_workspace_bytes(width,envelope.max_visible_keys));
++    }
+     const std::int32_t maximum_verify_tokens =
+         batch_size == 1 && (envelope.wide_verification || envelope.small_prefill)
+             ? kMaximumSingleRowVerifyTokens
+@@ -707,7 +724,36 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
          }
      }
  
@@ -11258,9 +11278,17 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
 +    }
 +
      auto scope = workspace.scope();
++    if (detail::selective_int8_applies(geometry,cache.storage,envelope,batch,width)) {
++        detail::kv_cache_append_batch_launch(k,v,positions,valid_columns,kv_table_rows,cache,stream);
++        detail::selective_int8_cached_launch(q,positions,&valid_columns,&kv_table_rows,scale,
++                                            cache,envelope,workspace,out,stream);
++        if (gate!=nullptr) sigmoid_mul(*gate,out,stream);
++        return;
++    }
      const detail::CausalAttentionRoute route =
          detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
-@@ -769,6 +802,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
+     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
+@@ -769,7 +815,21 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
      constexpr const char* op = "causal_softmax_attention_cached";
      validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
  
@@ -11274,8 +11302,14 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..e019e2d86a2c75c5f8f6bf0614c9968f
 +    }
 +
      auto scope = workspace.scope();
++    if (detail::selective_int8_applies(geometry,cache.storage,envelope,1,q.ne[2])) {
++        detail::selective_int8_cached_launch(q,positions,nullptr,nullptr,scale,
++            single_row_paged_kv_batch_view(cache),envelope,workspace,out,stream);
++        return;
++    }
      const detail::CausalAttentionRoute route =
          detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
+     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
 diff --git a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
 index ebf44eeb8ad687f4ed22eb0431341b485c641a78..ce7ff494d0e96ea886597fa96381be5d687c13fc 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
@@ -11405,6 +11439,2854 @@ index 1b4bef3d37598a5a9174cbbf3fe5a14297e4c4b5..09283671d1d0d0e1bb100c72a5b9ebe6
                  q_data, keys, values, key_scales, value_scales, metadata, pos, scale, out_data,
                  width, static_cast<float*>(partials.rows.data),
                  static_cast<float2*>(partials.stats.data));
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..c465e6e9b3d566980322bb34e88bdcc6f40a1dc4
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu
+@@ -0,0 +1,109 @@
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/launch.h"
++#if defined(NINFER_SM120_NVFP4)
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h"
++#include "core/layout.h"
++#include "core/device.h"
++#include <array>
++#include <atomic>
++#include <cstdlib>
++#include <string_view>
++
++namespace ninfer::ops::detail {
++namespace {
++bool enabled() {
++    static const bool value=[] {
++        const char* raw=std::getenv("NINFER_SELECTIVE_INT8_PREFILL");
++        if (!raw || std::string_view(raw)=="1") return true;
++        if (std::string_view(raw)=="0") return false;
++        throw std::invalid_argument("NINFER_SELECTIVE_INT8_PREFILL must be 0 or 1");
++    }();
++    return value;
++}
++bool measured_device() {
++    static std::array<std::atomic<int>,64> known{};
++    int device=-1;
++    if (cudaGetDevice(&device)!=cudaSuccess || device<0 || device>=64) return false;
++    auto& slot=known[device];
++    int result=slot.load(std::memory_order_relaxed);
++    if (!result) {
++        int major=0,minor=0,sms=0;
++        if (cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device)!=cudaSuccess ||
++            cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device)!=cudaSuccess ||
++            cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess)
++            return false;
++        result=(major==12 && minor==0 && sms==170) ? 1 : -1;
++        slot.store(result,std::memory_order_relaxed);
++    }
++    return result==1;
++}
++selective_i8::CausalKvPartition partition(int width,int visible) {
++    const int independent=4*((width+7)/8);
++    selective_i8::CausalKvPartition p{1,selective_i8::causal_partition_target(340,independent),8};
++    p.capacity=p.active(visible);
++    return p;
++}
++template<bool Masked>
++void launch(const selective_i8::CausalAttentionOperands& p, selective_i8::Int8KvReadView cache,
++            selective_i8::CausalKvPartition part, selective_i8::CausalPartialView partial,
++            cudaStream_t stream) {
++    using G=selective_i8::CausalD256H24Kv4;
++    using Instance=selective_i8::Int8KvGroupedInstance<G,8>;
++    using S=typename Instance::Schedule;
++    selective_i8::validate_quantized_causal_operands<G>(p,cache);
++    constexpr auto kernel=selective_i8::int8_kv_grouped_mma_kernel<
++        G,S,false,Masked,selective_i8::CausalCachedInput,true>;
++    constexpr int bytes=S::kDynamicArena ? S::kArenaBytes : 0;
++    if constexpr (bytes>0) configure_cuda_device_once([] {
++        return cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes);
++    });
++    const dim3 grid(4*((p.width+7)/8),part.capacity,1);
++    kernel<<<grid,S::kThreads,bytes,stream>>>(p.q,{},p.positions,
++        cache.keys,cache.values,cache.key_scales,cache.value_scales,cache.tables,
++        cache.valid_columns,cache.table_rows,cache.table_stride,p.width,p.visible_capacity,
++        part,p.scale,partial.acc,partial.maximum,partial.sum);
++    CUDA_CHECK(cudaGetLastError());
++    selective_i8::launch_causal_natural_merge<G,typename Instance::Merge,false,Masked,false>(
++        p,cache.valid_columns,part,partial,stream);
++}
++}
++bool selective_int8_applies(AttentionHeadGeometry geometry,KvCacheStorage storage,
++                            CausalAttentionExecutionEnvelope envelope,int batch,int width) {
++    return geometry.head_dim==256 && geometry.query_heads==24 && geometry.kv_heads==4 &&
++        storage==KvCacheStorage::Int8Group64 && batch==1 && !envelope.fast_prompt_kernel &&
++        (width==224 || width==240 || width==246 || width==251) &&
++        envelope.max_visible_keys>=12288 && envelope.max_visible_keys<=53248 &&
++        enabled() && measured_device();
++}
++std::size_t selective_int8_workspace_bytes(int width,std::uint32_t visible) {
++    WorkspaceLayoutBuilder layout;
++    (void)selective_i8::allocate_causal_partials(layout,24,width,partition(width,visible).capacity,1);
++    return layout.peak_bytes(1);
++}
++void selective_int8_cached_launch(const Tensor& q,const Tensor& positions,
++                                  const Tensor* valid,const Tensor* rows,float scale,
++                                  PagedKVBatchLayerView cache,CausalAttentionExecutionEnvelope envelope,
++                                  WorkspaceArena& workspace,Tensor& out,cudaStream_t stream) {
++    auto scope=workspace.scope();
++    const auto part=partition(q.ne[2],envelope.max_visible_keys);
++    const auto partial=selective_i8::allocate_causal_partials(workspace,24,q.ne[2],part.capacity,1);
++    const auto p=selective_i8::make_causal_operands(q,positions,out,scale,envelope.max_visible_keys);
++    const auto view=selective_i8::make_quantized_causal_cache_view<selective_i8::Int8KvReadView>(cache,valid,rows);
++    if (view.valid_columns) launch<true>(p,view,part,partial.view(),stream);
++    else launch<false>(p,view,part,partial.view(),stream);
++}
++}
++#else
++#include <stdexcept>
++namespace ninfer::ops::detail {
++bool selective_int8_applies(AttentionHeadGeometry, KvCacheStorage,
++                            CausalAttentionExecutionEnvelope, int, int) { return false; }
++std::size_t selective_int8_workspace_bytes(int, std::uint32_t) { return 0; }
++void selective_int8_cached_launch(const Tensor&, const Tensor&, const Tensor*, const Tensor*,
++                                  float, PagedKVBatchLayerView, CausalAttentionExecutionEnvelope,
++                                  WorkspaceArena&, Tensor&, cudaStream_t) {
++    throw std::logic_error("selective INT8 prefill is unavailable in this build");
++}
++}
++#endif
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f879c72c8e5b91a2f4482c3ed7b8a2ec41dbca96
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include "ninfer/ops/softmax_attention.h"
++#include "core/arena.h"
++
++namespace ninfer::ops::detail {
++// Restricted to the measured H24/KV4 INT8 prefill widths. Decode and width 256
++// keep their existing kernels. The override is immutable during an engine run.
++bool selective_int8_applies(AttentionHeadGeometry geometry, KvCacheStorage storage,
++                            CausalAttentionExecutionEnvelope envelope, int batch, int width);
++std::size_t selective_int8_workspace_bytes(int width, std::uint32_t visible_capacity);
++void selective_int8_cached_launch(const Tensor& q, const Tensor& positions,
++                                  const Tensor* valid, const Tensor* rows, float scale,
++                                  PagedKVBatchLayerView cache,
++                                  CausalAttentionExecutionEnvelope envelope,
++                                  WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
++}
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..0925e0f933cced2d5cc7cf7a00cb9e1d85dccac3
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh
+@@ -0,0 +1,79 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include <cuda_runtime.h>
++#include <cstddef>
++
++namespace ninfer::ops::detail::selective_i8 {
++enum class Cache { ca, cg };
++}
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++__device__ __forceinline__ void prefetch_l2(const void* data, std::size_t bytes,
++                                            std::size_t offset) {
++    if (data && offset < bytes) {
++        const auto* address = static_cast<const char*>(data) + offset;
++        asm volatile("prefetch.global.L2 [%0];" ::"l"(address));
++    }
++}
++
++template <class V, class T>
++__device__ __forceinline__ V load_vec(const T* ptr) {
++    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
++                  sizeof(V) == 16);
++    return *reinterpret_cast<const V*>(ptr);
++}
++
++template <class V, class T>
++__device__ __forceinline__ V load_ldg(const T* ptr) {
++    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
++                  sizeof(V) == 16);
++    return __ldg(reinterpret_cast<const V*>(ptr));
++}
++
++template <class T, class V>
++__device__ __forceinline__ void store_vec(T* ptr, V value) {
++    static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
++                  sizeof(V) == 16);
++    *reinterpret_cast<V*>(ptr) = value;
++}
++
++__device__ __forceinline__ uint4 streaming_load(const uint4* input) {
++    uint4 value;
++    asm volatile("ld.global.cs.v4.u32 {%0,%1,%2,%3}, [%4];"
++                 : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
++                 : "l"(input));
++    return value;
++}
++
++__device__ __forceinline__ unsigned smem_addr(const void* ptr) {
++    return static_cast<unsigned>(__cvta_generic_to_shared(ptr));
++}
++
++// Permute eight-element vectors within each 64-element row sector.
++__device__ __forceinline__ int swizzle_xor_64(int row, int col) { return col ^ ((row & 7) << 3); }
++
++// Permute sixteen-element vectors within each 128-element row sector.
++__device__ __forceinline__ int swizzle_xor_128(int row, int col) { return col ^ ((row & 7) << 4); }
++
++// Compose an MMA shared-memory lane base with precomputed column/matrix and row XOR bits.
++__device__ __forceinline__ unsigned swizzle_xor_address(unsigned base, unsigned column,
++                                                        unsigned matrix, unsigned row) {
++    return base + ((column | matrix) ^ row);
++}
++
++// Storage and launch must select the same static/dynamic representation.
++template <int Bytes>
++__device__ __forceinline__ unsigned char* shared_storage() {
++    static_assert(Bytes > 0 && Bytes <= 99 * 1024);
++    if constexpr (Bytes > 48 * 1024) {
++        extern __shared__ __align__(16) unsigned char dynamic_storage[];
++        return dynamic_storage;
++    } else {
++        __shared__ __align__(16) unsigned char static_storage[Bytes];
++        return static_storage;
++    }
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc217d024cb1de0d86cb295adffb97a13c8eac42
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh
+@@ -0,0 +1,116 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh"
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
++                 : "=r"(r0), "=r"(r1)
++                 : "r"(addr));
++}
++
++__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
++                                            unsigned addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
++                 : "r"(addr));
++}
++
++__device__ __forceinline__ void ldmatrix_x2_t(unsigned& r0, unsigned& r1, unsigned addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
++                 : "=r"(r0), "=r"(r1)
++                 : "r"(addr));
++}
++
++__device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
++                                              unsigned& r3, unsigned addr) {
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
++                 : "r"(addr));
++}
++
++__device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
++                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
++                                         unsigned b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
++                                        unsigned a1, unsigned a2, unsigned a3, unsigned b0,
++                                        unsigned b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
++                                       unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++// On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
++// UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
++// existing row scales in FP32 after the MMA. No operand repacking is needed.
++__device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
++                                             unsigned a0, unsigned a1, unsigned a2, unsigned a3,
++                                             unsigned b0, unsigned b1) {
++    constexpr unsigned kUnitScale8          = 0x7Fu;
++    constexpr unsigned short kScaleBlockId  = 0;
++    constexpr unsigned short kScaleThreadId = 0;
++    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
++                 "m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
++                 "{%10}, {%11,%12}, {%13}, {%14,%15};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(kUnitScale8),
++                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(kUnitScale8), "h"(kScaleBlockId),
++                   "h"(kScaleThreadId));
++}
++
++__device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
++                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
++                                              unsigned b0, unsigned b1) {
++    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
++                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float& c3, float a0,
++                                         float a1, float a2, float a3, float b0, float b1) {
++    mma_tf32_bits(c0, c1, c2, c3, __float_as_uint(a0), __float_as_uint(a1), __float_as_uint(a2),
++                  __float_as_uint(a3), __float_as_uint(b0), __float_as_uint(b1));
++}
++
++__device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, float& c3,
++                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
++                                               unsigned b0, unsigned b1, unsigned sfa,
++                                               unsigned sfb) {
++    constexpr unsigned short kScaleBlockId  = 0;
++    constexpr unsigned short kScaleThreadId = 0;
++    asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
++                 "m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
++                 "{%0,%1,%2,%3}, "
++                 "{%4,%5,%6,%7}, "
++                 "{%8,%9}, "
++                 "{%0,%1,%2,%3}, "
++                 "{%10}, "
++                 "{%11,%12}, "
++                 "{%13}, "
++                 "{%14,%15};\n"
++                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
++                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
++                   "h"(kScaleThreadId));
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b3992310aaa238d2b3df437b43a2f15ed715245
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh
+@@ -0,0 +1,135 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh"
++
++#include <cuda.h>
++#include <cuda_pipeline.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++template <int Bytes, Cache Policy = Cache::ca>
++__device__ __forceinline__ void cp_async(void* smem_dst, const void* gmem_src) {
++    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "cp_async supports 4, 8, or 16 bytes");
++    if constexpr (Policy == Cache::cg) {
++        static_assert(Bytes == 16, "cp.async.cg requires a 16-byte copy");
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
++                     :
++                     : "r"(smem_addr(smem_dst)), "l"(gmem_src));
++    } else {
++        asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n"
++                     :
++                     : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes));
++    }
++}
++
++template <int Bytes, Cache Policy = Cache::ca>
++__device__ __forceinline__ void cp_async_zfill(void* smem_dst, const void* gmem_src,
++                                               int src_bytes) {
++    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16,
++                  "cp_async_zfill supports 4, 8, or 16 bytes");
++    if constexpr (Policy == Cache::cg) {
++        static_assert(Bytes == 16, "cp.async.cg requires a 16-byte copy");
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
++                     :
++                     : "r"(smem_addr(smem_dst)), "l"(gmem_src), "r"(src_bytes));
++    } else {
++        asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n"
++                     :
++                     : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes), "r"(src_bytes));
++    }
++}
++
++__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
++
++template <int Groups>
++__device__ __forceinline__ void cp_wait() {
++    static_assert(Groups >= 0 && Groups <= 7, "cp_wait group count must fit the PTX immediate");
++    asm volatile("cp.async.wait_group %0;\n" : : "n"(Groups));
++}
++
++template <int Bytes>
++__device__ __forceinline__ void pipe_copy(void* smem_dst, const void* gmem_src) {
++    static_assert(Bytes == 4 || Bytes == 8 || Bytes == 16, "pipe_copy supports 4, 8, or 16 bytes");
++    __pipeline_memcpy_async(smem_dst, gmem_src, Bytes);
++}
++
++__device__ __forceinline__ void pipe_commit() { __pipeline_commit(); }
++
++template <int Groups>
++__device__ __forceinline__ void pipe_wait() {
++    static_assert(Groups >= 0 && Groups <= 7, "pipe_wait group count must fit the PTX immediate");
++    __pipeline_wait_prior(Groups);
++}
++
++__device__ __forceinline__ void cta_mbarrier_init(std::uint64_t* barrier, std::uint32_t arrivals) {
++    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
++                 :
++                 : "r"(smem_addr(barrier)), "r"(arrivals)
++                 : "memory");
++}
++
++__device__ __forceinline__ void cta_mbarrier_wait(std::uint64_t* barrier, std::uint32_t phase) {
++    constexpr std::uint32_t kSuspendTicks = 0x989680;
++    asm volatile("{\n"
++                 ".reg .pred done;\n"
++                 "wait_loop_%=: \n"
++                 "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1, %2;\n"
++                 "@done bra wait_done_%=;\n"
++                 "bra wait_loop_%=;\n"
++                 "wait_done_%=: \n"
++                 "}\n"
++                 :
++                 : "r"(smem_addr(barrier)), "r"(phase), "r"(kSuspendTicks)
++                 : "memory");
++}
++
++__device__ __forceinline__ void cta_mbarrier_arrive(std::uint64_t* barrier) {
++    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" : : "r"(smem_addr(barrier)) : "memory");
++}
++
++__device__ __forceinline__ void cta_mbarrier_arrive_expect_tx(std::uint64_t* barrier,
++                                                              std::uint32_t bytes) {
++    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
++                 :
++                 : "r"(smem_addr(barrier)), "r"(bytes)
++                 : "memory");
++}
++
++__device__ __forceinline__ void cta_mbarrier_fence_init() {
++    asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
++}
++
++// The caller owns tensor-map geometry, shared layout, and mbarrier transaction accounting.
++__device__ __forceinline__ void tma_load_2d(void* destination, const CUtensorMap* map, int c0,
++                                            int c1, std::uint64_t* barrier) {
++    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
++                 "[%0], [%1, {%2, %3}], [%4];"
++                 :
++                 : "r"(smem_addr(destination)), "l"(map), "r"(c0), "r"(c1), "r"(smem_addr(barrier))
++                 : "memory");
++}
++
++__device__ __forceinline__ void tma_load_3d(void* destination, const CUtensorMap* map, int c0,
++                                            int c1, int c2, std::uint64_t* barrier) {
++    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
++                 "[%0], [%1, {%2, %3, %4}], [%5];"
++                 :
++                 : "r"(smem_addr(destination)), "l"(map), "r"(c0), "r"(c1), "r"(c2),
++                   "r"(smem_addr(barrier))
++                 : "memory");
++}
++
++__device__ __forceinline__ void tma_load_4d(void* destination, const CUtensorMap* map, int c0,
++                                            int c1, int c2, int c3, std::uint64_t* barrier) {
++    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
++                 "[%0], [%1, {%2, %3, %4, %5}], [%6];"
++                 :
++                 : "r"(smem_addr(destination)), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3),
++                   "r"(smem_addr(barrier))
++                 : "memory");
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f69c76af6a38a68f3fb12670d67bd9253c32e5f
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh
+@@ -0,0 +1,214 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include <cuda_runtime.h>
++#include <math_constants.h>
++
++#include <climits>
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++inline constexpr int kWarpSize          = 32;
++inline constexpr unsigned kFullWarpMask = 0xffffffffu;
++
++template <int Width = kWarpSize, class T>
++__device__ __forceinline__ T warp_sum(T x, unsigned mask = kFullWarpMask) {
++    static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
++#pragma unroll
++    for (int offset = Width / 2; offset > 0; offset >>= 1) {
++        x += __shfl_xor_sync(mask, x, offset, Width);
++    }
++    return x;
++}
++
++template <int Width = kWarpSize, class T>
++__device__ __forceinline__ T warp_reduce_sum(T x, unsigned mask = kFullWarpMask) {
++    static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
++#pragma unroll
++    for (int offset = Width / 2; offset > 0; offset >>= 1) {
++        x += __shfl_down_sync(mask, x, offset, Width);
++    }
++    return x;
++}
++
++template <int Width = kWarpSize>
++__device__ __forceinline__ float warp_max(float x, unsigned mask = kFullWarpMask) {
++    static_assert(Width > 0 && Width <= kWarpSize && (Width & (Width - 1)) == 0);
++#pragma unroll
++    for (int offset = Width / 2; offset > 0; offset >>= 1) {
++        x = fmaxf(x, __shfl_xor_sync(mask, x, offset, Width));
++    }
++    return x;
++}
++
++template <int BlockSize>
++__device__ __forceinline__ float block_reduce_sum(float x, float* sums) {
++    static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
++    static_assert((BlockSize & (BlockSize - 1)) == 0);
++    constexpr int Warps = BlockSize / kWarpSize;
++
++    x = warp_reduce_sum(x);
++    if constexpr (Warps == 1) { return x; }
++
++    const int lane = threadIdx.x & (kWarpSize - 1);
++    const int warp = threadIdx.x / kWarpSize;
++    if (lane == 0) { sums[warp] = x; }
++    __syncthreads();
++
++    x = threadIdx.x < Warps ? sums[lane] : 0.0f;
++    if (warp == 0) { x = warp_reduce_sum<Warps>(x); }
++    return x;
++}
++
++struct WelfordMoments {
++    float mean;
++    float m2;
++    int count;
++};
++
++__device__ __forceinline__ WelfordMoments welford_merge(WelfordMoments a, WelfordMoments b) {
++    if (b.count == 0) return a;
++    if (a.count == 0) return b;
++    const float delta = b.mean - a.mean;
++    const int count   = a.count + b.count;
++    const float ratio = static_cast<float>(b.count) / static_cast<float>(count);
++    return {a.mean + delta * ratio,
++            a.m2 + b.m2 +
++                delta * delta *
++                    (static_cast<float>(a.count) * static_cast<float>(b.count) /
++                     static_cast<float>(count)),
++            count};
++}
++
++__device__ __forceinline__ void welford_update(WelfordMoments& moments, float value) {
++    ++moments.count;
++    const float delta = value - moments.mean;
++    moments.mean += delta / static_cast<float>(moments.count);
++    moments.m2 += delta * (value - moments.mean);
++}
++
++__device__ __forceinline__ WelfordMoments warp_reduce_moments(WelfordMoments value) {
++    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
++        const WelfordMoments other{
++            __shfl_down_sync(kFullWarpMask, value.mean, offset),
++            __shfl_down_sync(kFullWarpMask, value.m2, offset),
++            __shfl_down_sync(kFullWarpMask, value.count, offset),
++        };
++        value = welford_merge(value, other);
++    }
++    return value;
++}
++
++// Finite score/id total order: larger scores win, ties prefer lower ids; signed
++// zero is canonicalized. Key zero is reserved below every valid score/id pair.
++struct ScoreIdOrderGreater {
++    __device__ __forceinline__ bool operator()(std::uint64_t lhs, std::uint64_t rhs) const {
++        return lhs > rhs;
++    }
++};
++
++__device__ __forceinline__ std::uint32_t ordered_score_bits(float value) {
++    if (value == 0.0f) { value = 0.0f; }
++    const std::uint32_t bits = __float_as_uint(value);
++    return (bits & 0x80000000u) != 0 ? ~bits : (bits ^ 0x80000000u);
++}
++
++__device__ __forceinline__ std::uint64_t score_id_order_key(float value, std::int32_t id) {
++    if (id == INT_MAX) { return 0; }
++    return (static_cast<std::uint64_t>(ordered_score_bits(value)) << 32) |
++           static_cast<std::uint32_t>(0xffffffffu - static_cast<std::uint32_t>(id));
++}
++
++__device__ __forceinline__ float score_from_order_key(std::uint64_t key) {
++    const std::uint32_t ordered = static_cast<std::uint32_t>(key >> 32);
++    const std::uint32_t bits    = (ordered & 0x80000000u) != 0 ? (ordered ^ 0x80000000u) : ~ordered;
++    return __uint_as_float(bits);
++}
++
++__device__ __forceinline__ std::int32_t id_from_order_key(std::uint64_t key) {
++    if (key == 0) { return INT_MAX; }
++    return static_cast<std::int32_t>(0xffffffffu - static_cast<std::uint32_t>(key));
++}
++
++__device__ inline unsigned long long block_reduce_max_key(unsigned long long key,
++                                                          unsigned long long* warp_keys) {
++    constexpr unsigned int kMask = 0xffffffffu;
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        const unsigned long long other = __shfl_down_sync(kMask, key, offset);
++        if (other > key) { key = other; }
++    }
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    if (lane == 0) { warp_keys[warp] = key; }
++    __syncthreads();
++    key = (warp == 0 && lane < (blockDim.x >> 5)) ? warp_keys[lane] : 0ull;
++    if (warp == 0) {
++        for (int offset = 16; offset > 0; offset >>= 1) {
++            const unsigned long long other = __shfl_down_sync(kMask, key, offset);
++            if (other > key) { key = other; }
++        }
++    }
++    return key;
++}
++
++__device__ __forceinline__ bool score_id_better(float value, std::int32_t index, float best_value,
++                                                std::int32_t best_index) {
++    return value > best_value || (value == best_value && index < best_index);
++}
++
++__device__ __forceinline__ void warp_reduce_argmax(float& value, std::int32_t& index) {
++    constexpr unsigned int kMask = 0xffffffffu;
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        const float other_value        = __shfl_down_sync(kMask, value, offset);
++        const std::int32_t other_index = __shfl_down_sync(kMask, index, offset);
++        if (score_id_better(other_value, other_index, value, index)) {
++            value = other_value;
++            index = other_index;
++        }
++    }
++}
++
++// Requires a multiple of 32 threads, at most 512. Only thread 0 owns the block result.
++__device__ __forceinline__ void block_reduce_argmax(float& value, std::int32_t& index) {
++    __shared__ float warp_values[16];
++    __shared__ std::int32_t warp_indices[16];
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    warp_reduce_argmax(value, index);
++    if (lane == 0) {
++        warp_values[warp]  = value;
++        warp_indices[warp] = index;
++    }
++    __syncthreads();
++
++    value = (lane < (blockDim.x >> 5)) ? warp_values[lane] : -CUDART_INF_F;
++    index = (lane < (blockDim.x >> 5)) ? warp_indices[lane] : INT32_MAX;
++    if (warp == 0) { warp_reduce_argmax(value, index); }
++}
++
++template <int BlockSize>
++__device__ __forceinline__ float block_max_broadcast(float value) {
++    static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);
++    static_assert((BlockSize & (BlockSize - 1)) == 0);
++    constexpr int kWarps = BlockSize / kWarpSize;
++    __shared__ float warp_maxima[kWarps];
++    __shared__ float result;
++
++    const int lane = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
++    const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
++    value          = warp_max(value);
++    if (lane == 0) { warp_maxima[warp] = value; }
++    __syncthreads();
++
++    if (warp == 0) {
++        value = lane < kWarps ? warp_maxima[lane] : -CUDART_INF_F;
++        value = warp_max(value);
++        if (lane == 0) { result = value; }
++    }
++    __syncthreads();
++    return result;
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bba887cc5669dbeb871d91f720dd8ec9edbc8c8
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh
+@@ -0,0 +1,125 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++template <int Width>
++struct alignas(2 * Width) Bf16Vector {
++    __nv_bfloat16 word[Width];
++
++    __device__ static Bf16Vector load(const __nv_bfloat16* p) {
++        return *reinterpret_cast<const Bf16Vector*>(p);
++    }
++
++    __device__ void store(__nv_bfloat16* p) const { *reinterpret_cast<Bf16Vector*>(p) = *this; }
++};
++
++template <int Pairs>
++struct alignas(Pairs* static_cast<int>(sizeof(__nv_bfloat162))) Bf16PairPack {
++    static_assert(Pairs == 1 || Pairs == 2 || Pairs == 4);
++    __nv_bfloat162 pair[Pairs];
++};
++
++using Bf16x4Pack = Bf16PairPack<2>;
++using Bf16x8Pack = Bf16PairPack<4>;
++
++union alignas(16) Bf16x8Bits {
++    uint4 raw;
++    __nv_bfloat162 pair[4];
++};
++
++static_assert(sizeof(Bf16x8Bits) == 16);
++
++static_assert(sizeof(Bf16x4Pack) == 8);
++static_assert(sizeof(Bf16x8Pack) == 16);
++
++// Exact widening of the two signed bytes in the low 16 bits.
++__device__ __forceinline__ unsigned int8x2_to_bf16x2_bits(unsigned values) {
++    union PairBits {
++        __nv_bfloat162 pair;
++        unsigned bits;
++    };
++
++    PairBits biased;
++    biased.bits          = __byte_perm(values, 0x43004300u, 0x7150) & 0xff7fff7fu;
++    const unsigned signs = (values & 0x80u) | ((values & 0x8000u) << 8);
++    PairBits bias;
++    bias.bits = 0x43004300u | signs;
++    PairBits result;
++    result.pair = __hsub2_rn(biased.pair, bias.pair);
++    return result.bits;
++}
++
++__device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
++    std::uint32_t out;
++    const std::uint32_t lo_bits = __float_as_uint(lo);
++    const std::uint32_t hi_bits = __float_as_uint(hi);
++    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
++    return out;
++}
++
++// Exact BF16 expansion for consumers that need FP32 operand bits, including TF32 MMA.
++__device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsigned& low,
++                                                           unsigned& high) {
++    low  = packed << 16;
++    high = packed & 0xffff0000U;
++}
++
++__device__ __forceinline__ std::uint32_t pack_f16x2(float lo, float hi) {
++    const __half2 packed = __floats2half2_rn(lo, hi);
++    return load_vec<std::uint32_t>(&packed);
++}
++
++__device__ __forceinline__ std::uint32_t bf16x2_bits_to_f16x2_bits(std::uint32_t bits) {
++    const __nv_bfloat162 source = load_vec<__nv_bfloat162>(&bits);
++    const __half2 converted =
++        __halves2half2(__half(__low2bfloat16(source)), __half(__high2bfloat16(source)));
++    return load_vec<std::uint32_t>(&converted);
++}
++
++__device__ __forceinline__ int4 bf16x8_bits_to_f16x8_bits(int4 bits) {
++    return make_int4(
++        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.x))),
++        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.y))),
++        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.z))),
++        static_cast<int>(bf16x2_bits_to_f16x2_bits(static_cast<std::uint32_t>(bits.w))));
++}
++
++__device__ __forceinline__ float2 bf16x2_to_float2(__nv_bfloat162 value) {
++    return __bfloat1622float2(value);
++}
++
++__device__ __forceinline__ float2 bf16x2_bits_to_float2(std::uint32_t bits) {
++    return bf16x2_to_float2(load_vec<__nv_bfloat162>(&bits));
++}
++
++__device__ __forceinline__ void load_bf16x4(float (&values)[4], const __nv_bfloat16* source) {
++    // The source must be 8-byte aligned. A built-in vector keeps one 64-bit load;
++    // loading a pair-of-pairs struct can scalarize into two 32-bit requests.
++    const uint2 packed = load_vec<uint2>(source);
++    const float2 low   = bf16x2_bits_to_float2(packed.x);
++    const float2 high  = bf16x2_bits_to_float2(packed.y);
++    values[0]          = low.x;
++    values[1]          = low.y;
++    values[2]          = high.x;
++    values[3]          = high.y;
++}
++
++__device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
++    return load_vec<__half2>(&bits);
++}
++
++__device__ __forceinline__ float load_fp16_unaligned(const std::uint8_t* source) {
++    const auto bits =
++        static_cast<std::uint16_t>(source[0]) | (static_cast<std::uint16_t>(source[1]) << 8);
++    return __half2float(__ushort_as_half(static_cast<std::uint16_t>(bits)));
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..62feff583225b33b4c6cb230088924037552c561
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh
+@@ -0,0 +1,75 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h"
++
++#include <cuda_runtime.h>
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++// Exact division for numerator and positive divisor in [0, 2^31). The bounded
++// numerator keeps the high-product addition representable in 32 bits.
++struct FastDivisorU31 {
++    std::uint32_t multiplier, shift, divisor;
++
++    static FastDivisorU31 make(std::uint32_t divisor) {
++        if (divisor == 0 || divisor >= (std::uint32_t{1} << 31))
++            throw std::invalid_argument("FastDivisorU31: divisor must be in [1,2^31)");
++        std::uint32_t shift = 0;
++        while ((std::uint32_t{1} << shift) < divisor) ++shift;
++        const auto multiplier = static_cast<std::uint32_t>(
++            ((std::uint64_t{1} << 32) * ((std::uint64_t{1} << shift) - divisor)) / divisor + 1);
++        return {multiplier, shift, divisor};
++    }
++
++    __host__ __device__ std::uint32_t divide(std::uint32_t numerator) const {
++#if defined(__CUDA_ARCH__)
++        return (__umulhi(numerator, multiplier) + numerator) >> shift;
++#else
++        return numerator / divisor;
++#endif
++    }
++};
++
++__device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
++
++__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++// Fast tanh-based profile; saturation and rounding differ from sigmoid's expf path.
++__device__ __forceinline__ float sigmoid_approx(float x) {
++    float y;
++    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(0.5F * x));
++    return 0.5F * y + 0.5F;
++}
++
++__device__ __forceinline__ float softplus(float x) { return (x > 20.0f) ? x : log1pf(expf(x)); }
++
++__device__ __forceinline__ float exp2_approx(float x) {
++    float y;
++    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++// Keep flush-to-zero explicit so callers of exp2_approx retain their subnormal behavior.
++__device__ __forceinline__ float exp2_approx_ftz(float x) {
++    float y;
++    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++    return y;
++}
++
++__device__ __forceinline__ float exp_approx_ftz(float x) { return exp2_approx_ftz(x * kLog2E); }
++
++template <bool TanhApprox>
++__device__ __forceinline__ float gelu(float value) {
++    constexpr float kInvSqrt2 = 0.70710678118654752440f;
++    constexpr float kSqrt2Pi  = 0.79788456080286535588f;
++    if constexpr (TanhApprox) {
++        return 0.5f * value *
++               (1.0f + tanhf(kSqrt2Pi * (value + 0.044715f * value * value * value)));
++    }
++    return 0.5f * value * (1.0f + erff(value * kInvSqrt2));
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c07e9b76de6ed2e1d9ff3f6eb2590ca4eed66c13
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h
+@@ -0,0 +1,53 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include <type_traits>
++#include <cmath>
++
++#if defined(__CUDACC__)
++#    define NINFER_KERNEL_HD __host__ __device__
++#else
++#    define NINFER_KERNEL_HD
++#endif
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++// Host FP32 SiLU without exp overflow for large negative finite inputs.
++inline float silu_stable(float value) noexcept {
++    const float exponential = std::exp(-std::abs(value));
++    return value >= 0 ? value / (1.0F + exponential) : (value * exponential) / (1.0F + exponential);
++}
++
++inline constexpr float kLog2E = 1.4426950408889634F;
++
++template <class T>
++NINFER_KERNEL_HD constexpr T div_up(T x, T d) {
++    static_assert(std::is_integral_v<T>, "div_up requires an integral type");
++    return x / d + static_cast<T>(x % d != 0);
++}
++
++template <class T>
++NINFER_KERNEL_HD constexpr T round_up(T x, T multiple) {
++    static_assert(std::is_integral_v<T>, "round_up requires an integral type");
++    return div_up(x, multiple) * multiple;
++}
++
++template <auto Alignment, class T>
++NINFER_KERNEL_HD constexpr T align_up(T x) {
++    static_assert(std::is_integral_v<T>, "align_up requires an integral type");
++    static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
++                  "align_up requires a power-of-two alignment");
++    constexpr T a = static_cast<T>(Alignment);
++    return (x + a - 1) & ~(a - 1);
++}
++
++template <int Bits>
++NINFER_KERNEL_HD constexpr int sign_extend(int x) {
++    static_assert(Bits > 0 && Bits < 32, "sign_extend supports bit widths in [1, 31]");
++    constexpr int sign = 1 << (Bits - 1);
++    return (x ^ sign) - sign;
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
++
++#undef NINFER_KERNEL_HD
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f46498d6686d1e07e52a341653bf8f1449baeafd
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh
+@@ -0,0 +1,408 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8::common {
++
++struct Q4RowSplitStorage {
++    static constexpr int kGroupK             = 64;
++    static constexpr int kCodeBytesPerGroup  = 32;
++    static constexpr int kScaleBytesPerGroup = 2;
++};
++
++struct Q4SimtDecodeAtom {
++    __device__ static __forceinline__ void
++    decode_eight(std::uint32_t packed, std::uint16_t scale_bits, float (&weights)[8]) {
++        const std::uint32_t word = packed ^ 0x88888888u;
++        const float scale        = __half2float(__ushort_as_half(scale_bits));
++        const __half2 bias       = __half2half2(__ushort_as_half(0x6408)); // 1032.0
++#pragma unroll
++        for (int pair = 0; pair < 4; ++pair) {
++            const std::uint32_t bits = ((word >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
++            const __half2 decoded    = __hsub2(half2_from_bits(bits), bias);
++            const float2 values      = __half22float2(decoded);
++            weights[pair]            = values.x * scale;
++            weights[pair + 4]        = values.y * scale;
++        }
++    }
++
++    __device__ static __forceinline__ void
++    decode_pair(std::uint8_t packed, std::uint16_t scale_bits, float& w0, float& w1) {
++        const float scale = __half2float(__ushort_as_half(scale_bits));
++        const int q0      = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
++        const int q1      = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
++        w0                = static_cast<float>(q0) * scale;
++        w1                = static_cast<float>(q1) * scale;
++    }
++};
++
++struct Q4MmaDecodeAtom {
++    // Eight packed codes -> four bf16 pairs, in weight order; out[i] holds the pair for
++    // lane = 4 * chunk + i. A nibble n decodes to the integer (n ^ 8) - 8, which lies in [-8, 7]
++    // and which bf16 represents exactly, so forming 128 + (n ^ 8) and subtracting 136 lands on it.
++    // The values are unscaled: callers of this overload fold the group scale into the
++    // accumulation, unlike decode_pair below.
++    static __device__ __forceinline__ void decode_eight(unsigned word, unsigned (&out)[4]) {
++        const unsigned kBias  = 0x43084308u; // bf16 136.0 in both halves
++        const unsigned kMagic = 0x43004300u; // bf16 128.0 in both halves
++        word ^= 0x88888888u;
++        const unsigned lo        = word & 0x0f0f0f0fu;
++        const unsigned hi        = (word >> 4) & 0x0f0f0f0fu;
++        const unsigned even      = __byte_perm(lo, hi, 0x5140);
++        const unsigned odd       = __byte_perm(lo, hi, 0x7362);
++        const unsigned biased[4] = {
++            __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
++            __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const __nv_bfloat162 value =
++                __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&biased[i]),
++                        *reinterpret_cast<const __nv_bfloat162*>(&kBias));
++            out[i] = *reinterpret_cast<const unsigned*>(&value);
++        }
++    }
++
++    static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* codes,
++                                                                 const std::uint8_t* scale_ptr,
++                                                                 std::int64_t group_index,
++                                                                 int lane) {
++        const float scale =
++            __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
++        const std::uint8_t packed =
++            codes[group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
++        const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
++        const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
++        return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
++                                     static_cast<float>(q1) * scale);
++    }
++};
++
++struct Q5RowSplitStorage {
++    static constexpr int kGroupK             = 64;
++    static constexpr int kCodeBytesPerGroup  = 32;
++    static constexpr int kHighBytesPerGroup  = 8;
++    static constexpr int kScaleBytesPerGroup = 2;
++
++    // A chunk is the eight codes one thread decodes, so it spans four packed bytes.
++    static constexpr int kCodeBytesPerChunk = 4;
++    static constexpr int kHighBytesPerChunk =
++        kHighBytesPerGroup / (kCodeBytesPerGroup / kCodeBytesPerChunk);
++    static_assert(kHighBytesPerChunk * (kCodeBytesPerGroup / kCodeBytesPerChunk) ==
++                      kHighBytesPerGroup,
++                  "the high-bit plane must divide evenly across a group's chunks");
++};
++
++struct Q5ScalarDecodeAtom {
++    static constexpr int kGroupK = Q5RowSplitStorage::kGroupK;
++
++    __device__ static __forceinline__ void
++    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
++              std::int64_t group_index, int lane, float& w0, float& w1) {
++        decode_pair(codes, high, scales, group_index, lane, w0, w1);
++    }
++
++    __device__ static __forceinline__ void
++    decode_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
++                std::int64_t group_index, int lane, float& w0, float& w1) {
++        const float scale = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(
++            scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup)));
++        const std::uint8_t packed =
++            codes[group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane];
++        const std::uint8_t high_byte =
++            high[group_index * Q5RowSplitStorage::kHighBytesPerGroup + (lane >> 2)];
++        const int shift = (lane & 3) * 2;
++        const int q0 =
++            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 1) << 4)) ^ 0x10) - 0x10;
++        const int q1 =
++            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 1)) & 1) << 4)) ^ 0x10) -
++            0x10;
++        w0 = static_cast<float>(q0) * scale;
++        w1 = static_cast<float>(q1) * scale;
++    }
++};
++
++struct Q5SimtDecodeAtom {
++    __device__ static __forceinline__ void
++    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
++               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
++        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
++            codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
++        const std::uint8_t high_bits =
++            high[group_index * Q5RowSplitStorage::kHighBytesPerGroup + lane_in_group];
++        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
++            scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
++        decode_eight(packed, high_bits, scale_bits, weights);
++    }
++
++    __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
++                                                        std::uint8_t high_bits,
++                                                        std::uint16_t scale_bits,
++                                                        float (&weights)[8]) {
++        const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xffu;
++        const float scale        = __half2float(__ushort_as_half(scale_bits));
++        const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
++#pragma unroll
++        for (int pair = 0; pair < 4; ++pair) {
++            std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
++            bits |= (((high >> pair) & 1u) << 4) | (((high >> (pair + 4)) & 1u) << 20);
++            const __half2 decoded = __hsub2(half2_from_bits(bits), bias);
++            const float2 values   = __half22float2(decoded);
++            weights[pair]         = values.x * scale;
++            weights[pair + 4]     = values.y * scale;
++        }
++    }
++};
++
++struct Q5MmaDecodeAtom {
++    // Four packed bytes plus its high-bit byte -> four bf16 pairs, in weight order; out[i] holds
++    // the pair decode_pair produces at lane = 4 * chunk + i.
++    static __device__ __forceinline__ void
++    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
++        const unsigned high = high_chunk[0];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const unsigned byte = (word >> (8 * i)) & 0xffu;
++            const int q0        = ((static_cast<int>(byte & 0x0fu) |
++                             static_cast<int>(((high >> (2 * i)) & 1u) << 4)) ^
++                            0x10) -
++                           0x10;
++            const int q1 = ((static_cast<int>(byte >> 4) |
++                             static_cast<int>(((high >> (2 * i + 1)) & 1u) << 4)) ^
++                            0x10) -
++                           0x10;
++            const __nv_bfloat162 value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
++                                                               static_cast<float>(q1) * scale);
++            out[i]                     = *reinterpret_cast<const unsigned*>(&value);
++        }
++    }
++
++    static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* staged_codes,
++                                                                 const std::uint8_t* staged_high,
++                                                                 const std::uint8_t* scale_ptr,
++                                                                 std::int64_t staged_group_index,
++                                                                 int lane) {
++        const float scale =
++            __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
++        const std::uint8_t packed =
++            staged_codes[staged_group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane];
++        const std::uint8_t high_byte =
++            staged_high[staged_group_index * Q5RowSplitStorage::kHighBytesPerGroup + (lane >> 2)];
++        const int shift = (lane & 3) * 2;
++        const int q0 =
++            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 1) << 4)) ^ 0x10) - 0x10;
++        const int q1 =
++            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 1)) & 1) << 4)) ^ 0x10) -
++            0x10;
++        return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
++                                     static_cast<float>(q1) * scale);
++    }
++};
++
++struct Q6RowSplitStorage {
++    static constexpr int kGroupK             = 64;
++    static constexpr int kCodeBytesPerGroup  = 32;
++    static constexpr int kHighBytesPerGroup  = 16;
++    static constexpr int kScaleBytesPerGroup = 2;
++
++    // A chunk is the eight codes one thread decodes, so it spans four packed bytes.
++    static constexpr int kCodeBytesPerChunk = 4;
++    static constexpr int kHighBytesPerChunk =
++        kHighBytesPerGroup / (kCodeBytesPerGroup / kCodeBytesPerChunk);
++    static_assert(kHighBytesPerChunk * (kCodeBytesPerGroup / kCodeBytesPerChunk) ==
++                      kHighBytesPerGroup,
++                  "the high-bit plane must divide evenly across a group's chunks");
++};
++
++__device__ __forceinline__ int unpack_q6_code(const std::uint8_t* codes, const std::uint8_t* high,
++                                              int index) {
++    const std::uint8_t low_byte   = codes[index >> 1];
++    const std::uint32_t low       = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
++    const int high_pos            = index * 2;
++    const std::uint32_t high_bits = (high[high_pos >> 3] >> (high_pos & 7)) & 0x03u;
++    const std::uint32_t value     = low | (high_bits << 4);
++    return (value & 0x20u) ? static_cast<int>(value) - 64 : static_cast<int>(value);
++}
++
++struct Q6SimtDecodeAtom {
++    __device__ static __forceinline__ void
++    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
++               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
++        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
++            codes + group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
++        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
++            high + group_index * Q6RowSplitStorage::kHighBytesPerGroup + lane_in_group * 2);
++        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
++            scales + group_index * Q6RowSplitStorage::kScaleBytesPerGroup);
++        decode_eight(packed, high_bits, scale_bits, weights);
++    }
++
++    __device__ static __forceinline__ void decode_eight(std::uint32_t packed,
++                                                        std::uint16_t high_bits,
++                                                        std::uint16_t scale_bits,
++                                                        float (&weights)[8]) {
++        const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xaaaau;
++        const float scale        = __half2float(__ushort_as_half(scale_bits));
++        const __half2 bias       = __half2half2(__ushort_as_half(0x6420)); // 1056.0
++#pragma unroll
++        for (int pair = 0; pair < 4; ++pair) {
++            std::uint32_t bits = ((packed >> (4 * pair)) & 0x000f000fu) | 0x64006400u;
++            bits |= (((high >> (2 * pair)) & 3u) << 4) | (((high >> (2 * pair + 8)) & 3u) << 20);
++            const __half2 decoded = __hsub2(half2_from_bits(bits), bias);
++            const float2 values   = __half22float2(decoded);
++            weights[pair]         = values.x * scale;
++            weights[pair + 4]     = values.y * scale;
++        }
++    }
++};
++
++struct Q6MmaDecodeAtom {
++    // Four packed bytes plus their two high-bit bytes -> four bf16 pairs, in weight order; out[i]
++    // holds the pair decode_pair produces at lane = 4 * chunk + i.
++    static __device__ __forceinline__ void
++    decode_eight(unsigned word, const std::uint8_t* high_chunk, float scale, unsigned (&out)[4]) {
++        const unsigned high0 = high_chunk[0];
++        const unsigned high1 = high_chunk[1];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) {
++            const unsigned byte = (word >> (8 * i)) & 0xffu;
++            const unsigned high = i < 2 ? high0 : high1;
++            const int shift     = (i & 1) * 4;
++            const int q0 =
++                ((static_cast<int>(byte & 0x0fu) | static_cast<int>(((high >> shift) & 3u) << 4)) ^
++                 0x20) -
++                0x20;
++            const int q1 = ((static_cast<int>(byte >> 4) |
++                             static_cast<int>(((high >> (shift + 2)) & 3u) << 4)) ^
++                            0x20) -
++                           0x20;
++            const __nv_bfloat162 value = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
++                                                               static_cast<float>(q1) * scale);
++            out[i]                     = *reinterpret_cast<const unsigned*>(&value);
++        }
++    }
++
++    static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* staged_codes,
++                                                                 const std::uint8_t* staged_high,
++                                                                 const std::uint8_t* scale_ptr,
++                                                                 std::int64_t staged_group_index,
++                                                                 int lane) {
++        const float scale =
++            __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
++        const std::uint8_t packed =
++            staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane];
++        const std::uint8_t high_byte =
++            staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)];
++        const int shift = (lane & 1) * 4;
++        const int q0 =
++            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4)) ^ 0x20) - 0x20;
++        const int q1 =
++            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4)) ^ 0x20) -
++            0x20;
++        return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
++                                     static_cast<float>(q1) * scale);
++    }
++};
++
++struct Q8RowSplitStorage {
++    static constexpr int kGroupK             = 32;
++    static constexpr int kCodeBytesPerGroup  = 32;
++    static constexpr int kHighBytesPerGroup  = 0;
++    static constexpr int kScaleBytesPerGroup = 2;
++};
++
++__device__ __forceinline__ __nv_bfloat162 dequant_q8_pair(std::uint16_t packed, float scale) {
++    const auto lo = static_cast<std::int8_t>(packed & 0xffu);
++    const auto hi = static_cast<std::int8_t>(packed >> 8);
++    return __floats2bfloat162_rn(static_cast<float>(lo) * scale, static_cast<float>(hi) * scale);
++}
++
++struct Q8ScalarDecodeAtom {
++    __device__ static __forceinline__ float load_one(const std::uint8_t* codes,
++                                                     const std::uint8_t* scales,
++                                                     std::int64_t group_index, int lane) {
++        const float scale = __half2float(
++            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
++        return static_cast<float>(static_cast<std::int8_t>(codes[group_index * kGroupK + lane])) *
++               scale;
++    }
++
++    static constexpr int kGroupK = Q8RowSplitStorage::kGroupK;
++
++    __device__ static __forceinline__ void
++    load_pair(const std::uint8_t* codes, const std::uint8_t* /*high*/, const std::uint8_t* scales,
++              std::int64_t group_index, int lane, float& w0, float& w1) {
++        if (lane >= kGroupK / 2) {
++            w0 = 0.0f;
++            w1 = 0.0f;
++            return;
++        }
++        const float scale = __half2float(
++            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
++        const std::uint8_t* packed = codes + group_index * Q8RowSplitStorage::kCodeBytesPerGroup +
++                                     static_cast<std::int64_t>(lane) * 2;
++        w0 = static_cast<float>(static_cast<std::int8_t>(packed[0])) * scale;
++        w1 = static_cast<float>(static_cast<std::int8_t>(packed[1])) * scale;
++    }
++};
++
++struct Int8Fp16Scale {
++    __half scale;
++    float inverse_scale;
++};
++
++// Exact persistent group-scale boundary shared by standalone and fused append. The stored scale is
++// FP16-RNE(absmax/127); codes always use the reciprocal of that represented FP16 value.
++__device__ __forceinline__ Int8Fp16Scale int8_fp16_scale(float absmax) {
++    const __half scale            = __float2half_rn(absmax > 0.0f ? absmax / 127.0f : 0.0f);
++    const float represented_scale = __half2float(scale);
++    return {
++        .scale         = scale,
++        .inverse_scale = represented_scale > 0.0f ? 1.0f / represented_scale : 0.0f,
++    };
++}
++
++__device__ __forceinline__ std::int8_t int8_quant_code(float x, float inv_scale) {
++    if (inv_scale == 0.0f) { return static_cast<std::int8_t>(0); }
++    int q = __float2int_rn(x * inv_scale);
++    q     = max(-127, min(127, q));
++    return static_cast<std::int8_t>(q);
++}
++
++__device__ __forceinline__ int4 int8_dequant_bf16x8(const std::int8_t* codes8, float s) {
++    const int2 raw       = load_vec<int2>(codes8);
++    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
++    unsigned packed[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const float x0 = static_cast<float>(c[2 * i]) * s;
++        const float x1 = static_cast<float>(c[2 * i + 1]) * s;
++        packed[i]      = pack_bf16x2(x0, x1);
++    }
++    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
++                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
++}
++
++// Eight code bytes share one represented FP16 scale; expansion multiplies in FP16.
++__device__ __forceinline__ int4 int8_dequant_f16x8(const std::int8_t* codes8, __half scale) {
++    const int2 raw       = load_vec<int2>(codes8);
++    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
++    const __half2 s2     = __halves2half2(scale, scale);
++    unsigned packed[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const __half2 code2 =
++            __floats2half2_rn(static_cast<float>(c[2 * i]), static_cast<float>(c[2 * i + 1]));
++        const __half2 value2 = __hmul2(code2, s2);
++        packed[i]            = *reinterpret_cast<const unsigned*>(&value2);
++    }
++    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
++                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
++}
++
++} // namespace ninfer::ops::detail::selective_i8::common
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..20aeb0f4ef86d6409d217eaaa4a700b530c0d0d4
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh
+@@ -0,0 +1,68 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include <cuda_runtime.h>
++
++namespace ninfer::ops::detail::selective_i8::kv {
++
++// Apply the five lane dimensions of a Sylvester transform to independent columns. Keeping the
++// column loop inside each stage exposes their independent shuffle instructions while preserving
++// the butterfly and rounding order of every column.
++template <int Columns>
++__device__ __forceinline__ void hadamard_d32_columns_inplace(float (&values)[Columns], int lane) {
++    constexpr unsigned FullMask = 0xffffffffu;
++
++#pragma unroll
++    for (int stride = 1; stride <= 16; stride <<= 1) {
++#pragma unroll
++        for (int column = 0; column < Columns; ++column) {
++            const float value = values[column];
++            const float peer  = __shfl_xor_sync(FullMask, value, stride);
++            values[column] = (lane & stride) == 0 ? __fadd_rn(value, peer) : __fsub_rn(peer, value);
++        }
++    }
++}
++
++// Factorized H256 support for latency-oriented kernels that distribute one D256 row across four
++// G64 warps. The H64 fragments are intentionally unnormalized; the final H4 leaf applies 2^-4.
++__device__ __forceinline__ void hadamard_d64_fragment_inplace(float (&values)[2], int lane) {
++    hadamard_d32_columns_inplace(values, lane);
++    const float low  = values[0];
++    const float high = values[1];
++    values[0]        = __fadd_rn(low, high);
++    values[1]        = __fsub_rn(low, high);
++}
++
++__device__ __forceinline__ float
++normalized_hadamard_d256_group_value_from_h64(float x0, float x1, float x2, float x3, int group) {
++    const float y0  = (group & 1) == 0 ? __fadd_rn(x0, x1) : __fsub_rn(x0, x1);
++    const float y1  = (group & 1) == 0 ? __fadd_rn(x2, x3) : __fsub_rn(x2, x3);
++    const float out = (group & 2) == 0 ? __fadd_rn(y0, y1) : __fsub_rn(y0, y1);
++    return __fmul_rn(out, 0x1p-4f);
++}
++
++// One full warp owns one D256 row. Lane l carries dimensions l+32*r in values[r]. The fixed
++// normalized Sylvester transform is shared by persistent K preparation and transient Q
++// preparation; it never materializes an intermediate row outside registers.
++__device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)[8], int lane) {
++    hadamard_d32_columns_inplace(values, lane);
++
++#pragma unroll
++    for (int span = 1; span < 8; span <<= 1) {
++#pragma unroll
++        for (int base = 0; base < 8; base += 2 * span) {
++#pragma unroll
++            for (int offset = 0; offset < span; ++offset) {
++                const float low              = values[base + offset];
++                const float high             = values[base + offset + span];
++                values[base + offset]        = __fadd_rn(low, high);
++                values[base + offset + span] = __fsub_rn(low, high);
++            }
++        }
++    }
++
++#pragma unroll
++    for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
++}
++
++} // namespace ninfer::ops::detail::selective_i8::kv
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..72cb9d2e3b155ef1eda8898ad5f41af6ef96bbd8
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh
+@@ -0,0 +1,130 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "core/paged_kv_cache.h"
++
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8::kv {
++
++inline constexpr int kPageShift   = 6;
++inline constexpr int kPageMask    = kPagedKVPageSize - 1;
++inline constexpr int kHeadDim     = 256;
++inline constexpr int kInt8Group   = 64;
++inline constexpr int kInt8Groups  = kHeadDim / kInt8Group;
++inline constexpr int kNvfp4Group  = 16;
++inline constexpr int kNvfp4Groups = kHeadDim / kNvfp4Group;
++
++static_assert(kPagedKVPageSize == (1 << kPageShift));
++
++template <int Heads>
++struct D256Geometry {
++    static_assert(Heads == 2 || Heads == 4);
++    static constexpr int KVHeads = Heads;
++};
++
++struct DirectMetadata {
++    const std::int32_t* table;
++
++    __device__ __forceinline__ int valid_tokens(int width) const { return width; }
++
++    __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
++};
++
++template <bool Masked>
++struct BatchMetadata {
++    static constexpr bool masked = Masked;
++    const std::int32_t* tables;
++    const std::int32_t* valid_columns;
++    const std::int32_t* table_rows;
++    std::int32_t table_stride;
++
++    __device__ __forceinline__ int valid_tokens(int width) const {
++        if constexpr (Masked) {
++            const int valid = valid_columns[0];
++            return valid <= 0 ? 0 : (valid < width ? valid : width);
++        }
++        return width;
++    }
++
++    __device__ __forceinline__ const std::int32_t* block_table() const {
++        return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
++    }
++};
++
++__device__ __forceinline__ int lookup_page(const std::int32_t* table, int position) {
++    return table[position >> kPageShift];
++}
++
++// [leading, page offset, head, physical page].
++template <int Leading, int Heads>
++__device__ __forceinline__ std::int64_t page_major_head_offset(int page, int head) {
++    return static_cast<std::int64_t>(Leading) * kPagedKVPageSize *
++           (head + static_cast<std::int64_t>(Heads) * page);
++}
++
++template <int Leading, int Heads>
++__device__ __forceinline__ std::int64_t page_major_offset(int page, int head, int offset,
++                                                          int component) {
++    return page_major_head_offset<Leading, Heads>(page, head) +
++           static_cast<std::int64_t>(Leading) * offset + component;
++}
++
++template <int Leading, int Heads>
++__device__ __forceinline__ std::int64_t page_major_offset(const std::int32_t* table, int head,
++                                                          int position, int component) {
++    return page_major_offset<Leading, Heads>(lookup_page(table, position), head,
++                                             position & kPageMask, component);
++}
++
++// [leading, page offset, physical page, head].
++template <int Leading>
++__device__ __forceinline__ std::int64_t head_major_offset(int page, int head, int offset,
++                                                          int component, int physical_pages) {
++    return component + static_cast<std::int64_t>(Leading) *
++                           (offset + kPagedKVPageSize *
++                                         (page + static_cast<std::int64_t>(physical_pages) * head));
++}
++
++// One slot: [feature, ring position, head]. The caller applies the explicit state-slot stride.
++template <int Dim, int Capacity>
++__device__ __forceinline__ std::int64_t cyclic_offset(int position, int head, int padded_capacity,
++                                                      int component = 0) {
++    static_assert((Capacity & (Capacity - 1)) == 0);
++    return component +
++           static_cast<std::int64_t>(Dim) *
++               ((position & (Capacity - 1)) + static_cast<std::int64_t>(padded_capacity) * head);
++}
++
++template <class Geometry>
++__device__ __forceinline__ std::int64_t source_offset(int head, int component, int token) {
++    return component + static_cast<std::int64_t>(kHeadDim) *
++                           (head + static_cast<std::int64_t>(Geometry::KVHeads) * token);
++}
++
++template <int Heads, int CodeExtent, int ScaleExtent, int ValuesPerCode = 1>
++struct QuantizedRowLayout {
++    __device__ static __forceinline__ std::int64_t code_offset(int page, int head, int component,
++                                                               int offset) {
++        return page_major_offset<CodeExtent, Heads>(page, head, offset, component / ValuesPerCode);
++    }
++
++    __device__ static __forceinline__ std::int64_t scale_offset(int page, int head, int group,
++                                                                int offset) {
++        return page_major_offset<ScaleExtent, Heads>(page, head, offset, group);
++    }
++
++    __device__ static __forceinline__ std::int64_t scale_offset(int page, int head, int offset) {
++        static_assert(ScaleExtent == 1);
++        return scale_offset(page, head, 0, offset);
++    }
++};
++
++template <int Heads>
++using Int8G64Layout = QuantizedRowLayout<Heads, 256, 4>;
++template <int Heads>
++using Fp8RowLayout = QuantizedRowLayout<Heads, 256, 1>;
++template <int Heads>
++using Nvfp4G16Layout = QuantizedRowLayout<Heads, 128, 16, 2>;
++
++} // namespace ninfer::ops::detail::selective_i8::kv
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7df56ca722ea39e22cc5505c1619c7ff065958fe
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h
+@@ -0,0 +1,23 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh"
++
++namespace ninfer::ops::detail::selective_i8 {
++
++template <class G, int Tokens>
++struct Int8KvGroupedInstance {
++    static_assert(Tokens > 0 && Tokens * G::GroupSize <= 64);
++    static constexpr int kRowTiles  = (Tokens * G::GroupSize + 15) / 16;
++    static constexpr bool kWideKeys = G::GroupSize == 8 && kRowTiles >= 3;
++    using Schedule                  = Int8KvGroupedMmaSchedule<Tokens,
++                                              kWideKeys        ? 4 * kRowTiles
++                                                               : kRowTiles <= 2 ? 8
++                                                                                : 2 * kRowTiles,
++                                              kWideKeys ? 64 : 32, kWideKeys ? 1 : 2>;
++    using Merge                     = Int8KvMergeSchedule<G::QHeads == 24 ? 256 : 64>;
++};
++
++using Int8KvTiledInstance = Int8KvTiledMmaSchedule<64, 64, 128>;
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..6da7c78c8fe5fbadaeaa8415e1d6aa1052c5092f
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh
+@@ -0,0 +1,39 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh"
++
++namespace ninfer::ops::detail::selective_i8 {
++
++__device__ __forceinline__ void causal_store_partial_pair(float* target, float a, float b) {
++    *reinterpret_cast<float2*>(target) = make_float2(a, b);
++}
++
++template <class G>
++__device__ __forceinline__ void causal_store_output_pair(__nv_bfloat16* out, int head, int d,
++                                                         int token, float a, float b) {
++    *reinterpret_cast<unsigned*>(out + causal_q_index<G>(head, d, token)) =
++        common::pack_bf16x2(a, b);
++}
++
++__device__ __forceinline__ void causal_store_output(__nv_bfloat16* out, float value) {
++    *out = __float2bfloat16(value);
++}
++
++// A warp converts one normalized row from the represented rotated V coordinates.
++template <class G>
++__device__ __forceinline__ void
++causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head, int token) {
++    static_assert(G::kHeadDim == kCausalHeadDim);
++    const int lane = threadIdx.x & 31;
++    float values[8];
++#pragma unroll
++    for (int r = 0; r < 8; ++r) values[r] = row[lane + 32 * r];
++    kv::normalized_hadamard_d256_inplace(values, lane);
++#pragma unroll
++    for (int r = 0; r < 8; ++r)
++        causal_store_output(out + causal_q_index<G>(head, lane + 32 * r, token), values[r]);
++}
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..43ffb2845eb1a3939ca999ebd0382245f707dca8
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h
+@@ -0,0 +1,26 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++namespace ninfer::ops::detail::selective_i8 {
++
++template <int QHeadsValue, int KVHeadsValue>
++struct AttentionHeadMapping {
++    static_assert(QHeadsValue > 0 && KVHeadsValue > 0);
++    static_assert(QHeadsValue % KVHeadsValue == 0);
++
++    static constexpr int QHeads    = QHeadsValue;
++    static constexpr int KVHeads   = KVHeadsValue;
++    static constexpr int GroupSize = QHeads / KVHeads;
++};
++
++inline constexpr int kCausalHeadDim = 256;
++
++template <int HeadDim, int QueryHeads, int KVHeads>
++struct CausalGeometry : AttentionHeadMapping<QueryHeads, KVHeads> {
++    static_assert(HeadDim > 0 && HeadDim % 64 == 0);
++    static constexpr int kHeadDim = HeadDim;
++};
++
++using CausalD256H24Kv4 = CausalGeometry<256, 24, 4>;
++using CausalD256H16Kv2 = CausalGeometry<256, 16, 2>;
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..290c6c18c024ce879eadee97e7a0baf58f2dee23
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh
+@@ -0,0 +1,599 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh"
++
++namespace ninfer::ops::detail::selective_i8 {
++
++// Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
++// PV dequantizes represented V to FP16 and accumulates in FP32.
++template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
++          bool ParallelQueries = false>
++__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
++    void int8_kv_grouped_mma_kernel(
++        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos,
++        typename Int8KvCacheView<CacheInput::writes_cache>::Code* cache_k_i8,
++        typename Int8KvCacheView<CacheInput::writes_cache>::Code* cache_v_i8,
++        typename Int8KvCacheView<CacheInput::writes_cache>::KeyScale* cache_k_scale,
++        typename Int8KvCacheView<CacheInput::writes_cache>::ValueScale* cache_v_scale,
++        const std::int32_t* block_tables, const std::int32_t* valid_columns,
++        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
++        std::int32_t logical_capacity, CausalKvPartition partition, float scale, float* partial_acc,
++        float* partial_m, float* partial_l) {
++    constexpr int TokenTile            = Schedule::kTokenTile;
++    constexpr int WarpsPerCta          = Schedule::kWarps;
++    constexpr int KeyBlock             = Schedule::kKeyRows;
++    constexpr bool DynamicArena        = Schedule::kDynamicArena;
++    constexpr int Wc                   = WarpsPerCta;
++    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
++    constexpr int RowTiles             = (RowCount + 15) / 16;
++    constexpr int Br                   = RowTiles * 16;
++    constexpr int Bc                   = KeyBlock;
++    constexpr int D                    = 256;
++    constexpr int DB16                 = D / 2;
++    constexpr int Threads              = Wc * 32;
++    constexpr int Groups               = kv::kInt8Groups;
++    constexpr int GroupKc              = kv::kInt8Group / 32;
++    constexpr int QKKs                 = D / 32;
++    constexpr int QKNt                 = Bc / 8;
++    constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
++    constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
++    constexpr int PVKs                 = Bc / 16;
++    constexpr int ProducerThreads      = RowTiles * 32;
++    constexpr int VLoaderThreads       = Threads - ProducerThreads;
++    constexpr float Log2E              = common::kLog2E;
++    constexpr unsigned FullMask        = 0xffffffffu;
++
++    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 64);
++    static_assert(Bc == 32 || Bc == 64);
++    static_assert(RowTiles >= 1 && RowTiles <= 4);
++    static_assert(Wc % RowTiles == 0);
++    static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
++    static_assert(QKKs == Groups * GroupKc);
++
++    // Keep Q in a compact dedicated tile so the producer can reload one
++    // 64-dimension group at a time instead of carrying all eight fragments in
++    // registers across the whole kernel. The main arena holds K i8, V i8, and
++    // V FP16 during the key loop.
++    __shared__ __align__(16) std::int8_t q_s[Br * D];
++    __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 4 * Bc * D];
++    extern __shared__ __align__(16) std::int8_t dynamic_r_s[];
++    std::int8_t* r_s     = DynamicArena ? dynamic_r_s : static_r_s;
++    std::int8_t* q_i8    = q_s;
++    float* q_scale_tmp   = reinterpret_cast<float*>(r_s);
++    std::int8_t* k_i8    = r_s;
++    __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
++    __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
++    std::int8_t* v_i8    = r_s + Bc * D;
++    __half* v_f16        = reinterpret_cast<__half*>(r_s + 2 * Bc * D);
++    __shared__ __align__(16) __half p_s[Br * Bc];
++    __shared__ float alpha_s[Br];
++    __shared__ __align__(16) __half k_scale_s[Bc * Groups];
++    __shared__ __align__(16) __half v_scale_s[Bc * Groups];
++
++    static_assert(!ParallelQueries || !CacheInput::writes_cache);
++    const int kv_head      = ParallelQueries ? blockIdx.x % Geometry::KVHeads : blockIdx.x;
++    const int column_begin = ParallelQueries ? (blockIdx.x / Geometry::KVHeads) * TokenTile : 0;
++    const int tile_tokens = ParallelQueries ? min(TokenTile, full_width - column_begin) : TokenTile;
++    const int partial_width = full_width;
++    const int partial_begin = column_begin;
++    const int split         = static_cast<int>(blockIdx.y);
++    const int batch         = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
++    const int split_count   = static_cast<int>(gridDim.y);
++    const int tid           = static_cast<int>(threadIdx.x);
++    const int warp          = tid >> 5;
++    const int lane          = tid & 31;
++
++    int valid_tokens = tile_tokens;
++    if constexpr (Masked) {
++        const int remaining = valid_columns[batch] - column_begin;
++        valid_tokens        = remaining <= 0 ? 0 : min(remaining, tile_tokens);
++    }
++    std::int64_t column_base = column_begin;
++    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++    q += static_cast<std::int64_t>(256) * Geometry::QHeads * column_base;
++    const int last_pos = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
++    pos += column_base;
++    if constexpr (CacheInput::writes_cache) {
++        input.k += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
++        input.v += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
++    }
++    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
++    const std::int32_t* block_table =
++        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
++    if constexpr (MultiBatch) {
++        partial_acc +=
++            static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * partial_width * split_count;
++        partial_m +=
++            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
++        partial_l +=
++            static_cast<std::int64_t>(batch) * Geometry::QHeads * partial_width * split_count;
++    }
++
++    if (valid_tokens == 0) return; // Merge writes exact zero for masked columns.
++    if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
++    const int window             = last_pos + 1;
++    const int active_split_count = partition.active(window);
++    if (split >= active_split_count) return;
++    const int logical_tiles    = common::div_up(window, Bc);
++    const int first_owned_tile = split * logical_tiles / active_split_count;
++    const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
++    const int split_start      = first_owned_tile * Bc;
++    const int split_end        = min(end_owned_tile * Bc, window);
++    const int first_tile       = split_start;
++    const int key_blocks       = common::div_up(split_end - first_tile, Bc);
++
++    if constexpr (CacheInput::writes_cache) {
++        // Decompose H256 as H4 over four independently transformed H64 groups. The existing
++        // (token, group) warp schedule computes all H64 fragments in parallel; the FP32 main arena
++        // is the exchange point for the final H4 stage. This retains the complete transform's
++        // butterfly/rounding order while shortening the fused append critical path. V stays in
++        // the original coordinates and retains the existing G64 codec.
++        float* k_h64_s = reinterpret_cast<float*>(r_s);
++        for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
++            const int token    = pair / Groups;
++            const int grp      = pair - token * Groups;
++            const int position = pos[token];
++            if (position < split_start || position >= split_end) { continue; }
++            const int d0            = grp * kv::kInt8Group + lane;
++            const int d1            = d0 + 32;
++            const std::int64_t src0 = causal_new_index<Geometry>(kv_head, d0, token);
++            const std::int64_t src1 = causal_new_index<Geometry>(kv_head, d1, token);
++            float k_h64[2] = {__bfloat162float(input.k[src0]), __bfloat162float(input.k[src1])};
++            kv::hadamard_d64_fragment_inplace(k_h64, lane);
++            k_h64_s[token * D + d0] = k_h64[0];
++            k_h64_s[token * D + d1] = k_h64[1];
++        }
++        __syncthreads();
++
++        for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
++            const int token    = pair / Groups;
++            const int grp      = pair - token * Groups;
++            const int position = pos[token];
++            if (position < split_start || position >= split_end) { continue; }
++            const int physical_page = block_table[position >> kv::kPageShift];
++            const int page_offset   = position & kv::kPageMask;
++            const int d0            = grp * kv::kInt8Group + lane;
++            const int d1            = d0 + 32;
++            const std::int64_t src0 = causal_new_index<Geometry>(kv_head, d0, token);
++            const std::int64_t src1 = causal_new_index<Geometry>(kv_head, d1, token);
++
++            float k_out[2];
++#pragma unroll
++            for (int half = 0; half < 2; ++half) {
++                const int dh   = lane + half * 32;
++                const float x0 = k_h64_s[token * D + dh];
++                const float x1 = k_h64_s[token * D + kv::kInt8Group + dh];
++                const float x2 = k_h64_s[token * D + 2 * kv::kInt8Group + dh];
++                const float x3 = k_h64_s[token * D + 3 * kv::kInt8Group + dh];
++                k_out[half] =
++                    kv::normalized_hadamard_d256_group_value_from_h64(x0, x1, x2, x3, grp);
++            }
++
++            const float kv0    = k_out[0];
++            const float kv1    = k_out[1];
++            const float vv0    = __bfloat162float(input.v[src0]);
++            const float vv1    = __bfloat162float(input.v[src1]);
++            float kamax        = fmaxf(fabsf(kv0), fabsf(kv1));
++            float vamax        = fmaxf(fabsf(vv0), fabsf(vv1));
++            kamax              = common::warp_max(kamax, FullMask);
++            vamax              = common::warp_max(vamax, FullMask);
++            const auto k_quant = common::int8_fp16_scale(kamax);
++            const auto v_quant = common::int8_fp16_scale(vamax);
++            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
++                                                                         page_offset)] =
++                common::int8_quant_code(kv0, k_quant.inverse_scale);
++            cache_k_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
++                                                                         page_offset)] =
++                common::int8_quant_code(kv1, k_quant.inverse_scale);
++            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d0,
++                                                                         page_offset)] =
++                common::int8_quant_code(vv0, v_quant.inverse_scale);
++            cache_v_i8[kv::Int8G64Layout<Geometry::KVHeads>::code_offset(physical_page, kv_head, d1,
++                                                                         page_offset)] =
++                common::int8_quant_code(vv1, v_quant.inverse_scale);
++            if (lane == 0) {
++                const std::int64_t so = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
++                    physical_page, kv_head, grp, page_offset);
++                cache_k_scale[so] = k_quant.scale;
++                cache_v_scale[so] = v_quant.scale;
++            }
++        }
++        __syncthreads();
++    }
++
++    for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
++    for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
++    __syncthreads();
++
++    for (int row = warp; row < RowCount; row += Wc) {
++        int q_head = 0;
++        int token  = 0;
++        causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
++        float q_values[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const int d = lane + 32 * r;
++            q_values[r] = token < valid_tokens
++                              ? __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)])
++                              : 0.0f;
++        }
++        kv::normalized_hadamard_d256_inplace(q_values, lane);
++
++#pragma unroll
++        for (int grp = 0; grp < Groups; ++grp) {
++            const int d0    = grp * kv::kInt8Group + lane;
++            const int d1    = d0 + 32;
++            const float x0  = q_values[2 * grp];
++            const float x1  = q_values[2 * grp + 1];
++            float amax      = fmaxf(fabsf(x0), fabsf(x1));
++            amax            = common::warp_max(amax, FullMask);
++            const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
++            const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
++            causal_store_query_code(q_i8, row, d0, common::int8_quant_code(x0, inv));
++            causal_store_query_code(q_i8, row, d1, common::int8_quant_code(x1, inv));
++            if (lane == 0) { q_scale_tmp[row * Groups + grp] = qs; }
++        }
++    }
++    __syncthreads();
++
++    const int gid = lane >> 2;
++    const int lid = lane & 3;
++
++    const int a_mat    = lane >> 3;
++    const int a_rin    = lane & 7;
++    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
++    const int a_coloff = (a_mat >> 1) << 3;
++    const int b_rin    = lane & 7;
++    const int b_koff   = ((lane >> 3) & 1) << 3;
++
++    float q_scale_r0[Groups];
++    float q_scale_r1[Groups];
++    if (warp < RowTiles) {
++        const int producer_row0 = warp * 16 + gid;
++#pragma unroll
++        for (int g = 0; g < Groups; ++g) {
++            float qs0     = (lid == 0 && producer_row0 < tile_tokens * Geometry::GroupSize)
++                                ? q_scale_tmp[producer_row0 * Groups + g]
++                                : 0.0f;
++            float qs1     = (lid == 0 && producer_row0 + 8 < RowCount)
++                                ? q_scale_tmp[(producer_row0 + 8) * Groups + g]
++                                : 0.0f;
++            q_scale_r0[g] = __shfl_sync(FullMask, qs0, gid * 4);
++            q_scale_r1[g] = __shfl_sync(FullMask, qs1, gid * 4);
++        }
++    }
++    __syncthreads();
++
++    float acc[PVNtPerWarp][4];
++#pragma unroll
++    for (int n = 0; n < PVNtPerWarp; ++n) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
++    }
++
++    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
++    float l0 = 0.0f, l1 = 0.0f;
++
++    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
++        for (int key_l = tid; key_l < Bc; key_l += Threads) {
++            const int key = tile_k0 + key_l;
++            if (key >= split_start && key < split_end) {
++                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::scale_offset(
++                    physical_page, kv_head, 0, key & kv::kPageMask);
++                common::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
++                common::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
++            } else {
++                common::store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
++                common::store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
++            }
++        }
++#pragma unroll 1
++        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
++            const int key_l = chunk / (D / 16);
++            const int dc    = chunk - key_l * (D / 16);
++            const int d     = dc * 16;
++            const int key   = tile_k0 + key_l;
++            if (key >= split_start && key < split_end) {
++                const std::int64_t off = kv::Int8G64Layout<Geometry::KVHeads>::code_offset(
++                    physical_page, kv_head, d, key & kv::kPageMask);
++                std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
++                common::cp_async<16>(dst, &cache_k_i8[off]);
++                common::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
++            } else {
++                std::int8_t* dst = &k_i8[key_l * D + common::swizzle_xor_64(key_l, dc * 8) * 2];
++                common::store_vec(dst, make_int4(0, 0, 0, 0));
++                common::store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
++            }
++        }
++        common::cp_commit();
++    };
++
++    int physical_page = block_table[first_tile >> kv::kPageShift];
++    issue_kv_tile(first_tile, physical_page);
++    common::cp_wait<0>();
++    __syncthreads();
++
++    for (int kb = 0; kb < key_blocks; ++kb) {
++        const int k0 = first_tile + kb * Bc;
++
++        // One warp per row tile produces P and alpha while the remaining warps
++        // stream/dequant V.
++        if (warp < RowTiles) {
++            const int producer_row_base = warp * 16;
++            __half* p_sw                = &p_s[producer_row_base * Bc];
++            float score[QKNt][4];
++#pragma unroll
++            for (int nt = 0; nt < QKNt; ++nt) {
++                score[nt][0] = 0.0f;
++                score[nt][1] = 0.0f;
++                score[nt][2] = 0.0f;
++                score[nt][3] = 0.0f;
++            }
++
++#pragma unroll
++            for (int g = 0; g < Groups; ++g) {
++                unsigned af[GroupKc][4];
++#pragma unroll
++                for (int kk = 0; kk < GroupKc; ++kk) {
++                    const int k    = g * GroupKc + kk;
++                    const int acol = k * 16 + a_coloff;
++                    common::ldmatrix_x4(
++                        af[kk][0], af[kk][1], af[kk][2], af[kk][3],
++                        common::smem_addr(
++                            &q_b16[(producer_row_base + a_rowoff) * DB16 +
++                                   common::swizzle_xor_64(producer_row_base + a_rowoff, acol)]));
++                }
++
++#pragma unroll
++                for (int nt = 0; nt < QKNt; ++nt) {
++                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++#pragma unroll
++                    for (int kk = 0; kk < GroupKc; ++kk) {
++                        const int k    = g * GroupKc + kk;
++                        const int brow = nt * 8 + b_rin;
++                        const int bcol = k * 16 + b_koff;
++                        unsigned bf[2];
++                        common::ldmatrix_x2(
++                            bf[0], bf[1],
++                            common::smem_addr(
++                                &k_b16[brow * DB16 + common::swizzle_xor_64(brow, bcol)]));
++                        common::mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3],
++                                       bf[0], bf[1]);
++                    }
++                    const int keya = nt * 8 + 2 * lid;
++                    const int keyb = keya + 1;
++                    float ka       = 0.0f;
++                    float kb2      = 0.0f;
++                    if (gid == 0) {
++                        ka  = __half2float(k_scale_s[keya * Groups + g]);
++                        kb2 = __half2float(k_scale_s[keyb * Groups + g]);
++                    }
++                    ka  = __shfl_sync(FullMask, ka, lid);
++                    kb2 = __shfl_sync(FullMask, kb2, lid);
++                    score[nt][0] += q_scale_r0[g] * ka * static_cast<float>(c0);
++                    score[nt][1] += q_scale_r0[g] * kb2 * static_cast<float>(c1);
++                    score[nt][2] += q_scale_r1[g] * ka * static_cast<float>(c2);
++                    score[nt][3] += q_scale_r1[g] * kb2 * static_cast<float>(c3);
++                }
++            }
++
++            const int row0 = producer_row_base + gid;
++            const int row1 = row0 + 8;
++            int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
++            causal_row_to_qt<Geometry>(row0, kv_head, q_head0, token0);
++            causal_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
++            const int qabs0 = (row0 < tile_tokens * Geometry::GroupSize) ? pos[token0] : -1;
++            const int qabs1 = (row1 < tile_tokens * Geometry::GroupSize) ? pos[token1] : -1;
++            float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
++#pragma unroll
++            for (int nt = 0; nt < QKNt; ++nt) {
++                const int col0 = nt * 8 + 2 * lid;
++                const int col1 = col0 + 1;
++                const int key0 = k0 + col0;
++                const int key1 = k0 + col1;
++                score[nt][0]   = (row0 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
++                                key0 < split_end && key0 <= qabs0)
++                                     ? score[nt][0] * scale
++                                     : -CUDART_INF_F;
++                score[nt][1]   = (row0 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
++                                key1 < split_end && key1 <= qabs0)
++                                     ? score[nt][1] * scale
++                                     : -CUDART_INF_F;
++                score[nt][2]   = (row1 < tile_tokens * Geometry::GroupSize && key0 >= split_start &&
++                                key0 < split_end && key0 <= qabs1)
++                                     ? score[nt][2] * scale
++                                     : -CUDART_INF_F;
++                score[nt][3]   = (row1 < tile_tokens * Geometry::GroupSize && key1 >= split_start &&
++                                key1 < split_end && key1 <= qabs1)
++                                     ? score[nt][3] * scale
++                                     : -CUDART_INF_F;
++                bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
++                bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
++            }
++            bm0 = common::warp_max<4>(bm0, FullMask);
++            bm1 = common::warp_max<4>(bm1, FullMask);
++
++            const float nm0 = fmaxf(m0, bm0);
++            const float nm1 = fmaxf(m1, bm1);
++            const float alpha0 =
++                (m0 == -CUDART_INF_F) ? 0.0f : causal_exp_difference(m0, nm0, Log2E);
++            const float alpha1 =
++                (m1 == -CUDART_INF_F) ? 0.0f : causal_exp_difference(m1, nm1, Log2E);
++
++            float bl0 = 0.0f, bl1 = 0.0f;
++#pragma unroll
++            for (int nt = 0; nt < QKNt; ++nt) {
++                const int col0  = nt * 8 + 2 * lid;
++                const int col1  = col0 + 1;
++                const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
++                                      ? causal_exp_difference(score[nt][0], nm0, Log2E)
++                                      : 0.0f;
++                const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
++                                      ? causal_exp_difference(score[nt][1], nm0, Log2E)
++                                      : 0.0f;
++                const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
++                                      ? causal_exp_difference(score[nt][2], nm1, Log2E)
++                                      : 0.0f;
++                const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
++                                      ? causal_exp_difference(score[nt][3], nm1, Log2E)
++                                      : 0.0f;
++                bl0 += p00 + p01;
++                bl1 += p10 + p11;
++                p_sw[gid * Bc + causal_probability_swizzle<Bc>(gid, col0)] = __float2half_rn(p00);
++                p_sw[gid * Bc + causal_probability_swizzle<Bc>(gid, col1)] = __float2half_rn(p01);
++                p_sw[(gid + 8) * Bc + causal_probability_swizzle<Bc>(gid + 8, col0)] =
++                    __float2half_rn(p10);
++                p_sw[(gid + 8) * Bc + causal_probability_swizzle<Bc>(gid + 8, col1)] =
++                    __float2half_rn(p11);
++            }
++            bl0 = common::warp_sum<4>(bl0, FullMask);
++            bl1 = common::warp_sum<4>(bl1, FullMask);
++
++            l0 = l0 * alpha0 + bl0;
++            l1 = l1 * alpha1 + bl1;
++            m0 = nm0;
++            m1 = nm1;
++            if (lid == 0) {
++                alpha_s[row0] = alpha0;
++                alpha_s[row1] = alpha1;
++            }
++        } else {
++            const int loader_tid = tid - ProducerThreads;
++#pragma unroll 1
++            for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
++                const int key_l = chunk / (D / 8);
++                const int dc    = chunk - key_l * (D / 8);
++                const int d     = dc * 8;
++                const int key   = k0 + key_l;
++                __half* dst     = &v_f16[key_l * D + common::swizzle_xor_64(key_l, d)];
++                if (key >= split_start && key < split_end) {
++                    const int grp = d >> 6;
++                    float vs      = 0.0f;
++                    if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
++                    vs                = __shfl_sync(FullMask, vs, grp * 8);
++                    const int2 raw    = common::load_vec<int2>(&v_i8[key_l * D + d]);
++                    const auto* codes = reinterpret_cast<const std::int8_t*>(&raw);
++                    int4 values;
++                    values.x = common::pack_f16x2(static_cast<float>(codes[0]) * vs,
++                                                  static_cast<float>(codes[1]) * vs);
++                    values.y = common::pack_f16x2(static_cast<float>(codes[2]) * vs,
++                                                  static_cast<float>(codes[3]) * vs);
++                    values.z = common::pack_f16x2(static_cast<float>(codes[4]) * vs,
++                                                  static_cast<float>(codes[5]) * vs);
++                    values.w = common::pack_f16x2(static_cast<float>(codes[6]) * vs,
++                                                  static_cast<float>(codes[7]) * vs);
++                    common::store_vec(dst, values);
++                } else {
++                    common::store_vec(dst, make_int4(0, 0, 0, 0));
++                }
++            }
++        }
++        __syncthreads();
++
++        const bool has_next = kb + 1 < key_blocks;
++        if (has_next) {
++            const int next_k0 = k0 + Bc;
++            if ((next_k0 & kv::kPageMask) == 0) {
++                physical_page = block_table[next_k0 >> kv::kPageShift];
++            }
++            issue_kv_tile(next_k0, physical_page);
++        }
++
++        const int consumer_tile     = warp % RowTiles;
++        const int consumer_slice    = warp / RowTiles;
++        const int consumer_row_base = consumer_tile * 16;
++        __half* p_consumer          = &p_s[consumer_row_base * Bc];
++        const float alpha0          = alpha_s[consumer_row_base + gid];
++        const float alpha1          = alpha_s[consumer_row_base + gid + 8];
++#pragma unroll
++        for (int n = 0; n < PVNtPerWarp; ++n) {
++            acc[n][0] *= alpha0;
++            acc[n][1] *= alpha0;
++            acc[n][2] *= alpha1;
++            acc[n][3] *= alpha1;
++        }
++
++#pragma unroll
++        for (int n = 0; n < PVNtPerWarp; ++n) {
++            const int global_n = consumer_slice * PVNtPerWarp + n;
++#pragma unroll
++            for (int k = 0; k < PVKs; ++k) {
++                unsigned pf[4];
++                const int pcol = k * 16 + a_coloff;
++                common::ldmatrix_x4(
++                    pf[0], pf[1], pf[2], pf[3],
++                    common::smem_addr(&p_consumer[a_rowoff * Bc +
++                                                  causal_probability_swizzle<Bc>(a_rowoff, pcol)]));
++                unsigned vf[2];
++                const int vrow = k * 16 + b_koff + b_rin;
++                const int vcol = global_n * 8;
++                common::ldmatrix_x2_t(
++                    vf[0], vf[1],
++                    common::smem_addr(&v_f16[vrow * D + common::swizzle_xor_64(vrow, vcol)]));
++                common::mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
++                                pf[3], vf[0], vf[1]);
++            }
++        }
++        if (has_next) { common::cp_wait<0>(); }
++        __syncthreads();
++    }
++
++    if (warp < RowTiles && lid == 0) {
++        const int row0 = warp * 16 + gid;
++        const int row1 = row0 + 8;
++        if (row0 < tile_tokens * Geometry::GroupSize) {
++            int q_head = 0;
++            int token  = 0;
++            causal_row_to_qt<Geometry>(row0, kv_head, q_head, token);
++            partial_m[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
++                                                  partial_width)] = m0;
++            partial_l[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
++                                                  partial_width)] = l0;
++        }
++        if (row1 < tile_tokens * Geometry::GroupSize) {
++            int q_head = 0;
++            int token  = 0;
++            causal_row_to_qt<Geometry>(row1, kv_head, q_head, token);
++            partial_m[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
++                                                  partial_width)] = m1;
++            partial_l[causal_stat_index<Geometry>(q_head, partial_begin + token, split,
++                                                  partial_width)] = l1;
++        }
++    }
++
++#pragma unroll
++    for (int n = 0; n < PVNtPerWarp; ++n) {
++        const int consumer_tile     = warp % RowTiles;
++        const int consumer_slice    = warp / RowTiles;
++        const int consumer_row_base = consumer_tile * 16;
++        const int d0                = (consumer_slice * PVNtPerWarp + n) * 8 + 2 * lid;
++        const int row0              = consumer_row_base + gid;
++        const int row1              = row0 + 8;
++        if (row0 < tile_tokens * Geometry::GroupSize) {
++            int q_head = 0;
++            int token  = 0;
++            causal_row_to_qt<Geometry>(row0, kv_head, q_head, token);
++            const std::int64_t dst = causal_partial_index<Geometry>(
++                q_head, d0, partial_begin + token, split, partial_width);
++            causal_store_partial_pair(&partial_acc[dst], acc[n][0], acc[n][1]);
++        }
++        if (row1 < tile_tokens * Geometry::GroupSize) {
++            int q_head = 0;
++            int token  = 0;
++            causal_row_to_qt<Geometry>(row1, kv_head, q_head, token);
++            const std::int64_t dst = causal_partial_index<Geometry>(
++                q_head, d0, partial_begin + token, split, partial_width);
++            causal_store_partial_pair(&partial_acc[dst], acc[n][2], acc[n][3]);
++        }
++    }
++}
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..22e5839b5deb3763b238c8b77e811886a3adf99b
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh
+@@ -0,0 +1,56 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h"
++
++namespace ninfer::ops::detail::selective_i8 {
++
++template <int TokenTile, int Warps, int KeyTile, int MinBlocks = 1, bool DynamicArena = true>
++struct Int8KvGroupedMmaSchedule {
++    static_assert(TokenTile > 0 && Warps > 0 && Warps <= 16 && MinBlocks > 0);
++    static_assert(KeyTile == 32 || KeyTile == 64);
++    static constexpr int kTokenTile     = TokenTile;
++    static constexpr int kWarps         = Warps;
++    static constexpr int kThreads       = Warps * 32;
++    static constexpr int kKeyRows       = KeyTile;
++    static constexpr int kMinBlocks     = MinBlocks;
++    static constexpr bool kDynamicArena = DynamicArena;
++    static constexpr int kArenaBytes    = 4 * KeyTile * 256;
++};
++
++// One QK warp per row tile; four PV warps split the output D axis.
++template <int QueryTile = 64, int KeyTile = 64, int MaxRegisters = 120>
++struct Int8KvTiledMmaSchedule {
++    static_assert(QueryTile == 16 || QueryTile == 32 || QueryTile == 64);
++    static_assert(KeyTile == 32 || KeyTile == 64);
++    static_assert(MaxRegisters > 0 && MaxRegisters <= 255);
++    static constexpr int kQueryRows       = QueryTile;
++    static constexpr int kKeyRows         = KeyTile;
++    static constexpr int kRowTiles        = QueryTile / 16;
++    static constexpr int kDConsumers      = 4;
++    static constexpr int kWarps           = kRowTiles * kDConsumers;
++    static constexpr int kThreads         = kWarps * 32;
++    static constexpr int kProducerWarps   = kRowTiles;
++    static constexpr int kProducerThreads = kProducerWarps * 32;
++    static constexpr int kMaxRegisters    = MaxRegisters;
++    static constexpr int kQBytes          = QueryTile * 256;
++    static constexpr int kQScaleBytes     = QueryTile * 4 * 4;
++    static constexpr int kKBytes          = KeyTile * 256;
++    static constexpr int kVBytes          = KeyTile * 256;
++    static constexpr int kVStageBytes     = KeyTile * 256 * 2;
++    static constexpr int kPBytes          = QueryTile * KeyTile * 2;
++    static constexpr int kScaleBytes      = 2 * KeyTile * 4 * 2;
++    static constexpr int kStatsBytes      = 2 * QueryTile * 4;
++    static constexpr int kSharedBytes = kQBytes + kQScaleBytes + kKBytes + kVBytes + kVStageBytes +
++                                        kPBytes + kScaleBytes + kStatsBytes;
++    static_assert(kSharedBytes <= 99 * 1024);
++};
++
++template <int DChunk>
++struct Int8KvMergeSchedule {
++    static_assert(DChunk > 0 && DChunk <= 256);
++    static constexpr int kDChunk  = DChunk;
++    static constexpr int kThreads = 256;
++};
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4315cc0acbcbac99f94a23e4fe3c1350600c329
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh
+@@ -0,0 +1,124 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++#include "core/device.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h"
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh"
++
++namespace ninfer::ops::detail::selective_i8 {
++
++template <class Geometry>
++__device__ __forceinline__ float
++causal_merge_natural_statistics(const float* partial_m, const float* partial_l, int q_head,
++                                int token, int tokens, int splits, float* weights, float* warp_sums,
++                                float* scalars) {
++    static_assert(CausalKvPartition::kMaxSplits <= 256);
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const auto index   = causal_stat_index<Geometry>(q_head, token, tid, tokens);
++    const float m      = tid < splits ? partial_m[index] : -CUDART_INF_F;
++    const float warp_m = common::warp_max(m);
++    if (lane == 0) warp_sums[warp] = warp_m;
++    __syncthreads();
++    if (warp == 0) {
++        const float maximum = common::warp_max(tid < 8 ? warp_sums[tid] : -CUDART_INF_F);
++        if (tid == 0) scalars[0] = maximum;
++    }
++    __syncthreads();
++    const float maximum     = scalars[0];
++    const float l           = tid < splits ? partial_l[index] : 0.0f;
++    const float weight      = l > 0.0f && maximum > -CUDART_INF_F ? expf(m - maximum) : 0.0f;
++    const float denominator = common::block_reduce_sum<256>(l * weight, warp_sums);
++    if (tid == 0) scalars[1] = denominator;
++    __syncthreads();
++    const float total = scalars[1];
++    if (tid < splits) weights[tid] = total > 0.0f ? weight : 0.0f;
++    __syncthreads();
++    return total;
++}
++
++template <class Geometry, int DChunk, bool MultiBatch, bool Masked, bool InverseRotation>
++__launch_bounds__(256) __global__
++    void causal_natural_merge_kernel(const float* partial_acc, const float* partial_m,
++                                     const float* partial_l, const std::int32_t* positions,
++                                     const std::int32_t* valid_columns, std::int32_t tokens,
++                                     std::int32_t batch_size, CausalKvPartition partition,
++                                     __nv_bfloat16* out) {
++    static_assert(Geometry::kHeadDim == kCausalHeadDim);
++    static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
++    static_assert(!InverseRotation || DChunk == kCausalHeadDim);
++    const int q_head      = static_cast<int>(blockIdx.x);
++    const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
++    const int flat_column = static_cast<int>(blockIdx.z);
++    int batch             = 0;
++    int token             = flat_column;
++    if constexpr (MultiBatch) {
++        batch = flat_column / tokens;
++        token = flat_column - batch * tokens;
++    }
++    const int tid         = static_cast<int>(threadIdx.x);
++    const int split_count = partition.capacity;
++    if (q_head >= Geometry::QHeads || token >= tokens) return;
++    if constexpr (MultiBatch) {
++        if (batch >= batch_size) return;
++    }
++    if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * tokens;
++    const int window  = positions[tokens - 1] + 1;
++    int output_column = token;
++    if constexpr (MultiBatch) output_column += batch * tokens;
++    if constexpr (Masked) {
++        const int absolute_column = token;
++        if (absolute_column >= valid_columns[batch]) {
++            if (tid < DChunk && d_start + tid < 256)
++                out[causal_q_index<Geometry>(q_head, d_start + tid, output_column)] =
++                    __float2bfloat16(0.0f);
++            return;
++        }
++    }
++
++    if constexpr (MultiBatch) {
++        partial_acc +=
++            static_cast<std::int64_t>(batch) * 256 * Geometry::QHeads * tokens * split_count;
++        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
++        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
++    }
++    const int active_splits = partition.active(window);
++    __shared__ float weights[256], warp_sums[8], scalars[2];
++    const float head_l = causal_merge_natural_statistics<Geometry>(
++        partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
++    const int d = d_start + tid;
++    if (tid >= DChunk || d >= 256) return;
++    float numerator = 0.0f;
++    for (int split = 0; split < active_splits; ++split) {
++        if (weights[split] != 0.0f)
++            numerator +=
++                partial_acc[causal_partial_index<Geometry>(q_head, d, token, split, tokens)] *
++                weights[split];
++    }
++
++    const float value = head_l > 0.0F ? numerator / head_l : 0.0F;
++    if constexpr (InverseRotation) {
++        __shared__ float normalized[kCausalHeadDim];
++        normalized[tid] = value;
++        __syncthreads();
++        if (tid < 32)
++            causal_store_inverse_rotated_row<Geometry>(normalized, out, q_head, output_column);
++    } else {
++        causal_store_output(out + causal_q_index<Geometry>(q_head, d, output_column), value);
++    }
++}
++
++template <class G, class S, bool MultiBatch, bool Masked, bool InverseRotation>
++void launch_causal_natural_merge(const CausalAttentionOperands& p,
++                                 const std::int32_t* valid_columns, CausalKvPartition partition,
++                                 CausalPartialView partial, cudaStream_t stream) {
++    static_assert(S::kThreads == 256);
++    const dim3 grid(G::QHeads, common::div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
++    causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
++        <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
++                                           valid_columns, p.width, p.batch, partition, p.out);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bd314a40545825c166949bfdd15acc7fbb8d313
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h
+@@ -0,0 +1,159 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++#include "core/arena.h"
++#include "core/paged_kv_cache.h"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h"
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++#include <type_traits>
++#include <stdexcept>
++
++namespace ninfer::ops::detail::selective_i8 {
++struct CausalAttentionOperands {
++    const __nv_bfloat16* q;
++    const std::int32_t* positions;
++    __nv_bfloat16* out;
++    float scale;
++    int width;
++    int batch;
++    int visible_capacity;
++    int head_dim;
++    int query_heads;
++};
++
++struct CausalAppendInput {
++    static constexpr bool writes_cache = true;
++    const __nv_bfloat16* k;
++    const __nv_bfloat16* v;
++};
++
++struct CausalCachedInput {
++    static constexpr bool writes_cache = false;
++};
++
++// Unnormalized FP32 numerator and sum. Maximum units belong to the owning
++// mainloop/merge: log2 for BF16, natural scaled-score units for quantized KV.
++struct CausalPartialView {
++    float* acc;
++    float* maximum;
++    float* sum;
++};
++
++struct CausalPartialStorage {
++    Tensor acc, maximum, sum;
++
++    CausalPartialView view() const {
++        return {static_cast<float*>(acc.data), static_cast<float*>(maximum.data),
++                static_cast<float*>(sum.data)};
++    }
++};
++
++inline CausalAttentionOperands make_causal_operands(const Tensor& q, const Tensor& positions,
++                                                    Tensor& out, float scale, int capacity) {
++    return {static_cast<const __nv_bfloat16*>(q.data),
++            static_cast<const std::int32_t*>(positions.data),
++            static_cast<__nv_bfloat16*>(out.data),
++            scale,
++            q.ne[2],
++            q.ne[3],
++            capacity,
++            q.ne[0],
++            q.ne[1]};
++}
++
++template <class Allocator>
++CausalPartialStorage allocate_causal_partials(Allocator& allocator, int heads, int width,
++                                              int splits, int batch) {
++    return {allocator.alloc(DType::FP32, {kCausalHeadDim, heads, width, splits * batch}),
++            allocator.alloc(DType::FP32, {heads, width, splits * batch}),
++            allocator.alloc(DType::FP32, {heads, width, splits * batch})};
++}
++
++template <class CodeType, class KeyScaleType, class ValueScaleType, bool Writable>
++struct QuantizedCausalCacheView {
++    using Code       = std::conditional_t<Writable, CodeType, const CodeType>;
++    using KeyScale   = std::conditional_t<Writable, KeyScaleType, const KeyScaleType>;
++    using ValueScale = std::conditional_t<Writable, ValueScaleType, const ValueScaleType>;
++    Code* keys;
++    Code* values;
++    KeyScale* key_scales;
++    ValueScale* value_scales;
++    const std::int32_t* tables;
++    const std::int32_t* valid_columns;
++    const std::int32_t* table_rows;
++    int table_stride, kv_heads;
++};
++
++template <class View>
++View make_quantized_causal_cache_view(const PagedKVBatchLayerView& cache,
++                                      const Tensor* valid = nullptr, const Tensor* rows = nullptr) {
++    return {static_cast<typename View::Code*>(cache.k_pages.data),
++            static_cast<typename View::Code*>(cache.v_pages.data),
++            static_cast<typename View::KeyScale*>(cache.k_scale_pages.data),
++            static_cast<typename View::ValueScale*>(cache.v_scale_pages.data),
++            static_cast<const std::int32_t*>(cache.block_tables.data),
++            valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
++            rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
++            cache.block_tables.ne[0],
++            cache.num_kv_heads};
++}
++
++template <class G, class View>
++void validate_quantized_causal_operands(const CausalAttentionOperands& p, View cache) {
++    static_assert(G::kHeadDim == kCausalHeadDim, "Quantized causal templates require D256");
++    if (p.query_heads != G::QHeads || cache.kv_heads != G::KVHeads || !p.q || !p.positions ||
++        !p.out || !cache.keys || !cache.values || !cache.key_scales || !cache.value_scales ||
++        !cache.tables || p.width < 1 || p.batch < 1 || p.visible_capacity < 1 ||
++        static_cast<std::int64_t>(p.visible_capacity) >
++            static_cast<std::int64_t>(cache.table_stride) * kPagedKVPageSize)
++        throw std::invalid_argument("quantized causal attention: invalid operands");
++}
++
++template <bool Writable>
++struct Bf16KvCacheView {
++    using Key   = std::conditional_t<Writable, __nv_bfloat16, const __nv_bfloat16>;
++    using Value = std::conditional_t<Writable, __half, const __half>;
++    Key* keys;
++    Value* values;
++    const std::int32_t* tables;
++    const std::int32_t* valid_columns;
++    const std::int32_t* table_rows;
++    int table_stride;
++    int head_dim;
++    int kv_heads;
++};
++
++using Bf16KvReadView = Bf16KvCacheView<false>;
++
++template <bool Writable>
++Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
++                                             const Tensor* valid = nullptr,
++                                             const Tensor* rows  = nullptr) {
++    return {static_cast<typename Bf16KvCacheView<Writable>::Key*>(cache.k_pages.data),
++            static_cast<typename Bf16KvCacheView<Writable>::Value*>(cache.v_pages.data),
++            static_cast<const std::int32_t*>(cache.block_tables.data),
++            valid ? static_cast<const std::int32_t*>(valid->data) : nullptr,
++            rows ? static_cast<const std::int32_t*>(rows->data) : nullptr,
++            cache.block_tables.ne[0],
++            cache.head_dim,
++            cache.num_kv_heads};
++}
++
++template <bool Writable>
++using Fp8KvCacheView = QuantizedCausalCacheView<std::uint8_t, __half, __half, Writable>;
++using Fp8KvReadView  = Fp8KvCacheView<false>;
++
++template <bool Writable>
++using Int8KvCacheView = QuantizedCausalCacheView<std::int8_t, __half, __half, Writable>;
++using Int8KvReadView  = Int8KvCacheView<false>;
++
++template <bool Writable>
++using Nvfp4KvCacheView =
++    QuantizedCausalCacheView<std::uint8_t, std::uint8_t, std::uint8_t, Writable>;
++using Nvfp4KvReadView = Nvfp4KvCacheView<false>;
++
++template <bool Writable>
++using K8V4KvCacheView = QuantizedCausalCacheView<std::uint8_t, __half, std::uint8_t, Writable>;
++using K8V4KvReadView  = K8V4KvCacheView<false>;
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8bcf8ced14a5e02429934143e6c804cd06c2ada
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h
+@@ -0,0 +1,29 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include <cuda_runtime.h>
++#include <algorithm>
++#include <cstdint>
++
++namespace ninfer::ops::detail::selective_i8 {
++
++// Capture reserves partials for the largest live row. Producer and merge use
++// the same live count; a wider capture never changes a row's work partition.
++struct CausalKvPartition {
++    static constexpr int kMaxSplits = 256;
++    int capacity                    = 1;
++    int target                      = 1;
++    int key_shift                   = 6; // log2 of the minimum KV keys per split
++
++    __host__ __device__ int active(int visible) const {
++        const int count = (visible + (1 << key_shift) - 1) >> key_shift;
++        return count < target ? count : target;
++    }
++};
++
++inline constexpr int causal_partition_target(std::int64_t cta_budget, int independent_tiles) {
++    return static_cast<int>(
++        std::clamp<std::int64_t>(cta_budget / independent_tiles, 1, CausalKvPartition::kMaxSplits));
++}
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..217a903b4460e85dfd54a13982a7665ce2511b4d
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh
+@@ -0,0 +1,74 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h"
++#include <cuda_bf16.h>
++
++namespace ninfer::ops::detail::selective_i8 {
++template <class G>
++__device__ __forceinline__ std::int64_t causal_q_index(int head, int d, int token = 0) {
++    return d + static_cast<std::int64_t>(G::kHeadDim) *
++                   (head + static_cast<std::int64_t>(G::QHeads) * token);
++}
++
++template <class G>
++__device__ __forceinline__ std::int64_t causal_new_index(int head, int d, int token = 0) {
++    return d + static_cast<std::int64_t>(G::kHeadDim) *
++                   (head + static_cast<std::int64_t>(G::KVHeads) * token);
++}
++
++template <class G>
++__device__ __forceinline__ std::int64_t causal_partial_index(int head, int d, int token, int split,
++                                                             int tokens) {
++    return d + static_cast<std::int64_t>(G::kHeadDim) *
++                   (head + static_cast<std::int64_t>(G::QHeads) *
++                               (token + static_cast<std::int64_t>(tokens) * split));
++}
++
++template <class G>
++__device__ __forceinline__ std::int64_t causal_stat_index(int head, int token, int split,
++                                                          int tokens) {
++    return head + static_cast<std::int64_t>(G::QHeads) *
++                      (token + static_cast<std::int64_t>(tokens) * split);
++}
++
++// Keep the explicit empty guard and row/d form: the compact modulo loop
++// caused register spills in sm_120a prefill kernels.
++template <typename Geometry>
++__device__ __forceinline__ void causal_zero_rows(__nv_bfloat16* out, int q_head, int row_begin,
++                                                 int row_end, int tid, int threads) {
++    if (row_begin >= row_end) { return; }
++    const int elements = (row_end - row_begin) * Geometry::kHeadDim;
++    for (int element = tid; element < elements; element += threads) {
++        const int row = row_begin + element / Geometry::kHeadDim;
++        const int d   = element - (row - row_begin) * Geometry::kHeadDim;
++        out[causal_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
++    }
++}
++
++template <typename Byte>
++__device__ __forceinline__ void causal_store_query_code(Byte* tile, int row, int d, Byte code) {
++    const int col_b16 = d >> 1;
++    const int byte    = d & 1;
++    const int off = (row * (kCausalHeadDim / 2) + common::swizzle_xor_64(row, col_b16)) * 2 + byte;
++    tile[off]     = code;
++}
++
++template <typename Geometry>
++__device__ __forceinline__ void causal_row_to_qt(int row, int kv_head, int& q_head, int& token) {
++    token             = row / Geometry::GroupSize;
++    const int local_q = row - token * Geometry::GroupSize;
++    q_head            = kv_head * Geometry::GroupSize + local_q;
++}
++
++template <int Columns>
++__device__ __forceinline__ int causal_probability_swizzle(int row, int col) {
++    if constexpr (Columns == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
++    return common::swizzle_xor_64(row, col);
++}
++
++} // namespace ninfer::ops::detail::selective_i8
+diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f74672cb0bda3abae98a5b7fc136c46b046dfd41
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh
+@@ -0,0 +1,59 @@
++// Adapted from NInfer 64d10fbf9f8e6bfc79ab0570b94674c5b9997929 (Apache-2.0).
++#pragma once
++
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh"
++#include "ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh"
++#include <math_constants.h>
++#include <limits>
++
++namespace ninfer::ops::detail::selective_i8 {
++
++inline constexpr float kAttentionNegativeInfinity = -std::numeric_limits<float>::infinity();
++
++// Keep the maximum in raw QK units in the mainloop, allowing scale to fold into
++// the exponent's FMA. Exported partial maxima are always in log2 units.
++struct OnlineSoftmaxRow {
++    float maximum;
++    float sum;
++    float scaled_maximum;
++
++    __device__ OnlineSoftmaxRow()
++        : maximum(kAttentionNegativeInfinity), sum(0.0f), scaled_maximum(0.0f) {}
++
++    template <bool MayBeEmpty = true>
++    __device__ __forceinline__ float update(float tile_maximum, float scale_log2) {
++        const float previous = maximum;
++        maximum              = fmaxf(maximum, tile_maximum);
++        scaled_maximum       = maximum * scale_log2;
++        if constexpr (MayBeEmpty)
++            if (maximum == kAttentionNegativeInfinity) scaled_maximum = 0.0f;
++        const float alpha = common::exp2_approx(__fmaf_rn(previous, scale_log2, -scaled_maximum));
++        return alpha;
++    }
++
++    __device__ __forceinline__ void accumulate(float alpha, float tile_sum) {
++        sum = __fmaf_rn(sum, alpha, tile_sum);
++    }
++
++    __device__ __forceinline__ float probability(float score, float scale_log2) const {
++        return common::exp2_approx(__fmaf_rn(score, scale_log2, -scaled_maximum));
++    }
++
++    __device__ __forceinline__ void finish() { sum = common::warp_sum<4>(sum, 0xffffffffu); }
++};
++
++__device__ __forceinline__ float softmax_log2_state_weight(float maximum, float sum,
++                                                           float combined) {
++    return sum > 0.0f ? common::exp2_approx(maximum - combined) : 0.0f;
++}
++
++// Grouped scores already include attention_scale; tiled scores fold it into exp2.
++__device__ __forceinline__ float causal_exp_difference(float score, float maximum, float scale) {
++    return common::exp2_approx((score - maximum) * scale);
++}
++
++__device__ __forceinline__ float causal_exp_scaled(float score, float scaled_maximum, float scale) {
++    return common::exp2_approx(__fmaf_rn(score, scale, -scaled_maximum));
++}
++
++} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/sliding_window/kernel.cuh b/src/ops/softmax_attention/sliding_window/kernel.cuh
 index f628de7563538c73a3ae808edfb816578637664f..6600cc45e8ab60857bb23251bb152a2e61147b23 100644
 --- a/src/ops/softmax_attention/sliding_window/kernel.cuh
@@ -11570,6 +14452,16 @@ index cf2d614e83c9708268c3e22fa333387b6d3e3aeb..618e655ea484125fd5c0795f46a9cc44
  }
  
  } // namespace ninfer::ops
+diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
+index 7897fa52c7ca1f9d2432503509eeea433ecbde7b..880d548d49fe30ed59e0d548b3c46c7227e850a5 100644
+--- a/src/ops/softmax_attention/sources.cmake
++++ b/src/ops/softmax_attention/sources.cmake
+@@ -1,4 +1,5 @@
+ target_sources(ninfer_ops PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/selective_int8/launch.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_w1_h24_append.cu"
 diff --git a/src/ops/token_sums/sources.cmake b/src/ops/token_sums/sources.cmake
 new file mode 100644
 index 0000000000000000000000000000000000000000..f14957b3c31fe64f3f59b3e673a5755834f6d71c
