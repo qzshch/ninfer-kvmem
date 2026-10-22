@@ -7323,11 +7323,12 @@ index 36af6e27ead9c3ce27d0c61d3f8be45f35972730..09840538f339ff2c2235eb18d24d206c
      // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
      // transaction the Engine drives for Legacy materialization: quote, reserve, then
 diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
-index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e98cae5fce 100644
+index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8a093bbdf 100644
 --- a/src/models/qwen3_5/program/program_impl.cpp
 +++ b/src/models/qwen3_5/program/program_impl.cpp
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,10 @@
 +#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
++#include "models/qwen3_5/program/storage/checkpoint_residency.h"
 +#include "kvmem/spill_io.hpp"
  #include "models/qwen3_5/program/structured_round.h"
  #include "models/qwen3_5/program/program_impl.h"
@@ -7336,7 +7337,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
  #include "models/qwen3_5/program/context_work.h"
  #include "models/qwen3_5/program/context.h"
  #include "models/qwen3_5/execution/linear.h"
-@@ -7,6 +11,7 @@
+@@ -7,6 +12,7 @@
  #include "core/host_kv_clamp.h"
  #include "core/startup.h"
  #include "core/device.h"
@@ -7344,7 +7345,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
  #include <cuda_runtime.h>
  #include "ninfer/ops/target_logprobs.h"
  
-@@ -229,7 +234,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -229,7 +235,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                           DeviceContext& device_in, const StartupObserver& startup_observer,
                           std::unique_ptr<execution::NativeExpertRuntime> expert_runtime)
      : parameters(parameters_in), device(device_in), capacity(plan.capacity),
@@ -7359,7 +7360,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
        context_cache(plan.context_cache),
        continuation_capacity(normalized_private_capacity(plan.context_cache)),
        shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
-@@ -282,9 +293,50 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -282,9 +294,50 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
        context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                 CudaEventTimer(device_in, device_in.transfer_stream),
                                 CudaEventTimer(device_in, device_in.transfer_stream)} {
@@ -7410,26 +7411,21 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
      // Hand `work` the extra ranks' storage. From here one arena serves every device: the layer loop
      // switches ranks alongside ScopedDeviceRank and every workspace call site is unchanged.
      for (DeviceArena& rank_storage : workspace_storage_by_rank) {
-@@ -375,6 +427,34 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -375,6 +428,29 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
      }
      state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
                                                                      plan.persistent.state_images);
 +    if (kvmem_window_tokens) {
 +        const auto configured_capacity=checkpoint_buffer_pool_capacity();
-+        const char* resident_value=std::getenv("NINFER_EXPERIMENT_CHECKPOINT_RESIDENT");
-+        if (resident_value && std::string_view(resident_value)!="0" && std::string_view(resident_value)!="1")
-+            throw std::invalid_argument("checkpoint residency requires 0 or 1");
-+        const bool resident=resident_value && std::string_view(resident_value)=="1";
++        const bool resident=checkpoint_resident_enabled(std::getenv("NINFER_KVMEM_CHECKPOINT_RESIDENT"));
 +        const char* reuse=std::getenv("NINFER_EXPERIMENT_REWRITE_SCRATCH_REUSE");
-+        const std::size_t scratch_slots=speculative_backend==SpeculativeBackend::Mtp
-+            ? (reuse && reuse[0]=='2' ? 1 : max_concurrency) : 0;
++        // Reconstruction backs up one lane at a time on the single executor;
++        // the retained scratch lease also holds exactly one image.
++        const std::size_t scratch_slots=speculative_backend==SpeculativeBackend::Mtp ? 1 : 0;
 +        const std::size_t transient_slots=2+scratch_slots;
-+        // Each active/retained window has at most five checkpoint records.
-+        // Add one capture replacement, one idle-I/O source after eviction,
-+        // and the separate retained reconstruction backup. Shared aliases do
-+        // not consume another image. Never steal a live lease on overflow.
 +        const std::size_t capacity=resident
-+            ? kKvmemCheckpointKinds.size()*(std::size_t(max_concurrency)+kvmem_options.retained_sessions)+transient_slots
++            ? checkpoint_resident_capacity(max_concurrency,kvmem_options.retained_sessions,
++                                           kKvmemCheckpointKinds.size(),scratch_slots)
 +            : configured_capacity;
 +        const auto bytes=state_images->host_layout().image_bytes;
 +        if (capacity) memory_checkpoint_pool=std::make_unique<CheckpointBufferPool>(capacity,bytes,resident);
@@ -7445,7 +7441,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
      if (plan.context_cache.host_state_slots != 0) {
          const std::uint64_t host_state_bytes =
              static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-@@ -445,6 +525,30 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -445,6 +521,30 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
              *backend_kv_pages, backend->execution_tables(), address_capacity,
              backend->execution_tables().logical_page_capacity());
      }
@@ -7476,7 +7472,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
      pressure_text_page_scratch_.resize(text_kv_pages->capacity());
      pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
      if (backend_kv_pages) {
-@@ -556,6 +660,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -556,6 +656,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
          throw std::logic_error("DFlash decode frame does not match the sequence plan");
      }
      prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
@@ -7522,7 +7518,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
      if (plan.persistent.score_hidden) {
          score_hidden = plan.persistent.score_hidden->bind(backing);
      }
-@@ -638,6 +781,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -638,6 +777,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
      }
      if (use_cuda_graph) {
          StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
@@ -7535,7 +7531,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
          const std::size_t free_before = device.free_bytes();
          prepare_graphs();
          device.synchronize();
-@@ -647,6 +796,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -647,6 +792,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
              free_after == 0 ? std::nullopt
                              : std::optional<std::size_t>(
                                    free_before > free_after ? free_before - free_after : 0);
@@ -7551,7 +7547,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
          graph_phase.complete();
      }
      work.reset();
-@@ -672,6 +830,14 @@ ProgramImpl::~ProgramImpl() noexcept {
+@@ -672,6 +826,14 @@ ProgramImpl::~ProgramImpl() noexcept {
          (void)cudaStreamSynchronize(transfer_streams[rank]);
          (void)cudaStreamSynchronize(compute_streams[rank]);
      }
@@ -7566,7 +7562,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
  }
  
  std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-@@ -869,6 +1035,66 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
+@@ -869,6 +1031,66 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
  
  MemorySummary ProgramImpl::memory_summary() const noexcept {
      MemorySummary out;
@@ -7633,7 +7629,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e9
      out.device          = device.device;
      out.max_context     = capacity;
      out.kv_capacity     = kv_capacity;
-@@ -893,6 +1119,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+@@ -893,6 +1115,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
      }
      out.workspace = ArenaMemorySummary{workspace_storage.capacity(), active_workspace_bytes,
                                         std::max(work.peak_used(), workspace_logical_peak_bytes)};
@@ -8259,10 +8255,10 @@ index afd28ebab3c121f66e64188f74da68d080bf05be..07b669d9f0eb5d6150eff29da9c9905c
                                   frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
 diff --git a/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e402a56de1677f818acacf4c48f487f4335eca38
+index 0000000000000000000000000000000000000000..8c2df7dbbffd7ded3b86a92b1117b5562d3335de
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,117 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -8279,7 +8275,8 @@ index 0000000000000000000000000000000000000000..e402a56de1677f818acacf4c48f487f4
 +// A free-list bound, not a limit on live checkpoints. A lease must remain alive
 +// until every CPU/GPU transfer using it completes; the pool invents no fence.
 +// Only the last shared reference returns a buffer, and every buffer has exactly
-+// the fixed image size of its owning Program. No allocation is prewarmed here.
++// the fixed image size of its owning Program. Prewarming is explicit and runs
++// before the Program is exposed to requests.
 +template <class Buffer>
 +class BoundedCheckpointBufferPool final
 +    : public std::enable_shared_from_this<BoundedCheckpointBufferPool<Buffer>> {
@@ -8429,6 +8426,47 @@ index 0000000000000000000000000000000000000000..effa6ec3e3e6f527f2610db5b46213cd
 +private:
 +    std::shared_ptr<Pool> pool_;
 +};
++
++} // namespace ninfer::models::qwen3_5::detail
+diff --git a/src/models/qwen3_5/program/storage/checkpoint_residency.h b/src/models/qwen3_5/program/storage/checkpoint_residency.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..44e39d213292db2f4d8313c00fd5b23d1bac2663
+--- /dev/null
++++ b/src/models/qwen3_5/program/storage/checkpoint_residency.h
+@@ -0,0 +1,35 @@
++#pragma once
++
++#include <cstddef>
++#include <limits>
++#include <stdexcept>
++#include <string_view>
++
++namespace ninfer::models::qwen3_5::detail {
++
++// Parse once at startup. Null and "0" preserve the existing allocation path.
++inline bool checkpoint_resident_enabled(const char* value) {
++    if (!value || std::string_view(value) == "0") return false;
++    if (std::string_view(value) == "1") return true;
++    throw std::invalid_argument("NINFER_KVMEM_CHECKPOINT_RESIDENT must be 0 or 1");
++}
++
++// Catalog aliases share images. Only a replacement capture and the single
++// outstanding idle-I/O owner can hold images beyond those catalogs. Scratch
++// leases are explicit so callers account for their actual simultaneous lifetime.
++inline std::size_t checkpoint_resident_capacity(std::size_t active,
++                                                std::size_t retained,
++                                                std::size_t kinds,
++                                                std::size_t scratch) {
++    constexpr auto limit = std::numeric_limits<std::size_t>::max();
++    if (!active || !kinds) throw std::invalid_argument("empty checkpoint resident geometry");
++    if (retained > limit - active || scratch > limit - 2)
++        throw std::overflow_error("checkpoint resident capacity overflow");
++    const auto transient = 2 + scratch;
++    const auto windows = active + retained;
++    if (windows > (limit - transient) / kinds)
++        throw std::overflow_error("checkpoint resident capacity overflow");
++    return windows * kinds + transient;
++}
 +
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/context.cpp b/src/models/qwen3_5/program/storage/context.cpp
@@ -8864,10 +8902,10 @@ index 0000000000000000000000000000000000000000..17052b71a874111621aca5bc6eb1d868
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..bcbba273d8f0a336e7142379fb2a3ccdf2f21ef8
+index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6de4f13ade
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,1601 @@
+@@ -0,0 +1,1599 @@
 +#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
@@ -10065,8 +10103,7 @@ index 0000000000000000000000000000000000000000..bcbba273d8f0a336e7142379fb2a3ccd
 +                auto& checkpoint = memory_checkpoint_slot(history, *pending->checkpoint);
 +                if (!checkpoint || checkpoint->state || checkpoint->cold_state.size() != work.state.size())
 +                    throw std::logic_error("prepared state image changed before publication");
-+                auto state = memory_checkpoint_pool ? memory_checkpoint_pool->acquire(work.state.size())
-+                    : std::make_shared<PinnedHostBuffer>(work.state.size());
++                auto state = std::make_unique<PinnedHostBuffer>(work.state.size());
 +                std::memcpy(state->data(), work.state.data(), work.state.size());
 +                checkpoint->state = std::move(state);
 +                checkpoint->cold_state = {};
@@ -10152,8 +10189,7 @@ index 0000000000000000000000000000000000000000..bcbba273d8f0a336e7142379fb2a3ccd
 +    for (const auto kind : kKvmemCheckpointKinds) {
 +        auto& slot = memory_checkpoint_slot(*history, kind);
 +        if (!slot || slot->state || !slot->cold_state.size()) continue;
-+        auto state = memory_checkpoint_pool ? memory_checkpoint_pool->acquire(slot->cold_state.size())
-+            : std::make_shared<PinnedHostBuffer>(slot->cold_state.size());
++        auto state = std::make_unique<PinnedHostBuffer>(slot->cold_state.size());
 +        slot->cold_state.read(0, state->data(), state->size());
 +        slot->state = std::move(state);
 +        slot->cold_state = {};
