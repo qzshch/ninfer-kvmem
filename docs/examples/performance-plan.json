@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "id": "replace-with-campaign-id",
+  "claims": [
+    "operator_latency"
+  ],
+  "arms": [
+    {
+      "arm": "A",
+      "binary_sha256": "<actual-binary-sha256>",
+      "source_manifest_sha256": "<source-manifest-sha256>",
+      "recipe_sha256": "<recipe-sha256>",
+      "device_profile_sha256": "<calibration-sha256>",
+      "treatment": "control"
+    },
+    {
+      "arm": "B",
+      "binary_sha256": "<actual-binary-sha256>",
+      "source_manifest_sha256": "<source-manifest-sha256>",
+      "recipe_sha256": "<recipe-sha256>",
+      "device_profile_sha256": "<calibration-sha256>",
+      "treatment": "one declared change"
+    }
+  ],
+  "requests": [
+    {
+      "id": "shape-1",
+      "body_sha256": "<actual-request-or-synthetic-case-sha256>",
+      "source": "synthetic"
+    }
+  ],
+  "cache_protocol": "Describe cold/warm preparation, replay and eviction history.",
+  "arrival_protocol": "Describe fixed dependency/arrival protocol and exclusivity.",
+  "allowed_differences": [
+    "one declared change"
+  ],
+  "metrics": [
+    {
+      "key": "cuda_event_ms",
+      "direction": "lower",
+      "availability": "required",
+      "claim": true
+    },
+    {
+      "key": "prefix_restore_s",
+      "direction": "lower",
+      "availability": "unavailable",
+      "reason": "No exclusive prefix-restore timer in this build.",
+      "claim": false
+    }
+  ],
+  "collectors": {
+    "ordinary": {
+      "enabled": true,
+      "fields": [
+        "cuda_event_ms"
+      ]
+    },
+    "quality": {
+      "enabled": true,
+      "fields": [
+        "fp64_oracle",
+        "graph_replay"
+      ]
+    },
+    "nsight": {
+      "enabled": true,
+      "fields": [
+        "nsight.kernel",
+        "nsight.api"
+      ]
+    }
+  },
+  "comparison": {
+    "order": [
+      "A",
+      "B",
+      "B",
+      "A"
+    ],
+    "minimum_blocks": 1,
+    "noise_floor_pct": 2,
+    "regression_limit_pct": 3,
+    "aa_evidence_sha256": "<measured-AA-evidence-sha256>"
+  },
+  "roi": {
+    "trigger": "first measured graph after warmup",
+    "target_event": "replace with exact kernel/NVTX event",
+    "minimum_target_events": 1
+  },
+  "observer_failure_policy": "record_only"
+}

@@ -36,6 +36,7 @@ jobs:
           python3 tests/test_validation_portability.py
           python3 tests/test_public_evidence.py
           python3 tests/test_multi_needle.py
+          python3 tests/test_performance_evidence.py
           python3 -m unittest discover -s scripts -p test_native_stats.py
   host-linux:
     needs: changes
