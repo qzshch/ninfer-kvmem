@@ -7323,7 +7323,7 @@ index 36af6e27ead9c3ce27d0c61d3f8be45f35972730..09840538f339ff2c2235eb18d24d206c
      // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
      // transaction the Engine drives for Legacy materialization: quote, reserve, then
 diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
-index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166496a77bd 100644
+index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..171bdeaf0e93dfb76f139e1261b6b5e98cae5fce 100644
 --- a/src/models/qwen3_5/program/program_impl.cpp
 +++ b/src/models/qwen3_5/program/program_impl.cpp
 @@ -1,5 +1,9 @@
@@ -7410,19 +7410,42 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
      // Hand `work` the extra ranks' storage. From here one arena serves every device: the layer loop
      // switches ranks alongside ScopedDeviceRank and every workspace call site is unchanged.
      for (DeviceArena& rank_storage : workspace_storage_by_rank) {
-@@ -375,6 +427,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -375,6 +427,34 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
      }
      state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
                                                                      plan.persistent.state_images);
 +    if (kvmem_window_tokens) {
-+        const auto capacity=checkpoint_buffer_pool_capacity();
-+        if (capacity) memory_checkpoint_pool=std::make_unique<CheckpointBufferPool>(
-+            capacity,state_images->host_layout().image_bytes);
++        const auto configured_capacity=checkpoint_buffer_pool_capacity();
++        const char* resident_value=std::getenv("NINFER_EXPERIMENT_CHECKPOINT_RESIDENT");
++        if (resident_value && std::string_view(resident_value)!="0" && std::string_view(resident_value)!="1")
++            throw std::invalid_argument("checkpoint residency requires 0 or 1");
++        const bool resident=resident_value && std::string_view(resident_value)=="1";
++        const char* reuse=std::getenv("NINFER_EXPERIMENT_REWRITE_SCRATCH_REUSE");
++        const std::size_t scratch_slots=speculative_backend==SpeculativeBackend::Mtp
++            ? (reuse && reuse[0]=='2' ? 1 : max_concurrency) : 0;
++        const std::size_t transient_slots=2+scratch_slots;
++        // Each active/retained window has at most five checkpoint records.
++        // Add one capture replacement, one idle-I/O source after eviction,
++        // and the separate retained reconstruction backup. Shared aliases do
++        // not consume another image. Never steal a live lease on overflow.
++        const std::size_t capacity=resident
++            ? kKvmemCheckpointKinds.size()*(std::size_t(max_concurrency)+kvmem_options.retained_sessions)+transient_slots
++            : configured_capacity;
++        const auto bytes=state_images->host_layout().image_bytes;
++        if (capacity) memory_checkpoint_pool=std::make_unique<CheckpointBufferPool>(capacity,bytes,resident);
++        if (resident) {
++            if (speculative_backend==SpeculativeBackend::Mtp && reuse && reuse[0]=='2') {
++                memory_reconstruction_scratch=memory_checkpoint_pool->acquire(bytes);
++                std::fprintf(stderr,"REWRITE_SCRATCH_RESIDENT image_bytes=%zu slots=1 prewarm=1\n",bytes);
++            }
++            std::fprintf(stderr,"CHECKPOINT_RESIDENT active=%u retained=%u catalog_slots=5 transient_slots=%zu slots=%zu reserved_bytes=%zu\n",
++                max_concurrency,kvmem_options.retained_sessions,transient_slots,capacity,capacity*bytes);
++        }
 +    }
      if (plan.context_cache.host_state_slots != 0) {
          const std::uint64_t host_state_bytes =
              static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-@@ -445,6 +502,30 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -445,6 +525,30 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
              *backend_kv_pages, backend->execution_tables(), address_capacity,
              backend->execution_tables().logical_page_capacity());
      }
@@ -7453,7 +7476,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
      pressure_text_page_scratch_.resize(text_kv_pages->capacity());
      pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
      if (backend_kv_pages) {
-@@ -556,6 +637,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -556,6 +660,45 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
          throw std::logic_error("DFlash decode frame does not match the sequence plan");
      }
      prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
@@ -7499,7 +7522,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
      if (plan.persistent.score_hidden) {
          score_hidden = plan.persistent.score_hidden->bind(backing);
      }
-@@ -638,6 +758,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -638,6 +781,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
      }
      if (use_cuda_graph) {
          StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
@@ -7512,7 +7535,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
          const std::size_t free_before = device.free_bytes();
          prepare_graphs();
          device.synchronize();
-@@ -647,6 +773,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
+@@ -647,6 +796,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
              free_after == 0 ? std::nullopt
                              : std::optional<std::size_t>(
                                    free_before > free_after ? free_before - free_after : 0);
@@ -7528,7 +7551,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
          graph_phase.complete();
      }
      work.reset();
-@@ -672,6 +807,14 @@ ProgramImpl::~ProgramImpl() noexcept {
+@@ -672,6 +830,14 @@ ProgramImpl::~ProgramImpl() noexcept {
          (void)cudaStreamSynchronize(transfer_streams[rank]);
          (void)cudaStreamSynchronize(compute_streams[rank]);
      }
@@ -7543,7 +7566,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
  }
  
  std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-@@ -869,6 +1012,66 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
+@@ -869,6 +1035,66 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
  
  MemorySummary ProgramImpl::memory_summary() const noexcept {
      MemorySummary out;
@@ -7610,7 +7633,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..9a0fc93c0dc07861ef4f69b9deac8166
      out.device          = device.device;
      out.max_context     = capacity;
      out.kv_capacity     = kv_capacity;
-@@ -893,6 +1096,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+@@ -893,6 +1119,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
      }
      out.workspace = ArenaMemorySummary{workspace_storage.capacity(), active_workspace_bytes,
                                         std::max(work.peak_used(), workspace_logical_peak_bytes)};
@@ -8236,10 +8259,10 @@ index afd28ebab3c121f66e64188f74da68d080bf05be..07b669d9f0eb5d6150eff29da9c9905c
                                   frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
 diff --git a/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..07ad496633d000995fd72719bddeded1468a48f5
+index 0000000000000000000000000000000000000000..e402a56de1677f818acacf4c48f487f4335eca38
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,116 @@
 +#pragma once
 +
 +#include <cstddef>
@@ -8296,6 +8319,20 @@ index 0000000000000000000000000000000000000000..07ad496633d000995fd72719bddeded1
 +        });
 +    }
 +
++    // All leases are held together so no prewarmed image can be reacquired
++    // during preparation. Touch is explicit because allocation alone need not
++    // fault every page in. Call only before the Program is exposed to requests.
++    template <class Touch>
++    void prewarm(std::size_t count, Touch&& touch) {
++        if (count > capacity_) throw std::invalid_argument("checkpoint prewarm exceeds cache capacity");
++        std::vector<std::shared_ptr<Buffer>> held;
++        held.reserve(count);
++        for (std::size_t i=0;i<count;++i) {
++            held.push_back(acquire(image_bytes_));
++            touch(*held.back());
++        }
++    }
++
 +    void close() noexcept {
 +        std::vector<std::unique_ptr<Buffer>> retired;
 +        {
@@ -8344,10 +8381,10 @@ index 0000000000000000000000000000000000000000..07ad496633d000995fd72719bddeded1
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h b/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c95f65806648462c8c666261871241c3cbbd7cf0
+index 0000000000000000000000000000000000000000..effa6ec3e3e6f527f2610db5b46213cd935f9572
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +#pragma once
 +
 +#include "models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h"
@@ -8356,6 +8393,7 @@ index 0000000000000000000000000000000000000000..c95f65806648462c8c666261871241c3
 +#include <charconv>
 +#include <cstdio>
 +#include <cstdlib>
++#include <cstring>
 +#include <string_view>
 +
 +namespace ninfer::models::qwen3_5::detail {
@@ -8374,10 +8412,11 @@ index 0000000000000000000000000000000000000000..c95f65806648462c8c666261871241c3
 +class CheckpointBufferPool {
 +    using Pool=BoundedCheckpointBufferPool<PinnedHostBuffer>;
 +public:
-+    CheckpointBufferPool(std::size_t capacity,std::size_t image_bytes)
++    CheckpointBufferPool(std::size_t capacity,std::size_t image_bytes,bool prewarm=false)
 +        : pool_(std::make_shared<Pool>(capacity,image_bytes)) {
-+        std::fprintf(stderr,"CHECKPOINT_POOL capacity=%zu image_bytes=%zu maximum_cached_bytes=%zu prewarm=0\n",
-+                     capacity,image_bytes,capacity*image_bytes);
++        if (prewarm) pool_->prewarm(capacity,[](auto& image) { std::memset(image.data(),0,image.size()); });
++        std::fprintf(stderr,"CHECKPOINT_POOL capacity=%zu image_bytes=%zu maximum_cached_bytes=%zu prewarm=%zu\n",
++                     capacity,image_bytes,capacity*image_bytes,prewarm ? capacity : 0);
 +    }
 +    std::shared_ptr<PinnedHostBuffer> acquire(std::size_t bytes) { return pool_->acquire(bytes); }
 +    void close() noexcept {
@@ -8825,10 +8864,10 @@ index 0000000000000000000000000000000000000000..17052b71a874111621aca5bc6eb1d868
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6de4f13ade
+index 0000000000000000000000000000000000000000..bcbba273d8f0a336e7142379fb2a3ccdf2f21ef8
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,1599 @@
+@@ -0,0 +1,1601 @@
 +#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
@@ -10026,7 +10065,8 @@ index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6d
 +                auto& checkpoint = memory_checkpoint_slot(history, *pending->checkpoint);
 +                if (!checkpoint || checkpoint->state || checkpoint->cold_state.size() != work.state.size())
 +                    throw std::logic_error("prepared state image changed before publication");
-+                auto state = std::make_unique<PinnedHostBuffer>(work.state.size());
++                auto state = memory_checkpoint_pool ? memory_checkpoint_pool->acquire(work.state.size())
++                    : std::make_shared<PinnedHostBuffer>(work.state.size());
 +                std::memcpy(state->data(), work.state.data(), work.state.size());
 +                checkpoint->state = std::move(state);
 +                checkpoint->cold_state = {};
@@ -10112,7 +10152,8 @@ index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6d
 +    for (const auto kind : kKvmemCheckpointKinds) {
 +        auto& slot = memory_checkpoint_slot(*history, kind);
 +        if (!slot || slot->state || !slot->cold_state.size()) continue;
-+        auto state = std::make_unique<PinnedHostBuffer>(slot->cold_state.size());
++        auto state = memory_checkpoint_pool ? memory_checkpoint_pool->acquire(slot->cold_state.size())
++            : std::make_shared<PinnedHostBuffer>(slot->cold_state.size());
 +        slot->cold_state.read(0, state->data(), state->size());
 +        slot->state = std::move(state);
 +        slot->cold_state = {};
@@ -15139,7 +15180,7 @@ index b8d4e3dabc5fbb82bab450c135816c465c1f4167..8d8e528cf59fbc6416ce8acec4068748
      struct Impl;
      std::unique_ptr<Impl> impl_;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..fbf08d09c621270fc88846b6b8d6f20c251c2952 100644
+index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..42d8ff906b3784fb0e891c6f4d1e83225978850c 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -9,10 +9,38 @@ include(cmake/BenchSupportTests.cmake)
@@ -15181,7 +15222,7 @@ index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..fbf08d09c621270fc88846b6b8d6f20c
  # Exit code 77 is a skip for every test (tests/cuda_availability.h). Without a usable CUDA device --
  # no GPU, no driver, or only the toolkit's stub driver, as on a CI runner -- a test that has no check
  # of its own fails on its first CUDA call with one of these runtime messages; report that as skipped
-@@ -21,8 +49,114 @@ ninfer_finalize_bundle(ninfer_tests)
+@@ -21,8 +49,118 @@ ninfer_finalize_bundle(ninfer_tests)
  get_property(_ninfer_all_tests DIRECTORY PROPERTY TESTS)
  set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_REGULAR_EXPRESSION
    "CUDA driver is a stub library;no CUDA-capable device is detected;CUDA driver version is insufficient for CUDA runtime version")
@@ -15296,6 +15337,10 @@ index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..fbf08d09c621270fc88846b6b8d6f20c
 +  ninfer_qwen3_5_mtp_graph_profiles_test ninfer_serve_options_test)
 +ninfer_finalize_bundle(ninfer_kvmem_nvfp4_tests)
 +ninfer_stage_runtime_dlls(ninfer_kvmem_nvfp4_tests)
++
++# Bounded host checkpoint leases and startup residency; no CUDA execution.
++ninfer_add_test(ninfer_checkpoint_buffer_resident_test STANDALONE
++  SOURCES host/test_checkpoint_buffer_resident.cpp)
 diff --git a/tests/README.md b/tests/README.md
 index 2a5ca0eb92d7c45741eaad388f0d2f9f789b00c7..7d010d046055e9427595db94b5ab48055ba0ced4 100644
 --- a/tests/README.md
@@ -19941,6 +19986,53 @@ index 0000000000000000000000000000000000000000..dd5f61073c604a3a2c0ea2b968be070c
 +        std::cerr << "TOKEN_SUMS FAIL " << error.what() << '\n';
 +        return 1;
 +    }
++}
+diff --git a/tests/host/test_checkpoint_buffer_resident.cpp b/tests/host/test_checkpoint_buffer_resident.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c8894a1d3cedc7f134cc37eed0275510b24a90cf
+--- /dev/null
++++ b/tests/host/test_checkpoint_buffer_resident.cpp
+@@ -0,0 +1,41 @@
++#include "models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h"
++#include <algorithm>
++
++#include <cstring>
++#include <iostream>
++#include <vector>
++struct Image {
++    static inline unsigned allocations=0,releases=0;
++    explicit Image(std::size_t n):bytes(n) {++allocations;}
++    ~Image(){++releases;}
++    void* data(){return bytes.data();}
++    std::size_t size()const{return bytes.size();}
++    std::vector<std::byte> bytes;
++};
++#define REQUIRE(condition) do { if (!(condition)) throw std::runtime_error(#condition); } while (false)
++using Pool=ninfer::models::qwen3_5::detail::BoundedCheckpointBufferPool<Image>;
++int main(){
++    {
++        auto pool=std::make_shared<Pool>(23,4096);
++        pool->prewarm(23,[](Image& i){std::memset(i.data(),0,i.size());});
++        REQUIRE(Image::allocations==23 && pool->statistics().cached==23);
++        for(unsigned round=0;round<100;++round){
++            std::vector<std::shared_ptr<Image>> live;
++            for(unsigned i=0;i<23;++i){auto p=pool->acquire(4096);std::fill(p->bytes.begin(),p->bytes.end(),std::byte(i));live.push_back(p);}
++            for(unsigned i=0;i<23;++i)REQUIRE(live[i]->bytes[0]==std::byte(i));
++            auto alias=live.front();live.clear();REQUIRE(pool->statistics().cached==22);
++            REQUIRE(alias->bytes[0]==std::byte(0));
++        }
++        REQUIRE(Image::allocations==23 && Image::releases==0);
++        bool rejected=false;try{pool->prewarm(24,[](Image&){});}catch(const std::invalid_argument&){rejected=true;}REQUIRE(rejected);
++        auto held=pool->acquire(4096);pool->close();REQUIRE(held->bytes.size()==4096);
++    }
++    REQUIRE(Image::allocations==Image::releases);
++    {
++        auto pool=std::make_shared<Pool>(4,4096);unsigned touched=0;
++        bool failed=false;try{pool->prewarm(4,[&](Image&){if(++touched==3)throw std::runtime_error("injected touch failure");});}catch(const std::runtime_error&){failed=true;}
++        REQUIRE(failed && pool->statistics().cached==3);
++    }
++    REQUIRE(Image::allocations==Image::releases);
++    std::cout<<"PASS:23 independent warmed leases,100 churn cycles,no runtime allocation/free,shared aliases,close lifetime,touch-failure cleanup,bounds\n";
 +}
 diff --git a/tests/host/test_prefill_service_work.cpp b/tests/host/test_prefill_service_work.cpp
 new file mode 100644
