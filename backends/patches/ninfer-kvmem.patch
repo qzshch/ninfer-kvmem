@@ -1,13 +1,13 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 11bc2bc30811c944fc4e4a1c16373806da33c96e..644640cf406d550f5dfab2e3d3af13ad74053ded 100644
+index 11bc2bc30811c944fc4e4a1c16373806da33c96e..05a3d2b34a2c79aedf0f7defc3bdf473dd6ef60c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -1,5 +1,17 @@
  cmake_minimum_required(VERSION 3.28)
  
-+# This build contains the bounded host preparation/qualification tool only. It does not
-+# publish an Engine or initialize CUDA/SynapseAI; the CUDA product build remains below.
-+option(NINFER_GAUDI2_PREPARATION_ONLY "Build the standalone Gaudi2 block-FP8 preparation tool" OFF)
++# Gaudi2 targets are separate from the CUDA Engine. Host preparation/tests need no
++# SDK; the native Linux library/smokes require actual SynapseAI headers and library.
++option(NINFER_GAUDI2_PREPARATION_ONLY "Build Gaudi2 host preparation and offline qualification" OFF)
 +option(NINFER_GAUDI2_NATIVE_RUNTIME "Build the native Linux SynapseAI resource adapter" OFF)
 +option(NINFER_GAUDI2_SDK_HEADER_CHECK "Compile the resource adapter against actual SDK headers only" OFF)
 +if(NINFER_GAUDI2_PREPARATION_ONLY OR NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
@@ -514,15 +514,16 @@ index 09381b4e9abfb5576fba68b43b81ce896a1f1afb..b3eb36950ae216647e28fdc029fadf72
                                        envelope_, workspace_, output_tensor_, stream);
      }
 diff --git a/docs/README.md b/docs/README.md
-index 65f99bc29093c167140ddc7f02082df192e28126..594a6b6ead4fb6cfa7fcdeffad407aff6ca54cd2 100644
+index 65f99bc29093c167140ddc7f02082df192e28126..fa4ab3efe4788940bf3d4ecbfc03082233981edd 100644
 --- a/docs/README.md
 +++ b/docs/README.md
-@@ -45,6 +45,8 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
+@@ -45,6 +45,9 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
  
  ## Repository-local guides
  
 +- [Gaudi2 block-FP8 preparation](gaudi2-preparation.md): standalone host tool, numerical profile and current implementation boundary.
 +- [Native Gaudi2 resources](gaudi2-runtime.md): real-SDK adapter, DMA leases, offline lifecycle tests and device-validation limits.
++- [Native Gaudi2 BF16 GEMM](gaudi2-bf16-gemm.md): static linear graph, output casts, recipe/workspace ownership and offline qualification.
  - [Benchmarks](../bench/README.md)
  - [Tests](../tests/README.md)
  - [Tools](../tools/README.md)
@@ -548,12 +549,126 @@ index b1311bea4c50adf2640dda4292313fb56d7579d3..c06d9e4a63ce3013399c694bc93efcd0
  | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
  | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
  | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
+diff --git a/docs/gaudi2-bf16-gemm.md b/docs/gaudi2-bf16-gemm.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cfbb60af729e42a1d9450187961638b8c3aafad8
+--- /dev/null
++++ b/docs/gaudi2-bf16-gemm.md
+@@ -0,0 +1,108 @@
++# Native Gaudi2 BF16 GEMM
++
++`src/ops/gaudi2/bf16_gemm.h` implements one explicit static linear operator:
++
++```text
++A[M,K] BF16, W[N,K] BF16 -> Y[M,N] BF16 = A * transpose(W)
++```
++
++All planes are compact row-major. There is no bias, alpha/beta, arbitrary stride,
++dynamic-M launch or fused activation. The shape is fixed when constructing
++`Bf16Gemm(device, {M,N,K}, max_workspace_bytes)`; another shape requires another
++recipe. Dimensions must be positive signed-32-bit extents, byte products must fit
++`size_t`, and the three device allocations must match the required byte sizes
++exactly and be disjoint. This supports a BF16 weight tile produced from the
++official block-FP8 preparation path, but does not implement its model loader or
++streaming schedule. It is not an FP8-MME/W8A8 operator.
++
++## Graph and numerical contract
++
++The graph uses native `gemm`, input order `{A,W}` and
++`synGEMMParams{false,true}`. Synapse's FCD-first geometries are `{K,M}`, `{K,N}`
++and `{N,M}` respectively; there is no physical weight transpose or hidden host
++copy. All three tensors have explicit BF16 device type and permutation disabled.
++Each occupies its own persistent section at offset zero. W is an ordinary
++runtime input, not a `SetHostPtr`/const tensor copied into a recipe.
++
++The MME node explicitly requests `synRoundToNearest`. The SDK documents its
++default as round-nearest-even; the
++[Gaudi architecture documentation](https://docs.habana.ai/en/latest/Gaudi_Overview/Gaudi_Architecture.html)
++states that Gaudi2 MME data types accumulate in FP32. Output is nevertheless
++**BF16**, including its final rounding boundary. Composing multiple linears
++requires a BF16 cast after each output; FP32 accumulation does not make the
++outputs FP32. Hardware reduction order, subnormal handling and numerical error
++remain to be qualified on Gaudi2.
++
++The mapping follows the fixed official PyTorch bridge's
++[shape reversal](https://github.com/HabanaAI/gaudi-pytorch-bridge/blob/5176b1b2d6865608514e83a2b1fd66459920676e/backend/synapse_helpers/tensor_builder_base.cpp#L23)
++and [linear/GEMM parameters](https://github.com/HabanaAI/gaudi-pytorch-bridge/blob/5176b1b2d6865608514e83a2b1fd66459920676e/habana_kernels/linear_kernels.cpp#L37).
++These are interface/layout evidence, not a substitute for physical execution.
++
++## Ownership and execution
++
++Graph construction uses current tensor-handle/geometry/type/section APIs.
++Construction releases external tensor handles before graph destruction, matching
++the SDK's reference-count contract. The compiled recipe remains independent of
++those construction handles. Tensor IDs are queried by the explicit names
++`A`, `W`, `Y`; IDs are not guessed from enumeration order. Launch uses the
++current `synLaunchWithExternalEventsExt` API, flags zero and no external events,
++with actual IDs, device addresses and static geometries.
++
++The physical runtime owns the recipe and its workspace. Workspace size is queried
++after compilation and rejected before allocation when it exceeds the explicit
++budget; zero workspace creates no allocation. A `Compute` completion holds the
++recipe, workspace, stream and A/W/Y allocations until its event completes.
++Compute has its own operand/workspace leases, distinct from a completed upload's
++DMA leases. Pending uploads must first be observed complete. While compute is
++pending, operand access, overwrite, download and another use of that recipe's
++workspace are rejected. Read-sharing/concurrent launches are not implemented.
++
++The closed operator validates buffer sizes/aliasing before the private native
++launch primitive. Arbitrary caller-created `RecipeBinding` objects cannot invoke
++that primitive. `Stream::native_handle()` still requires callers to own resources
++for any external operations they enqueue themselves.
++
++Launch failure may be ambiguous: the implementation drains its stream before
++releasing leases even if the driver returned an error after admitting work.
++Event-record failure follows the same rule. Explicit query/wait failures retain
++leases. Destroying or replacing an unfinished `Compute` waits for it; a final
++unrecoverable fence/cleanup failure terminates rather than freeing active memory.
++There is no cross-stream event-chaining or compute/DMA-overlap claim.
++
++## Build and evidence
++
++The host preparation build includes `ninfer-gaudi2-bf16-gemm-test`. Its private
++fake API validates graph descriptors, persistent sections, dtype, rounding,
++transpose, nonpositional tensor IDs and bound addresses. It delays simulated
++FP32-FMA computation until an event is drained. An independent FP64 formula
++decodes the BF16 inputs and chooses the nearest BF16 result by numerical distance.
++Fixtures use exact dyadic sums to distinguish matrix/cast semantics without
++claiming that the hardware's FP32 reduction order is identical.
++
++Tests include asymmetric `M=2,N=3,K=5`, BF16 midpoint ties, a 513-term case that
++would lose increments under BF16 accumulation, and an output tile with real
++Qwen `K=5120`. They cover workspace bounds/zero workspace, partial graph failure,
++compile/ID/allocation failure, queued-launch errors, event failures, move and
++destruction lifetimes, operand reuse and later unrelated DMA. A full
++`{1,17408,5120}` FFN resource query is checked without allocating a full weight
++matrix. These tests qualify the graph/Host contract and reference semantics;
++they are **not MME hardware numerical or performance evidence**.
++
++The production runtime and GEMM source files were independently compiled against
++verified official SynapseAI 1.24.1-482 headers with MSVC 14.44 x64, C++20 and
++`/W4 /WX` (external vendor warnings excluded). Native linking, graph compilation
++by `libSynapse`, physical launch/readback and throughput remain unverified.
++
++The [native runtime build](gaudi2-runtime.md) also builds
++`ninfer-gaudi2-gemm-smoke`. On a configured Gaudi2 Linux host, explicitly run:
++
++```sh
++build-gaudi2-native/src/core/gaudi2/ninfer-gaudi2-gemm-smoke
++```
++
++It uploads the asymmetric 2x3x5 fixture, launches the real recipe, downloads Y
++and compares the exact golden values `[[17,3,11.5],[-7.5,12,-8]]`.
++The smoke is not registered in host-only CI and has not been executed on Gaudi2.
++Model-level linear binding, quantized device dequantization, GQA/GDN, full-KV and
++KVMem integration remain later work; no public Engine HPU generation route is
++advertised by this increment.
 diff --git a/docs/gaudi2-preparation.md b/docs/gaudi2-preparation.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..d1425b67cd2191e1854f06471adb3537abd7576d
+index 0000000000000000000000000000000000000000..216d77641f8cbca9669756003506f0a5d6db7019
 --- /dev/null
 +++ b/docs/gaudi2-preparation.md
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,83 @@
 +# Gaudi2 block-FP8 preparation
 +
 +The Gaudi2 development path currently provides a standalone C++ host preparation
@@ -561,8 +676,10 @@ index 0000000000000000000000000000000000000000..d1425b67cd2191e1854f06471adb3537
 +[native resource adapter](gaudi2-runtime.md) supplies SynapseAI device/Host storage,
 +streams and DMA fences, with offline lifecycle qualification. It does not execute
 +a model on HPU. The ordinary NInfer Engine and CUDA build keep their existing path.
-+Recipes, TPC/MME execution, GDN, full-KV generation and KVMem device integration
-+remain to be implemented.
++The [static BF16 GEMM Op](gaudi2-bf16-gemm.md) supplies the first native recipe
++and launch ownership path, with real-SDK compile and offline graph/math checks.
++Physical TPC/MME execution remains unverified; GDN, full-KV generation and KVMem
++device integration remain to be implemented.
 +
 +Build without CUDA or the Gaudi SDK (CMake 3.28+, C++20, Python 3.11+):
 +
@@ -637,17 +754,19 @@ index 0000000000000000000000000000000000000000..d1425b67cd2191e1854f06471adb3537
 +copied into this host implementation.
 diff --git a/docs/gaudi2-runtime.md b/docs/gaudi2-runtime.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7038581d6924a6fefe94ad2ea505af39b6879b9
+index 0000000000000000000000000000000000000000..98c872fa1ff30bf54e38b4cf887412b1b0b4dba7
 --- /dev/null
 +++ b/docs/gaudi2-runtime.md
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,108 @@
 +# Native Gaudi2 resources
 +
 +`src/core/gaudi2/runtime.h` and `.cpp` provide the first native SynapseAI resource
 +boundary for the future Qwen runner. They call the real C API directly: initialize
 +and acquire Gaudi2, allocate device and pinned Host storage, create streams, queue
-+H2D/D2H copies, record/query/wait events and query free/total memory. They do not
-+execute model mathematics, compile recipes or substitute a PyTorch inference worker.
++H2D/D2H copies, record/query/wait events and query free/total memory. The resource
++layer also compiles native graphs into bounded-workspace recipes and owns compute
++completion. The closed [BF16 GEMM Op](gaudi2-bf16-gemm.md) owns the first graph's
++mathematics; this layer does not substitute a PyTorch inference worker.
 +
 +One standalone native session owns one Gaudi2 device. Resource objects retain
 +that session, so releasing the `Device` facade before a pending transfer does not
@@ -675,7 +794,8 @@ index 0000000000000000000000000000000000000000..e7038581d6924a6fefe94ad2ea505af3
 +
 +`Stream::native_handle()` permits future recipe integration. External queued
 +compute must retain its own buffers and completion fences. A `Transfer` retains
-+only the operands of its own copy. There is no `synStreamWaitEvent`/cross-stream
++only the operands of its own copy. The native GEMM's separate `Compute` owns its
++recipe, workspace and all device operands. There is no `synStreamWaitEvent`/cross-stream
 +compute dependency implementation in this increment and no claim of compute/DMA
 +overlap, recipe completion ownership or asynchronous model inference.
 +
@@ -742,8 +862,10 @@ index 0000000000000000000000000000000000000000..e7038581d6924a6fefe94ad2ea505af3
 +empty/range failures, failed allocation/create/submit/record/query/wait and retry.
 +Linux linking, driver initialization, physical DMA, SDK failure semantics, actual
 +HBM/free-memory observations and the smoke executable remain unverified without
-+a Gaudi2 environment. Recipe/TPC/MME, GDN/full-KV, model generation and KVMem device
-+integration remain later work. No throughput or HPU memory-peak claim is made.
++a Gaudi2 environment. Native static GEMM recipe construction/launch ownership is
++implemented and offline tested; physical MME execution, TPC dequantization,
++GDN/full-KV, model generation and KVMem device integration remain to be qualified
++or implemented. No throughput or HPU memory-peak claim is made.
 diff --git a/docs/gemma4.md b/docs/gemma4.md
 index ce79ebe92acfe76124a6dbff076f641837042799..c46fd0027a6bf43a08225bef9d6c30f05ad4a041 100644
 --- a/docs/gemma4.md
@@ -2390,10 +2512,10 @@ index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..c6fd4ea216d0e03aad5fd0ad51418ada6a3415e1
+index 0000000000000000000000000000000000000000..54680e8aa9f27c23567603c7a1b5accb0e2af18b
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,70 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -2416,12 +2538,22 @@ index 0000000000000000000000000000000000000000..c6fd4ea216d0e03aad5fd0ad51418ada
 +# with a strict asynchronous test double. These includes/defines are PRIVATE to
 +# this target; no fake SDK can be selected as a product fallback.
 +add_executable(ninfer-gaudi2-runtime-lifecycle-test
-+  runtime.cpp tests/runtime_lifecycle_test.cpp tests/fake_synapse/fake_synapse.cpp)
++  runtime.cpp tests/runtime_lifecycle_test.cpp tests/fake_synapse/fake_synapse.cpp
++  tests/fake_synapse/fake_gemm.cpp)
 +target_compile_features(ninfer-gaudi2-runtime-lifecycle-test PRIVATE cxx_std_20)
 +target_compile_definitions(ninfer-gaudi2-runtime-lifecycle-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
 +target_include_directories(ninfer-gaudi2-runtime-lifecycle-test PRIVATE
 +  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
 +add_test(NAME ninfer-gaudi2-runtime-lifecycle COMMAND ninfer-gaudi2-runtime-lifecycle-test)
++
++add_executable(ninfer-gaudi2-bf16-gemm-test runtime.cpp
++  ../../ops/gaudi2/bf16_gemm.cpp tests/bf16_gemm_test.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
++target_compile_features(ninfer-gaudi2-bf16-gemm-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-bf16-gemm-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-bf16-gemm-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-bf16-gemm COMMAND ninfer-gaudi2-bf16-gemm-test)
 +
 +if(NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
 +  find_path(NINFER_SYNAPSE_INCLUDE_DIR synapse_api.h
@@ -2429,9 +2561,10 @@ index 0000000000000000000000000000000000000000..c6fd4ea216d0e03aad5fd0ad51418ada
 +  if(NOT NINFER_SYNAPSE_INCLUDE_DIR)
 +    message(FATAL_ERROR "Actual SynapseAI headers required: set NINFER_SYNAPSE_INCLUDE_DIR")
 +  endif()
-+  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp)
++  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp)
 +  target_compile_features(ninfer_gaudi2_runtime_sdk_check PRIVATE cxx_std_20)
-+  target_include_directories(ninfer_gaudi2_runtime_sdk_check PRIVATE "${NINFER_SYNAPSE_INCLUDE_DIR}")
++  target_include_directories(ninfer_gaudi2_runtime_sdk_check PRIVATE "${NINFER_SYNAPSE_INCLUDE_DIR}"
++    "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 +endif()
 +if(NINFER_GAUDI2_NATIVE_RUNTIME)
 +  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -2445,10 +2578,12 @@ index 0000000000000000000000000000000000000000..c6fd4ea216d0e03aad5fd0ad51418ada
 +  add_library(ninfer_gaudi2_runtime STATIC $<TARGET_OBJECTS:ninfer_gaudi2_runtime_sdk_check>)
 +  target_compile_features(ninfer_gaudi2_runtime PUBLIC cxx_std_20)
 +  target_include_directories(ninfer_gaudi2_runtime PUBLIC
-+    "${CMAKE_CURRENT_SOURCE_DIR}" "${NINFER_SYNAPSE_INCLUDE_DIR}")
++    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../.." "${NINFER_SYNAPSE_INCLUDE_DIR}")
 +  target_link_libraries(ninfer_gaudi2_runtime PUBLIC "${NINFER_SYNAPSE_LIBRARY}")
 +  add_executable(ninfer-gaudi2-dma-smoke runtime_smoke.cpp)
 +  target_link_libraries(ninfer-gaudi2-dma-smoke PRIVATE ninfer_gaudi2_runtime)
++  add_executable(ninfer-gaudi2-gemm-smoke ../../ops/gaudi2/bf16_gemm_smoke.cpp)
++  target_link_libraries(ninfer-gaudi2-gemm-smoke PRIVATE ninfer_gaudi2_runtime)
 +  # Device execution is deliberate and is never registered in host-only CTest.
 +endif()
 diff --git a/src/core/gaudi2/block_fp8.cpp b/src/core/gaudi2/block_fp8.cpp
@@ -2840,16 +2975,17 @@ index 0000000000000000000000000000000000000000..adb77ed64e4f26b49584ba0154c8f3e7
 +}
 diff --git a/src/core/gaudi2/runtime.cpp b/src/core/gaudi2/runtime.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f9b982c1a
+index 0000000000000000000000000000000000000000..c5c686e4bce5e5284e884967ad0aec58531f6e89
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,289 @@
 +#include "runtime.h"
 +
 +#include <atomic>
 +#include <exception>
 +#include <limits>
 +#include <utility>
++#include <vector>
 +
 +namespace ninfer::gaudi2 {
 +namespace {
@@ -2951,6 +3087,53 @@ index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f
 +        cleanup(synEventDestroy(event));
 +    }
 +};
++struct RecipeState {
++    std::shared_ptr<DeviceState> device;
++    synRecipeHandle handle = nullptr;
++    std::shared_ptr<DeviceStorage> workspace;
++    bool leased = false;
++    RecipeState(std::shared_ptr<DeviceState> d, synGraphHandle graph, const char* name,
++                std::size_t max_workspace_bytes) : device(std::move(d)) {
++        check(synGraphCompile(&handle, graph, name, nullptr), "synGraphCompile");
++        try {
++            std::uint64_t bytes = 0;
++            check(synWorkspaceGetSize(&bytes, handle), "synWorkspaceGetSize");
++            if (bytes > max_workspace_bytes || bytes > std::numeric_limits<std::size_t>::max())
++                throw std::length_error("Gaudi2 recipe workspace exceeds its explicit budget");
++            if (bytes) workspace = std::make_shared<DeviceStorage>(device, static_cast<std::size_t>(bytes));
++        } catch (...) { cleanup(synRecipeDestroy(handle)); throw; }
++    }
++    ~RecipeState() { cleanup(synRecipeDestroy(handle)); }
++};
++struct ComputeState {
++    std::shared_ptr<StreamState> stream;
++    std::shared_ptr<RecipeState> recipe;
++    std::vector<std::shared_ptr<DeviceStorage>> buffers;
++    std::vector<synLaunchTensorInfoExt> bindings;
++    synEventHandle event = nullptr;
++    bool leased = false, submitted = false, recorded = false, completed = false;
++    ComputeState(std::shared_ptr<StreamState> s, std::shared_ptr<RecipeState> r)
++        : stream(std::move(s)), recipe(std::move(r)) {
++        check(synEventCreate(&event, stream->device->id, 0), "synEventCreate(compute)");
++    }
++    void release() noexcept {
++        if (!leased) return;
++        for (const auto& buffer : buffers) buffer->leased = false;
++        if (recipe->workspace) recipe->workspace->leased = false;
++        recipe->leased = false; leased = false;
++    }
++    void wait() {
++        if (!completed && submitted)
++            check(recorded ? synEventSynchronize(event) : synStreamSynchronize(stream->handle),
++                  recorded ? "synEventSynchronize(compute)" : "synStreamSynchronize(after launch failure)");
++        completed = true; release();
++    }
++    ~ComputeState() {
++        if (!completed && submitted)
++            cleanup(recorded ? synEventSynchronize(event) : synStreamSynchronize(stream->handle));
++        release(); cleanup(synEventDestroy(event));
++    }
++};
 +} // namespace detail
 +
 +Device::Device() : state_(std::make_shared<detail::DeviceState>()) {}
@@ -2968,9 +3151,22 @@ index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f
 +    check(synDeviceGetMemoryInfo(state_->id, &info.free_bytes, &info.total_bytes), "synDeviceGetMemoryInfo");
 +    return info;
 +}
++Recipe Device::compile(synGraphHandle graph, const char* name, std::size_t max_workspace_bytes) const {
++    if (!graph || !name || !*name) throw std::invalid_argument("Gaudi2 compile requires graph and recipe name");
++    return Recipe(std::make_shared<detail::RecipeState>(state_, graph, name, max_workspace_bytes));
++}
++std::size_t Recipe::workspace_bytes() const noexcept {
++    return state_ && state_->workspace ? state_->workspace->size : 0;
++}
++void Recipe::tensor_ids(std::span<const char*> names, std::span<std::uint64_t> ids) const {
++    if (!state_ || names.empty() || names.size() != ids.size() || names.size() > std::numeric_limits<std::uint32_t>::max())
++        throw std::invalid_argument("Gaudi2 tensor id query has invalid recipe or planes");
++    check(synTensorRetrieveIds(state_->handle, names.data(), ids.data(), static_cast<std::uint32_t>(names.size())),
++          "synTensorRetrieveIds");
++}
 +std::size_t DeviceBuffer::size() const noexcept { return state_ ? state_->size : 0; }
 +std::uint64_t DeviceBuffer::address() const {
-+    if (!state_ || state_->leased) throw std::logic_error("Gaudi2 device buffer is empty or leased by DMA");
++    if (!state_ || state_->leased) throw std::logic_error("Gaudi2 device buffer is empty or leased by queued work");
 +    return state_->address;
 +}
 +std::size_t PinnedBuffer::size() const noexcept { return state_ ? state_->size : 0; }
@@ -3011,6 +3207,39 @@ index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f
 +                          std::size_t destination_offset, std::size_t source_offset) {
 +    return copy(source, destination, false, bytes, source_offset, destination_offset);
 +}
++Compute Stream::launch(Recipe& recipe, std::span<const RecipeBinding> bindings) {
++    (void)native_handle();
++    if (!recipe.state_ || recipe.state_->device != state_->device || bindings.empty() ||
++        bindings.size() > std::numeric_limits<std::uint32_t>::max())
++        throw std::invalid_argument("Gaudi2 recipe/bindings do not belong to this device");
++    if (recipe.state_->leased) throw std::logic_error("Gaudi2 recipe/workspace still has an in-flight launch");
++    auto execution = std::make_unique<detail::ComputeState>(state_, recipe.state_);
++    execution->buffers.reserve(bindings.size()); execution->bindings.reserve(bindings.size());
++    for (const auto& binding : bindings) {
++        if (!binding.buffer || !binding.buffer->state_ || binding.buffer->state_->device != state_->device ||
++            !binding.sizes[0] || !binding.sizes[1])
++            throw std::invalid_argument("Gaudi2 recipe binding has an empty/foreign buffer or shape");
++        if (binding.buffer->state_->leased) throw std::logic_error("Gaudi2 compute operand is already leased");
++        for (const auto& previous : execution->bindings)
++            if (previous.tensorId == binding.tensor_id || previous.pTensorAddress == binding.buffer->state_->address)
++                throw std::invalid_argument("Gaudi2 recipe bindings alias an id or device allocation");
++        synLaunchTensorInfoExt info{};
++        info.tensorId = binding.tensor_id; info.pTensorAddress = binding.buffer->state_->address;
++        info.tensorType = DATA_TENSOR; info.tensorSize[0] = binding.sizes[0]; info.tensorSize[1] = binding.sizes[1];
++        execution->bindings.push_back(info); execution->buffers.push_back(binding.buffer->state_);
++    }
++    execution->leased = true; recipe.state_->leased = true;
++    for (const auto& buffer : execution->buffers) buffer->leased = true;
++    if (recipe.state_->workspace) recipe.state_->workspace->leased = true;
++    execution->submitted = true;
++    check(synLaunchWithExternalEventsExt(state_->handle, execution->bindings.data(),
++          static_cast<std::uint32_t>(execution->bindings.size()),
++          recipe.state_->workspace ? recipe.state_->workspace->address : 0,
++          recipe.state_->handle, nullptr, 0, 0), "synLaunchWithExternalEventsExt");
++    check(synEventRecord(execution->event, state_->handle), "synEventRecord(compute)");
++    execution->recorded = true;
++    return Compute(std::move(execution));
++}
 +Transfer::Transfer() = default;
 +Transfer::Transfer(std::unique_ptr<detail::TransferState> state) : state_(std::move(state)) {}
 +Transfer::~Transfer() = default;
@@ -3025,23 +3254,38 @@ index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f
 +    state_->completed = true; state_->release();
 +    return true;
 +}
++Compute::Compute() = default;
++Compute::Compute(std::unique_ptr<detail::ComputeState> state) : state_(std::move(state)) {}
++Compute::~Compute() = default;
++Compute::Compute(Compute&&) noexcept = default;
++Compute& Compute::operator=(Compute&&) noexcept = default;
++void Compute::wait() { if (state_) state_->wait(); }
++bool Compute::ready() {
++    if (!state_ || state_->completed) return true;
++    const auto status = synEventQuery(state_->event);
++    if (status == synBusy) return false;
++    check(status, "synEventQuery(compute)");
++    state_->completed = true; state_->release(); return true;
++}
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.h b/src/core/gaudi2/runtime.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23258f910c
+index 0000000000000000000000000000000000000000..815b2eaa71a26eab0ea0a89fa6923d3aaa98a0bd
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,153 @@
 +#pragma once
 +
 +#include <synapse_api.h>
 +
 +#include <cstddef>
 +#include <cstdint>
++#include <array>
 +#include <memory>
 +#include <span>
 +#include <stdexcept>
 +#include <string>
++#include <utility>
 +
 +namespace ninfer::gaudi2 {
 +class SynapseError : public std::runtime_error {
@@ -3053,16 +3297,19 @@ index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23
 +};
 +
 +namespace detail { struct DeviceState; struct DeviceStorage; struct HostStorage;
-+                   struct StreamState; struct TransferState; }
++                   struct StreamState; struct TransferState; struct RecipeState; struct ComputeState; }
 +class Stream;
 +class Transfer;
++class Recipe;
++class Compute;
++class Bf16Gemm;
 +
 +class DeviceBuffer {
 +public:
 +    DeviceBuffer() = default;
 +    [[nodiscard]] std::size_t size() const noexcept;
-+    // Host-side accessors reject a pending DMA lease. Returned addresses/spans must
-+    // not be used after submitting a transfer until that transfer has completed.
++    // Accessors reject pending DMA/compute leases. Returned addresses/spans must
++    // not be used after submitting queued work until its completion is observed.
 +    [[nodiscard]] std::uint64_t address() const;
 +private:
 +    friend class Device; friend class Stream;
@@ -3099,6 +3346,40 @@ index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23
 +    std::unique_ptr<detail::TransferState> state_;
 +};
 +
++// Physical, compiled SynapseAI recipe with bounded, recipe-owned device workspace.
++class Recipe {
++public:
++    Recipe() = default;
++    [[nodiscard]] std::size_t workspace_bytes() const noexcept;
++    void tensor_ids(std::span<const char*> names, std::span<std::uint64_t> ids) const;
++private:
++    friend class Device; friend class Stream;
++    explicit Recipe(std::shared_ptr<detail::RecipeState> state) : state_(std::move(state)) {}
++    std::shared_ptr<detail::RecipeState> state_;
++};
++
++struct RecipeBinding {
++    std::uint64_t tensor_id;
++    DeviceBuffer* buffer;
++    std::array<std::uint64_t, 2> sizes; // FCD first, matching the fixed graph geometry.
++};
++
++class Compute {
++public:
++    Compute();
++    ~Compute();
++    Compute(Compute&&) noexcept;
++    Compute& operator=(Compute&&) noexcept;
++    Compute(const Compute&) = delete;
++    Compute& operator=(const Compute&) = delete;
++    void wait();
++    [[nodiscard]] bool ready();
++private:
++    friend class Stream;
++    explicit Compute(std::unique_ptr<detail::ComputeState> state);
++    std::unique_ptr<detail::ComputeState> state_;
++};
++
 +class Stream {
 +public:
 +    Stream() = default;
@@ -3113,7 +3394,10 @@ index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23
 +                                    std::size_t bytes, std::size_t destination_offset = 0,
 +                                    std::size_t source_offset = 0);
 +private:
-+    friend class Device;
++    friend class Device; friend class Bf16Gemm;
++    // Only the closed Op may bind its validated static geometry. This is not an
++    // unchecked public tensor/graph execution interface.
++    [[nodiscard]] Compute launch(Recipe& recipe, std::span<const RecipeBinding> bindings);
 +    explicit Stream(std::shared_ptr<detail::StreamState> state) : state_(std::move(state)) {}
 +    [[nodiscard]] Transfer copy(DeviceBuffer&, PinnedBuffer&, bool upload, std::size_t,
 +                                std::size_t device_offset, std::size_t host_offset);
@@ -3137,6 +3421,8 @@ index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23
 +    [[nodiscard]] PinnedBuffer allocate_host(std::size_t bytes) const;
 +    [[nodiscard]] Stream create_stream() const;
 +    [[nodiscard]] MemoryInfo memory_info() const;
++    [[nodiscard]] Recipe compile(synGraphHandle graph, const char* name,
++                                  std::size_t max_workspace_bytes) const;
 +private:
 +    std::shared_ptr<detail::DeviceState> state_;
 +};
@@ -3272,28 +3558,412 @@ index 0000000000000000000000000000000000000000..2569a6b53a3d55cc96227d0a103c39a6
 +
 +if __name__ == '__main__':
 +    unittest.main()
+diff --git a/src/core/gaudi2/tests/bf16_gemm_test.cpp b/src/core/gaudi2/tests/bf16_gemm_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c5aacb337d35ca3409bfc369310d480a13c3789
+--- /dev/null
++++ b/src/core/gaudi2/tests/bf16_gemm_test.cpp
+@@ -0,0 +1,173 @@
++#include "ops/gaudi2/bf16_gemm.h"
++#include "control.h"
++
++#include <algorithm>
++#include <bit>
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <limits>
++#include <vector>
++
++using namespace ninfer::gaudi2;
++namespace {
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++template<class Exception, class F> void rejects(F&& f) {
++    try { f(); } catch (const Exception&) { return; }
++    throw std::runtime_error("GEMM expected exception was not raised");
++}
++double decode(std::uint16_t word) { return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16); }
++// Independent nearest-representable oracle: compare distances to adjacent BF16
++// values in FP64, resolving an exact midpoint by the even stored low bit.
++std::uint16_t nearest(double value) {
++    const auto f = static_cast<float>(value);
++    const auto prefix = std::bit_cast<std::uint32_t>(f) >> 16;
++    const double d0 = std::abs(value - decode(static_cast<std::uint16_t>(prefix)));
++    const double d1 = std::abs(value - decode(static_cast<std::uint16_t>(prefix + 1)));
++    return static_cast<std::uint16_t>(d0 < d1 || (d0 == d1 && !(prefix & 1)) ? prefix : prefix + 1);
++}
++std::vector<std::uint16_t> oracle(Bf16GemmShape shape, const std::vector<std::uint16_t>& a,
++                                  const std::vector<std::uint16_t>& w) {
++    std::vector<std::uint16_t> y(shape.m * shape.n);
++    for (std::size_t r = 0; r < shape.m; ++r) for (std::size_t c = 0; c < shape.n; ++c) {
++        double sum = 0;
++        for (std::size_t k = 0; k < shape.k; ++k) sum += decode(a[r * shape.k + k]) * decode(w[c * shape.k + k]);
++        y[r * shape.n + c] = nearest(sum);
++    }
++    return y;
++}
++void put(PinnedBuffer& host, const std::vector<std::uint16_t>& words) {
++    require(host.size() == words.size() * 2, "fixture Host size");
++    std::memcpy(host.bytes().data(), words.data(), host.size());
++}
++std::vector<std::uint16_t> get(PinnedBuffer& host) {
++    std::vector<std::uint16_t> words(host.size() / 2);
++    std::memcpy(words.data(), host.bytes().data(), host.size()); return words;
++}
++void run_case(Bf16GemmShape shape, const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& w) {
++    Device device; auto stream = device.create_stream(); Bf16Gemm gemm(device, shape, 4096);
++    auto ah = device.allocate_host(shape.a_bytes()), wh = device.allocate_host(shape.w_bytes()), yh = device.allocate_host(shape.y_bytes());
++    auto ad = device.allocate_device(shape.a_bytes()), wd = device.allocate_device(shape.w_bytes()), yd = device.allocate_device(shape.y_bytes());
++    put(ah, a); put(wh, w);
++    auto upload_a = stream.upload(ad, ah, ah.size()); auto upload_w = stream.upload(wd, wh, wh.size());
++    rejects<std::logic_error>([&] { (void)gemm.launch(stream, ad, wd, yd); });
++    upload_a.wait(); upload_w.wait();
++    auto execution = gemm.launch(stream, ad, wd, yd);
++    require(!execution.ready(), "compute must not complete merely because a DMA completed");
++    rejects<std::logic_error>([&] { (void)ad.address(); });
++    rejects<std::logic_error>([&] { (void)wd.address(); });
++    rejects<std::logic_error>([&] { (void)yd.address(); });
++    rejects<std::logic_error>([&] { (void)stream.download(yh, yd, yh.size()); });
++    execution.wait(); execution.wait(); require(execution.ready(), "compute completion must be idempotent");
++    auto download = stream.download(yh, yd, yh.size()); download.wait();
++    require(get(yh) == oracle(shape, a, w), "offline graph/math result differs from independent FP64/BF16 oracle");
++}
++void math_and_static_shapes() {
++    // Rectangular and asymmetric: catches dimensions/input order/transpose errors
++    // that square/all-ones fixtures cannot distinguish.
++    run_case({2, 3, 5}, {nearest(1), nearest(2), nearest(3), nearest(4), nearest(5),
++                         nearest(-2), nearest(.5), nearest(1), nearest(0), nearest(-3)},
++                       {nearest(2), nearest(-1), nearest(0), nearest(3), nearest(1),
++                        nearest(-1), nearest(4), nearest(2), nearest(0), nearest(-2),
++                        nearest(.5), nearest(0), nearest(-1), nearest(1), nearest(2)});
++    fake_synapse::assert_clean();
++    run_case({1, 2, 2}, {nearest(1), nearest(1)},
++                       {nearest(1), nearest(1.0 / 256), nearest(1), nearest(3.0 / 256)});
++    fake_synapse::assert_clean();
++    std::vector<std::uint16_t> a(513, nearest(1)), w(513, nearest(1.0 / 256));
++    w.back() = nearest(-2); run_case({1, 1, 513}, a, w); // BF16 accumulator would lose increments.
++    fake_synapse::assert_clean();
++    const Bf16GemmShape tile{1, 128, 5120};
++    a.resize(tile.m * tile.k); w.resize(tile.n * tile.k);
++    for (std::size_t i = 0; i < a.size(); ++i) a[i] = nearest((static_cast<int>(i % 19) - 9) / 16.0);
++    for (std::size_t i = 0; i < w.size(); ++i) w[i] = nearest((static_cast<int>((i * 7) % 23) - 11) / 16.0);
++    // Dyadic fixtures make FP32 and FP64 sums exact even at a real Qwen K extent.
++    run_case(tile, a, w); fake_synapse::assert_clean();
++    const Bf16GemmShape full_ffn{1, 17408, 5120}; full_ffn.validate();
++    require(full_ffn.a_bytes() == 10240 && full_ffn.w_bytes() == 178257920 && full_ffn.y_bytes() == 34816,
++            "real Qwen FFN resource query");
++    Device device;
++    rejects<std::invalid_argument>([&] { Bf16Gemm bad(device, {0, 3, 5}, 4096); });
++    rejects<std::invalid_argument>([&] { Bf16Gemm bad(device, {1, 3, std::numeric_limits<std::size_t>::max()}, 4096); });
++    rejects<std::overflow_error>([] { (void)Bf16GemmShape{1, 1, std::numeric_limits<std::size_t>::max()}.w_bytes(); });
++}
++void execution_lifetime() {
++    Compute retained;
++    {
++        Device device; auto stream = device.create_stream(); Bf16Gemm gemm(device, {1, 1, 1}, 4096);
++        auto ah = device.allocate_host(2), wh = device.allocate_host(2);
++        auto ad = device.allocate_device(2), wd = device.allocate_device(2), yd = device.allocate_device(2);
++        put(ah, {nearest(2)}); put(wh, {nearest(3)});
++        stream.upload(ad, ah, 2).wait(); stream.upload(wd, wh, 2).wait();
++        retained = gemm.launch(stream, ad, wd, yd);
++    }
++    require(fake_synapse::live_allocations() == 4, "compute must retain A/W/Y and workspace after all facades die");
++    retained.wait(); retained = Compute{}; fake_synapse::assert_clean();
++}
++void busy_workspace_ranges_and_fences() {
++    Device device; auto stream = device.create_stream(); Bf16Gemm gemm(device, {2, 2, 2}, 4096);
++    auto a = device.allocate_device(8), w = device.allocate_device(8), y = device.allocate_device(8);
++    auto a2 = device.allocate_device(8), w2 = device.allocate_device(8), y2 = device.allocate_device(8);
++    auto tiny = device.allocate_device(2);
++    rejects<std::invalid_argument>([&] { (void)gemm.launch(stream, tiny, w, y); });
++    rejects<std::invalid_argument>([&] { (void)gemm.launch(stream, a, a, y); });
++    auto execution = gemm.launch(stream, a, w, y);
++    rejects<std::logic_error>([&] { (void)gemm.launch(stream, a2, w2, y2); });
++    auto unrelated_host = device.allocate_host(8);
++    auto unrelated = device.allocate_device(8);
++    auto later_dma = stream.upload(unrelated, unrelated_host, 8);
++    execution.wait(); require(!later_dma.ready(), "compute fence must not complete later unrelated DMA"); later_dma.wait();
++    auto first = gemm.launch(stream, a, w, y);
++    stream.synchronize(); require(first.ready(), "successful compute query must release leases");
++    auto second = gemm.launch(stream, a2, w2, y2); first = std::move(second);
++    require(second.ready(), "moved-from Compute is empty"); first.wait();
++    Bf16Gemm other_recipe(device, {2, 2, 2}, 4096);
++    auto old_pending = gemm.launch(stream, a, w, y);
++    auto new_pending = other_recipe.launch(stream, a2, w2, y2);
++    old_pending = std::move(new_pending); // Must finish the old recipe before replacing its fence.
++    old_pending.wait();
++}
++void construction_failures() {
++    Device device;
++    for (const auto operation : {"synGraphCreate", "synTensorHandleCreate", "synTensorSetGeometry", "synTensorSetDeviceDataType",
++         "synTensorSetAllowPermutation", "synSectionCreate", "synSectionSetPersistent", "synTensorAssignToSection",
++         "synNodeCreateWithId", "synNodeSetRoundingMode", "synGraphCompile", "synWorkspaceGetSize", "synTensorRetrieveIds", "synDeviceMalloc"}) {
++        fake_synapse::fail_next(operation); rejects<SynapseError>([&] { Bf16Gemm bad(device, {2, 3, 5}, 4096); });
++        fake_synapse::assert_graph_clean(); require(!fake_synapse::live_allocations(), "failed recipe must free workspace");
++    }
++    fake_synapse::fail_after("synTensorHandleCreate", 2);
++    rejects<SynapseError>([&] { Bf16Gemm bad(device, {2, 3, 5}, 4096); }); fake_synapse::assert_graph_clean();
++    fake_synapse::set_workspace_bytes(4097);
++    rejects<std::length_error>([&] { Bf16Gemm bad(device, {2, 3, 5}, 4096); }); fake_synapse::assert_graph_clean();
++    fake_synapse::set_workspace_bytes(0);
++    {
++        Bf16Gemm zero(device, {2, 3, 5}, 0); require(!zero.workspace_bytes(), "zero workspace must not allocate hidden storage");
++        auto stream = device.create_stream();
++        auto a = device.allocate_device(20), w = device.allocate_device(30), y = device.allocate_device(12);
++        auto execution = zero.launch(stream, a, w, y); execution.wait();
++    }
++    fake_synapse::set_workspace_bytes(4096);
++}
++void launch_failures() {
++    Device device; auto stream = device.create_stream(); Bf16Gemm gemm(device, {1, 1, 1}, 4096);
++    auto a = device.allocate_device(2), w = device.allocate_device(2), y = device.allocate_device(2);
++    for (const auto operation : {"synEventCreate", "synLaunchWithExternalEventsExt", "synEventRecord"}) {
++        fake_synapse::fail_next(operation);
++        rejects<SynapseError>([&] { (void)gemm.launch(stream, a, w, y); });
++        (void)a.address(); (void)w.address(); (void)y.address();
++    }
++    auto execution = gemm.launch(stream, a, w, y);
++    fake_synapse::fail_next("synEventQuery"); rejects<SynapseError>([&] { (void)execution.ready(); });
++    rejects<std::logic_error>([&] { (void)y.address(); });
++    fake_synapse::fail_next("synEventSynchronize"); rejects<SynapseError>([&] { execution.wait(); });
++    rejects<std::logic_error>([&] { (void)a.address(); }); execution.wait();
++}
++}
++int main() {
++    try {
++        math_and_static_shapes(); fake_synapse::assert_clean(); execution_lifetime();
++        busy_workspace_ranges_and_fences(); fake_synapse::assert_clean();
++        construction_failures(); fake_synapse::assert_clean(); launch_failures(); fake_synapse::assert_clean();
++        std::cout << "offline GEMM graph, FP64 oracle and asynchronous ownership checks passed\n";
++    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
++}
 diff --git a/src/core/gaudi2/tests/fake_synapse/control.h b/src/core/gaudi2/tests/fake_synapse/control.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ae0e325441fafe2e639e853e9adc078d4c339e00
+index 0000000000000000000000000000000000000000..79501439ff8e0df8ab8039245e3cf0eb034bdb5d
 --- /dev/null
 +++ b/src/core/gaudi2/tests/fake_synapse/control.h
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,20 @@
 +#pragma once
 +#include <cstddef>
 +#include <string_view>
++#include "synapse_api.h"
++#include <functional>
++#include <span>
 +namespace fake_synapse {
 +void fail_next(std::string_view operation);
++void fail_after(std::string_view operation, std::size_t successes);
 +void clear_failure();
 +void assert_clean();
 +std::size_t live_allocations();
 +std::size_t completed_copies();
++bool consume_failure(const char* operation);
++void enqueue(synStreamHandle, std::function<void()> action, std::span<const std::uint64_t> references);
++bool valid_range(std::uint64_t pointer, std::uint64_t bytes);
++void assert_graph_clean();
++void set_workspace_bytes(std::uint64_t bytes);
++std::size_t completed_gemms();
++}
+diff --git a/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp b/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f563b0c224bd046c799609835838412ec2bcafd
+--- /dev/null
++++ b/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp
+@@ -0,0 +1,189 @@
++// Private offline graph/queue simulator. Never compiled into the native runtime.
++#include "synapse_api.h"
++#include "control.h"
++
++#include <algorithm>
++#include <array>
++#include <bit>
++#include <cmath>
++#include <map>
++#include <set>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++struct FakeSynSection { synGraphHandle graph; bool persistent = false; };
++struct FakeSynTensor {
++    synGraphHandle graph; std::string name; synTensorGeometry geometry{};
++    synDataType dtype{}; synSectionHandle section = nullptr;
++    bool typed = false, permutation_fixed = false, linked = false, external = true;
++};
++struct FakeSynGraph {
++    std::vector<synTensor> tensors;
++    std::array<synTensor, 3> operands{};
++    bool node = false, rounded = false;
++};
++struct FakeSynRecipe {
++    std::array<std::uint64_t, 3> ids{47, 11, 803}; // deliberately neither positional nor monotonic
++    std::array<synTensorGeometry, 3> geometry{};
++    std::uint64_t workspace;
++    std::size_t pending = 0;
++};
++namespace {
++std::set<synGraphHandle> graphs;
++std::set<synTensor> tensors;
++std::set<synSectionHandle> sections;
++std::set<synRecipeHandle> recipes;
++std::uint64_t workspace_size = 4096;
++std::size_t gemms = 0;
++void demand(bool value) { if (!value) throw std::runtime_error("offline GEMM graph/launch contract failed"); }
++bool fail(const char* name) { return fake_synapse::consume_failure(name); }
++float decode(std::uint16_t word) { return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16); }
++std::uint16_t round_bf16(float value) {
++    auto bits = std::bit_cast<std::uint32_t>(value);
++    bits += 0x7fffu + ((bits >> 16) & 1u); return static_cast<std::uint16_t>(bits >> 16);
++}
++}
++namespace fake_synapse {
++void assert_graph_clean() { demand(graphs.empty() && tensors.empty() && sections.empty() && recipes.empty()); }
++void set_workspace_bytes(std::uint64_t bytes) { workspace_size = bytes; }
++std::size_t completed_gemms() { return gemms; }
++}
++extern "C" {
++synStatus synGraphCreate(synGraphHandle* graph, synDeviceType type) {
++    if (fail("synGraphCreate")) return synFail;
++    demand(type == synDeviceGaudi2); *graph = new FakeSynGraph; graphs.insert(*graph); return synSuccess;
++}
++synStatus synGraphDestroy(synGraphHandle graph) {
++    demand(graphs.erase(graph) == 1);
++    for (const auto tensor : graph->tensors) {
++        demand(tensor->linked && !tensor->external && tensors.erase(tensor) == 1); delete tensor;
++    }
++    delete graph; return synSuccess;
++}
++synStatus synTensorHandleCreate(synTensor* tensor, synGraphHandle graph, synTensorType type, const char* name) {
++    if (fail("synTensorHandleCreate")) return synFail;
++    demand(graphs.contains(graph) && type == DATA_TENSOR && name);
++    *tensor = new FakeSynTensor{graph, name}; graph->tensors.push_back(*tensor); tensors.insert(*tensor); return synSuccess;
++}
++synStatus synTensorSetGeometry(synTensor tensor, const synTensorGeometry* geometry, synGeometryType type) {
++    if (fail("synTensorSetGeometry")) return synFail;
++    demand(tensors.contains(tensor) && geometry && type == synGeometrySizes && geometry->dims == 2);
++    demand(geometry->sizes[0] && geometry->sizes[1]);
++    tensor->geometry = *geometry; return synSuccess;
++}
++synStatus synTensorSetDeviceDataType(synTensor tensor, synDataType type) {
++    if (fail("synTensorSetDeviceDataType")) return synFail;
++    demand(tensors.contains(tensor) && type == syn_type_bf16); tensor->dtype = type; tensor->typed = true; return synSuccess;
++}
++synStatus synTensorSetAllowPermutation(synTensor tensor, bool allow) {
++    if (fail("synTensorSetAllowPermutation")) return synFail;
++    demand(tensors.contains(tensor) && !allow); tensor->permutation_fixed = true; return synSuccess;
++}
++synStatus synTensorDestroy(synTensor tensor) {
++    demand(tensors.contains(tensor) && tensor->external); tensor->external = false;
++    if (!tensor->linked) {
++        auto& owned = tensor->graph->tensors; owned.erase(std::find(owned.begin(), owned.end(), tensor));
++        tensors.erase(tensor); delete tensor;
++    }
++    return synSuccess;
++}
++synStatus synSectionCreate(synSectionHandle* section, std::uint64_t descriptor, synGraphHandle graph) {
++    if (fail("synSectionCreate")) return synFail;
++    demand(graphs.contains(graph) && descriptor == 0); *section = new FakeSynSection{graph}; sections.insert(*section); return synSuccess;
++}
++synStatus synSectionSetPersistent(synSectionHandle section, bool persistent) {
++    if (fail("synSectionSetPersistent")) return synFail;
++    demand(sections.contains(section) && persistent); section->persistent = true; return synSuccess;
++}
++synStatus synTensorAssignToSection(synTensor tensor, synSectionHandle section, std::uint64_t offset) {
++    if (fail("synTensorAssignToSection")) return synFail;
++    demand(tensors.contains(tensor) && sections.contains(section) && offset == 0 && tensor->graph == section->graph);
++    tensor->section = section; return synSuccess;
++}
++synStatus synSectionDestroy(synSectionHandle section) {
++    demand(sections.erase(section) == 1); delete section; return synSuccess;
++}
++synStatus synNodeCreateWithId(synGraphHandle graph, const synTensor* inputs, const synTensor* outputs,
++                             std::uint32_t input_count, std::uint32_t output_count, const void* parameters,
++                             unsigned bytes, const char* guid, const char*, synNodeId* node,
++                             const char** input_layouts, const char** output_layouts) {
++    if (fail("synNodeCreateWithId")) return synFail;
++    demand(graphs.contains(graph) && !graph->node && input_count == 2 && output_count == 1);
++    demand(parameters && bytes == sizeof(synGEMMParams) && std::string(guid) == "gemm" && !input_layouts && !output_layouts);
++    const auto& p = *static_cast<const synGEMMParams*>(parameters); demand(!p.transpose_a && p.transpose_b);
++    graph->operands = {inputs[0], inputs[1], outputs[0]};
++    const std::array<std::string, 3> expected{"A", "W", "Y"};
++    for (std::size_t i = 0; i < 3; ++i) {
++        auto tensor = graph->operands[i]; demand(tensors.contains(tensor) && tensor->graph == graph && tensor->name == expected[i]);
++        tensor->linked = true;
++    }
++    graph->node = true; *node = 119; return synSuccess;
++}
++synStatus synNodeSetRoundingMode(synGraphHandle graph, synNodeId node, synRoundingMode mode) {
++    if (fail("synNodeSetRoundingMode")) return synFail;
++    demand(graphs.contains(graph) && graph->node && node == 119 && mode == synRoundToNearest);
++    graph->rounded = true; return synSuccess;
++}
++synStatus synGraphCompile(synRecipeHandle* recipe, synGraphHandle graph, const char* name, const char* log) {
++    if (fail("synGraphCompile")) return synFail;
++    demand(graphs.contains(graph) && graph->node && graph->rounded && name && !log);
++    std::array<synTensorGeometry, 3> geometry;
++    for (std::size_t i = 0; i < 3; ++i) {
++        const auto tensor = graph->operands[i];
++        demand(tensor->typed && tensor->permutation_fixed && tensor->section && tensor->section->persistent);
++        geometry[i] = tensor->geometry;
++    }
++    demand(geometry[0].sizes[0] == geometry[1].sizes[0] && geometry[0].sizes[1] == geometry[2].sizes[1] &&
++           geometry[1].sizes[1] == geometry[2].sizes[0]);
++    *recipe = new FakeSynRecipe{{47, 11, 803}, geometry, workspace_size}; recipes.insert(*recipe); return synSuccess;
++}
++synStatus synRecipeDestroy(synRecipeHandle recipe) {
++    demand(recipes.contains(recipe) && !recipe->pending); recipes.erase(recipe); delete recipe; return synSuccess;
++}
++synStatus synWorkspaceGetSize(std::uint64_t* bytes, synRecipeHandle recipe) {
++    if (fail("synWorkspaceGetSize")) return synFail;
++    demand(recipes.contains(recipe)); *bytes = recipe->workspace; return synSuccess;
++}
++synStatus synTensorRetrieveIds(synRecipeHandle recipe, const char** names, std::uint64_t* ids, std::uint32_t count) {
++    if (fail("synTensorRetrieveIds")) return synFail;
++    demand(recipes.contains(recipe) && count == 3);
++    const std::array<std::string, 3> expected{"A", "W", "Y"};
++    for (std::size_t i = 0; i < count; ++i) { demand(names[i] == expected[i]); ids[i] = recipe->ids[i]; }
++    return synSuccess;
++}
++synStatus synLaunchWithExternalEventsExt(synStreamHandle stream, const synLaunchTensorInfoExt* infos,
++                                        std::uint32_t count, std::uint64_t workspace, synRecipeHandle recipe,
++                                        synEventHandle* external, std::uint32_t events, std::uint32_t flags) {
++    demand(recipes.contains(recipe) && count == 3 && !external && !events && !flags);
++    std::array<std::uint64_t, 4> addresses{};
++    std::array<bool, 3> seen{};
++    for (std::size_t j = 0; j < count; ++j) {
++        auto found = std::find(recipe->ids.begin(), recipe->ids.end(), infos[j].tensorId);
++        demand(found != recipe->ids.end()); const auto i = static_cast<std::size_t>(found - recipe->ids.begin());
++        demand(!seen[i] && !infos[j].tensorName && infos[j].tensorType == DATA_TENSOR); seen[i] = true;
++        const auto& g = recipe->geometry[i];
++        demand(infos[j].tensorSize[0] == g.sizes[0] && infos[j].tensorSize[1] == g.sizes[1]);
++        const auto bytes = g.sizes[0] * g.sizes[1] * 2;
++        demand(fake_synapse::valid_range(infos[j].pTensorAddress, bytes)); addresses[i] = infos[j].pTensorAddress;
++    }
++    demand(recipe->workspace ? fake_synapse::valid_range(workspace, recipe->workspace) : workspace == 0);
++    addresses[3] = workspace; ++recipe->pending;
++    fake_synapse::enqueue(stream, [recipe, addresses] {
++        demand(recipes.contains(recipe));
++        const auto k = recipe->geometry[0].sizes[0], m = recipe->geometry[0].sizes[1], n = recipe->geometry[1].sizes[1];
++        const auto* a = reinterpret_cast<const std::uint16_t*>(addresses[0]);
++        const auto* w = reinterpret_cast<const std::uint16_t*>(addresses[1]);
++        auto* y = reinterpret_cast<std::uint16_t*>(addresses[2]);
++        for (std::uint64_t row = 0; row < m; ++row) for (std::uint64_t column = 0; column < n; ++column) {
++            float sum = 0;
++            for (std::uint64_t inner = 0; inner < k; ++inner)
++                sum = std::fma(decode(a[row * k + inner]), decode(w[column * k + inner]), sum);
++            y[row * n + column] = round_bf16(sum);
++        }
++        --recipe->pending; ++gemms;
++    }, addresses);
++    // Like the DMA fake, deliberately admit work before reporting an injected error.
++    return fail("synLaunchWithExternalEventsExt") ? synFail : synSuccess;
++}
 +}
 diff --git a/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp b/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535e0880a47
+index 0000000000000000000000000000000000000000..37c2498a268533aa9ea53fe1f42597fcee1367b4
 --- /dev/null
 +++ b/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,142 @@
 +#include "synapse_api.h"
 +#include "control.h"
 +
@@ -3305,19 +3975,27 @@ index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535
 +#include <set>
 +#include <stdexcept>
 +#include <string>
++#include <variant>
++#include <vector>
 +
 +struct Copy { std::uint64_t source, destination, bytes; };
-+struct FakeSynStream { std::deque<Copy> pending; std::size_t completed = 0; };
++struct Kernel { std::function<void()> action; std::vector<std::uint64_t> references; };
++struct FakeSynStream { std::deque<std::variant<Copy, Kernel>> pending; std::size_t completed = 0; };
 +struct FakeSynEvent { FakeSynStream* stream = nullptr; std::size_t target = 0; };
 +namespace {
 +std::string failure;
++std::size_t failure_skips = 0;
 +bool initialized = false, acquired = false;
 +std::map<std::uint64_t, std::unique_ptr<std::byte[]>> device_memory, host_memory;
 +std::map<std::uint64_t, std::size_t> sizes;
 +std::set<FakeSynStream*> streams;
 +std::set<FakeSynEvent*> events;
 +std::size_t copies = 0;
-+bool fail(const char* operation) { if (failure == operation) { failure.clear(); return true; } return false; }
++bool fail(const char* operation) {
++    if (failure != operation) return false;
++    if (failure_skips) { --failure_skips; return false; }
++    failure.clear(); return true;
++}
 +void demand(bool value) { if (!value) throw std::runtime_error("offline SynapseAI lifecycle invariant failed"); }
 +bool valid_pointer(std::uint64_t pointer, std::uint64_t bytes) {
 +    for (const auto& [base, size] : sizes)
@@ -3327,17 +4005,22 @@ index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535
 +void drain(FakeSynStream* stream, std::size_t count) {
 +    while (stream->completed < count) {
 +        demand(!stream->pending.empty());
-+        const auto copy = stream->pending.front(); stream->pending.pop_front();
-+        demand(valid_pointer(copy.source, copy.bytes) && valid_pointer(copy.destination, copy.bytes));
-+        std::memcpy(reinterpret_cast<void*>(copy.destination), reinterpret_cast<const void*>(copy.source), copy.bytes);
-+        ++stream->completed; ++copies;
++        auto work = std::move(stream->pending.front()); stream->pending.pop_front();
++        if (auto* copy = std::get_if<Copy>(&work)) {
++            demand(valid_pointer(copy->source, copy->bytes) && valid_pointer(copy->destination, copy->bytes));
++            std::memcpy(reinterpret_cast<void*>(copy->destination), reinterpret_cast<const void*>(copy->source), copy->bytes);
++            ++copies;
++        } else std::get<Kernel>(work).action();
++        ++stream->completed;
 +    }
 +}
 +void no_pending_reference(std::uint64_t pointer) {
 +    const auto size = sizes.at(pointer);
-+    for (const auto stream : streams) for (const auto& copy : stream->pending)
-+        demand(!(copy.source >= pointer && copy.source - pointer < size) &&
-+               !(copy.destination >= pointer && copy.destination - pointer < size));
++    for (const auto stream : streams) for (const auto& work : stream->pending) {
++        const auto unreferenced = [&](std::uint64_t p) { demand(!(p >= pointer && p - pointer < size)); };
++        if (const auto* copy = std::get_if<Copy>(&work)) { unreferenced(copy->source); unreferenced(copy->destination); }
++        else for (const auto p : std::get<Kernel>(work).references) unreferenced(p);
++    }
 +}
 +synStatus allocate(std::uint64_t bytes, std::uint64_t* address,
 +                   std::map<std::uint64_t, std::unique_ptr<std::byte[]>>& allocations) {
@@ -3349,11 +4032,17 @@ index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535
 +}
 +}
 +namespace fake_synapse {
-+void fail_next(std::string_view operation) { failure = operation; }
++void fail_next(std::string_view operation) { failure = operation; failure_skips = 0; }
++void fail_after(std::string_view operation, std::size_t successes) { failure = operation; failure_skips = successes; }
 +void clear_failure() { failure.clear(); }
-+void assert_clean() { demand(!initialized && !acquired && device_memory.empty() && host_memory.empty() && streams.empty() && events.empty()); }
++void assert_clean() { demand(!initialized && !acquired && device_memory.empty() && host_memory.empty() && streams.empty() && events.empty() && sizes.empty()); assert_graph_clean(); }
 +std::size_t live_allocations() { return sizes.size(); }
 +std::size_t completed_copies() { return copies; }
++bool consume_failure(const char* operation) { return fail(operation); }
++void enqueue(synStreamHandle stream, std::function<void()> action, std::span<const std::uint64_t> references) {
++    stream->pending.emplace_back(Kernel{std::move(action), {references.begin(), references.end()}});
++}
++bool valid_range(std::uint64_t pointer, std::uint64_t bytes) { return valid_pointer(pointer, bytes); }
 +}
 +extern "C" {
 +synStatus synInitialize() { if (fail("synInitialize")) return synFail; demand(!initialized); initialized = true; return synSuccess; }
@@ -3362,7 +4051,7 @@ index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535
 +    if (fail("synDeviceAcquireByDeviceType")) return synFail;
 +    demand(initialized && !acquired && type == synDeviceGaudi2); acquired = true; *id = 7; return synSuccess;
 +}
-+synStatus synDeviceRelease(synDeviceId id) { demand(acquired && id == 7 && sizes.empty() && streams.empty() && events.empty()); acquired = false; return synSuccess; }
++synStatus synDeviceRelease(synDeviceId id) { demand(acquired && id == 7 && sizes.empty() && streams.empty() && events.empty()); fake_synapse::assert_graph_clean(); acquired = false; return synSuccess; }
 +synStatus synDeviceGetMemoryInfo(synDeviceId, std::uint64_t* free, std::uint64_t* total) {
 +    if (fail("synDeviceGetMemoryInfo")) return synFail;
 +    *total = 96ull << 30; *free = 95ull << 30; return synSuccess;
@@ -3413,16 +4102,16 @@ index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535
 +    demand(valid_pointer(source, bytes) && valid_pointer(destination, bytes));
 +    // Deliberately enqueue before injected failure: the adapter must drain an
 +    // ambiguous failed submit, not assume no work reached the device.
-+    stream->pending.push_back({source, destination, bytes});
++    stream->pending.emplace_back(Copy{source, destination, bytes});
 +    return fail("synMemCopyAsync") ? synFail : synSuccess;
 +}
 +}
 diff --git a/src/core/gaudi2/tests/fake_synapse/synapse_api.h b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a0d77b6c49120b2c9e495e369695774f093d4f46
+index 0000000000000000000000000000000000000000..84561c1fe2bec29e33c4c51cf8e70d00c412b9fa
 --- /dev/null
 +++ b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,77 @@
 +#pragma once
 +// Test-only C declarations. Never a fallback SDK or runtime implementation.
 +#ifndef NINFER_GAUDI2_RUNTIME_TEST_FAKE
@@ -3437,6 +4126,28 @@ index 0000000000000000000000000000000000000000..a0d77b6c49120b2c9e495e369695774f
 +struct FakeSynEvent;
 +using synStreamHandle = FakeSynStream*;
 +using synEventHandle = FakeSynEvent*;
++struct FakeSynGraph;
++struct FakeSynTensor;
++struct FakeSynSection;
++struct FakeSynRecipe;
++using synGraphHandle = FakeSynGraph*;
++using synTensor = FakeSynTensor*;
++using synSectionHandle = FakeSynSection*;
++using synRecipeHandle = FakeSynRecipe*;
++using synNodeId = std::uint64_t;
++enum synTensorType { DATA_TENSOR = 0 };
++enum synDataType { syn_type_bf16 = 2 };
++enum synGeometryType { synGeometrySizes = 1 };
++enum synRoundingMode { synRoundToNearest = 1 };
++struct synTensorGeometry { std::uint64_t sizes[25]; std::uint32_t dims; };
++struct synGEMMParams {
++    synGEMMParams(bool a = false, bool b = false) : transpose_a(a), transpose_b(b) {}
++    bool transpose_a; bool transpose_b;
++};
++struct synLaunchTensorInfoExt {
++    const char* tensorName; std::uint64_t pTensorAddress; synTensorType tensorType;
++    std::uint64_t tensorSize[25]; std::uint64_t tensorId;
++};
 +extern "C" {
 +synStatus synInitialize();
 +synStatus synDestroy();
@@ -3456,6 +4167,27 @@ index 0000000000000000000000000000000000000000..a0d77b6c49120b2c9e495e369695774f
 +synStatus synEventQuery(synEventHandle);
 +synStatus synEventSynchronize(synEventHandle);
 +synStatus synMemCopyAsync(synStreamHandle, std::uint64_t, std::uint64_t, std::uint64_t, synDmaDir);
++synStatus synGraphCreate(synGraphHandle*, synDeviceType);
++synStatus synGraphDestroy(synGraphHandle);
++synStatus synTensorHandleCreate(synTensor*, synGraphHandle, synTensorType, const char*);
++synStatus synTensorSetGeometry(synTensor, const synTensorGeometry*, synGeometryType);
++synStatus synTensorSetDeviceDataType(synTensor, synDataType);
++synStatus synTensorSetAllowPermutation(synTensor, bool);
++synStatus synTensorAssignToSection(synTensor, synSectionHandle, std::uint64_t);
++synStatus synTensorDestroy(synTensor);
++synStatus synSectionCreate(synSectionHandle*, std::uint64_t, synGraphHandle);
++synStatus synSectionSetPersistent(synSectionHandle, bool);
++synStatus synSectionDestroy(synSectionHandle);
++synStatus synNodeCreateWithId(synGraphHandle, const synTensor*, const synTensor*, std::uint32_t,
++                            std::uint32_t, const void*, unsigned, const char*, const char*, synNodeId*,
++                            const char**, const char**);
++synStatus synNodeSetRoundingMode(synGraphHandle, synNodeId, synRoundingMode);
++synStatus synGraphCompile(synRecipeHandle*, synGraphHandle, const char*, const char*);
++synStatus synRecipeDestroy(synRecipeHandle);
++synStatus synWorkspaceGetSize(std::uint64_t*, synRecipeHandle);
++synStatus synTensorRetrieveIds(synRecipeHandle, const char**, std::uint64_t*, std::uint32_t);
++synStatus synLaunchWithExternalEventsExt(synStreamHandle, const synLaunchTensorInfoExt*, std::uint32_t,
++                                       std::uint64_t, synRecipeHandle, synEventHandle*, std::uint32_t, std::uint32_t);
 +}
 diff --git a/src/core/gaudi2/tests/runtime_lifecycle_test.cpp b/src/core/gaudi2/tests/runtime_lifecycle_test.cpp
 new file mode 100644
@@ -12376,6 +13108,189 @@ index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840
  include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")
+diff --git a/src/ops/gaudi2/bf16_gemm.cpp b/src/ops/gaudi2/bf16_gemm.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d609be982ea18c3147601310dfba13a6e1c92471
+--- /dev/null
++++ b/src/ops/gaudi2/bf16_gemm.cpp
+@@ -0,0 +1,69 @@
++#include "bf16_gemm.h"
++
++#include <exception>
++
++namespace ninfer::gaudi2 {
++namespace {
++void check(synStatus status, const char* operation) {
++    if (status != synSuccess) throw SynapseError(status, operation);
++}
++void cleanup(synStatus status) noexcept { if (status != synSuccess) std::terminate(); }
++struct GraphBuilder {
++    synGraphHandle graph = nullptr;
++    std::array<synTensor, 3> tensors{};
++    std::array<synSectionHandle, 3> sections{};
++    GraphBuilder() { check(synGraphCreate(&graph, synDeviceGaudi2), "synGraphCreate(GEMM)"); }
++    GraphBuilder(const GraphBuilder&) = delete;
++    GraphBuilder& operator=(const GraphBuilder&) = delete;
++    ~GraphBuilder() {
++        // Synapse tensors are reference counted. Release our handles before
++        // GraphDestroy releases the graph's references; never destroy afterwards.
++        for (auto tensor : tensors) if (tensor) cleanup(synTensorDestroy(tensor));
++        for (auto section : sections) if (section) cleanup(synSectionDestroy(section));
++        cleanup(synGraphDestroy(graph));
++    }
++    void tensor(std::size_t index, const char* name, std::size_t fcd, std::size_t outer) {
++        check(synTensorHandleCreate(&tensors[index], graph, DATA_TENSOR, name), "synTensorHandleCreate(GEMM)");
++        synTensorGeometry geometry{};
++        geometry.dims = 2; geometry.sizes[0] = fcd; geometry.sizes[1] = outer;
++        check(synTensorSetGeometry(tensors[index], &geometry, synGeometrySizes), "synTensorSetGeometry(GEMM)");
++        check(synTensorSetDeviceDataType(tensors[index], syn_type_bf16), "synTensorSetDeviceDataType(GEMM)");
++        check(synTensorSetAllowPermutation(tensors[index], false), "synTensorSetAllowPermutation(GEMM)");
++        check(synSectionCreate(&sections[index], 0, graph), "synSectionCreate(GEMM)");
++        check(synSectionSetPersistent(sections[index], true), "synSectionSetPersistent(GEMM)");
++        check(synTensorAssignToSection(tensors[index], sections[index], 0), "synTensorAssignToSection(GEMM)");
++    }
++};
++}
++Bf16Gemm::Bf16Gemm(const Device& device, Bf16GemmShape shape, std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    shape_.validate();
++    GraphBuilder builder;
++    builder.tensor(0, "A", shape.k, shape.m);
++    builder.tensor(1, "W", shape.k, shape.n);
++    builder.tensor(2, "Y", shape.n, shape.m);
++    const std::array<synTensor, 2> inputs{builder.tensors[0], builder.tensors[1]};
++    const synGEMMParams parameters{false, true};
++    synNodeId node = 0;
++    check(synNodeCreateWithId(builder.graph, inputs.data(), &builder.tensors[2], 2, 1,
++          &parameters, sizeof(parameters), "gemm", "ninfer_bf16_linear", &node, nullptr, nullptr),
++          "synNodeCreateWithId(GEMM)");
++    check(synNodeSetRoundingMode(builder.graph, node, synRoundToNearest), "synNodeSetRoundingMode(GEMM RNE)");
++    recipe_ = device.compile(builder.graph, "ninfer_gaudi2_bf16_gemm", max_workspace_bytes);
++    std::array<const char*, 3> names{"A", "W", "Y"};
++    recipe_.tensor_ids(names, tensor_ids_);
++}
++Compute Bf16Gemm::launch(Stream& stream, DeviceBuffer& a, DeviceBuffer& w, DeviceBuffer& y) {
++    if (a.size() != shape_.a_bytes() || w.size() != shape_.w_bytes() || y.size() != shape_.y_bytes())
++        throw std::invalid_argument("Gaudi2 BF16 GEMM buffer sizes do not match its static geometry");
++    // These accessors also reject pending uploads/compute. Initial AR preparation
++    // uses explicit host-observed completion, not implicit cross-stream chaining.
++    if (a.address() == w.address() || a.address() == y.address() || w.address() == y.address())
++        throw std::invalid_argument("Gaudi2 BF16 GEMM requires disjoint operand allocations");
++    const std::array<RecipeBinding, 3> bindings{{
++        {tensor_ids_[0], &a, {shape_.k, shape_.m}},
++        {tensor_ids_[1], &w, {shape_.k, shape_.n}},
++        {tensor_ids_[2], &y, {shape_.n, shape_.m}}}};
++    return stream.launch(recipe_, bindings);
++}
++} // namespace ninfer::gaudi2
+diff --git a/src/ops/gaudi2/bf16_gemm.h b/src/ops/gaudi2/bf16_gemm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6642144475b9661aa5d0e8ef2c919d8d036e67c
+--- /dev/null
++++ b/src/ops/gaudi2/bf16_gemm.h
+@@ -0,0 +1,18 @@
++#pragma once
++#include "core/gaudi2/runtime.h"
++#include "bf16_gemm_shape.h"
++
++namespace ninfer::gaudi2 {
++class Bf16Gemm {
++public:
++    // Builds one closed static graph and allocates its bounded device workspace.
++    Bf16Gemm(const Device& device, Bf16GemmShape shape, std::size_t max_workspace_bytes);
++    [[nodiscard]] Bf16GemmShape shape() const noexcept { return shape_; }
++    [[nodiscard]] std::size_t workspace_bytes() const noexcept { return recipe_.workspace_bytes(); }
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& a, DeviceBuffer& w, DeviceBuffer& y);
++private:
++    Bf16GemmShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 3> tensor_ids_{};
++};
++} // namespace ninfer::gaudi2
+diff --git a/src/ops/gaudi2/bf16_gemm_shape.h b/src/ops/gaudi2/bf16_gemm_shape.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1da6b3365742ec73ddc2c1789e03466ad0bacea
+--- /dev/null
++++ b/src/ops/gaudi2/bf16_gemm_shape.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <initializer_list>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::gaudi2 {
++// One static recipe: row-major A[M,K], W[N,K], Y[M,N] = A * transpose(W).
++// All three tensors store BF16 words. There are no implicit strides/bias/alpha/beta.
++struct Bf16GemmShape {
++    std::size_t m, n, k;
++    void validate() const {
++        for (const auto dimension : {m, n, k})
++            if (!dimension || dimension > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
++                throw std::invalid_argument("Gaudi2 GEMM dimensions must be positive signed-32-bit extents");
++        (void)a_bytes(); (void)w_bytes(); (void)y_bytes();
++    }
++    [[nodiscard]] std::size_t a_bytes() const { return bytes(m, k); }
++    [[nodiscard]] std::size_t w_bytes() const { return bytes(n, k); }
++    [[nodiscard]] std::size_t y_bytes() const { return bytes(m, n); }
++private:
++    static std::size_t bytes(std::size_t a, std::size_t b) {
++        if (!a || !b || a > std::numeric_limits<std::size_t>::max() / b ||
++            a * b > std::numeric_limits<std::size_t>::max() / 2)
++            throw std::overflow_error("Gaudi2 BF16 GEMM byte size is empty or overflows");
++        return a * b * 2;
++    }
++};
++} // namespace ninfer::gaudi2
+diff --git a/src/ops/gaudi2/bf16_gemm_smoke.cpp b/src/ops/gaudi2/bf16_gemm_smoke.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1a318e0b5a233cf5cf0212eda38569bbc4eb96b
+--- /dev/null
++++ b/src/ops/gaudi2/bf16_gemm_smoke.cpp
+@@ -0,0 +1,42 @@
++#include "bf16_gemm.h"
++
++#include <array>
++#include <bit>
++#include <cstring>
++#include <iostream>
++
++namespace {
++template<std::size_t N> void put(ninfer::gaudi2::PinnedBuffer& buffer, const std::array<float, N>& values) {
++    std::array<std::uint16_t, N> words{};
++    for (std::size_t i = 0; i < N; ++i) {
++        const auto bits = std::bit_cast<std::uint32_t>(values[i]);
++        if (bits & 0xffffu) throw std::logic_error("smoke inputs must be exactly representable BF16");
++        words[i] = static_cast<std::uint16_t>(bits >> 16);
++    }
++    std::memcpy(buffer.bytes().data(), words.data(), sizeof(words));
++}
++}
++int main() {
++    using namespace ninfer::gaudi2;
++    try {
++        Device device; auto stream = device.create_stream();
++        Bf16Gemm gemm(device, {2, 3, 5}, 64u * 1024u * 1024u);
++        auto ah = device.allocate_host(20), wh = device.allocate_host(30), yh = device.allocate_host(12);
++        auto a = device.allocate_device(20), w = device.allocate_device(30), y = device.allocate_device(12);
++        put(ah, std::array<float, 10>{1, 2, 3, 4, 5, -2, .5f, 1, 0, -3});
++        put(wh, std::array<float, 15>{2, -1, 0, 3, 1, -1, 4, 2, 0, -2, .5f, 0, -1, 1, 2});
++        stream.upload(a, ah, ah.size()).wait(); stream.upload(w, wh, wh.size()).wait();
++        auto execution = gemm.launch(stream, a, w, y); execution.wait();
++        stream.download(yh, y, yh.size()).wait();
++        std::array<std::uint16_t, 6> actual{};
++        std::memcpy(actual.data(), yh.bytes().data(), sizeof(actual));
++        // Independent exact golden values: [[17,3,11.5],[-7.5,12,-8]].
++        constexpr std::array<std::uint16_t, 6> expected{0x4188, 0x4040, 0x4138, 0xc0f0, 0x4140, 0xc100};
++        if (actual != expected) {
++            std::cerr << "Gaudi2 native GEMM readback differs from the exact rectangular fixture\n"; return 1;
++        }
++        std::cout << "Gaudi2 native BF16 [2,5] x transpose([3,5]) readback passed; workspace="
++                  << gemm.workspace_bytes() << " bytes\n";
++        return 0;
++    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
++}
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
 index 80ee5321d2b1b221c3ada74a7471b38751cbed6b..80b0242580da3f3a35eae487698ae7d718927b2d 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu

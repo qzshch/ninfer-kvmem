@@ -43,9 +43,19 @@ x64 and C++20; Linux linking and physical device execution are still unverified.
 The prepared backend's `docs/gaudi2-runtime.md` defines its ownership contract,
 explicit real-SDK build flags and optional hardware smoke command.
 
+The first closed native math Op is a static BF16 GEMM: row-major A[M,K], W[N,K]
+produce BF16 Y[M,N] = A * transpose(W). It builds the actual SynapseAI graph,
+queries real tensor IDs, bounds workspace and retains all compute operands until
+an event completes. Private host graph/queue tests use an independent FP64/BF16
+reference, and both production source files compile against the real SDK headers.
+The native rectangular GEMM smoke is built for explicitly invoked Gaudi2 testing;
+it has not run on hardware. Its full contract is in the prepared backend's
+`docs/gaudi2-bf16-gemm.md`. FP32 MME accumulation still rounds each output to BF16.
+
 Windows MSVC host checks cover exact FP8 decoding, BF16 cast boundaries,
 nonaligned tile scales, bounded allocation, malformed inputs and asynchronous
 resource lifetimes. CI builds and runs the host suite on Linux and Windows.
-Real-checkpoint accuracy, recipes/TPC/MME, GDN, full-KV ordinary AR and later KVMem
-device integration still require implementation and validation on Gaudi2. No
+Real-checkpoint accuracy, physical recipe/MME execution, TPC dequantization, GDN,
+full-KV ordinary AR and later KVMem device integration still require implementation
+and validation on Gaudi2. No
 throughput result is available yet.
