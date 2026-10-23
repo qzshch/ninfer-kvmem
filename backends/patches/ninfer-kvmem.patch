@@ -754,10 +754,10 @@ index 0000000000000000000000000000000000000000..216d77641f8cbca9669756003506f0a5
 +copied into this host implementation.
 diff --git a/docs/gaudi2-runtime.md b/docs/gaudi2-runtime.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..98c872fa1ff30bf54e38b4cf887412b1b0b4dba7
+index 0000000000000000000000000000000000000000..14c744f4d18a2d606f25842e3f240eb63f402c85
 --- /dev/null
 +++ b/docs/gaudi2-runtime.md
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,116 @@
 +# Native Gaudi2 resources
 +
 +`src/core/gaudi2/runtime.h` and `.cpp` provide the first native SynapseAI resource
@@ -821,6 +821,14 @@ index 0000000000000000000000000000000000000000..98c872fa1ff30bf54e38b4cf887412b1
 +  -DNINFER_SYNAPSE_INCLUDE_DIR=/path/to/sdk/include/habanalabs
 +cmake --build build-gaudi2-sdk --config Release --target ninfer_gaudi2_runtime_sdk_check -j
 +```
++
++On MSVC this object target explicitly uses `/utf-8 /EHsc`: official UTF-8 SDK
++comments must not be decoded using the Windows system code page, and exception
++unwinding is required for resource cleanup. The vendor SDK include directory is
++`SYSTEM`; project source remains subject to the caller's warning policy. This
++target was also built through CMake with `CMAKE_CXX_FLAGS="/W4 /WX"` on CP936
++Windows. These options are scoped to the SDK object target and do not change the
++existing CUDA Engine targets.
 +
 +For the native Linux library and an explicitly invoked 4096-byte DMA round trip:
 +
@@ -2512,10 +2520,10 @@ index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..54680e8aa9f27c23567603c7a1b5accb0e2af18b
+index 0000000000000000000000000000000000000000..299e638cdd9b3741dfe0ebf3410ed1f2c11bdaa5
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -2563,8 +2571,15 @@ index 0000000000000000000000000000000000000000..54680e8aa9f27c23567603c7a1b5accb
 +  endif()
 +  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp)
 +  target_compile_features(ninfer_gaudi2_runtime_sdk_check PRIVATE cxx_std_20)
-+  target_include_directories(ninfer_gaudi2_runtime_sdk_check PRIVATE "${NINFER_SYNAPSE_INCLUDE_DIR}"
-+    "${CMAKE_CURRENT_SOURCE_DIR}/../..")
++  if(MSVC)
++    # The official SDK headers contain UTF-8 comments. Their decoding must not
++    # depend on the Windows system code page, including CP936 developer hosts.
++    # Exception unwinding is part of resource ownership even if a caller replaces
++    # CMAKE_CXX_FLAGS to request stricter warnings.
++    target_compile_options(ninfer_gaudi2_runtime_sdk_check PRIVATE /utf-8 /EHsc)
++  endif()
++  target_include_directories(ninfer_gaudi2_runtime_sdk_check SYSTEM PRIVATE "${NINFER_SYNAPSE_INCLUDE_DIR}")
++  target_include_directories(ninfer_gaudi2_runtime_sdk_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 +endif()
 +if(NINFER_GAUDI2_NATIVE_RUNTIME)
 +  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
