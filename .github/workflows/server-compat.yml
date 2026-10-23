@@ -3,7 +3,7 @@ name: Server and UI compatibility
 on:
   pull_request:
   push:
-    branches: [master, feat/multi-backend-framework]
+    branches: [main, master, feat/multi-backend-framework, feat/gaudi2]
   workflow_dispatch:
 
 permissions:

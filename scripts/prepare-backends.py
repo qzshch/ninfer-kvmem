@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def git(directory, *args, check=True, env=None):
     return subprocess.run(['git', '-c', 'core.longpaths=true', '-c', 'core.autocrlf=false',
                            '-C', str(directory), *args], check=check,
-                          capture_output=True, text=True, env=env)
+                          capture_output=True, text=True, encoding='utf-8', env=env)
 
 
 def verify_tree(directory, expected):
