@@ -1,14 +1,16 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 11bc2bc30811c944fc4e4a1c16373806da33c96e..ce371e53939851a2161e881217beabb157d5407d 100644
+index 11bc2bc30811c944fc4e4a1c16373806da33c96e..644640cf406d550f5dfab2e3d3af13ad74053ded 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -1,5 +1,15 @@
+@@ -1,5 +1,17 @@
  cmake_minimum_required(VERSION 3.28)
  
 +# This build contains the bounded host preparation/qualification tool only. It does not
 +# publish an Engine or initialize CUDA/SynapseAI; the CUDA product build remains below.
 +option(NINFER_GAUDI2_PREPARATION_ONLY "Build the standalone Gaudi2 block-FP8 preparation tool" OFF)
-+if(NINFER_GAUDI2_PREPARATION_ONLY)
++option(NINFER_GAUDI2_NATIVE_RUNTIME "Build the native Linux SynapseAI resource adapter" OFF)
++option(NINFER_GAUDI2_SDK_HEADER_CHECK "Compile the resource adapter against actual SDK headers only" OFF)
++if(NINFER_GAUDI2_PREPARATION_ONLY OR NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
 +  project(ninfer_gaudi2_preparation LANGUAGES CXX)
 +  enable_testing()
 +  add_subdirectory(src/core/gaudi2)
@@ -18,7 +20,7 @@ index 11bc2bc30811c944fc4e4a1c16373806da33c96e..ce371e53939851a2161e881217beabb1
  # The current implementation supports Ampere sm_86 and early Ada sm_89, plus sm_80 (GA100, e.g.
  # CMP 170HX) as an unmeasured compatibility target: it shares the sm_86 instruction set the
  # kernels use, but none of its route tables have been swept. sm_70 (Tesla V100) builds the same
-@@ -173,7 +183,13 @@ if(MSVC)
+@@ -173,7 +185,13 @@ if(MSVC)
      # active code page instead. Needed by every translation unit that includes fmt/spdlog
      # headers, not just spdlog's own .cpp files, so this is global rather than per-target.
      $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
@@ -33,7 +35,7 @@ index 11bc2bc30811c944fc4e4a1c16373806da33c96e..ce371e53939851a2161e881217beabb1
    # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
    # the project-wide /MD runtime. Keep one CRT in the final process. $<HOST_LINK:...> keeps this
    # off the CUDA relocatable device-link step, which forwards it to cl.exe without the /link
-@@ -194,24 +210,11 @@ else()
+@@ -194,24 +212,11 @@ else()
      $<$<COMPILE_LANGUAGE:C,CXX>:-Wimplicit-fallthrough>
      $<$<COMPILE_LANGUAGE:C,CXX>:-Werror=implicit-fallthrough>)
  
@@ -63,7 +65,7 @@ index 11bc2bc30811c944fc4e4a1c16373806da33c96e..ce371e53939851a2161e881217beabb1
    add_compile_options(
      $<$<COMPILE_LANGUAGE:C,CXX>:-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>
      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffile-prefix-map=${PROJECT_SOURCE_DIR}=.>)
-@@ -262,6 +265,13 @@ function(ninfer_stamp_build_id target)
+@@ -262,6 +267,13 @@ function(ninfer_stamp_build_id target)
    target_sources(${target} PRIVATE ${NINFER_BUILD_ID_HEADER})
    target_include_directories(${target} PRIVATE ${CMAKE_BINARY_DIR}/generated)
  endfunction()
@@ -512,14 +514,15 @@ index 09381b4e9abfb5576fba68b43b81ce896a1f1afb..b3eb36950ae216647e28fdc029fadf72
                                        envelope_, workspace_, output_tensor_, stream);
      }
 diff --git a/docs/README.md b/docs/README.md
-index 65f99bc29093c167140ddc7f02082df192e28126..5145ce283845a5027d85d7872d6b467dcc70288c 100644
+index 65f99bc29093c167140ddc7f02082df192e28126..594a6b6ead4fb6cfa7fcdeffad407aff6ca54cd2 100644
 --- a/docs/README.md
 +++ b/docs/README.md
-@@ -45,6 +45,7 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
+@@ -45,6 +45,8 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
  
  ## Repository-local guides
  
 +- [Gaudi2 block-FP8 preparation](gaudi2-preparation.md): standalone host tool, numerical profile and current implementation boundary.
++- [Native Gaudi2 resources](gaudi2-runtime.md): real-SDK adapter, DMA leases, offline lifecycle tests and device-validation limits.
  - [Benchmarks](../bench/README.md)
  - [Tests](../tests/README.md)
  - [Tools](../tools/README.md)
@@ -547,17 +550,19 @@ index b1311bea4c50adf2640dda4292313fb56d7579d3..c06d9e4a63ce3013399c694bc93efcd0
  | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 diff --git a/docs/gaudi2-preparation.md b/docs/gaudi2-preparation.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..6bc57d3b78bb8fb06d8bb259dbcfff484e2bf4db
+index 0000000000000000000000000000000000000000..d1425b67cd2191e1854f06471adb3537abd7576d
 --- /dev/null
 +++ b/docs/gaudi2-preparation.md
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,81 @@
 +# Gaudi2 block-FP8 preparation
 +
 +The Gaudi2 development path currently provides a standalone C++ host preparation
-+tool and exact numerical qualification. It does not execute a model on HPU.
-+The ordinary NInfer Engine and CUDA build keep their existing path. SynapseAI
-+device allocation, recipes, TPC/MME execution, GDN, full-KV generation and KVMem
-+device integration are not implemented by this target.
++tool and exact numerical qualification. The separate
++[native resource adapter](gaudi2-runtime.md) supplies SynapseAI device/Host storage,
++streams and DMA fences, with offline lifecycle qualification. It does not execute
++a model on HPU. The ordinary NInfer Engine and CUDA build keep their existing path.
++Recipes, TPC/MME execution, GDN, full-KV generation and KVMem device integration
++remain to be implemented.
 +
 +Build without CUDA or the Gaudi SDK (CMake 3.28+, C++20, Python 3.11+):
 +
@@ -630,6 +635,115 @@ index 0000000000000000000000000000000000000000..6bc57d3b78bb8fb06d8bb259dbcfff48
 +[1Cat's dequantization/BF16 path](https://github.com/1CatAI/1Cat-vLLM-Gaudi/blob/e2266e0efa381e6649e0f25b789cbb61b21b0e1f/flashinfer_gaudi/block_scaled.py)
 +and the existing NInfer HF block-FP8 source decoder. No external kernel source is
 +copied into this host implementation.
+diff --git a/docs/gaudi2-runtime.md b/docs/gaudi2-runtime.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7038581d6924a6fefe94ad2ea505af39b6879b9
+--- /dev/null
++++ b/docs/gaudi2-runtime.md
+@@ -0,0 +1,103 @@
++# Native Gaudi2 resources
++
++`src/core/gaudi2/runtime.h` and `.cpp` provide the first native SynapseAI resource
++boundary for the future Qwen runner. They call the real C API directly: initialize
++and acquire Gaudi2, allocate device and pinned Host storage, create streams, queue
++H2D/D2H copies, record/query/wait events and query free/total memory. They do not
++execute model mathematics, compile recipes or substitute a PyTorch inference worker.
++
++One standalone native session owns one Gaudi2 device. Resource objects retain
++that session, so releasing the `Device` facade before a pending transfer does not
++release the physical device. Device facades may be copied but cannot be moved.
++The runner serializes calls to these objects; this is not a concurrent allocator.
++The owner must not coexist with an independently initialized SynapseAI/PyTorch
++session in the same process.
++
++An upload/download obtains exclusive leases on both operands until its event
++completes. `PinnedBuffer::bytes()`, `DeviceBuffer::address()` and another transfer
++reject an outstanding lease. Previously returned spans/addresses must not be used
++while leased. Each `Transfer` retains its stream and both allocations. `wait()`
++and successful `ready()` release the leases; destroying a pending transfer waits.
++Moving over a pending transfer first completes the old one. A failed copy submit
++or event record drains the stream before releasing either operand, including an
++ambiguous submit that may have enqueued some work before returning an error.
++
++Explicit wait/query errors throw `SynapseError` with the actual `synStatus` and
++keep the leases. A caller may retry a recoverable wait. Destruction cannot silently
++free possibly active DMA buffers: an unsuccessful final fence or native cleanup
++terminates the process. Callers should explicitly wait while they can handle and
++report an error. Range checks reject zero-length/out-of-allocation copies before
++submission. Buffer allocation sizes are explicit; model/Host budget policy remains
++the runner's responsibility.
++
++`Stream::native_handle()` permits future recipe integration. External queued
++compute must retain its own buffers and completion fences. A `Transfer` retains
++only the operands of its own copy. There is no `synStreamWaitEvent`/cross-stream
++compute dependency implementation in this increment and no claim of compute/DMA
++overlap, recipe completion ownership or asynchronous model inference.
++
++## Build and offline qualification
++
++The existing `NINFER_GAUDI2_PREPARATION_ONLY=ON` build includes
++`ninfer-gaudi2-runtime-lifecycle-test`. It compiles the production adapter source
++against a private, test-only C API double. The fake queues copies and only applies
++them on a fence/stream drain. Freeing a still-referenced operand or releasing a
++device with live resources fails the test. It also deliberately queues a copy
++before an injected submit error to verify the failure cleanup path.
++
++The fake header is guarded by `NINFER_GAUDI2_RUNTIME_TEST_FAKE`, defined only for
++that test target. It is never linked into the product adapter or selected as a
++fallback when the real SDK is missing. Offline tests establish Host ownership,
++ordering and failure behavior; they do not establish DMA/driver correctness.
++
++For an explicit compile-only check against an actual SDK:
++
++```sh
++cmake -S backends/ninfer -B build-gaudi2-sdk -DCMAKE_BUILD_TYPE=Release \
++  -DNINFER_GAUDI2_SDK_HEADER_CHECK=ON \
++  -DNINFER_SYNAPSE_INCLUDE_DIR=/path/to/sdk/include/habanalabs
++cmake --build build-gaudi2-sdk --config Release --target ninfer_gaudi2_runtime_sdk_check -j
++```
++
++For the native Linux library and an explicitly invoked 4096-byte DMA round trip:
++
++```sh
++cmake -S backends/ninfer -B build-gaudi2-native -DCMAKE_BUILD_TYPE=Release \
++  -DNINFER_GAUDI2_NATIVE_RUNTIME=ON \
++  -DNINFER_SYNAPSE_INCLUDE_DIR=/usr/include/habanalabs \
++  -DNINFER_SYNAPSE_LIBRARY=/path/to/libSynapse.so
++cmake --build build-gaudi2-native --config Release -j
++build-gaudi2-native/src/core/gaudi2/ninfer-gaudi2-dma-smoke
++```
++
++Native configuration requires Linux, actual headers and `libSynapse`. Missing
++SDK components fail configuration. The hardware smoke is not registered as a
++host-only CTest and is never run automatically in an environment without Gaudi2.
++These instructions apply from the wrapper root after preparing the backend;
++use `-S .` from a standalone prepared NInfer tree.
++
++## Evidence and remaining work
++
++The adapter was independently compiled, without linking or initialization, against
++official SynapseAI **1.24.1-482** headers using MSVC 14.44 x64, C++20, `/W4 /WX`
++(vendor headers excluded from project warnings). All 163 extracted SDK headers
++were checked against the verified extraction manifest. The original package was
++verified after writing using SHA256
++`66b7f816a9c2fa5ae125c5ab0c1f104dc555c58026bdc5f43b2f673fa4484e1b`.
++The package was obtained from the
++[official package repository](https://vault.habana.ai/artifactory/debian/jammy/pool/main/h/habanalabs-graph/habanalabs-graph_1.24.1-482_amd64.deb),
++following the [official installation package description](https://docs.habana.ai/en/latest/Installation_Guide/Custom_Driver_and_Software_Installation.html).
++SDK files are local build prerequisites and are not copied into this repository.
++
++The production call patterns were checked against the official PyTorch bridge
++[stream implementation](https://github.com/HabanaAI/gaudi-pytorch-bridge/blob/5176b1b2d6865608514e83a2b1fd66459920676e/backend/synapse_helpers/stream.cpp)
++and its device/Host-memory/event helpers. SynapseAI_Core's no-op stream/event
++demonstrations are not used as an execution implementation.
++
++The offline tests cover deferred round trips and offsets, event scope, duplicate
++session rejection, operand reuse, move assignment, facade destruction order,
++empty/range failures, failed allocation/create/submit/record/query/wait and retry.
++Linux linking, driver initialization, physical DMA, SDK failure semantics, actual
++HBM/free-memory observations and the smoke executable remain unverified without
++a Gaudi2 environment. Recipe/TPC/MME, GDN/full-KV, model generation and KVMem device
++integration remain later work. No throughput or HPU memory-peak claim is made.
 diff --git a/docs/gemma4.md b/docs/gemma4.md
 index ce79ebe92acfe76124a6dbff076f641837042799..c46fd0027a6bf43a08225bef9d6c30f05ad4a041 100644
 --- a/docs/gemma4.md
@@ -2276,10 +2390,10 @@ index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..9774ed64596afe2fd82a609b80196fbec339e174
+index 0000000000000000000000000000000000000000..c6fd4ea216d0e03aad5fd0ad51418ada6a3415e1
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,57 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -2297,6 +2411,46 @@ index 0000000000000000000000000000000000000000..9774ed64596afe2fd82a609b80196fbe
 +add_test(NAME ninfer-gaudi2-fp8-tile-files
 +  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_fp8_tile_files.py"
 +          "$<TARGET_FILE:ninfer-gaudi2-fp8-tile>")
++
++# The offline executable compiles the real adapter source but resolves the C API
++# with a strict asynchronous test double. These includes/defines are PRIVATE to
++# this target; no fake SDK can be selected as a product fallback.
++add_executable(ninfer-gaudi2-runtime-lifecycle-test
++  runtime.cpp tests/runtime_lifecycle_test.cpp tests/fake_synapse/fake_synapse.cpp)
++target_compile_features(ninfer-gaudi2-runtime-lifecycle-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-runtime-lifecycle-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-runtime-lifecycle-test PRIVATE
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-runtime-lifecycle COMMAND ninfer-gaudi2-runtime-lifecycle-test)
++
++if(NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
++  find_path(NINFER_SYNAPSE_INCLUDE_DIR synapse_api.h
++    HINTS "${NINFER_SYNAPSE_ROOT}" PATH_SUFFIXES include/habanalabs include)
++  if(NOT NINFER_SYNAPSE_INCLUDE_DIR)
++    message(FATAL_ERROR "Actual SynapseAI headers required: set NINFER_SYNAPSE_INCLUDE_DIR")
++  endif()
++  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp)
++  target_compile_features(ninfer_gaudi2_runtime_sdk_check PRIVATE cxx_std_20)
++  target_include_directories(ninfer_gaudi2_runtime_sdk_check PRIVATE "${NINFER_SYNAPSE_INCLUDE_DIR}")
++endif()
++if(NINFER_GAUDI2_NATIVE_RUNTIME)
++  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    message(FATAL_ERROR "Native SynapseAI execution requires Linux; SDK_HEADER_CHECK performs compile-only checks")
++  endif()
++  find_library(NINFER_SYNAPSE_LIBRARY NAMES Synapse
++    HINTS "${NINFER_SYNAPSE_ROOT}" PATH_SUFFIXES lib lib64 lib/habanalabs)
++  if(NOT NINFER_SYNAPSE_LIBRARY)
++    message(FATAL_ERROR "Actual libSynapse required: set NINFER_SYNAPSE_LIBRARY")
++  endif()
++  add_library(ninfer_gaudi2_runtime STATIC $<TARGET_OBJECTS:ninfer_gaudi2_runtime_sdk_check>)
++  target_compile_features(ninfer_gaudi2_runtime PUBLIC cxx_std_20)
++  target_include_directories(ninfer_gaudi2_runtime PUBLIC
++    "${CMAKE_CURRENT_SOURCE_DIR}" "${NINFER_SYNAPSE_INCLUDE_DIR}")
++  target_link_libraries(ninfer_gaudi2_runtime PUBLIC "${NINFER_SYNAPSE_LIBRARY}")
++  add_executable(ninfer-gaudi2-dma-smoke runtime_smoke.cpp)
++  target_link_libraries(ninfer-gaudi2-dma-smoke PRIVATE ninfer_gaudi2_runtime)
++  # Device execution is deliberate and is never registered in host-only CTest.
++endif()
 diff --git a/src/core/gaudi2/block_fp8.cpp b/src/core/gaudi2/block_fp8.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..5c38dda7ab0d7841535e4b8ed642a5e10ce15d07
@@ -2684,6 +2838,335 @@ index 0000000000000000000000000000000000000000..adb77ed64e4f26b49584ba0154c8f3e7
 +        return 1;
 +    }
 +}
+diff --git a/src/core/gaudi2/runtime.cpp b/src/core/gaudi2/runtime.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..512d8a0ad1ed61696d9695c24a9d691f9b982c1a
+--- /dev/null
++++ b/src/core/gaudi2/runtime.cpp
+@@ -0,0 +1,182 @@
++#include "runtime.h"
++
++#include <atomic>
++#include <exception>
++#include <limits>
++#include <utility>
++
++namespace ninfer::gaudi2 {
++namespace {
++std::atomic_flag session_owned = ATOMIC_FLAG_INIT;
++void check(synStatus status, const char* operation) {
++    if (status != synSuccess) throw SynapseError(status, operation);
++}
++void cleanup(synStatus status) noexcept {
++    // A failed fence cannot justify freeing memory still reachable by DMA. A
++    // native teardown failure is fatal rather than silently releasing/reusing it.
++    if (status != synSuccess) std::terminate();
++}
++void range(std::size_t size, std::size_t offset, std::size_t bytes) {
++    if (!bytes || offset > size || bytes > size - offset)
++        throw std::invalid_argument("Gaudi2 DMA range is empty or outside allocation");
++}
++} // namespace
++
++SynapseError::SynapseError(synStatus status, const char* operation)
++    : std::runtime_error(std::string(operation) + " failed (SynapseAI status " +
++                         std::to_string(static_cast<int>(status)) + ")"), status_(status) {}
++
++namespace detail {
++struct DeviceState {
++    synDeviceId id = 0;
++    DeviceState() {
++        if (session_owned.test_and_set())
++            throw std::logic_error("a native Gaudi2 SynapseAI session already exists");
++        bool initialized = false;
++        try {
++            check(synInitialize(), "synInitialize"); initialized = true;
++            check(synDeviceAcquireByDeviceType(&id, synDeviceGaudi2), "synDeviceAcquireByDeviceType(Gaudi2)");
++        } catch (...) {
++            if (initialized) cleanup(synDestroy());
++            session_owned.clear();
++            throw;
++        }
++    }
++    ~DeviceState() {
++        cleanup(synDeviceRelease(id));
++        cleanup(synDestroy());
++        session_owned.clear();
++    }
++};
++struct DeviceStorage {
++    std::shared_ptr<DeviceState> device;
++    std::uint64_t address = 0;
++    std::size_t size;
++    bool leased = false;
++    DeviceStorage(std::shared_ptr<DeviceState> d, std::size_t n) : device(std::move(d)), size(n) {
++        check(synDeviceMalloc(device->id, size, 0, 0, &address), "synDeviceMalloc");
++    }
++    ~DeviceStorage() { cleanup(synDeviceFree(device->id, address, 0)); }
++};
++struct HostStorage {
++    std::shared_ptr<DeviceState> device;
++    void* address = nullptr;
++    std::size_t size;
++    bool leased = false;
++    HostStorage(std::shared_ptr<DeviceState> d, std::size_t n) : device(std::move(d)), size(n) {
++        check(synHostMalloc(device->id, size, 0, &address), "synHostMalloc");
++    }
++    ~HostStorage() { cleanup(synHostFree(device->id, address, 0)); }
++};
++struct StreamState {
++    std::shared_ptr<DeviceState> device;
++    synStreamHandle handle = nullptr;
++    explicit StreamState(std::shared_ptr<DeviceState> d) : device(std::move(d)) {
++        check(synStreamCreateGeneric(&handle, device->id, 0), "synStreamCreateGeneric");
++    }
++    ~StreamState() {
++        cleanup(synStreamSynchronize(handle));
++        cleanup(synStreamDestroy(handle));
++    }
++};
++struct TransferState {
++    std::shared_ptr<StreamState> stream;
++    std::shared_ptr<DeviceStorage> device;
++    std::shared_ptr<HostStorage> host;
++    synEventHandle event = nullptr;
++    bool leased = false, submitted = false, recorded = false, completed = false;
++    TransferState(std::shared_ptr<StreamState> s, std::shared_ptr<DeviceStorage> d,
++                  std::shared_ptr<HostStorage> h) : stream(std::move(s)), device(std::move(d)), host(std::move(h)) {
++        check(synEventCreate(&event, stream->device->id, 0), "synEventCreate");
++    }
++    void release() noexcept { if (leased) { device->leased = false; host->leased = false; leased = false; } }
++    void wait() {
++        if (!completed && submitted) {
++            check(recorded ? synEventSynchronize(event) : synStreamSynchronize(stream->handle),
++                  recorded ? "synEventSynchronize" : "synStreamSynchronize(after submit failure)");
++        }
++        completed = true;
++        release();
++    }
++    ~TransferState() {
++        if (!completed && submitted)
++            cleanup(recorded ? synEventSynchronize(event) : synStreamSynchronize(stream->handle));
++        release();
++        cleanup(synEventDestroy(event));
++    }
++};
++} // namespace detail
++
++Device::Device() : state_(std::make_shared<detail::DeviceState>()) {}
++DeviceBuffer Device::allocate_device(std::size_t bytes) const {
++    if (!bytes) throw std::invalid_argument("Gaudi2 device allocation must be positive");
++    return DeviceBuffer(std::make_shared<detail::DeviceStorage>(state_, bytes));
++}
++PinnedBuffer Device::allocate_host(std::size_t bytes) const {
++    if (!bytes) throw std::invalid_argument("Gaudi2 pinned allocation must be positive");
++    return PinnedBuffer(std::make_shared<detail::HostStorage>(state_, bytes));
++}
++Stream Device::create_stream() const { return Stream(std::make_shared<detail::StreamState>(state_)); }
++MemoryInfo Device::memory_info() const {
++    MemoryInfo info{};
++    check(synDeviceGetMemoryInfo(state_->id, &info.free_bytes, &info.total_bytes), "synDeviceGetMemoryInfo");
++    return info;
++}
++std::size_t DeviceBuffer::size() const noexcept { return state_ ? state_->size : 0; }
++std::uint64_t DeviceBuffer::address() const {
++    if (!state_ || state_->leased) throw std::logic_error("Gaudi2 device buffer is empty or leased by DMA");
++    return state_->address;
++}
++std::size_t PinnedBuffer::size() const noexcept { return state_ ? state_->size : 0; }
++std::span<std::byte> PinnedBuffer::bytes() {
++    if (!state_ || state_->leased) throw std::logic_error("Gaudi2 pinned buffer is empty or leased by DMA");
++    return {static_cast<std::byte*>(state_->address), state_->size};
++}
++synStreamHandle Stream::native_handle() const {
++    if (!state_) throw std::logic_error("Gaudi2 stream is empty");
++    return state_->handle;
++}
++void Stream::synchronize() { check(synStreamSynchronize(native_handle()), "synStreamSynchronize"); }
++Transfer Stream::copy(DeviceBuffer& device, PinnedBuffer& host, bool upload, std::size_t bytes,
++                      std::size_t device_offset, std::size_t host_offset) {
++    (void)native_handle();
++    if (!device.state_ || !host.state_ || device.state_->device != state_->device ||
++        host.state_->device != state_->device)
++        throw std::invalid_argument("Gaudi2 DMA resources do not belong to this device");
++    range(device.size(), device_offset, bytes); range(host.size(), host_offset, bytes);
++    if (device.state_->leased || host.state_->leased)
++        throw std::logic_error("Gaudi2 DMA buffer cannot be reused before its fence completes");
++    auto transfer = std::make_unique<detail::TransferState>(state_, device.state_, host.state_);
++    transfer->leased = true; device.state_->leased = true; host.state_->leased = true;
++    const auto d = device.state_->address + device_offset;
++    const auto h = reinterpret_cast<std::uint64_t>(host.state_->address) + host_offset;
++    transfer->submitted = true; // Even a failed submission is drained before releasing either buffer.
++    check(synMemCopyAsync(state_->handle, upload ? h : d, bytes, upload ? d : h,
++                          upload ? HOST_TO_DRAM : DRAM_TO_HOST), "synMemCopyAsync");
++    check(synEventRecord(transfer->event, state_->handle), "synEventRecord");
++    transfer->recorded = true;
++    return Transfer(std::move(transfer));
++}
++Transfer Stream::upload(DeviceBuffer& destination, PinnedBuffer& source, std::size_t bytes,
++                        std::size_t destination_offset, std::size_t source_offset) {
++    return copy(destination, source, true, bytes, destination_offset, source_offset);
++}
++Transfer Stream::download(PinnedBuffer& destination, DeviceBuffer& source, std::size_t bytes,
++                          std::size_t destination_offset, std::size_t source_offset) {
++    return copy(source, destination, false, bytes, source_offset, destination_offset);
++}
++Transfer::Transfer() = default;
++Transfer::Transfer(std::unique_ptr<detail::TransferState> state) : state_(std::move(state)) {}
++Transfer::~Transfer() = default;
++Transfer::Transfer(Transfer&&) noexcept = default;
++Transfer& Transfer::operator=(Transfer&&) noexcept = default;
++void Transfer::wait() { if (state_) state_->wait(); }
++bool Transfer::ready() {
++    if (!state_ || state_->completed) return true;
++    const auto status = synEventQuery(state_->event);
++    if (status == synBusy) return false;
++    check(status, "synEventQuery");
++    state_->completed = true; state_->release();
++    return true;
++}
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/runtime.h b/src/core/gaudi2/runtime.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..cad0fe0959ba3d42b38f54f6049abe23258f910c
+--- /dev/null
++++ b/src/core/gaudi2/runtime.h
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <synapse_api.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <span>
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::gaudi2 {
++class SynapseError : public std::runtime_error {
++public:
++    SynapseError(synStatus status, const char* operation);
++    [[nodiscard]] synStatus status() const noexcept { return status_; }
++private:
++    synStatus status_;
++};
++
++namespace detail { struct DeviceState; struct DeviceStorage; struct HostStorage;
++                   struct StreamState; struct TransferState; }
++class Stream;
++class Transfer;
++
++class DeviceBuffer {
++public:
++    DeviceBuffer() = default;
++    [[nodiscard]] std::size_t size() const noexcept;
++    // Host-side accessors reject a pending DMA lease. Returned addresses/spans must
++    // not be used after submitting a transfer until that transfer has completed.
++    [[nodiscard]] std::uint64_t address() const;
++private:
++    friend class Device; friend class Stream;
++    explicit DeviceBuffer(std::shared_ptr<detail::DeviceStorage> state) : state_(std::move(state)) {}
++    std::shared_ptr<detail::DeviceStorage> state_;
++};
++
++class PinnedBuffer {
++public:
++    PinnedBuffer() = default;
++    [[nodiscard]] std::size_t size() const noexcept;
++    [[nodiscard]] std::span<std::byte> bytes();
++private:
++    friend class Device; friend class Stream;
++    explicit PinnedBuffer(std::shared_ptr<detail::HostStorage> state) : state_(std::move(state)) {}
++    std::shared_ptr<detail::HostStorage> state_;
++};
++
++class Transfer {
++public:
++    Transfer();
++    ~Transfer();
++    Transfer(Transfer&&) noexcept;
++    Transfer& operator=(Transfer&&) noexcept;
++    Transfer(const Transfer&) = delete;
++    Transfer& operator=(const Transfer&) = delete;
++    // A successful event completion releases the leases. Destruction also waits;
++    // dropping the user's buffers/context before a transfer is therefore safe.
++    void wait();
++    [[nodiscard]] bool ready();
++private:
++    friend class Stream;
++    explicit Transfer(std::unique_ptr<detail::TransferState> state);
++    std::unique_ptr<detail::TransferState> state_;
++};
++
++class Stream {
++public:
++    Stream() = default;
++    void synchronize();
++    [[nodiscard]] synStreamHandle native_handle() const;
++    // External recipe/compute submissions through this handle must retain their
++    // own buffers and fences; Transfer owns only the operands of its DMA copy.
++    [[nodiscard]] Transfer upload(DeviceBuffer& destination, PinnedBuffer& source,
++                                  std::size_t bytes, std::size_t destination_offset = 0,
++                                  std::size_t source_offset = 0);
++    [[nodiscard]] Transfer download(PinnedBuffer& destination, DeviceBuffer& source,
++                                    std::size_t bytes, std::size_t destination_offset = 0,
++                                    std::size_t source_offset = 0);
++private:
++    friend class Device;
++    explicit Stream(std::shared_ptr<detail::StreamState> state) : state_(std::move(state)) {}
++    [[nodiscard]] Transfer copy(DeviceBuffer&, PinnedBuffer&, bool upload, std::size_t,
++                                std::size_t device_offset, std::size_t host_offset);
++    std::shared_ptr<detail::StreamState> state_;
++};
++
++struct MemoryInfo { std::uint64_t free_bytes; std::uint64_t total_bytes; };
++
++// One standalone native SynapseAI owner per process. It must not coexist with an
++// independently initialized PyTorch/SynapseAI session. Resources retain ownership.
++// Calls on these objects are serialized by the owning runner thread; they are not
++// a concurrent allocator or general multi-device runtime.
++class Device {
++public:
++    Device();
++    Device(const Device&) = default;
++    Device& operator=(const Device&) = default;
++    Device(Device&&) = delete;
++    Device& operator=(Device&&) = delete;
++    [[nodiscard]] DeviceBuffer allocate_device(std::size_t bytes) const;
++    [[nodiscard]] PinnedBuffer allocate_host(std::size_t bytes) const;
++    [[nodiscard]] Stream create_stream() const;
++    [[nodiscard]] MemoryInfo memory_info() const;
++private:
++    std::shared_ptr<detail::DeviceState> state_;
++};
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/runtime_smoke.cpp b/src/core/gaudi2/runtime_smoke.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f707efafc2670920360c463e7ed862b264d00054
+--- /dev/null
++++ b/src/core/gaudi2/runtime_smoke.cpp
+@@ -0,0 +1,20 @@
++#include "runtime.h"
++#include <algorithm>
++#include <iostream>
++
++int main() {
++    try {
++        ninfer::gaudi2::Device device;
++        auto stream = device.create_stream();
++        auto source = device.allocate_host(4096), destination = device.allocate_host(4096);
++        auto memory = device.allocate_device(4096);
++        for (std::size_t i = 0; i < source.size(); ++i) source.bytes()[i] = static_cast<std::byte>(i % 251);
++        auto upload = stream.upload(memory, source, source.size()); upload.wait();
++        auto download = stream.download(destination, memory, destination.size()); download.wait();
++        if (!std::equal(source.bytes().begin(), source.bytes().end(), destination.bytes().begin())) return 1;
++        const auto info = device.memory_info();
++        std::cout << "Gaudi2 native 4096-byte DMA round trip passed; free=" << info.free_bytes
++                  << " total=" << info.total_bytes << '\n';
++        return 0;
++    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
++}
 diff --git a/src/core/gaudi2/test_fp8_tile_files.py b/src/core/gaudi2/test_fp8_tile_files.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..2569a6b53a3d55cc96227d0a103c39a6f620b2c3
@@ -2789,6 +3272,303 @@ index 0000000000000000000000000000000000000000..2569a6b53a3d55cc96227d0a103c39a6
 +
 +if __name__ == '__main__':
 +    unittest.main()
+diff --git a/src/core/gaudi2/tests/fake_synapse/control.h b/src/core/gaudi2/tests/fake_synapse/control.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae0e325441fafe2e639e853e9adc078d4c339e00
+--- /dev/null
++++ b/src/core/gaudi2/tests/fake_synapse/control.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include <cstddef>
++#include <string_view>
++namespace fake_synapse {
++void fail_next(std::string_view operation);
++void clear_failure();
++void assert_clean();
++std::size_t live_allocations();
++std::size_t completed_copies();
++}
+diff --git a/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp b/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..197bba530fb5547958563823a7f3a535e0880a47
+--- /dev/null
++++ b/src/core/gaudi2/tests/fake_synapse/fake_synapse.cpp
+@@ -0,0 +1,123 @@
++#include "synapse_api.h"
++#include "control.h"
++
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <map>
++#include <memory>
++#include <set>
++#include <stdexcept>
++#include <string>
++
++struct Copy { std::uint64_t source, destination, bytes; };
++struct FakeSynStream { std::deque<Copy> pending; std::size_t completed = 0; };
++struct FakeSynEvent { FakeSynStream* stream = nullptr; std::size_t target = 0; };
++namespace {
++std::string failure;
++bool initialized = false, acquired = false;
++std::map<std::uint64_t, std::unique_ptr<std::byte[]>> device_memory, host_memory;
++std::map<std::uint64_t, std::size_t> sizes;
++std::set<FakeSynStream*> streams;
++std::set<FakeSynEvent*> events;
++std::size_t copies = 0;
++bool fail(const char* operation) { if (failure == operation) { failure.clear(); return true; } return false; }
++void demand(bool value) { if (!value) throw std::runtime_error("offline SynapseAI lifecycle invariant failed"); }
++bool valid_pointer(std::uint64_t pointer, std::uint64_t bytes) {
++    for (const auto& [base, size] : sizes)
++        if (pointer >= base && pointer - base <= size && bytes <= size - (pointer - base)) return true;
++    return false;
++}
++void drain(FakeSynStream* stream, std::size_t count) {
++    while (stream->completed < count) {
++        demand(!stream->pending.empty());
++        const auto copy = stream->pending.front(); stream->pending.pop_front();
++        demand(valid_pointer(copy.source, copy.bytes) && valid_pointer(copy.destination, copy.bytes));
++        std::memcpy(reinterpret_cast<void*>(copy.destination), reinterpret_cast<const void*>(copy.source), copy.bytes);
++        ++stream->completed; ++copies;
++    }
++}
++void no_pending_reference(std::uint64_t pointer) {
++    const auto size = sizes.at(pointer);
++    for (const auto stream : streams) for (const auto& copy : stream->pending)
++        demand(!(copy.source >= pointer && copy.source - pointer < size) &&
++               !(copy.destination >= pointer && copy.destination - pointer < size));
++}
++synStatus allocate(std::uint64_t bytes, std::uint64_t* address,
++                   std::map<std::uint64_t, std::unique_ptr<std::byte[]>>& allocations) {
++    demand(acquired && bytes > 0);
++    auto data = std::make_unique<std::byte[]>(static_cast<std::size_t>(bytes));
++    *address = reinterpret_cast<std::uint64_t>(data.get());
++    sizes[*address] = static_cast<std::size_t>(bytes); allocations.emplace(*address, std::move(data));
++    return synSuccess;
++}
++}
++namespace fake_synapse {
++void fail_next(std::string_view operation) { failure = operation; }
++void clear_failure() { failure.clear(); }
++void assert_clean() { demand(!initialized && !acquired && device_memory.empty() && host_memory.empty() && streams.empty() && events.empty()); }
++std::size_t live_allocations() { return sizes.size(); }
++std::size_t completed_copies() { return copies; }
++}
++extern "C" {
++synStatus synInitialize() { if (fail("synInitialize")) return synFail; demand(!initialized); initialized = true; return synSuccess; }
++synStatus synDestroy() { demand(initialized && !acquired); initialized = false; return synSuccess; }
++synStatus synDeviceAcquireByDeviceType(synDeviceId* id, synDeviceType type) {
++    if (fail("synDeviceAcquireByDeviceType")) return synFail;
++    demand(initialized && !acquired && type == synDeviceGaudi2); acquired = true; *id = 7; return synSuccess;
++}
++synStatus synDeviceRelease(synDeviceId id) { demand(acquired && id == 7 && sizes.empty() && streams.empty() && events.empty()); acquired = false; return synSuccess; }
++synStatus synDeviceGetMemoryInfo(synDeviceId, std::uint64_t* free, std::uint64_t* total) {
++    if (fail("synDeviceGetMemoryInfo")) return synFail;
++    *total = 96ull << 30; *free = 95ull << 30; return synSuccess;
++}
++synStatus synDeviceMalloc(synDeviceId, std::uint64_t bytes, std::uint64_t, std::uint32_t, std::uint64_t* address) {
++    if (fail("synDeviceMalloc")) return synFail; return allocate(bytes, address, device_memory);
++}
++synStatus synDeviceFree(synDeviceId, std::uint64_t address, std::uint32_t) {
++    no_pending_reference(address); demand(device_memory.erase(address) == 1); sizes.erase(address); return synSuccess;
++}
++synStatus synHostMalloc(synDeviceId, std::uint64_t bytes, std::uint32_t, void** address) {
++    if (fail("synHostMalloc")) return synFail;
++    std::uint64_t raw = 0; const auto result = allocate(bytes, &raw, host_memory); *address = reinterpret_cast<void*>(raw); return result;
++}
++synStatus synHostFree(synDeviceId, const void* address, std::uint32_t) {
++    const auto raw = reinterpret_cast<std::uint64_t>(address); no_pending_reference(raw);
++    demand(host_memory.erase(raw) == 1); sizes.erase(raw); return synSuccess;
++}
++synStatus synStreamCreateGeneric(synStreamHandle* stream, synDeviceId, std::uint32_t) {
++    if (fail("synStreamCreateGeneric")) return synFail;
++    *stream = new FakeSynStream; streams.insert(*stream); return synSuccess;
++}
++synStatus synStreamDestroy(synStreamHandle stream) { demand(stream->pending.empty() && streams.erase(stream) == 1); delete stream; return synSuccess; }
++synStatus synStreamSynchronize(synStreamHandle stream) {
++    if (fail("synStreamSynchronize")) return synFail;
++    drain(stream, stream->completed + stream->pending.size()); return synSuccess;
++}
++synStatus synEventCreate(synEventHandle* event, synDeviceId, std::uint32_t) {
++    if (fail("synEventCreate")) return synFail;
++    *event = new FakeSynEvent; events.insert(*event); return synSuccess;
++}
++synStatus synEventDestroy(synEventHandle event) { demand(events.erase(event) == 1); delete event; return synSuccess; }
++synStatus synEventRecord(synEventHandle event, synStreamHandle stream) {
++    if (fail("synEventRecord")) return synFail;
++    event->stream = stream; event->target = stream->completed + stream->pending.size(); return synSuccess;
++}
++synStatus synEventQuery(synEventHandle event) {
++    if (fail("synEventQuery")) return synFail;
++    demand(event->stream); return event->stream->completed >= event->target ? synSuccess : synBusy;
++}
++synStatus synEventSynchronize(synEventHandle event) {
++    if (fail("synEventSynchronize")) return synFail;
++    demand(event->stream); drain(event->stream, event->target); return synSuccess;
++}
++synStatus synMemCopyAsync(synStreamHandle stream, std::uint64_t source, std::uint64_t bytes,
++                          std::uint64_t destination, synDmaDir direction) {
++    demand(direction == HOST_TO_DRAM || direction == DRAM_TO_HOST);
++    demand(valid_pointer(source, bytes) && valid_pointer(destination, bytes));
++    // Deliberately enqueue before injected failure: the adapter must drain an
++    // ambiguous failed submit, not assume no work reached the device.
++    stream->pending.push_back({source, destination, bytes});
++    return fail("synMemCopyAsync") ? synFail : synSuccess;
++}
++}
+diff --git a/src/core/gaudi2/tests/fake_synapse/synapse_api.h b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a0d77b6c49120b2c9e495e369695774f093d4f46
+--- /dev/null
++++ b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
+@@ -0,0 +1,34 @@
++#pragma once
++// Test-only C declarations. Never a fallback SDK or runtime implementation.
++#ifndef NINFER_GAUDI2_RUNTIME_TEST_FAKE
++#error "The fake SynapseAI header is restricted to the offline lifecycle test target"
++#endif
++#include <cstdint>
++using synDeviceId = std::uint32_t;
++enum synStatus { synSuccess = 0, synFail = 1, synBusy = 22 };
++enum synDeviceType { synDeviceGaudi = 0, synDeviceGaudi2 = 1 };
++enum synDmaDir { HOST_TO_DRAM = 0, DRAM_TO_HOST = 1 };
++struct FakeSynStream;
++struct FakeSynEvent;
++using synStreamHandle = FakeSynStream*;
++using synEventHandle = FakeSynEvent*;
++extern "C" {
++synStatus synInitialize();
++synStatus synDestroy();
++synStatus synDeviceAcquireByDeviceType(synDeviceId*, synDeviceType);
++synStatus synDeviceRelease(synDeviceId);
++synStatus synDeviceGetMemoryInfo(synDeviceId, std::uint64_t*, std::uint64_t*);
++synStatus synDeviceMalloc(synDeviceId, std::uint64_t, std::uint64_t, std::uint32_t, std::uint64_t*);
++synStatus synDeviceFree(synDeviceId, std::uint64_t, std::uint32_t);
++synStatus synHostMalloc(synDeviceId, std::uint64_t, std::uint32_t, void**);
++synStatus synHostFree(synDeviceId, const void*, std::uint32_t);
++synStatus synStreamCreateGeneric(synStreamHandle*, synDeviceId, std::uint32_t);
++synStatus synStreamDestroy(synStreamHandle);
++synStatus synStreamSynchronize(synStreamHandle);
++synStatus synEventCreate(synEventHandle*, synDeviceId, std::uint32_t);
++synStatus synEventDestroy(synEventHandle);
++synStatus synEventRecord(synEventHandle, synStreamHandle);
++synStatus synEventQuery(synEventHandle);
++synStatus synEventSynchronize(synEventHandle);
++synStatus synMemCopyAsync(synStreamHandle, std::uint64_t, std::uint64_t, std::uint64_t, synDmaDir);
++}
+diff --git a/src/core/gaudi2/tests/runtime_lifecycle_test.cpp b/src/core/gaudi2/tests/runtime_lifecycle_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5a31d2e8e0f4864e13ad72ca8c8f9e90b69521e
+--- /dev/null
++++ b/src/core/gaudi2/tests/runtime_lifecycle_test.cpp
+@@ -0,0 +1,106 @@
++#include "runtime.h"
++#include "control.h"
++
++#include <algorithm>
++#include <iostream>
++#include <limits>
++#include <stdexcept>
++#include <type_traits>
++
++using namespace ninfer::gaudi2;
++namespace {
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++template<class Exception, class F> void rejects(F&& action) {
++    try { action(); } catch (const Exception&) { return; }
++    throw std::runtime_error("expected exception was not raised");
++}
++void round_trip_and_ranges() {
++    Device device;
++    static_assert(!std::is_move_constructible_v<Device> && !std::is_move_assignable_v<Device>);
++    rejects<std::logic_error>([] { Device duplicate; });
++    auto stream = device.create_stream();
++    auto host = device.allocate_host(64); auto memory = device.allocate_device(64);
++    const auto info = device.memory_info(); require(info.free_bytes <= info.total_bytes, "memory information order");
++    for (std::size_t i = 0; i < 64; ++i) host.bytes()[i] = static_cast<std::byte>(i);
++    auto upload = stream.upload(memory, host, 16, 8, 4);
++    require(!upload.ready(), "fake must defer DMA until a real fence is drained");
++    rejects<std::logic_error>([&] { (void)host.bytes(); });
++    rejects<std::logic_error>([&] { (void)memory.address(); });
++    rejects<std::logic_error>([&] { (void)stream.upload(memory, host, 16); });
++    upload.wait(); upload.wait(); require(upload.ready(), "wait must be idempotent");
++    auto polled = stream.upload(memory, host, 16, 8, 4);
++    stream.synchronize();
++    require(polled.ready(), "successful event query must publish completed DMA");
++    (void)host.bytes(); (void)memory.address();
++    std::fill(host.bytes().begin(), host.bytes().end(), std::byte{0});
++    { auto download = stream.download(host, memory, 16, 32, 8); }
++    for (std::size_t i = 0; i < 16; ++i) require(host.bytes()[32 + i] == static_cast<std::byte>(4 + i), "DMA offset round trip");
++    rejects<std::invalid_argument>([&] { (void)stream.upload(memory, host, 0); });
++    rejects<std::invalid_argument>([&] { (void)stream.upload(memory, host, 2, 63); });
++    rejects<std::invalid_argument>([&] { (void)stream.upload(memory, host, 1, 0, std::numeric_limits<std::size_t>::max()); });
++    rejects<std::invalid_argument>([&] { (void)device.allocate_host(0); });
++    rejects<std::invalid_argument>([&] { (void)device.allocate_device(0); });
++    DeviceBuffer empty_device; PinnedBuffer empty_host; Stream empty_stream;
++    rejects<std::logic_error>([&] { (void)empty_device.address(); });
++    rejects<std::logic_error>([&] { (void)empty_host.bytes(); });
++    rejects<std::logic_error>([&] { empty_stream.synchronize(); });
++}
++void resources_outlive_facades() {
++    Transfer retained;
++    {
++        Device device; auto stream = device.create_stream();
++        auto host = device.allocate_host(8); auto memory = device.allocate_device(8);
++        retained = stream.upload(memory, host, 8);
++    }
++    require(fake_synapse::live_allocations() == 2, "transfer must retain both operands and device");
++    retained.wait(); retained = Transfer{};
++    fake_synapse::assert_clean();
++}
++void fence_scope_and_move_assignment() {
++    Device device; auto stream = device.create_stream();
++    auto h1 = device.allocate_host(8), h2 = device.allocate_host(8);
++    auto d1 = device.allocate_device(8), d2 = device.allocate_device(8);
++    auto first = stream.upload(d1, h1, 8); auto second = stream.upload(d2, h2, 8);
++    const auto before = fake_synapse::completed_copies();
++    first.wait();
++    require(fake_synapse::completed_copies() == before + 1 && !second.ready(), "event fence must not drain later work");
++    first = stream.upload(d1, h1, 8);
++    first = std::move(second); // Destruction of the old pending transfer waits for it.
++    require(second.ready(), "moved-from transfer must be empty"); second.wait(); first.wait();
++    require(fake_synapse::completed_copies() == before + 3, "move assignment completion count");
++}
++void failures() {
++    for (auto operation : {"synInitialize", "synDeviceAcquireByDeviceType"}) {
++        fake_synapse::fail_next(operation); rejects<SynapseError>([] { Device device; });
++        fake_synapse::assert_clean();
++    }
++    {
++        Device device;
++        fake_synapse::fail_next("synDeviceMalloc"); rejects<SynapseError>([&] { (void)device.allocate_device(8); });
++        fake_synapse::fail_next("synHostMalloc"); rejects<SynapseError>([&] { (void)device.allocate_host(8); });
++        fake_synapse::fail_next("synStreamCreateGeneric"); rejects<SynapseError>([&] { (void)device.create_stream(); });
++        require(fake_synapse::live_allocations() == 0, "failed allocation must not retain storage");
++        auto stream = device.create_stream(); auto host = device.allocate_host(8); auto memory = device.allocate_device(8);
++        for (auto operation : {"synEventCreate", "synMemCopyAsync", "synEventRecord"}) {
++            fake_synapse::fail_next(operation);
++            rejects<SynapseError>([&] { (void)stream.upload(memory, host, 8); });
++            (void)host.bytes(); (void)memory.address(); // Failed submission was safely drained.
++        }
++        auto transfer = stream.upload(memory, host, 8);
++        fake_synapse::fail_next("synEventQuery"); rejects<SynapseError>([&] { (void)transfer.ready(); });
++        rejects<std::logic_error>([&] { (void)host.bytes(); });
++        fake_synapse::fail_next("synEventSynchronize"); rejects<SynapseError>([&] { transfer.wait(); });
++        rejects<std::logic_error>([&] { (void)memory.address(); });
++        transfer.wait(); (void)host.bytes();
++        fake_synapse::fail_next("synDeviceGetMemoryInfo"); rejects<SynapseError>([&] { (void)device.memory_info(); });
++    }
++    fake_synapse::assert_clean();
++}
++}
++int main() {
++    try {
++        round_trip_and_ranges(); fake_synapse::assert_clean();
++        resources_outlive_facades(); fence_scope_and_move_assignment(); fake_synapse::assert_clean();
++        failures(); std::cout << "offline asynchronous resource lifecycle checks passed\n";
++    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
++}
 diff --git a/src/core/paged_kv_cache.cpp b/src/core/paged_kv_cache.cpp
 index 763fc4056e8c800efe86aa19c17e0fead493a8b1..8cc067240347a9c4181a6618e35aae59fb49f86b 100644
 --- a/src/core/paged_kv_cache.cpp

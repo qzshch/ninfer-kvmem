@@ -33,8 +33,19 @@ The read-only [checkpoint inventory](../scripts/gaudi2/README.md) validates loca
 safetensors metadata and emits native tile commands with explicit absolute
 plane offsets. It does not download weights or create a full BF16 model copy.
 
+The prepared backend also contains a native SynapseAI resource adapter:
+device/pinned Host allocation, streams, H2D/D2H transfers and completion fences
+with explicit DMA leases. Host lifecycle tests defer copies until their events
+complete and inject failures; their fake C API is private to the test executable
+and never substitutes for the native product runtime. The adapter was separately
+compiled against verified official SynapseAI 1.24.1-482 headers using MSVC 14.44
+x64 and C++20; Linux linking and physical device execution are still unverified.
+The prepared backend's `docs/gaudi2-runtime.md` defines its ownership contract,
+explicit real-SDK build flags and optional hardware smoke command.
+
 Windows MSVC host checks cover exact FP8 decoding, BF16 cast boundaries,
-nonaligned tile scales, bounded allocation and malformed inputs. CI is configured
-to build and run the same tests on Linux and Windows. Real-checkpoint accuracy, SynapseAI runtime/TPC/MME,
-GDN, full-KV ordinary AR and later KVMem device integration still require
-implementation and validation on Gaudi2. No throughput result is available yet.
+nonaligned tile scales, bounded allocation, malformed inputs and asynchronous
+resource lifetimes. CI builds and runs the host suite on Linux and Windows.
+Real-checkpoint accuracy, recipes/TPC/MME, GDN, full-KV ordinary AR and later KVMem
+device integration still require implementation and validation on Gaudi2. No
+throughput result is available yet.
