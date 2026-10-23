@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 11bc2bc30811c944fc4e4a1c16373806da33c96e..0a5e183a2b2e965109ede7f82f84ee6e5feaedc1 100644
+index 11bc2bc3..0a5e183a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -173,7 +173,13 @@ if(MSVC)
@@ -62,7 +62,7 @@ index 11bc2bc30811c944fc4e4a1c16373806da33c96e..0a5e183a2b2e965109ede7f82f84ee6e
  # --- Subdirectories ----------------------------------------------------------
  add_subdirectory(src)
 diff --git a/apps/cli/main.cpp b/apps/cli/main.cpp
-index e62d6fb6e780f0d717d4b3128d04e67d2fda037b..520314b7cc4c88b955f8b079eed42ea45b3b2bed 100644
+index e62d6fb6..520314b7 100644
 --- a/apps/cli/main.cpp
 +++ b/apps/cli/main.cpp
 @@ -395,6 +395,9 @@ int main(int argc, char** argv) {
@@ -88,7 +88,7 @@ index e62d6fb6e780f0d717d4b3128d04e67d2fda037b..520314b7cc4c88b955f8b079eed42ea4
          engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
  
 diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
-index 268d5d013bd1b971c90cc921bf28662832820b7f..d63247bd44e63a79a2f0f355536c1366139d5627 100644
+index 268d5d01..d63247bd 100644
 --- a/apps/cli/options.cpp
 +++ b/apps/cli/options.cpp
 @@ -1,6 +1,7 @@
@@ -213,7 +213,7 @@ index 268d5d013bd1b971c90cc921bf28662832820b7f..d63247bd44e63a79a2f0f355536c1366
  
      const bool has_prompt   = !options.prompt.empty();
 diff --git a/apps/cli/options.h b/apps/cli/options.h
-index a6d70323ce08b3ede98b2698022912c364cb05e0..1aab5155408e96ea21f78b1aa2a4ba06206725cf 100644
+index a6d70323..1aab5155 100644
 --- a/apps/cli/options.h
 +++ b/apps/cli/options.h
 @@ -54,6 +54,10 @@ struct Options {
@@ -228,7 +228,7 @@ index a6d70323ce08b3ede98b2698022912c364cb05e0..1aab5155408e96ea21f78b1aa2a4ba06
      bool prefill_a8     = true;
      bool prefill_cublas = false;
 diff --git a/apps/serve/main.cpp b/apps/serve/main.cpp
-index 1371ac66bfe5d12b218860e4db9dec0e3afa074f..709856394faac699ea26e85856a7f414d581ed8d 100644
+index 1371ac66..70985639 100644
 --- a/apps/serve/main.cpp
 +++ b/apps/serve/main.cpp
 @@ -280,6 +280,11 @@ int main(int argc, char** argv) {
@@ -264,7 +264,7 @@ index 1371ac66bfe5d12b218860e4db9dec0e3afa074f..709856394faac699ea26e85856a7f414
              }
              definitions.push_back(
 diff --git a/bench/README.md b/bench/README.md
-index 44285d6c3cb6e1faf54210eea060947a2ad431cc..1ec8bc2de5eb19557a7bbfde1f1f76a27f92af9c 100644
+index 44285d6c..1ec8bc2d 100644
 --- a/bench/README.md
 +++ b/bench/README.md
 @@ -37,7 +37,8 @@ Python interpreter; a benchmark-only configuration does not require one.
@@ -320,7 +320,7 @@ index 44285d6c3cb6e1faf54210eea060947a2ad431cc..1ec8bc2de5eb19557a7bbfde1f1f76a2
  and the proposal head independently; JSON and CSV identify DFlash2 explicitly. MTP alone reserves
  its extra lookahead KV margin. Schema v17 adds `rope_yarn_factor`.
 diff --git a/bench/inference/benchmarks.cmake b/bench/inference/benchmarks.cmake
-index 9270ebb3d3e1601cb28bf4bbbdbdb29c4839a855..e063007b10322457692fef3cf36a3fc98d60f3c3 100644
+index 9270ebb3..e063007b 100644
 --- a/bench/inference/benchmarks.cmake
 +++ b/bench/inference/benchmarks.cmake
 @@ -5,4 +5,4 @@ add_executable(ninfer_bench
@@ -330,7 +330,7 @@ index 9270ebb3d3e1601cb28bf4bbbdbdb29c4839a855..e063007b10322457692fef3cf36a3fc9
 -target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
 +target_link_libraries(ninfer_bench PRIVATE ninfer_engine kvmem ${NINFER_CUDART_TARGET})
 diff --git a/bench/inference/ninfer_bench.cpp b/bench/inference/ninfer_bench.cpp
-index 1cf07eaf1b5e130e08d717cd396ed04b5f7c9b12..2118401440fbbdb9eb54aa6862a84faaf9a62b5c 100644
+index 1cf07eaf..21184014 100644
 --- a/bench/inference/ninfer_bench.cpp
 +++ b/bench/inference/ninfer_bench.cpp
 @@ -78,7 +78,8 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
@@ -364,7 +364,7 @@ index 1cf07eaf1b5e130e08d717cd396ed04b5f7c9b12..2118401440fbbdb9eb54aa6862a84faa
          engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
          engine_options.kv_cache      = options.kv_cache;
 diff --git a/bench/inference/ninfer_bench_support.cpp b/bench/inference/ninfer_bench_support.cpp
-index 5eeea0a138692effc533dc2947ce5c967e226d7c..14ad37cf235782a20a1c998734d403dd10d648a1 100644
+index 5eeea0a1..14ad37cf 100644
 --- a/bench/inference/ninfer_bench_support.cpp
 +++ b/bench/inference/ninfer_bench_support.cpp
 @@ -1,4 +1,5 @@
@@ -463,7 +463,7 @@ index 5eeea0a138692effc533dc2947ce5c967e226d7c..14ad37cf235782a20a1c998734d403dd
              out << "\n        }" << (r + 1 == result.reps.size() ? "" : ",") << '\n';
          }
 diff --git a/bench/inference/ninfer_bench_support.h b/bench/inference/ninfer_bench_support.h
-index 8a2af66a7c23e30dab24ee370ec5dbd02eadcbd1..388d87513bd9edfbb185030dcefa1f7b6f650c5d 100644
+index 8a2af66a..388d8751 100644
 --- a/bench/inference/ninfer_bench_support.h
 +++ b/bench/inference/ninfer_bench_support.h
 @@ -64,6 +64,7 @@ struct BenchOptions {
@@ -483,7 +483,7 @@ index 8a2af66a7c23e30dab24ee370ec5dbd02eadcbd1..388d87513bd9edfbb185030dcefa1f7b
  
  struct TestResult {
 diff --git a/bench/ops/sliding_window_attention_bench.cu b/bench/ops/sliding_window_attention_bench.cu
-index 09381b4e9abfb5576fba68b43b81ce896a1f1afb..b3eb36950ae216647e28fdc029fadf72e7a66c6e 100644
+index 09381b4e..b3eb3695 100644
 --- a/bench/ops/sliding_window_attention_bench.cu
 +++ b/bench/ops/sliding_window_attention_bench.cu
 @@ -282,7 +282,7 @@ public:
@@ -496,7 +496,7 @@ index 09381b4e9abfb5576fba68b43b81ce896a1f1afb..b3eb36950ae216647e28fdc029fadf72
                                        envelope_, workspace_, output_tensor_, stream);
      }
 diff --git a/docs/cli.md b/docs/cli.md
-index b1311bea4c50adf2640dda4292313fb56d7579d3..c06d9e4a63ce3013399c694bc93efcd04bfcd442 100644
+index b1311bea..c06d9e4a 100644
 --- a/docs/cli.md
 +++ b/docs/cli.md
 @@ -249,7 +249,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
@@ -518,7 +518,7 @@ index b1311bea4c50adf2640dda4292313fb56d7579d3..c06d9e4a63ce3013399c694bc93efcd0
  | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
  | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 diff --git a/docs/gemma4.md b/docs/gemma4.md
-index ce79ebe92acfe76124a6dbff076f641837042799..c46fd0027a6bf43a08225bef9d6c30f05ad4a041 100644
+index ce79ebe9..c46fd002 100644
 --- a/docs/gemma4.md
 +++ b/docs/gemma4.md
 @@ -380,10 +380,10 @@ mask. The mask of its next token is computed on a thread of its own from the gra
@@ -537,7 +537,7 @@ index ce79ebe92acfe76124a6dbff076f641837042799..c46fd0027a6bf43a08225bef9d6c30f0
  
  String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string
 diff --git a/docs/gguf.md b/docs/gguf.md
-index 13ad7082b185d7faafdbb3c7c1305fd92c7ff743..f9b2d949a571c480e434126d13e6a795d85c0be8 100644
+index 13ad7082..f9b2d949 100644
 --- a/docs/gguf.md
 +++ b/docs/gguf.md
 @@ -2,13 +2,20 @@
@@ -564,7 +564,7 @@ index 13ad7082b185d7faafdbb3c7c1305fd92c7ff743..f9b2d949a571c480e434126d13e6a795
  
  Eighteen block types: the fifteen llama.cpp writes for dense models, `Q8_0`, `Q2_K`, `Q3_K`,
 diff --git a/docs/maintainer/dflash.md b/docs/maintainer/dflash.md
-index 6dec72ce69e53b86d217e286a3f714915165f010..624a387a47ca6d6f30f9042d655fd5a8a488a647 100644
+index 6dec72ce..624a387a 100644
 --- a/docs/maintainer/dflash.md
 +++ b/docs/maintainer/dflash.md
 @@ -80,6 +80,17 @@ observable BF16 cast between projection and head normalization. This complete co
@@ -586,7 +586,7 @@ index 6dec72ce69e53b86d217e286a3f714915165f010..624a387a47ca6d6f30f9042d655fd5a8
  
  The draft input is the target embedding of:
 diff --git a/docs/maintainer/engine-architecture.md b/docs/maintainer/engine-architecture.md
-index 0b8433ae2a50fbc679ebcff2b0d1b9a3db216705..55f8131923dd8a8bc299dafb2ba727ba48a0e3e9 100644
+index 0b8433ae..55f81319 100644
 --- a/docs/maintainer/engine-architecture.md
 +++ b/docs/maintainer/engine-architecture.md
 @@ -577,7 +577,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
@@ -619,7 +619,7 @@ index 0b8433ae2a50fbc679ebcff2b0d1b9a3db216705..55f8131923dd8a8bc299dafb2ba727ba
  Draft frames are compact at each round's actual proposal width, which may be narrower than the
  maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar
 diff --git a/docs/maintainer/paged-kv-cache.md b/docs/maintainer/paged-kv-cache.md
-index 6f63bd3ef323a3dc8a9c0a692e343a763e93ffdf..3f1f6a5ddf0e8d4e19c53c023e08a842879396a5 100644
+index 6f63bd3e..3f1f6a5d 100644
 --- a/docs/maintainer/paged-kv-cache.md
 +++ b/docs/maintainer/paged-kv-cache.md
 @@ -781,3 +781,223 @@ Exact model state 和 backend mathematics 见
@@ -847,7 +847,7 @@ index 6f63bd3ef323a3dc8a9c0a692e343a763e93ffdf..3f1f6a5ddf0e8d4e19c53c023e08a842
 +MTP/ngram, restoration and cancellation evidence is in the
 +[fast-prefill report](../../../../docs/fast-prefill-admission-validation-20261006.md).
 diff --git a/docs/maintainer/qwen3_5-model.md b/docs/maintainer/qwen3_5-model.md
-index b1ebbc28c6d88c67f9963067f0f0a9e3d52f8899..2ce56534b2692910565c220728ae0403fc747d48 100644
+index b1ebbc28..2ce56534 100644
 --- a/docs/maintainer/qwen3_5-model.md
 +++ b/docs/maintainer/qwen3_5-model.md
 @@ -305,7 +305,7 @@ stored rotated is converted back to the primal basis by the converter.
@@ -860,7 +860,7 @@ index b1ebbc28c6d88c67f9963067f0f0a9e3d52f8899..2ce56534b2692910565c220728ae0403
  differ in type. The execution layer keeps each GGUF part as its own weight
  (`ops::GgufProjectionWeights`): the GDN input projection lands q/k/v (output 0) and z (output 1)
 diff --git a/docs/ngram.md b/docs/ngram.md
-index a401ba13e9af78c5545f79e6264eb8d5b89247c9..ad854fe1bdb2e18d6073d458a6cde94073ae3f50 100644
+index a401ba13..ad854fe1 100644
 --- a/docs/ngram.md
 +++ b/docs/ngram.md
 @@ -36,14 +36,24 @@ another. The minimum match defaults to 12 and its supported range is 4..64.
@@ -891,7 +891,7 @@ index a401ba13e9af78c5545f79e6264eb8d5b89247c9..ad854fe1bdb2e18d6073d458a6cde940
  
  A round in which at least one row has a copy proposal is a copy round and verifies at the ngram
 diff --git a/docs/qwen3-8-flash-next.md b/docs/qwen3-8-flash-next.md
-index 548122fc105d63c2a13d5e86cf1ca6de817de7f8..428392585375e76da3da4391ad7838693fbec555 100644
+index 548122fc..42839258 100644
 --- a/docs/qwen3-8-flash-next.md
 +++ b/docs/qwen3-8-flash-next.md
 @@ -389,8 +389,9 @@ disk, which a later run finds there too.
@@ -907,7 +907,7 @@ index 548122fc105d63c2a13d5e86cf1ca6de817de7f8..428392585375e76da3da4391ad783869
  sampled token's top 20 from the same logits before sampling.
  
 diff --git a/docs/serving.md b/docs/serving.md
-index 66ec3957ad7b286e8b309f1e2c15699d324efc07..d4a9fa17ca2883258d67e176826c9c164ec1db63 100644
+index 66ec3957..d4a9fa17 100644
 --- a/docs/serving.md
 +++ b/docs/serving.md
 @@ -50,7 +50,9 @@ ledger.
@@ -1162,7 +1162,7 @@ index 66ec3957ad7b286e8b309f1e2c15699d324efc07..d4a9fa17ca2883258d67e176826c9c16
 +by proposed draft tokens; the bonus token is excluded. Native MTP, ngram and DFlash
 +counters keep their existing meanings.
 diff --git a/docs/weight-conversion.md b/docs/weight-conversion.md
-index 7e3c99008808a9400a354837ab5ae6a354bcb8df..93534864000b447d60ddd8fd1fb65911222ce3f7 100644
+index 7e3c9900..93534864 100644
 --- a/docs/weight-conversion.md
 +++ b/docs/weight-conversion.md
 @@ -72,8 +72,9 @@ The built-in recipes are ordinary Python functions in
@@ -1292,7 +1292,7 @@ index 7e3c99008808a9400a354837ab5ae6a354bcb8df..93534864000b447d60ddd8fd1fb65911
  All three name maps above were checked against a real checkpoint/GGUF pair on
  this machine the same way `qwen35_linear_attention_name_map` was (see its
 diff --git a/include/ninfer/ops/gated_delta_net.h b/include/ninfer/ops/gated_delta_net.h
-index 8d1727e43116f6d57605187456e69afffbe3f195..2ac892b788391e756bddb21a4fc74fbd76c3cf07 100644
+index 8d1727e4..2ac892b7 100644
 --- a/include/ninfer/ops/gated_delta_net.h
 +++ b/include/ninfer/ops/gated_delta_net.h
 @@ -88,7 +88,7 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
@@ -1305,7 +1305,7 @@ index 8d1727e43116f6d57605187456e69afffbe3f195..2ac892b788391e756bddb21a4fc74fbd
   *
   * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
 diff --git a/include/ninfer/ops/gdn_gating_proj.h b/include/ninfer/ops/gdn_gating_proj.h
-index b8279dfa673d96e2325eba2112cd005208b6530f..bdec36bc4f7dd32866e20e6f7ceb02c933df7e65 100644
+index b8279dfa..bdec36bc 100644
 --- a/include/ninfer/ops/gdn_gating_proj.h
 +++ b/include/ninfer/ops/gdn_gating_proj.h
 @@ -12,7 +12,8 @@
@@ -1353,7 +1353,7 @@ index b8279dfa673d96e2325eba2112cd005208b6530f..bdec36bc4f7dd32866e20e6f7ceb02c9
                            const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                            WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
 diff --git a/include/ninfer/ops/gdn_input_proj.h b/include/ninfer/ops/gdn_input_proj.h
-index 8eafb50a51da17f0e459c935dfda9f4d1cdab2b0..4cca794657f85a1d72e5813a35f6fbab39260766 100644
+index 8eafb50a..4cca7946 100644
 --- a/include/ninfer/ops/gdn_input_proj.h
 +++ b/include/ninfer/ops/gdn_input_proj.h
 @@ -319,6 +319,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
@@ -1369,7 +1369,7 @@ index 8eafb50a51da17f0e459c935dfda9f4d1cdab2b0..4cca794657f85a1d72e5813a35f6fbab
      const GgufProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);
 diff --git a/include/ninfer/ops/gdn_projected_conv.h b/include/ninfer/ops/gdn_projected_conv.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ead8950722c9e29f7101eddf3c35d9edae744837
+index 00000000..ead89507
 --- /dev/null
 +++ b/include/ninfer/ops/gdn_projected_conv.h
 @@ -0,0 +1,20 @@
@@ -1394,7 +1394,7 @@ index 0000000000000000000000000000000000000000..ead8950722c9e29f7101eddf3c35d9ed
 +
 +}
 diff --git a/include/ninfer/ops/gdn_replay.h b/include/ninfer/ops/gdn_replay.h
-index 04fd6f91228536646cb58dcf784382e3c8a74960..6bddc8ff2fbd4b2920b611b0a24c683a7e3d0d6c 100644
+index 04fd6f91..6bddc8ff 100644
 --- a/include/ninfer/ops/gdn_replay.h
 +++ b/include/ninfer/ops/gdn_replay.h
 @@ -42,7 +42,8 @@ struct GdnReplayFoldRow {
@@ -1408,7 +1408,7 @@ index 04fd6f91228536646cb58dcf784382e3c8a74960..6bddc8ff2fbd4b2920b611b0a24c683a
   * read-only, disjoint, and do not overlap either state region.
   */
 diff --git a/include/ninfer/ops/sliding_window_attention.h b/include/ninfer/ops/sliding_window_attention.h
-index 970484a9f364f2df4f864356c7120238ba7159d6..d1b4aef49a7a9355d2ca0e667011694116284edc 100644
+index 970484a9..d1b4aef4 100644
 --- a/include/ninfer/ops/sliding_window_attention.h
 +++ b/include/ninfer/ops/sliding_window_attention.h
 @@ -28,6 +28,11 @@ struct SlidingWindowAttentionExecutionEnvelope {
@@ -1434,7 +1434,7 @@ index 970484a9f364f2df4f864356c7120238ba7159d6..d1b4aef49a7a9355d2ca0e6670116941
                                const CyclicKVCacheLayerView& context,
                                SlidingWindowAttentionExecutionEnvelope envelope,
 diff --git a/include/ninfer/ops/softmax_attention.h b/include/ninfer/ops/softmax_attention.h
-index 7963ec61e7d905fe887dd9402f9d14a902faaefc..520da7ccff85fbff1324dc6ee55faf488a0e7ca0 100644
+index 7963ec61..520da7cc 100644
 --- a/include/ninfer/ops/softmax_attention.h
 +++ b/include/ninfer/ops/softmax_attention.h
 @@ -139,7 +139,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -1449,7 +1449,7 @@ index 7963ec61e7d905fe887dd9402f9d14a902faaefc..520da7ccff85fbff1324dc6ee55faf48
   * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
 diff --git a/include/ninfer/ops/token_sums.h b/include/ninfer/ops/token_sums.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..9c7ede518ca14fd2f735f9cfe5336c5fe09f40a4
+index 00000000..9c7ede51
 --- /dev/null
 +++ b/include/ninfer/ops/token_sums.h
 @@ -0,0 +1,19 @@
@@ -1473,7 +1473,7 @@ index 0000000000000000000000000000000000000000..9c7ede518ca14fd2f735f9cfe5336c5f
 +                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream);
 +} // namespace ninfer::ops
 diff --git a/include/ninfer/types.h b/include/ninfer/types.h
-index 6c481086733f6801140d4777747d7a80ad8ad0e7..f20623387fdedd9f37572a9fc22e74adcc48e706 100644
+index 6c481086..f2062338 100644
 --- a/include/ninfer/types.h
 +++ b/include/ninfer/types.h
 @@ -140,8 +140,9 @@ struct SpeculativeOptions {
@@ -1663,7 +1663,7 @@ index 6c481086733f6801140d4777747d7a80ad8ad0e7..f20623387fdedd9f37572a9fc22e74ad
      std::uint64_t computed_prefill_tokens = 0;
      // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
 diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
-index 291acf01ea3e9968717eb99c78438836f6580c70..54529a33313200cbd96222a07591ec06de6bf139 100644
+index 291acf01..54529a333 100644
 --- a/src/artifact/binder.cpp
 +++ b/src/artifact/binder.cpp
 @@ -138,6 +138,9 @@ void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
@@ -1747,7 +1747,7 @@ index 291acf01ea3e9968717eb99c78438836f6580c70..54529a33313200cbd96222a07591ec06
      std::sort(pinned.begin(), pinned.end(), [&](std::size_t a, std::size_t b) {
          return *demands_[a].pinned_order < *demands_[b].pinned_order;
 diff --git a/src/artifact/binder.h b/src/artifact/binder.h
-index 84f03ed57c04d77dfea5d10ac7f6b4a6fa2bd62b..52e990e4670ec67cfda2039a7776328c4cf04468 100644
+index 84f03ed5..52e990e4 100644
 --- a/src/artifact/binder.h
 +++ b/src/artifact/binder.h
 @@ -20,6 +20,9 @@ struct ParameterReference {
@@ -1778,7 +1778,7 @@ index 84f03ed57c04d77dfea5d10ac7f6b4a6fa2bd62b..52e990e4670ec67cfda2039a7776328c
          std::vector<std::byte> host_data;
      };
 diff --git a/src/artifact/materializer.cpp b/src/artifact/materializer.cpp
-index 7c4db3071217c4b57472ca09e7db167c6189d968..70cfbc641d35ed140b7258c6eac829b8a8038aa0 100644
+index 7c4db307..70cfbc64 100644
 --- a/src/artifact/materializer.cpp
 +++ b/src/artifact/materializer.cpp
 @@ -344,6 +344,15 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
@@ -1842,7 +1842,7 @@ index 7c4db3071217c4b57472ca09e7db167c6189d968..70cfbc641d35ed140b7258c6eac829b8
      const UploadTotals upload = upload_device_objects(reader, plan.device_objects,
                                                        out.arena_bases(), device, observer, phase,
 diff --git a/src/artifact/materializer.h b/src/artifact/materializer.h
-index bba466f3297b61babf3665a0b84311700981908a..017c0853055cf5ca4a910e3b83c0f0f27632465b 100644
+index bba466f3..017c0853 100644
 --- a/src/artifact/materializer.h
 +++ b/src/artifact/materializer.h
 @@ -9,6 +9,7 @@
@@ -1879,7 +1879,7 @@ index bba466f3297b61babf3665a0b84311700981908a..017c0853055cf5ca4a910e3b83c0f0f2
          std::optional<WeightParent> host;
          std::vector<std::byte> host_data;
 diff --git a/src/artifact/views.cpp b/src/artifact/views.cpp
-index 81d2b09c3db0574b82a1f7dd90887221281de6b6..f70178f9b1ee17a16ac0e426057a09c9ebbfa9a5 100644
+index 81d2b09c..f70178f9 100644
 --- a/src/artifact/views.cpp
 +++ b/src/artifact/views.cpp
 @@ -12,7 +12,9 @@ WeightView bind_view(const ParameterReference& reference,
@@ -1894,7 +1894,7 @@ index 81d2b09c3db0574b82a1f7dd90887221281de6b6..f70178f9b1ee17a16ac0e426057a09c9
                                   ? materialized.pinned_parent(part.object)
                                   : materialized.host_parent(part.object);
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 64ba2881c5990c298e43fe877df5d6e1faea745f..b88b4d1271ff7c6df91f5681fa1003f430fc4b95 100644
+index 64ba2881..b88b4d12 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -1,5 +1,7 @@
@@ -1916,7 +1916,7 @@ index 64ba2881c5990c298e43fe877df5d6e1faea745f..b88b4d1271ff7c6df91f5681fa1003f4
    target_link_libraries(ninfer_core PUBLIC ninfer_directstorage)
  endif()
 diff --git a/src/core/arena.cu b/src/core/arena.cu
-index 0184cab584cc8df5066c9c35559017f8907e80af..abf4c070e6d23cf7eddd0b8d947c410bf1dd1fc2 100644
+index 0184cab5..abf4c070 100644
 --- a/src/core/arena.cu
 +++ b/src/core/arena.cu
 @@ -1,4 +1,5 @@
@@ -2056,7 +2056,7 @@ index 0184cab584cc8df5066c9c35559017f8907e80af..abf4c070e6d23cf7eddd0b8d947c410b
      size_ = other.size_;
  
 diff --git a/src/core/arena.h b/src/core/arena.h
-index 277d3e3fbce6142b05500f676261edc36d6b8c2d..29976017afff980fc11d083cc628c4c9dd5a8738 100644
+index 277d3e3f..29976017 100644
 --- a/src/core/arena.h
 +++ b/src/core/arena.h
 @@ -6,10 +6,13 @@
@@ -2098,7 +2098,7 @@ index 277d3e3fbce6142b05500f676261edc36d6b8c2d..29976017afff980fc11d083cc628c4c9
  
  // Registers an existing host allocation without moving its bytes. The allocation must outlive
 diff --git a/src/core/decode_graph.cpp b/src/core/decode_graph.cpp
-index ae9f9424e935e43a18b9a11a8bd318f97f5676d7..5f7139b2d7c78f82441bb21ec44afefd8d619537 100644
+index ae9f9424..5f7139b2 100644
 --- a/src/core/decode_graph.cpp
 +++ b/src/core/decode_graph.cpp
 @@ -2,6 +2,7 @@
@@ -2118,7 +2118,7 @@ index ae9f9424e935e43a18b9a11a8bd318f97f5676d7..5f7139b2d7c78f82441bb21ec44afefd
          (void)cudaGetLastError();
          instantiate(definition);
 diff --git a/src/core/device.cu b/src/core/device.cu
-index f7845f7b9e7cd0c777c03542b455bfffdc46cd70..1e3b9d29c4be8016b4a9a28a3212451202525708 100644
+index f7845f7b..1e3b9d29 100644
 --- a/src/core/device.cu
 +++ b/src/core/device.cu
 @@ -1,4 +1,5 @@
@@ -2140,7 +2140,7 @@ index f7845f7b9e7cd0c777c03542b455bfffdc46cd70..1e3b9d29c4be8016b4a9a28a32124512
                   cudaGetErrorName(err), cudaGetErrorString(err));
      std::abort();
 diff --git a/src/core/device.h b/src/core/device.h
-index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6a1e50133 100644
+index e684873a..86281fc3 100644
 --- a/src/core/device.h
 +++ b/src/core/device.h
 @@ -17,6 +17,17 @@
@@ -2162,7 +2162,7 @@ index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6
  
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/paged_kv_cache.cpp b/src/core/paged_kv_cache.cpp
-index 763fc4056e8c800efe86aa19c17e0fead493a8b1..8cc067240347a9c4181a6618e35aae59fb49f86b 100644
+index 763fc405..8cc06724 100644
 --- a/src/core/paged_kv_cache.cpp
 +++ b/src/core/paged_kv_cache.cpp
 @@ -857,6 +857,35 @@ void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t r
@@ -2202,7 +2202,7 @@ index 763fc4056e8c800efe86aa19c17e0fead493a8b1..8cc067240347a9c4181a6618e35aae59
                                              std::span<std::byte* const> records,
                                              std::span<const std::uint32_t> record_groups,
 diff --git a/src/core/paged_kv_cache.h b/src/core/paged_kv_cache.h
-index d7d7e3e872ef97066313d3d53432c415eb8314ef..0ba74a5adddd969b1b1cd4f22fdf6a68475a3c31 100644
+index d7d7e3e8..0ba74a5a 100644
 --- a/src/core/paged_kv_cache.h
 +++ b/src/core/paged_kv_cache.h
 @@ -308,6 +308,18 @@ public:
@@ -2226,7 +2226,7 @@ index d7d7e3e872ef97066313d3d53432c415eb8314ef..0ba74a5adddd969b1b1cd4f22fdf6a68
                                std::span<const std::uint32_t> record_groups,
 diff --git a/src/core/resident_memory.cpp b/src/core/resident_memory.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d5841f3e799de281e5c8ac7c01f393272d0f2f01
+index 00000000..d5841f3e
 --- /dev/null
 +++ b/src/core/resident_memory.cpp
 @@ -0,0 +1,552 @@
@@ -2784,7 +2784,7 @@ index 0000000000000000000000000000000000000000..d5841f3e799de281e5c8ac7c01f39327
 +} // namespace ninfer::core
 diff --git a/src/core/resident_memory.h b/src/core/resident_memory.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..710f118eade1262188ba5c49b82fa5a0b889ea79
+index 00000000..710f118e
 --- /dev/null
 +++ b/src/core/resident_memory.h
 @@ -0,0 +1,85 @@
@@ -2875,7 +2875,7 @@ index 0000000000000000000000000000000000000000..710f118eade1262188ba5c49b82fa5a0
 +} // namespace ninfer::core
 diff --git a/src/core/resident_scan.cu b/src/core/resident_scan.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a26ffd9155440b596a9008e9a1a6c68be4e9d68
+index 00000000..9a26ffd9
 --- /dev/null
 +++ b/src/core/resident_scan.cu
 @@ -0,0 +1,43 @@
@@ -2923,7 +2923,7 @@ index 0000000000000000000000000000000000000000..9a26ffd9155440b596a9008e9a1a6c68
 +
 +} // namespace ninfer::core
 diff --git a/src/models/CMakeLists.txt b/src/models/CMakeLists.txt
-index 85cb08f40dcb2f0325cf6ba151cc7db36da13c97..daf222a2354b42b9050881a759fa8a54ec45f43a 100644
+index 85cb08f4..daf222a2 100644
 --- a/src/models/CMakeLists.txt
 +++ b/src/models/CMakeLists.txt
 @@ -10,7 +10,8 @@ add_library(ninfer_model_runtime STATIC)
@@ -2937,7 +2937,7 @@ index 85cb08f40dcb2f0325cf6ba151cc7db36da13c97..daf222a2354b42b9050881a759fa8a54
  include(qwen3_5/loading_sources.cmake)
  include(qwen3_5/frontend_sources.cmake)
 diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
-index 4533e7c6345451fd3d82a3ee2e64e4191368a47c..eee43ae316526e28cb872865caac8ce086cdc47b 100644
+index 4533e7c6..eee43ae3 100644
 --- a/src/models/qwen3_5/execution/attention.cpp
 +++ b/src/models/qwen3_5/execution/attention.cpp
 @@ -5,6 +5,7 @@
@@ -2990,7 +2990,7 @@ index 4533e7c6345451fd3d82a3ee2e64e4191368a47c..eee43ae316526e28cb872865caac8ce0
                normalized_key, stream);
  }
 diff --git a/src/models/qwen3_5/execution/attention.h b/src/models/qwen3_5/execution/attention.h
-index f690a931ec9a72f2ecbe782626d57937fe1a4973..1d60a13a7748410dc69b4663750a4965ed7aabaa 100644
+index f690a931..1d60a13a 100644
 --- a/src/models/qwen3_5/execution/attention.h
 +++ b/src/models/qwen3_5/execution/attention.h
 @@ -3,6 +3,7 @@
@@ -3011,7 +3011,7 @@ index f690a931ec9a72f2ecbe782626d57937fe1a4973..1d60a13a7748410dc69b4663750a4965
  
  } // namespace ninfer::models::qwen3_5::execution
 diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
-index 708b9fbb649687d72d037bfc66e47c26528b430e..9514df13fd4f2648f7bb9993fe7e1faa2a61dce4 100644
+index 708b9fbb..9514df13 100644
 --- a/src/models/qwen3_5/execution/draft.cpp
 +++ b/src/models/qwen3_5/execution/draft.cpp
 @@ -277,7 +277,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
@@ -3070,7 +3070,7 @@ index 708b9fbb649687d72d037bfc66e47c26528b430e..9514df13fd4f2648f7bb9993fe7e1faa
                      .licensed_counts = licensed_counts,
 diff --git a/src/models/qwen3_5/execution/joint_batch.h b/src/models/qwen3_5/execution/joint_batch.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4424e68c34e5c9eb4951a4d453ad17024f690072
+index 00000000..4424e68c
 --- /dev/null
 +++ b/src/models/qwen3_5/execution/joint_batch.h
 @@ -0,0 +1,146 @@
@@ -3222,7 +3222,7 @@ index 0000000000000000000000000000000000000000..4424e68c34e5c9eb4951a4d453ad1702
 +}
 diff --git a/src/models/qwen3_5/execution/memory_statistics.h b/src/models/qwen3_5/execution/memory_statistics.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ed68744f3bcd8db8f0947866ac9adddb93bc10cd
+index 00000000..ed68744f
 --- /dev/null
 +++ b/src/models/qwen3_5/execution/memory_statistics.h
 @@ -0,0 +1,40 @@
@@ -3267,7 +3267,7 @@ index 0000000000000000000000000000000000000000..ed68744f3bcd8db8f0947866ac9adddb
 +};
 +} // namespace ninfer::models::qwen3_5::execution
 diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
-index 4359daa9e605793454e13eb0421fa8249602dfc7..e822091852a7b05aae86b3e41790c7b3dba9407c 100644
+index 4359daa9..e8220918 100644
 --- a/src/models/qwen3_5/execution/text.cpp
 +++ b/src/models/qwen3_5/execution/text.cpp
 @@ -1,5 +1,7 @@
@@ -3932,7 +3932,7 @@ index 4359daa9e605793454e13eb0421fa8249602dfc7..e822091852a7b05aae86b3e41790c7b3
                                                                                  ar_visible};
                          mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
 diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
-index 7933438399e334078962a88f334b2eaa2d0f5efa..3c5df7e0302267106af64d18c1c6a01bf292a6ba 100644
+index 79334383..3c5df7e0 100644
 --- a/src/models/qwen3_5/execution/text.h
 +++ b/src/models/qwen3_5/execution/text.h
 @@ -1,4 +1,5 @@
@@ -3993,7 +3993,7 @@ index 7933438399e334078962a88f334b2eaa2d0f5efa..3c5df7e0302267106af64d18c1c6a01b
      const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
      std::int32_t active_sequence_batch_                                            = 0;
 diff --git a/src/models/qwen3_5/execution/vision.cpp b/src/models/qwen3_5/execution/vision.cpp
-index 0737fe5c325d628c09897eee78ea624fc617ef22..83c5dba3a47244e67923d27af01764ced321b2fe 100644
+index 0737fe5c..83c5dba3 100644
 --- a/src/models/qwen3_5/execution/vision.cpp
 +++ b/src/models/qwen3_5/execution/vision.cpp
 @@ -676,6 +676,28 @@ VisionOverlayWindowStats VisionPrefillSession::overlay_stats() const noexcept {
@@ -4026,7 +4026,7 @@ index 0737fe5c325d628c09897eee78ea624fc617ef22..83c5dba3a47244e67923d27af01764ce
      for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
          if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
 diff --git a/src/models/qwen3_5/execution/vision.h b/src/models/qwen3_5/execution/vision.h
-index fc92d1b8487f19ef8f566811d78248d06a345dc8..783a581d120e2a63c5f2b7074a6b5d682b6f359f 100644
+index fc92d1b8..783a581d 100644
 --- a/src/models/qwen3_5/execution/vision.h
 +++ b/src/models/qwen3_5/execution/vision.h
 @@ -109,6 +109,8 @@ public:
@@ -4039,7 +4039,7 @@ index fc92d1b8487f19ef8f566811d78248d06a345dc8..783a581d120e2a63c5f2b7074a6b5d68
      [[nodiscard]] double elapsed_seconds() const;
  
 diff --git a/src/models/qwen3_5/execution/workspace.h b/src/models/qwen3_5/execution/workspace.h
-index dbc8d092f66ddd993390ad7a2be5315f5d893ec6..1d4eab4f059fc7a20b96651e4bd25195e577e915 100644
+index dbc8d092..1d4eab4f 100644
 --- a/src/models/qwen3_5/execution/workspace.h
 +++ b/src/models/qwen3_5/execution/workspace.h
 @@ -26,7 +26,7 @@ struct TextPrefillRoots {
@@ -4069,7 +4069,7 @@ index dbc8d092f66ddd993390ad7a2be5315f5d893ec6..1d4eab4f059fc7a20b96651e4bd25195
      return out;
  }
 diff --git a/src/models/qwen3_5/frontend/chat_template.cpp b/src/models/qwen3_5/frontend/chat_template.cpp
-index 4a5fd3f2716ce1a327018c79a6cbd685ff984fdc..25560a7256e93c41229facdfc33cef3c8f43dc90 100644
+index 4a5fd3f2..25560a72 100644
 --- a/src/models/qwen3_5/frontend/chat_template.cpp
 +++ b/src/models/qwen3_5/frontend/chat_template.cpp
 @@ -451,6 +451,12 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
@@ -4086,7 +4086,7 @@ index 4a5fd3f2716ce1a327018c79a6cbd685ff984fdc..25560a7256e93c41229facdfc33cef3c
          if (!message_blocks[i]) continue;
          const auto& block = layout.messages[*message_blocks[i]];
 diff --git a/src/models/qwen3_5/frontend/chat_template.h b/src/models/qwen3_5/frontend/chat_template.h
-index 92b37774e08d3b98ce7dbba9eaf4178d12016a4f..ced302201f9ca4ac01d6b5e7448843456f4c8447 100644
+index 92b37774..ced30220 100644
 --- a/src/models/qwen3_5/frontend/chat_template.h
 +++ b/src/models/qwen3_5/frontend/chat_template.h
 @@ -123,6 +123,9 @@ struct RewriteCheckpointByteSpec {
@@ -4100,7 +4100,7 @@ index 92b37774e08d3b98ce7dbba9eaf4178d12016a4f..ced302201f9ca4ac01d6b5e744884345
      std::vector<MediaPlaceholderByteSpec> media_placeholders;
      std::vector<MediaTokenRunByteSpec> media_token_runs;
 diff --git a/src/models/qwen3_5/frontend/frontend.cpp b/src/models/qwen3_5/frontend/frontend.cpp
-index 8886bf4df1e94f78c2370a05cb81d05c9c2d3971..80ac09976e1ab9c68ac2cec64e7a053b7f87658c 100644
+index 8886bf4d..80ac0997 100644
 --- a/src/models/qwen3_5/frontend/frontend.cpp
 +++ b/src/models/qwen3_5/frontend/frontend.cpp
 @@ -14,6 +14,8 @@
@@ -4270,7 +4270,7 @@ index 8886bf4df1e94f78c2370a05cb81d05c9c2d3971..80ac09976e1ab9c68ac2cec64e7a053b
  
  const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 diff --git a/src/models/qwen3_5/frontend/frontend.h b/src/models/qwen3_5/frontend/frontend.h
-index 8584a840c654262757370397f28df680be843100..32dcc1ad3b2f3dbbf9231ef20120c9a371a4a275 100644
+index 8584a840..32dcc1ad 100644
 --- a/src/models/qwen3_5/frontend/frontend.h
 +++ b/src/models/qwen3_5/frontend/frontend.h
 @@ -107,7 +107,8 @@ public:
@@ -4284,7 +4284,7 @@ index 8584a840c654262757370397f28df680be843100..32dcc1ad3b2f3dbbf9231ef20120c9a3
      [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
      // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence
 diff --git a/src/models/qwen3_5/frontend/output_session.cpp b/src/models/qwen3_5/frontend/output_session.cpp
-index 4400ed30c2b2fdc6cf89eb6623de49a32f2c0324..c55d4ef45d11db51b886ed8c19c8532db8e30d0e 100644
+index 4400ed30..c55d4ef4 100644
 --- a/src/models/qwen3_5/frontend/output_session.cpp
 +++ b/src/models/qwen3_5/frontend/output_session.cpp
 @@ -443,7 +443,8 @@ public:
@@ -4443,7 +4443,7 @@ index 4400ed30c2b2fdc6cf89eb6623de49a32f2c0324..c55d4ef45d11db51b886ed8c19c8532d
      };
  }
 diff --git a/src/models/qwen3_5/frontend/output_session.h b/src/models/qwen3_5/frontend/output_session.h
-index 4267fc2896c76fc8576051e64cac48d9a6457131..bd1918a19db62586eb3c374bd96fab9751b41866 100644
+index 4267fc28..bd1918a1 100644
 --- a/src/models/qwen3_5/frontend/output_session.h
 +++ b/src/models/qwen3_5/frontend/output_session.h
 @@ -74,6 +74,8 @@ public:
@@ -4476,7 +4476,7 @@ index 4267fc2896c76fc8576051e64cac48d9a6457131..bd1918a19db62586eb3c374bd96fab97
  
      friend class Frontend;
 diff --git a/src/models/qwen3_5/frontend/prepared_prompt.h b/src/models/qwen3_5/frontend/prepared_prompt.h
-index 4eae32ca426a6405d9549733a53010a0e83880a6..d8f214b48d9be3c24645d1833eced5d2b02ca42a 100644
+index 4eae32ca..d8f214b4 100644
 --- a/src/models/qwen3_5/frontend/prepared_prompt.h
 +++ b/src/models/qwen3_5/frontend/prepared_prompt.h
 @@ -162,6 +162,12 @@ struct PreparedPromptData {
@@ -4501,7 +4501,7 @@ index 4eae32ca426a6405d9549733a53010a0e83880a6..d8f214b48d9be3c24645d1833eced5d2
      PrepareStats prepare;
      std::string graft_name;
 diff --git a/src/models/qwen3_5/frontend/processor.cpp b/src/models/qwen3_5/frontend/processor.cpp
-index 3138b997b1f9fe426b20a83fd74e6149ca7e3bb7..028aa18c0467306d3447496ba2a46886f38aa7c1 100644
+index 3138b997..028aa18c 100644
 --- a/src/models/qwen3_5/frontend/processor.cpp
 +++ b/src/models/qwen3_5/frontend/processor.cpp
 @@ -837,6 +837,10 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
@@ -4557,7 +4557,7 @@ index 3138b997b1f9fe426b20a83fd74e6149ca7e3bb7..028aa18c0467306d3447496ba2a46886
      output.cache_boundaries            = std::move(encoded.cache_boundaries);
      stats.prompt_tokens                = output.input_ids.size();
 diff --git a/src/models/qwen3_5/frontend/processor.h b/src/models/qwen3_5/frontend/processor.h
-index a3a49bcf24ea9b905493911584c9e6e54962eff5..5be6d35377cb0b29e362e39c7f5716057466906a 100644
+index a3a49bcf..5be6d353 100644
 --- a/src/models/qwen3_5/frontend/processor.h
 +++ b/src/models/qwen3_5/frontend/processor.h
 @@ -132,6 +132,7 @@ struct ProcessedInput {
@@ -4577,7 +4577,7 @@ index a3a49bcf24ea9b905493911584c9e6e54962eff5..5be6d35377cb0b29e362e39c7f571605
      std::vector<std::uint32_t> rewrite_execution_frontiers;
      std::vector<std::optional<std::uint32_t>> message_boundaries;
 diff --git a/src/models/qwen3_5/frontend/tool_call_parser.cpp b/src/models/qwen3_5/frontend/tool_call_parser.cpp
-index edd48f80f587fef65ffcff3de77f10e8ce12978f..bd323a7a678aa530bd647d28d991bcd2e2d2be00 100644
+index edd48f80..bd323a7a 100644
 --- a/src/models/qwen3_5/frontend/tool_call_parser.cpp
 +++ b/src/models/qwen3_5/frontend/tool_call_parser.cpp
 @@ -307,6 +307,8 @@ Contract::Tool compile_tool_contract(const Json& definition) {
@@ -4714,7 +4714,7 @@ index edd48f80f587fef65ffcff3de77f10e8ce12978f..bd323a7a678aa530bd647d28d991bcd2
          parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
      if (forced_ && parsed.diagnostics.fallback_reason != FallbackReason::None) {
 diff --git a/src/models/qwen3_5/frontend/tool_call_parser.h b/src/models/qwen3_5/frontend/tool_call_parser.h
-index 2a52830c80e8cce7bf871a2a4e048ba611cd6c09..5ed8c930a63d1477a80a6c7ae0205b0698505c7a 100644
+index 2a52830c..5ed8c930 100644
 --- a/src/models/qwen3_5/frontend/tool_call_parser.h
 +++ b/src/models/qwen3_5/frontend/tool_call_parser.h
 @@ -36,7 +36,9 @@ struct ToolCallOutputContract {
@@ -4760,7 +4760,7 @@ index 2a52830c80e8cce7bf871a2a4e048ba611cd6c09..5ed8c930a63d1477a80a6c7ae0205b06
      std::string content;
 diff --git a/src/models/qwen3_5/frontend/tool_contract.cpp b/src/models/qwen3_5/frontend/tool_contract.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..6859764ed4d4b4e4dea61d61485613e8dc88213e
+index 00000000..6859764e
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_contract.cpp
 @@ -0,0 +1,303 @@
@@ -5069,7 +5069,7 @@ index 0000000000000000000000000000000000000000..6859764ed4d4b4e4dea61d61485613e8
 +} // namespace ninfer::models::qwen3_5::frontend
 diff --git a/src/models/qwen3_5/frontend/tool_grammar.cpp b/src/models/qwen3_5/frontend/tool_grammar.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2e6f32c4c978e960655b3c55d72aa96ae391e01b
+index 00000000..2e6f32c4
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_grammar.cpp
 @@ -0,0 +1,81 @@
@@ -5156,7 +5156,7 @@ index 0000000000000000000000000000000000000000..2e6f32c4c978e960655b3c55d72aa96a
 +} // namespace ninfer::models::qwen3_5::frontend
 diff --git a/src/models/qwen3_5/frontend/tool_grammar.h b/src/models/qwen3_5/frontend/tool_grammar.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..81c71d7679f1007575eaf480226c0fed73efaf53
+index 00000000..81c71d76
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_grammar.h
 @@ -0,0 +1,5 @@
@@ -5167,7 +5167,7 @@ index 0000000000000000000000000000000000000000..81c71d7679f1007575eaf480226c0fed
 +}
 diff --git a/src/models/qwen3_5/frontend/tool_open_token.h b/src/models/qwen3_5/frontend/tool_open_token.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..da7d1f887a20cf4919f796585f2955da1693f0f7
+index 00000000..da7d1f88
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_open_token.h
 @@ -0,0 +1,26 @@
@@ -5198,7 +5198,7 @@ index 0000000000000000000000000000000000000000..da7d1f887a20cf4919f796585f2955da
 +
 +} // namespace ninfer::models::qwen3_5::frontend
 diff --git a/src/models/qwen3_5/frontend_sources.cmake b/src/models/qwen3_5/frontend_sources.cmake
-index 0c7fce3865f606f3358494a76a589b8006f342a7..de9a362b174feff2e380ea6dd1d3b2e5e014015c 100644
+index 0c7fce38..de9a362b 100644
 --- a/src/models/qwen3_5/frontend_sources.cmake
 +++ b/src/models/qwen3_5/frontend_sources.cmake
 @@ -9,4 +9,8 @@ target_sources(ninfer_model_runtime PRIVATE
@@ -5211,7 +5211,7 @@ index 0c7fce3865f606f3358494a76a589b8006f342a7..de9a362b174feff2e380ea6dd1d3b2e5
 +target_include_directories(ninfer_model_runtime PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 +target_link_libraries(ninfer_model_runtime PRIVATE ninfer_xgrammar)
 diff --git a/src/models/qwen3_5/load.cpp b/src/models/qwen3_5/load.cpp
-index 9298a87bf755fb4beddf40550623ea1e2cf1f732..b911fffb00ff50dd57903dabcfe308e55530d190 100644
+index 9298a87b..b911fffb 100644
 --- a/src/models/qwen3_5/load.cpp
 +++ b/src/models/qwen3_5/load.cpp
 @@ -245,6 +245,15 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
@@ -5231,7 +5231,7 @@ index 9298a87bf755fb4beddf40550623ea1e2cf1f732..b911fffb00ff50dd57903dabcfe308e5
      std::vector<StageBudget> budgets;
      budgets.reserve(free_bytes.size());
 diff --git a/src/models/qwen3_5/load/bindings.h b/src/models/qwen3_5/load/bindings.h
-index 2af1fcd4ca978d798108a29d244cd7956101ac86..8842ec40d57e9740458fb207cef6cbca236bb858 100644
+index 2af1fcd4..8842ec40 100644
 --- a/src/models/qwen3_5/load/bindings.h
 +++ b/src/models/qwen3_5/load/bindings.h
 @@ -63,10 +63,12 @@ private:
@@ -5248,7 +5248,7 @@ index 2af1fcd4ca978d798108a29d244cd7956101ac86..8842ec40d57e9740458fb207cef6cbca
  
  [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
 diff --git a/src/models/qwen3_5/load/prepare.cpp b/src/models/qwen3_5/load/prepare.cpp
-index 7afbc4ac2ac89053bddc502a5bbd86113657681f..f32ade2e5fe026c5a37c98d5ab7bb3fd438a1e26 100644
+index 7afbc4ac..f32ade2e 100644
 --- a/src/models/qwen3_5/load/prepare.cpp
 +++ b/src/models/qwen3_5/load/prepare.cpp
 @@ -200,6 +200,24 @@ void Bindings::evict(WeightId id, std::uint32_t rank) {
@@ -5300,7 +5300,7 @@ index 7afbc4ac2ac89053bddc502a5bbd86113657681f..f32ade2e5fe026c5a37c98d5ab7bb3fd
  
  bool Bindings::transcode(WeightId id, QType target, std::string_view option) {
 diff --git a/src/models/qwen3_5/program/context.h b/src/models/qwen3_5/program/context.h
-index 11a33ca2e9d96e5c2fab28baa12317bf7452c9a9..3136cc64372e185e4a98bbaa4337e9f3fa8ae8e1 100644
+index 11a33ca2..3136cc64 100644
 --- a/src/models/qwen3_5/program/context.h
 +++ b/src/models/qwen3_5/program/context.h
 @@ -46,6 +46,8 @@ struct ExecutionCore {
@@ -5321,7 +5321,7 @@ index 11a33ca2e9d96e5c2fab28baa12317bf7452c9a9..3136cc64372e185e4a98bbaa4337e9f3
  
  struct OrdinaryBatchContext {
 diff --git a/src/models/qwen3_5/program/context_work.cpp b/src/models/qwen3_5/program/context_work.cpp
-index c799d3e3203d92750c858734e449ff52ac222cc9..7ef49a6cb8a9c27c0ba0a8e5989b183c04a70ad1 100644
+index c799d3e3..7ef49a6c 100644
 --- a/src/models/qwen3_5/program/context_work.cpp
 +++ b/src/models/qwen3_5/program/context_work.cpp
 @@ -308,10 +308,15 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
@@ -5343,7 +5343,7 @@ index c799d3e3203d92750c858734e449ff52ac222cc9..7ef49a6cb8a9c27c0ba0a8e5989b183c
      };
  }
 diff --git a/src/models/qwen3_5/program/context_work.h b/src/models/qwen3_5/program/context_work.h
-index 38e479f7d0047cd22c56b0004efc36ba7925d93f..13224331f34f842e99eacca046e7cb5138a31cae 100644
+index 38e479f7..13224331 100644
 --- a/src/models/qwen3_5/program/context_work.h
 +++ b/src/models/qwen3_5/program/context_work.h
 @@ -77,6 +77,8 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
@@ -5357,7 +5357,7 @@ index 38e479f7d0047cd22c56b0004efc36ba7925d93f..13224331f34f842e99eacca046e7cb51
  
  } // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
-index 0490cf494b9c60e5d0d43a10b8b2e7d5b418d402..551dd68d0e8ff9fd8b493bffffd994c59f9d9603 100644
+index 0490cf49..551dd68d 100644
 --- a/src/models/qwen3_5/program/decode.cpp
 +++ b/src/models/qwen3_5/program/decode.cpp
 @@ -9,6 +9,7 @@
@@ -5795,7 +5795,7 @@ index 0490cf494b9c60e5d0d43a10b8b2e7d5b418d402..551dd68d0e8ff9fd8b493bffffd994c5
      request.pending   = {};
      return timing.finish();
 diff --git a/src/models/qwen3_5/program/graphs.cpp b/src/models/qwen3_5/program/graphs.cpp
-index 78c22267d7fd6564785b603c73cf2e4bbe8e0cbf..cf08c1beb54cfbf5a41074187cddc6376cbca210 100644
+index 78c22267..cf08c1be 100644
 --- a/src/models/qwen3_5/program/graphs.cpp
 +++ b/src/models/qwen3_5/program/graphs.cpp
 @@ -247,6 +247,8 @@ void ProgramImpl::prepare_graphs() {
@@ -5992,7 +5992,7 @@ index 78c22267d7fd6564785b603c73cf2e4bbe8e0cbf..cf08c1beb54cfbf5a41074187cddc637
                  }
              }
 diff --git a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
-index c2ded94a0a0a1c31a2feec81f1e38a1b637eae06..117e4af7e4a6b24c263c9dd0173394b4776b0fef 100644
+index c2ded94a..117e4af7 100644
 --- a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
 +++ b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
 @@ -764,6 +764,9 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
@@ -6007,7 +6007,7 @@ index c2ded94a0a0a1c31a2feec81f1e38a1b637eae06..117e4af7e4a6b24c263c9dd0173394b4
      refresh_state_views(sequence);
 diff --git a/src/models/qwen3_5/program/planning/prefill_service_work.h b/src/models/qwen3_5/program/planning/prefill_service_work.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..ca6192ff6f69e6040e3cc0d537b11ccd1cdf5fa0
+index 00000000..ca6192ff
 --- /dev/null
 +++ b/src/models/qwen3_5/program/planning/prefill_service_work.h
 @@ -0,0 +1,32 @@
@@ -6044,7 +6044,7 @@ index 0000000000000000000000000000000000000000..ca6192ff6f69e6040e3cc0d537b11ccd
 +
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/planning/pressure.cpp b/src/models/qwen3_5/program/planning/pressure.cpp
-index 328a7bc0f7fb18a2a0633a9f6d1c41aa0eceffe8..99b8a32f261e5c2b9bcc7d54357f15fa7a36d069 100644
+index 328a7bc0..99b8a32f 100644
 --- a/src/models/qwen3_5/program/planning/pressure.cpp
 +++ b/src/models/qwen3_5/program/planning/pressure.cpp
 @@ -2651,6 +2651,21 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
@@ -6070,7 +6070,7 @@ index 328a7bc0f7fb18a2a0633a9f6d1c41aa0eceffe8..99b8a32f261e5c2b9bcc7d54357f15fa
  bool ProgramImpl::persistent_backfill_safe(
      const RequestBasePlan& blocked_head, const AdmissionCandidate& candidate,
 diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
-index 9811b10e74fcf5099736f13f261a3bd94ec989e7..5e09429dc5ac8365a0da4fda9ee9122b95bc10b0 100644
+index 9811b10e..5e09429d 100644
 --- a/src/models/qwen3_5/program/planning/request_plan.cpp
 +++ b/src/models/qwen3_5/program/planning/request_plan.cpp
 @@ -1,6 +1,7 @@
@@ -6305,7 +6305,7 @@ index 9811b10e74fcf5099736f13f261a3bd94ec989e7..5e09429dc5ac8365a0da4fda9ee9122b
      std::uint64_t vision_patches = 0;
      if (plan.vision) {
 diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
-index ce8d779d32c5fe46b980d9ef82c5f01cd9a3f9bd..e116047ad33afc6f3ea7fc5ab289976a766ba6fa 100644
+index ce8d779d..e116047a 100644
 --- a/src/models/qwen3_5/program/planning/startup.cpp
 +++ b/src/models/qwen3_5/program/planning/startup.cpp
 @@ -1,3 +1,5 @@
@@ -6555,7 +6555,7 @@ index ce8d779d32c5fe46b980d9ef82c5f01cd9a3f9bd..e116047ad33afc6f3ea7fc5ab289976a
      const std::uint64_t minimum_pages64 =
          static_cast<std::uint64_t>(std::max(logical_pages, inputs.max_concurrency)) +
 diff --git a/src/models/qwen3_5/program/planning/startup.h b/src/models/qwen3_5/program/planning/startup.h
-index 120f013f4d4cc7e47114315ab6d61093d2855f79..d75fb32e23af09f0bd968f4bba84baafa9750144 100644
+index 120f013f..d75fb32e 100644
 --- a/src/models/qwen3_5/program/planning/startup.h
 +++ b/src/models/qwen3_5/program/planning/startup.h
 @@ -35,6 +35,17 @@ struct DFlashPersistentLayout {
@@ -6617,7 +6617,7 @@ index 120f013f4d4cc7e47114315ab6d61093d2855f79..d75fb32e23af09f0bd968f4bba84baaf
      std::uint32_t main_page_groups          = 0;
      std::uint32_t max_concurrency           = 1;
 diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
-index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7f2c65735 100644
+index 87862274..710cd386 100644
 --- a/src/models/qwen3_5/program/prefill.cpp
 +++ b/src/models/qwen3_5/program/prefill.cpp
 @@ -1,5 +1,8 @@
@@ -6712,7 +6712,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          if (staged.disk_restore_frontier != 0) {
              bool restored = false;
              try {
-@@ -888,8 +921,167 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+@@ -888,8 +921,170 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
      // laid out at the width it verified.
      const std::uint32_t verify_drafts = record_width - 1U;
      const auto tail_started           = Clock::now();
@@ -6752,13 +6752,16 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
 +                const auto bytes = state_images->host_layout().image_bytes;
 +                // This scratch remains live through the exact-boundary capture and
 +                // restore_base() synchronizes every device copy before releasing it.
-+                // Borrow from the existing bounded free-list; no additional pool,
-+                // prewarm, saved-state eviction or checkpoint policy change.
++                // The resident pool covers this backup independently of the old
++                // scratch experiment. Explicit retained mode still holds one lease.
 +                auto& original_state = reconstruction_scratch[row];
-+                static const int reuse_rewrite_scratch = [] {
++                static const int configured_rewrite_scratch = [] {
 +                    const char* value=std::getenv("NINFER_EXPERIMENT_REWRITE_SCRATCH_REUSE");
 +                    return value && value[0]=='2' ? 2 : (value && value[0]=='1' ? 1 : 0);
 +                }();
++                const int reuse_rewrite_scratch = memory_checkpoint_pool
++                    ? memory_checkpoint_pool->reconstruction_scratch_mode(configured_rewrite_scratch)
++                    : configured_rewrite_scratch;
 +                try {
 +                    HostTrace allocation_trace("memory.rewrite.scratch.allocate",
 +                        sequence.window.stamp.session.id, sequence.lane, pending.base_E, bytes);
@@ -6880,7 +6883,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          const std::span<const ops::GdnReplayFoldRow> fold_span(fold_rows.data(), lanes.size());
          {
              // Each state shard folds its own layers on its own device's stream.
-@@ -993,7 +1185,16 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+@@ -993,7 +1188,16 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
      } catch (...) {
          try {
              device.synchronize();
@@ -6898,7 +6901,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          work.reset();
          clear_execution_failure_lanes(lanes);
          throw;
-@@ -1006,6 +1207,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+@@ -1006,6 +1210,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
              SequenceState& sequence = active_sequence(lanes[row]);
              RequestControl& request = requests[lanes[row]];
              if (cancelled[row]) {
@@ -6906,7 +6909,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  if (!clear_lane_strict(sequence, request)) {
                      throw std::logic_error("cancelled speculative lane is not strictly releasable");
                  }
-@@ -1014,6 +1216,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+@@ -1014,6 +1219,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
  
              const PendingCandidate pending = request.pending;
              const std::uint32_t committed  = accepted_tokens[row];
@@ -6915,7 +6918,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
              settle_state_fork(sequence);
              const TokenId* token_base =
                  speculative_backend == SpeculativeBackend::Mtp
-@@ -1059,6 +1263,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+@@ -1059,6 +1266,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
  
              commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
              trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
@@ -6923,7 +6926,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
              if (terminal[row]) {
                  request.lifecycle = Lifecycle::Finishable;
              } else {
-@@ -1083,14 +1288,35 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1083,14 +1291,35 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
      }
  
      RequestControl::Prefill& staged = *request.prefill;
@@ -6961,7 +6964,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
      std::uint32_t processed_prompt_tokens = 0;
      // After a failed disk restore the admitted prefix is recomputed without being reported.
      const auto reported_tokens = [&staged, &processed_prompt_tokens] {
-@@ -1123,6 +1349,33 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1123,6 +1352,33 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
          // Prefill attention addresses its KV through the shared step table-row scalars. Another
          // lane's staging or capture can rebind them between this lane's steps, so every step
          // binds its own rows before any Prefill or MTP-bridge work.
@@ -6995,7 +6998,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          bind_sequence_kv(sequence);
          StateImageSelectors selectors = state_selectors(sequence);
          // Hybrid prefix cache taps (docs/maintainer/hybrid-prefix-cache-spec.md §7.1): an exact tap
-@@ -1152,7 +1405,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1152,7 +1408,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
              rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
          }
          execution::PrefillContext schedule_state{
@@ -7004,7 +7007,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
               replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
               proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
               mtp_attention_window, experts.get()},
-@@ -1169,6 +1422,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1169,6 +1425,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
              selectors.destination,
              staged.initial_mtp_extent,
              0};
@@ -7016,7 +7019,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
          // The chunk function takes the events itself: they are a view into the landing batch, and
          // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
-@@ -1208,7 +1466,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1208,7 +1469,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
  
          if (staged.cursor < staged.prompt_tokens) {
              const std::uint32_t nominal =
@@ -7025,7 +7028,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
              mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                      : workspace_plan.text_prefill);
              if (is_masked_draft_backend(speculative_backend)) {
-@@ -1234,7 +1492,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1234,7 +1495,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                      schedule_state.rewrite_checkpoint_hidden = nullptr;
                  }
  
@@ -7035,7 +7038,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  const std::optional<std::uint32_t> capture_frontier =
                      staged.next_capture < staged.capture_groups.size()
                          ? std::optional<std::uint32_t>(
-@@ -1258,6 +1517,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1258,6 +1520,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                  if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
                      split_frontier = *hybrid_split;
                  }
@@ -7061,7 +7064,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  execution::PrefillChunkResult result;
                  timing.pause();
                  if (staged.vision) {
-@@ -1281,7 +1559,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1281,7 +1562,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                  if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                      throw std::logic_error("ordinary prefill chunk made invalid progress");
                  }
@@ -7074,7 +7077,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  staged.cursor += result.processed_tokens;
                  processed_prompt_tokens += result.processed_tokens;
                  remaining -= result.processed_tokens;
-@@ -1296,6 +1578,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1296,6 +1581,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                  // Prompt transitions are canonical immediately. If this was the first write after
                  // an immutable source, close the Fork before potentially freezing a new rewrite.
                  settle_state_fork(sequence);
@@ -7097,7 +7100,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  if (hybrid_lane != nullptr && !result.finalized) {
                      hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
                  }
-@@ -1322,6 +1620,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1322,6 +1623,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
              }
  
              if (!finalized) {
@@ -7115,7 +7118,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
                  if (staged.cursor == staged.prompt_tokens) {
                      throw std::logic_error("staged prefill reached the prompt without sampling");
                  }
-@@ -1366,6 +1675,30 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1366,6 +1678,30 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
              }
          }
  
@@ -7146,7 +7149,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          copy_round_token();
          if (request.logprobs) { fetch_logprobs(1); }
          std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
-@@ -1440,6 +1773,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+@@ -1440,6 +1776,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
              .complete                = true,
              .timing                  = timing.finish(),
          };
@@ -7158,7 +7161,7 @@ index 87862274889d8e6679ee2041dd56e8f54d7418ea..5970b7049f675fbb2e9514a4bf5c32b7
          timing.begin_wait();
          try {
 diff --git a/src/models/qwen3_5/program/prefix/hybrid_program.cpp b/src/models/qwen3_5/program/prefix/hybrid_program.cpp
-index fc1ffbcfea4f0f7528d0d5915e5f5c31db0fc4c1..f88160cdcbb9f9e69f04f43ab570fdb17e0d1b5e 100644
+index fc1ffbcf..f88160cd 100644
 --- a/src/models/qwen3_5/program/prefix/hybrid_program.cpp
 +++ b/src/models/qwen3_5/program/prefix/hybrid_program.cpp
 @@ -4,6 +4,7 @@
@@ -7203,7 +7206,7 @@ index fc1ffbcfea4f0f7528d0d5915e5f5c31db0fc4c1..f88160cdcbb9f9e69f04f43ab570fdb1
          install_sampling(sequence, request, quote.sampling);
          sequence.mtp_draft_count = 0;
 diff --git a/src/models/qwen3_5/program/prefix_identity.h b/src/models/qwen3_5/program/prefix_identity.h
-index d19092aea2d27d90f87275c63c95f6a11dcd66ca..ead8ddeef3b755214ceba767957eac597c65ac74 100644
+index d19092ae..ead8ddee 100644
 --- a/src/models/qwen3_5/program/prefix_identity.h
 +++ b/src/models/qwen3_5/program/prefix_identity.h
 @@ -49,6 +49,7 @@ public:
@@ -7215,7 +7218,7 @@ index d19092aea2d27d90f87275c63c95f6a11dcd66ca..ead8ddeef3b755214ceba767957eac59
      std::array<std::vector<std::int32_t>, 3> positions_;
      std::vector<VisionItem> vision_items_;
 diff --git a/src/models/qwen3_5/program/program.cpp b/src/models/qwen3_5/program/program.cpp
-index 572568ec0e3b3c96edb04067d5617b713744bf52..70d0c40686428cba848879b3cef51bfd345e67ef 100644
+index 572568ec..70d0c406 100644
 --- a/src/models/qwen3_5/program/program.cpp
 +++ b/src/models/qwen3_5/program/program.cpp
 @@ -440,6 +440,15 @@ DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
@@ -7260,7 +7263,7 @@ index 572568ec0e3b3c96edb04067d5617b713744bf52..70d0c40686428cba848879b3cef51bfd
  bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix_cache(); }
  
 diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
-index 36af6e27ead9c3ce27d0c61d3f8be45f35972730..09840538f339ff2c2235eb18d24d206cbc77e163 100644
+index 36af6e27..09840538 100644
 --- a/src/models/qwen3_5/program/program.h
 +++ b/src/models/qwen3_5/program/program.h
 @@ -859,11 +859,18 @@ struct PrefillProgress {
@@ -7323,7 +7326,7 @@ index 36af6e27ead9c3ce27d0c61d3f8be45f35972730..09840538f339ff2c2235eb18d24d206c
      // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
      // transaction the Engine drives for Legacy materialization: quote, reserve, then
 diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
-index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8a093bbdf 100644
+index fe4ad6a6..0a5953ed 100644
 --- a/src/models/qwen3_5/program/program_impl.cpp
 +++ b/src/models/qwen3_5/program/program_impl.cpp
 @@ -1,5 +1,10 @@
@@ -7428,7 +7431,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8
 +                                           kKvmemCheckpointKinds.size(),scratch_slots)
 +            : configured_capacity;
 +        const auto bytes=state_images->host_layout().image_bytes;
-+        if (capacity) memory_checkpoint_pool=std::make_unique<CheckpointBufferPool>(capacity,bytes,resident);
++        if (capacity) memory_checkpoint_pool=std::make_unique<CheckpointBufferPool<PinnedHostBuffer>>(capacity,bytes,resident);
 +        if (resident) {
 +            if (speculative_backend==SpeculativeBackend::Mtp && reuse && reuse[0]=='2') {
 +                memory_reconstruction_scratch=memory_checkpoint_pool->acquire(bytes);
@@ -7562,7 +7565,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8
  }
  
  std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-@@ -869,6 +1031,66 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
+@@ -869,6 +1031,68 @@ runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
  
  MemorySummary ProgramImpl::memory_summary() const noexcept {
      MemorySummary out;
@@ -7582,6 +7585,8 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8
 +        memory.statistics_staging_bytes =
 +            (memory_statistics_host ? memory_statistics_host->size() : 0) +
 +            (memory_candidate_host ? memory_candidate_host->size() : 0);
++        memory.checkpoint_bytes += checkpoint_auxiliary_host_bytes(
++            memory_checkpoint_pool.get(), memory_reconstruction_scratch);
 +        memory.resident_pages = text_kv_pages->physical_pool().allocated_pages();
 +        memory.mtp_resident_pages = backend_kv_pages
 +            ? backend_kv_pages->physical_pool().allocated_pages() : 0;
@@ -7629,7 +7634,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8
      out.device          = device.device;
      out.max_context     = capacity;
      out.kv_capacity     = kv_capacity;
-@@ -893,6 +1115,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
+@@ -893,6 +1117,10 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
      }
      out.workspace = ArenaMemorySummary{workspace_storage.capacity(), active_workspace_bytes,
                                         std::max(work.peak_used(), workspace_logical_peak_bytes)};
@@ -7641,7 +7646,7 @@ index fe4ad6a6ad4c8394f1de3b942a6c942f21d1cbcd..d8d03f1e901de80a585fe1508088cbb8
          out.vision_workspace = VisionWorkspaceMemorySummary{
              .aggregate_prompt_tokens = static_cast<std::uint32_t>(
 diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
-index 56e87ea8aa2ed5f6b4670df6b5680523576f54fd..861bb2f3c22d6907f8aa2f2efe4c4d09ef18f608 100644
+index 56e87ea8..d8eb03fa 100644
 --- a/src/models/qwen3_5/program/program_impl.h
 +++ b/src/models/qwen3_5/program/program_impl.h
 @@ -1,4 +1,5 @@
@@ -7667,7 +7672,7 @@ index 56e87ea8aa2ed5f6b4670df6b5680523576f54fd..861bb2f3c22d6907f8aa2f2efe4c4d09
  
  namespace ninfer::models::qwen3_5::detail {
  
-+class CheckpointBufferPool;
++template <class Buffer> class CheckpointBufferPool;
 +
  using runtime::MtpAdaptiveBatchController;
  using runtime::MtpAdaptiveSignal;
@@ -8016,7 +8021,7 @@ index 56e87ea8aa2ed5f6b4670df6b5680523576f54fd..861bb2f3c22d6907f8aa2f2efe4c4d09
 +    // Reused transfer staging is bounded by the physical window. Durable history
 +    // uses ordinary host RAM, so pinned allocation count does not grow with H.
 +    std::unique_ptr<PinnedHostBuffer> memory_kv_staging;
-+    std::unique_ptr<CheckpointBufferPool> memory_checkpoint_pool;
++    std::unique_ptr<CheckpointBufferPool<PinnedHostBuffer>> memory_checkpoint_pool;
 +    // One Host image shared serially by every row/lane. Allocated only on its
 +    // first reconstruction boundary; references survive every failure fence.
 +    std::shared_ptr<PinnedHostBuffer> memory_reconstruction_scratch;
@@ -8145,7 +8150,7 @@ index 56e87ea8aa2ed5f6b4670df6b5680523576f54fd..861bb2f3c22d6907f8aa2f2efe4c4d09
                                     std::uint32_t backend_tokens = 0);
  
 diff --git a/src/models/qwen3_5/program/round_buffers.cpp b/src/models/qwen3_5/program/round_buffers.cpp
-index f00cc49febc9025cbce2a499f62d965b38ad79f5..eaf70d15993634ef039b009c81d954a00b95c8e5 100644
+index f00cc49f..eaf70d15 100644
 --- a/src/models/qwen3_5/program/round_buffers.cpp
 +++ b/src/models/qwen3_5/program/round_buffers.cpp
 @@ -291,6 +291,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
@@ -8168,7 +8173,7 @@ index f00cc49febc9025cbce2a499f62d965b38ad79f5..eaf70d15993634ef039b009c81d954a0
          ingress_tensor(offsetof(DFlashDecodeIngress, proposal_extents), DType::I32, {batch});
      target_valid_columns =
 diff --git a/src/models/qwen3_5/program/round_buffers.h b/src/models/qwen3_5/program/round_buffers.h
-index be9c1c84e5f65c3ec4099d7ec2472b3c32adde30..a9d28a53a31eef35d1238f4bd09b670354c05420 100644
+index be9c1c84..a9d28a53 100644
 --- a/src/models/qwen3_5/program/round_buffers.h
 +++ b/src/models/qwen3_5/program/round_buffers.h
 @@ -59,6 +59,7 @@ struct OrdinaryDecodeEgress {
@@ -8220,7 +8225,7 @@ index be9c1c84e5f65c3ec4099d7ec2472b3c32adde30..a9d28a53a31eef35d1238f4bd09b6703
      Tensor target_valid_columns;
      Tensor proposal_valid_columns;
 diff --git a/src/models/qwen3_5/program/speculative/mtp.cpp b/src/models/qwen3_5/program/speculative/mtp.cpp
-index 8b6ff5cffafcc2ad03ba3451d4f6adaa42a0fc19..2c4ebbc2280a4ce76831c96af868b46ed1170916 100644
+index 8b6ff5cf..2c4ebbc2 100644
 --- a/src/models/qwen3_5/program/speculative/mtp.cpp
 +++ b/src/models/qwen3_5/program/speculative/mtp.cpp
 @@ -32,6 +32,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
@@ -8241,7 +8246,7 @@ index 8b6ff5cffafcc2ad03ba3451d4f6adaa42a0fc19..2c4ebbc2280a4ce76831c96af868b46e
                                       .licensed_tokens         = licensed_tokens,
                                       .licensed_counts         = licensed_counts,
 diff --git a/src/models/qwen3_5/program/speculative/target_verification.cpp b/src/models/qwen3_5/program/speculative/target_verification.cpp
-index afd28ebab3c121f66e64188f74da68d080bf05be..07b669d9f0eb5d6150eff29da9c9905c2ef86bdf 100644
+index afd28eba..07b669d9 100644
 --- a/src/models/qwen3_5/program/speculative/target_verification.cpp
 +++ b/src/models/qwen3_5/program/speculative/target_verification.cpp
 @@ -13,6 +13,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
@@ -8255,7 +8260,7 @@ index afd28ebab3c121f66e64188f74da68d080bf05be..07b669d9f0eb5d6150eff29da9c9905c
                                   frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
 diff --git a/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c2df7dbbffd7ded3b86a92b1117b5562d3335de
+index 00000000..8c2df7db
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h
 @@ -0,0 +1,117 @@
@@ -8378,14 +8383,13 @@ index 0000000000000000000000000000000000000000..8c2df7dbbffd7ded3b86a92b1117b556
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h b/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..effa6ec3e3e6f527f2610db5b46213cd935f9572
+index 00000000..6113fcaf
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/checkpoint_buffer_pool.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,62 @@
 +#pragma once
 +
 +#include "models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h"
-+#include "core/arena.h"
 +
 +#include <charconv>
 +#include <cstdio>
@@ -8406,16 +8410,23 @@ index 0000000000000000000000000000000000000000..effa6ec3e3e6f527f2610db5b46213cd
 +    return capacity;
 +}
 +
++template <class Buffer>
 +class CheckpointBufferPool {
-+    using Pool=BoundedCheckpointBufferPool<PinnedHostBuffer>;
++    using Pool=BoundedCheckpointBufferPool<Buffer>;
 +public:
 +    CheckpointBufferPool(std::size_t capacity,std::size_t image_bytes,bool prewarm=false)
-+        : pool_(std::make_shared<Pool>(capacity,image_bytes)) {
++        : pool_(std::make_shared<Pool>(capacity,image_bytes)), resident_(prewarm) {
 +        if (prewarm) pool_->prewarm(capacity,[](auto& image) { std::memset(image.data(),0,image.size()); });
 +        std::fprintf(stderr,"CHECKPOINT_POOL capacity=%zu image_bytes=%zu maximum_cached_bytes=%zu prewarm=%zu\n",
 +                     capacity,image_bytes,capacity*image_bytes,prewarm ? capacity : 0);
 +    }
-+    std::shared_ptr<PinnedHostBuffer> acquire(std::size_t bytes) { return pool_->acquire(bytes); }
++    std::shared_ptr<Buffer> acquire(std::size_t bytes) { return pool_->acquire(bytes); }
++    int reconstruction_scratch_mode(int configured) const noexcept {
++        // Resident mode covers the backup even when the old experiment is off.
++        // Explicit pooled/retained modes keep their existing ownership behavior.
++        return resident_ && configured == 0 ? 1 : configured;
++    }
++    std::size_t idle_bytes() const { return pool_->statistics().cached_bytes; }
 +    void close() noexcept {
 +        const auto stats=pool_->statistics();
 +        std::fprintf(stderr,"CHECKPOINT_POOL_CLOSE hits=%llu misses=%llu cached=%zu cached_bytes=%zu high_water_cached_bytes=%zu\n",
@@ -8425,12 +8436,22 @@ index 0000000000000000000000000000000000000000..effa6ec3e3e6f527f2610db5b46213cd
 +    }
 +private:
 +    std::shared_ptr<Pool> pool_;
++    const bool resident_;
 +};
++
++// Catalog images are counted by their owners. An idle image cannot also be
++// leased, and the independently retained reconstruction backup is never a
++// catalog image. Count its allocation once, regardless of shared aliases.
++template <class Buffer>
++std::size_t checkpoint_auxiliary_host_bytes(const CheckpointBufferPool<Buffer>* pool,
++                                           const std::shared_ptr<Buffer>& scratch) {
++    return (pool ? pool->idle_bytes() : 0) + (scratch ? scratch->size() : 0);
++}
 +
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/checkpoint_residency.h b/src/models/qwen3_5/program/storage/checkpoint_residency.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..44e39d213292db2f4d8313c00fd5b23d1bac2663
+index 00000000..44e39d21
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/checkpoint_residency.h
 @@ -0,0 +1,35 @@
@@ -8470,7 +8491,7 @@ index 0000000000000000000000000000000000000000..44e39d213292db2f4d8313c00fd5b23d
 +
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/context.cpp b/src/models/qwen3_5/program/storage/context.cpp
-index 9085edcc7beaa3649711d7695784d2494dea7755..e680ddb47a93005aeee3c0e0adcd4489524a700c 100644
+index 9085edcc..e680ddb4 100644
 --- a/src/models/qwen3_5/program/storage/context.cpp
 +++ b/src/models/qwen3_5/program/storage/context.cpp
 @@ -1,4 +1,5 @@
@@ -8667,7 +8688,7 @@ index 9085edcc7beaa3649711d7695784d2494dea7755..e680ddb47a93005aeee3c0e0adcd4489
  
 diff --git a/src/models/qwen3_5/program/storage/host_trace.h b/src/models/qwen3_5/program/storage/host_trace.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2588a5453ad1f8122dae49a8e62119bafc9728a
+index 00000000..d2588a54
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/host_trace.h
 @@ -0,0 +1,88 @@
@@ -8761,7 +8782,7 @@ index 0000000000000000000000000000000000000000..d2588a5453ad1f8122dae49a8e62119b
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/kvmem_transfer_trace.h b/src/models/qwen3_5/program/storage/kvmem_transfer_trace.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..17052b71a874111621aca5bc6eb1d868b466afac
+index 00000000..17052b71
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_transfer_trace.h
 @@ -0,0 +1,135 @@
@@ -8902,7 +8923,7 @@ index 0000000000000000000000000000000000000000..17052b71a874111621aca5bc6eb1d868
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6de4f13ade
+index 00000000..e3c4c804
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 @@ -0,0 +1,1599 @@
@@ -10507,7 +10528,7 @@ index 0000000000000000000000000000000000000000..e3c4c804a9fa372338a0eb04da1ffb6d
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/memory_statistics.cpp b/src/models/qwen3_5/program/storage/memory_statistics.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..536f88af08c85e74a7b7fd501572970f18ccdb6e
+index 00000000..536f88af
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/memory_statistics.cpp
 @@ -0,0 +1,149 @@
@@ -10661,7 +10682,7 @@ index 0000000000000000000000000000000000000000..536f88af08c85e74a7b7fd501572970f
 +}
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/session_snapshot.cpp b/src/models/qwen3_5/program/storage/session_snapshot.cpp
-index 035f96ceb09bdca39dfa4682070b56cc6fa635b9..3fefcbb2ad710623f70d3eeeccdfcd86f1afa6e2 100644
+index 035f96ce..3fefcbb2 100644
 --- a/src/models/qwen3_5/program/storage/session_snapshot.cpp
 +++ b/src/models/qwen3_5/program/storage/session_snapshot.cpp
 @@ -1049,6 +1049,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
@@ -10673,7 +10694,7 @@ index 035f96ceb09bdca39dfa4682070b56cc6fa635b9..3fefcbb2ad710623f70d3eeeccdfcd86
          sequence.mtp_draft_count         = 0;
          sequence.tail_hidden_valid       = session.tail_hidden_valid != 0;
 diff --git a/src/models/qwen3_5/program/storage/state_store.h b/src/models/qwen3_5/program/storage/state_store.h
-index 4b55fec491e2f2f15258fafff61f074c6973c1cc..d649126916bfc9370fc3a36dc69b26af90e607af 100644
+index 4b55fec4..d6491269 100644
 --- a/src/models/qwen3_5/program/storage/state_store.h
 +++ b/src/models/qwen3_5/program/storage/state_store.h
 @@ -184,6 +184,19 @@ public:
@@ -10697,7 +10718,7 @@ index 4b55fec491e2f2f15258fafff61f074c6973c1cc..d649126916bfc9370fc3a36dc69b26af
          Object& object       = require_copied_destination(handle);
          object.content_epoch = next_epoch();
 diff --git a/src/models/qwen3_5/program/structured_round.cpp b/src/models/qwen3_5/program/structured_round.cpp
-index 0701716bde1ac17667820c163f84ca0be6cb315f..f9a3d852de1d5391828f6af79768523de4bd5bb6 100644
+index 0701716b..f9a3d852 100644
 --- a/src/models/qwen3_5/program/structured_round.cpp
 +++ b/src/models/qwen3_5/program/structured_round.cpp
 @@ -100,6 +100,12 @@ void CUDART_CB StructuredRound::collect(void* opaque) noexcept {
@@ -10715,7 +10736,7 @@ index 0701716bde1ac17667820c163f84ca0be6cb315f..f9a3d852de1d5391828f6af79768523d
                              lane * self.width_ * self.words_);
 diff --git a/src/models/qwen3_5/program/tool_open_mask.h b/src/models/qwen3_5/program/tool_open_mask.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..458e350b0bdd0e0d98b3caa0b6779f0c66f602cc
+index 00000000..458e350b
 --- /dev/null
 +++ b/src/models/qwen3_5/program/tool_open_mask.h
 @@ -0,0 +1,26 @@
@@ -10746,7 +10767,7 @@ index 0000000000000000000000000000000000000000..458e350b0bdd0e0d98b3caa0b6779f0c
 +
 +} // namespace ninfer::models::qwen3_5
 diff --git a/src/models/qwen3_5/program/transactions/commit.cpp b/src/models/qwen3_5/program/transactions/commit.cpp
-index 9a1a1b398f7e05a3fd002c282d7aad89989f0974..3b7e895ba40af86c676fb70ea6ce69be0aae34eb 100644
+index 9a1a1b39..3b7e895b 100644
 --- a/src/models/qwen3_5/program/transactions/commit.cpp
 +++ b/src/models/qwen3_5/program/transactions/commit.cpp
 @@ -49,6 +49,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
@@ -10856,7 +10877,7 @@ index 9a1a1b398f7e05a3fd002c282d7aad89989f0974..3b7e895ba40af86c676fb70ea6ce69be
      out.timings     = request.timings;
      out.speculative = std::move(request.speculative_stats);
 diff --git a/src/models/qwen3_5/program/transactions/materialization.cpp b/src/models/qwen3_5/program/transactions/materialization.cpp
-index 22b200945fea940d985630bda0daba7de9e514b7..9fea8f1ab74d4ffbaceaac69d7b2ed7ac7d46283 100644
+index 22b20094..9fea8f1a 100644
 --- a/src/models/qwen3_5/program/transactions/materialization.cpp
 +++ b/src/models/qwen3_5/program/transactions/materialization.cpp
 @@ -1,5 +1,6 @@
@@ -10923,7 +10944,7 @@ index 22b200945fea940d985630bda0daba7de9e514b7..9fea8f1ab74d4ffbaceaac69d7b2ed7a
      if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
          submitted = transaction->transfer_submitted;
 diff --git a/src/models/qwen3_5/program_sources.cmake b/src/models/qwen3_5/program_sources.cmake
-index 9d19d569e24b2aa6ca0232dee76c83313a534a65..b6f6f9fe52a47d74d1acc94af195736a233ac372 100644
+index 9d19d569..b6f6f9fe 100644
 --- a/src/models/qwen3_5/program_sources.cmake
 +++ b/src/models/qwen3_5/program_sources.cmake
 @@ -17,6 +17,8 @@ target_sources(ninfer_model_runtime PRIVATE
@@ -10936,7 +10957,7 @@ index 9d19d569e24b2aa6ca0232dee76c83313a534a65..b6f6f9fe52a47d74d1acc94af195736a
    "${CMAKE_CURRENT_LIST_DIR}/program/storage/session_snapshot.cpp"
    "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
-index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840e500ee56 100644
+index 0a3dc796..5b1e8e9f 100644
 --- a/src/ops/CMakeLists.txt
 +++ b/src/ops/CMakeLists.txt
 @@ -22,6 +22,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
@@ -10948,7 +10969,7 @@ index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840
  include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
-index 80ee5321d2b1b221c3ada74a7471b38751cbed6b..80b0242580da3f3a35eae487698ae7d718927b2d 100644
+index 80ee5321..80b02425 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
 +++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
 @@ -685,4 +685,46 @@ std::int32_t bf16_gdn_gating_proj_mma_resident_ctas_per_sm(bool geometry35,
@@ -10999,7 +11020,7 @@ index 80ee5321d2b1b221c3ada74a7471b38751cbed6b..80b0242580da3f3a35eae487698ae7d7
 +
  } // namespace ninfer::ops::detail
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
-index 73d57fdac2f9ce09ef65603840c3be55f50a17f7..85f0fcbe1ddaa99dcd6240ad09dddbd9a0b0d1ba 100644
+index 73d57fda..85f0fcbe 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
 +++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
 @@ -15,6 +15,10 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
@@ -11014,7 +11035,7 @@ index 73d57fdac2f9ce09ef65603840c3be55f50a17f7..85f0fcbe1ddaa99dcd6240ad09dddbd9
      None,
      Full,
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
-index da182554febd8536857c80387d544a87cb86e27e..4be07ecf386fc13cef84e80a9d0750652f2f679e 100644
+index da182554..4be07ecf 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
 +++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
 @@ -224,6 +224,7 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -11074,7 +11095,7 @@ index da182554febd8536857c80387d544a87cb86e27e..4be07ecf386fc13cef84e80a9d075065
                            : resolve_from_routes(k35Routes, problem, sm_count);
  }
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h
-index 1f4c5282c0e4e506354879bd9e9cf579ff200e94..299df37364821d788e4d1213ec26d15f23c97bc4 100644
+index 1f4c5282..299df373 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h
 +++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h
 @@ -14,6 +14,7 @@
@@ -11086,7 +11107,7 @@ index 1f4c5282c0e4e506354879bd9e9cf579ff200e94..299df37364821d788e4d1213ec26d15f
      SmallTSplit10,
      SimtWarpRowC4,
 diff --git a/src/ops/gdn_input_proj/gdn_projected_conv.cu b/src/ops/gdn_input_proj/gdn_projected_conv.cu
-index d2fab2d6b02eb12b86f80292965196f0f27d234a..b7d07fd0faf5d08a71d082e2e9a9bd800ad9f05b 100644
+index d2fab2d6..b7d07fd0 100644
 --- a/src/ops/gdn_input_proj/gdn_projected_conv.cu
 +++ b/src/ops/gdn_input_proj/gdn_projected_conv.cu
 @@ -1,3 +1,4 @@
@@ -11129,7 +11150,7 @@ index d2fab2d6b02eb12b86f80292965196f0f27d234a..b7d07fd0faf5d08a71d082e2e9a9bd80
 +}
 +} // namespace ninfer::ops
 diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
-index 888492ceaa2e0d61678b86b01365df863ffe8395..e5be4992aae53ba892eaea9054343bbb6cdcee82 100644
+index 888492ce..e5be4992 100644
 --- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
 +++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
 @@ -275,6 +275,13 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
@@ -11147,7 +11168,7 @@ index 888492ceaa2e0d61678b86b01365df863ffe8395..e5be4992aae53ba892eaea9054343bbb
  }
  
 diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
-index 5de482af35cdcdd4cd2d15933918aa15e7915c7c..7f2c63b7b60c913bc830a76dcb756e888b94aea4 100644
+index 5de482af..7f2c63b7 100644
 --- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
 +++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
 @@ -480,6 +480,7 @@ struct FoldGeometry {
@@ -11159,7 +11180,7 @@ index 5de482af35cdcdd4cd2d15933918aa15e7915c7c..7f2c63b7b60c913bc830a76dcb756e88
  template <class Geometry, class StateT = float>
  struct FoldAccess {
 diff --git a/src/ops/linear_attention/gated_delta_net/replay.cpp b/src/ops/linear_attention/gated_delta_net/replay.cpp
-index 7757b4e0223d81b5bb7f027f8b750b31ea96698c..9f9ac70ad64fd308b5fa11c464f67fed12254dda 100644
+index 7757b4e0..9f9ac70a 100644
 --- a/src/ops/linear_attention/gated_delta_net/replay.cpp
 +++ b/src/ops/linear_attention/gated_delta_net/replay.cpp
 @@ -104,7 +104,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
@@ -11184,7 +11205,7 @@ index 7757b4e0223d81b5bb7f027f8b750b31ea96698c..9f9ac70ad64fd308b5fa11c464f67fed
  
  void validate_fold_records(const GdnReplayRecords& records) {
 diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
-index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..f487376637bd807922b7121b97843c974c8ddb3b 100644
+index 9ff92d70..f4873766 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
 +++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
 @@ -11,6 +11,7 @@
@@ -11311,7 +11332,7 @@ index 9ff92d70f3122e77ed4f84655dd7d5c52b58a85c..f487376637bd807922b7121b97843c97
          detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, cache.storage, envelope);
      if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
 diff --git a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
-index ebf44eeb8ad687f4ed22eb0431341b485c641a78..ce7ff494d0e96ea886597fa96381be5d687c13fc 100644
+index ebf44eeb..ce7ff494 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
 +++ b/src/ops/softmax_attention/dense/causal_cache/geometry.cuh
 @@ -12,6 +12,9 @@ struct CausalAttentionGeometry : AttentionHeadMapping<QHeadsValue, KVHeadsValue>
@@ -11325,7 +11346,7 @@ index ebf44eeb8ad687f4ed22eb0431341b485c641a78..ce7ff494d0e96ea886597fa96381be5d
  using CausalD256H16Kv2 = CausalAttentionGeometry<16, 2, 2>;
  
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt.cu b/src/ops/softmax_attention/dense/causal_cache/prompt.cu
-index f10317d6bb43795ea7600b3e7f621ed882fc20a8..043c6790094386df147eb4858f4829f4e9ef1b09 100644
+index f10317d6..043c6790 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt.cu
 @@ -307,6 +307,16 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
@@ -11363,7 +11384,7 @@ index f10317d6bb43795ea7600b3e7f621ed882fc20a8..043c6790094386df147eb4858f4829f4
                                                                         metadata, out, fast, stream);
      };
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
-index 97c31f8f6b86b2700f5b7a75d5726ff538d08cce..63d62cea0aa0af7938f1eae7adc5cb3547ed8913 100644
+index 97c31f8f..63d62cea 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cu
 @@ -51,6 +51,16 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
@@ -11384,7 +11405,7 @@ index 97c31f8f6b86b2700f5b7a75d5726ff538d08cce..63d62cea0aa0af7938f1eae7adc5cb35
                                                                         metadata, out, stream);
  }
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
-index 8ecb6208c8a6d9ae21244a123bea2bf65fbb1dc7..f4950a8efef9d91da5acf3f05c1dd3146a13431a 100644
+index 8ecb6208..f4950a8e 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
 @@ -51,6 +51,16 @@ void causal_attention_prompt_k8v4_attention_dispatch(const Tensor& q, const Tens
@@ -11405,7 +11426,7 @@ index 8ecb6208c8a6d9ae21244a123bea2bf65fbb1dc7..f4950a8efef9d91da5acf3f05c1dd314
                                                                          metadata, out, stream);
  }
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu
-index 86c617483efeb4714d4117a1d99b6bcd6e3e930e..aa4e5e622dd32927dfb819f444bc31d271de2f8e 100644
+index 86c61748..aa4e5e62 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cu
 @@ -51,6 +51,16 @@ void causal_attention_prompt_nvfp4_attention_dispatch(const Tensor& q, const Ten
@@ -11426,7 +11447,7 @@ index 86c617483efeb4714d4117a1d99b6bcd6e3e930e..aa4e5e622dd32927dfb819f444bc31d2
                                                                           metadata, out, stream);
  }
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
-index 1b4bef3d37598a5a9174cbbf3fe5a14297e4c4b5..09283671d1d0d0e1bb100c72a5b9ebe6f23b4384 100644
+index 1b4bef3d..09283671 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
 @@ -51,7 +51,8 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
@@ -11441,7 +11462,7 @@ index 1b4bef3d37598a5a9174cbbf3fe5a14297e4c4b5..09283671d1d0d0e1bb100c72a5b9ebe6
                  static_cast<float2*>(partials.stats.data));
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..c465e6e9b3d566980322bb34e88bdcc6f40a1dc4
+index 00000000..c465e6e9
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.cu
 @@ -0,0 +1,109 @@
@@ -11556,7 +11577,7 @@ index 0000000000000000000000000000000000000000..c465e6e9b3d566980322bb34e88bdcc6
 +#endif
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f879c72c8e5b91a2f4482c3ed7b8a2ec41dbca96
+index 00000000..f879c72c
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/launch.h
 @@ -0,0 +1,16 @@
@@ -11578,7 +11599,7 @@ index 0000000000000000000000000000000000000000..f879c72c8e5b91a2f4482c3ed7b8a2ec
 +}
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..0925e0f933cced2d5cc7cf7a00cb9e1d85dccac3
+index 00000000..0925e0f9
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/memory.cuh
 @@ -0,0 +1,79 @@
@@ -11663,7 +11684,7 @@ index 0000000000000000000000000000000000000000..0925e0f933cced2d5cc7cf7a00cb9e1d
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..bc217d024cb1de0d86cb295adffb97a13c8eac42
+index 00000000..bc217d02
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/mma.cuh
 @@ -0,0 +1,116 @@
@@ -11785,7 +11806,7 @@ index 0000000000000000000000000000000000000000..bc217d024cb1de0d86cb295adffb97a1
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..9b3992310aaa238d2b3df437b43a2f15ed715245
+index 00000000..9b399231
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/pipeline.cuh
 @@ -0,0 +1,135 @@
@@ -11926,7 +11947,7 @@ index 0000000000000000000000000000000000000000..9b3992310aaa238d2b3df437b43a2f15
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..3f69c76af6a38a68f3fb12670d67bd9253c32e5f
+index 00000000..3f69c76a
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/cuda/reduce.cuh
 @@ -0,0 +1,214 @@
@@ -12146,7 +12167,7 @@ index 0000000000000000000000000000000000000000..3f69c76af6a38a68f3fb12670d67bd92
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bba887cc5669dbeb871d91f720dd8ec9edbc8c8
+index 00000000..4bba887c
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/convert.cuh
 @@ -0,0 +1,125 @@
@@ -12277,7 +12298,7 @@ index 0000000000000000000000000000000000000000..4bba887cc5669dbeb871d91f720dd8ec
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..62feff583225b33b4c6cb230088924037552c561
+index 00000000..62feff58
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.cuh
 @@ -0,0 +1,75 @@
@@ -12358,7 +12379,7 @@ index 0000000000000000000000000000000000000000..62feff583225b33b4c6cb23008892403
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c07e9b76de6ed2e1d9ff3f6eb2590ca4eed66c13
+index 00000000..c07e9b76
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/numeric/math.h
 @@ -0,0 +1,53 @@
@@ -12417,7 +12438,7 @@ index 0000000000000000000000000000000000000000..c07e9b76de6ed2e1d9ff3f6eb2590ca4
 +#undef NINFER_KERNEL_HD
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..f46498d6686d1e07e52a341653bf8f1449baeafd
+index 00000000..f46498d6
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/common/quant/integer.cuh
 @@ -0,0 +1,408 @@
@@ -12831,7 +12852,7 @@ index 0000000000000000000000000000000000000000..f46498d6686d1e07e52a341653bf8f14
 +} // namespace ninfer::ops::detail::selective_i8::common
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..20aeb0f4ef86d6409d217eaaa4a700b530c0d0d4
+index 00000000..20aeb0f4
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/hadamard.cuh
 @@ -0,0 +1,68 @@
@@ -12905,7 +12926,7 @@ index 0000000000000000000000000000000000000000..20aeb0f4ef86d6409d217eaaa4a700b5
 +} // namespace ninfer::ops::detail::selective_i8::kv
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..72cb9d2e3b155ef1eda8898ad5f41af6ef96bbd8
+index 00000000..72cb9d2e
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/kv_cache/kernels/layout.cuh
 @@ -0,0 +1,130 @@
@@ -13041,7 +13062,7 @@ index 0000000000000000000000000000000000000000..72cb9d2e3b155ef1eda8898ad5f41af6
 +} // namespace ninfer::ops::detail::selective_i8::kv
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7df56ca722ea39e22cc5505c1619c7ff065958fe
+index 00000000..7df56ca7
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/dense/causal_cache/int8/instances.h
 @@ -0,0 +1,23 @@
@@ -13070,7 +13091,7 @@ index 0000000000000000000000000000000000000000..7df56ca722ea39e22cc5505c1619c7ff
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..6da7c78c8fe5fbadaeaa8415e1d6aa1052c5092f
+index 00000000..6da7c78c
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/epilogue.cuh
 @@ -0,0 +1,39 @@
@@ -13115,7 +13136,7 @@ index 0000000000000000000000000000000000000000..6da7c78c8fe5fbadaeaa8415e1d6aa10
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..43ffb2845eb1a3939ca999ebd0382245f707dca8
+index 00000000..43ffb284
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/geometry.h
 @@ -0,0 +1,26 @@
@@ -13147,7 +13168,7 @@ index 0000000000000000000000000000000000000000..43ffb2845eb1a3939ca999ebd0382245
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..290c6c18c024ce879eadee97e7a0baf58f2dee23
+index 00000000..290c6c18
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/grouped_mma.cuh
 @@ -0,0 +1,599 @@
@@ -13752,7 +13773,7 @@ index 0000000000000000000000000000000000000000..290c6c18c024ce879eadee97e7a0baf5
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..22e5839b5deb3763b238c8b77e811886a3adf99b
+index 00000000..22e5839b
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/int8/schedule.cuh
 @@ -0,0 +1,56 @@
@@ -13814,7 +13835,7 @@ index 0000000000000000000000000000000000000000..22e5839b5deb3763b238c8b77e811886
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..c4315cc0acbcbac99f94a23e4fe3c1350600c329
+index 00000000..c4315cc0
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/merge.cuh
 @@ -0,0 +1,124 @@
@@ -13944,7 +13965,7 @@ index 0000000000000000000000000000000000000000..c4315cc0acbcbac99f94a23e4fe3c135
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bd314a40545825c166949bfdd15acc7fbb8d313
+index 00000000..4bd314a4
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/operands.h
 @@ -0,0 +1,159 @@
@@ -14109,7 +14130,7 @@ index 0000000000000000000000000000000000000000..4bd314a40545825c166949bfdd15acc7
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8bcf8ced14a5e02429934143e6c804cd06c2ada
+index 00000000..c8bcf8ce
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/partition.h
 @@ -0,0 +1,29 @@
@@ -14144,7 +14165,7 @@ index 0000000000000000000000000000000000000000..c8bcf8ced14a5e02429934143e6c804c
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..217a903b4460e85dfd54a13982a7665ce2511b4d
+index 00000000..217a903b
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/causal/tile_io.cuh
 @@ -0,0 +1,74 @@
@@ -14224,7 +14245,7 @@ index 0000000000000000000000000000000000000000..217a903b4460e85dfd54a13982a7665c
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..f74672cb0bda3abae98a5b7fc136c46b046dfd41
+index 00000000..f74672cb
 --- /dev/null
 +++ b/src/ops/softmax_attention/dense/causal_cache/selective_int8/ported/ops/softmax_attention/kernels/softmax.cuh
 @@ -0,0 +1,59 @@
@@ -14288,7 +14309,7 @@ index 0000000000000000000000000000000000000000..f74672cb0bda3abae98a5b7fc136c46b
 +
 +} // namespace ninfer::ops::detail::selective_i8
 diff --git a/src/ops/softmax_attention/sliding_window/kernel.cuh b/src/ops/softmax_attention/sliding_window/kernel.cuh
-index f628de7563538c73a3ae808edfb816578637664f..6600cc45e8ab60857bb23251bb152a2e61147b23 100644
+index f628de75..6600cc45 100644
 --- a/src/ops/softmax_attention/sliding_window/kernel.cuh
 +++ b/src/ops/softmax_attention/sliding_window/kernel.cuh
 @@ -11,8 +11,11 @@ struct SlidingWindowAttentionPolicy {
@@ -14341,7 +14362,7 @@ index f628de7563538c73a3ae808edfb816578637664f..6600cc45e8ab60857bb23251bb152a2e
      const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
  
 diff --git a/src/ops/softmax_attention/sliding_window/launch.cu b/src/ops/softmax_attention/sliding_window/launch.cu
-index eb84f12b99ffd2f04f792019d52b41cb8e7c477e..f93ee67fafb18efde499af54c99e1926e7475212 100644
+index eb84f12b..f93ee67f 100644
 --- a/src/ops/softmax_attention/sliding_window/launch.cu
 +++ b/src/ops/softmax_attention/sliding_window/launch.cu
 @@ -109,7 +109,7 @@ const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute rout
@@ -14399,7 +14420,7 @@ index eb84f12b99ffd2f04f792019d52b41cb8e7c477e..f93ee67fafb18efde499af54c99e1926
          };
          if (plan.reduce_warps == 4) {
 diff --git a/src/ops/softmax_attention/sliding_window/launch.h b/src/ops/softmax_attention/sliding_window/launch.h
-index b606fe21657d6de772961c0f71d7c035ae3d109b..9637f22ba3387e6813cc735b2935997ef2620fef 100644
+index b606fe21..9637f22b 100644
 --- a/src/ops/softmax_attention/sliding_window/launch.h
 +++ b/src/ops/softmax_attention/sliding_window/launch.h
 @@ -29,7 +29,7 @@ sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens,
@@ -14412,7 +14433,7 @@ index b606fe21657d6de772961c0f71d7c035ae3d109b..9637f22ba3387e6813cc735b2935997e
                                       const SlidingWindowAttentionPlan& plan, Tensor& partial_acc,
                                       Tensor& partial_m, Tensor& partial_l, Tensor& out,
 diff --git a/src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp b/src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp
-index cf2d614e83c9708268c3e22fa333387b6d3e3aeb..618e655ea484125fd5c0795f46a9cc4437a6e1e2 100644
+index cf2d614e..618e655e 100644
 --- a/src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp
 +++ b/src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp
 @@ -112,7 +112,8 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
@@ -14453,7 +14474,7 @@ index cf2d614e83c9708268c3e22fa333387b6d3e3aeb..618e655ea484125fd5c0795f46a9cc44
  
  } // namespace ninfer::ops
 diff --git a/src/ops/softmax_attention/sources.cmake b/src/ops/softmax_attention/sources.cmake
-index 7897fa52c7ca1f9d2432503509eeea433ecbde7b..880d548d49fe30ed59e0d548b3c46c7227e850a5 100644
+index 7897fa52..880d548d 100644
 --- a/src/ops/softmax_attention/sources.cmake
 +++ b/src/ops/softmax_attention/sources.cmake
 @@ -1,4 +1,5 @@
@@ -14464,14 +14485,14 @@ index 7897fa52c7ca1f9d2432503509eeea433ecbde7b..880d548d49fe30ed59e0d548b3c46c72
    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_w1_h24_append.cu"
 diff --git a/src/ops/token_sums/sources.cmake b/src/ops/token_sums/sources.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..f14957b3c31fe64f3f59b3e673a5755834f6d71c
+index 00000000..f14957b3
 --- /dev/null
 +++ b/src/ops/token_sums/sources.cmake
 @@ -0,0 +1 @@
 +target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/token_sums.cu")
 diff --git a/src/ops/token_sums/token_sums.cu b/src/ops/token_sums/token_sums.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..2babaf6c913138a59714e56977f2d210097a9220
+index 00000000..2babaf6c
 --- /dev/null
 +++ b/src/ops/token_sums/token_sums.cu
 @@ -0,0 +1,70 @@
@@ -14546,7 +14567,7 @@ index 0000000000000000000000000000000000000000..2babaf6c913138a59714e56977f2d210
 +}
 +} // namespace ninfer::ops
 diff --git a/src/ops/weight_input.cpp b/src/ops/weight_input.cpp
-index 2c3fe5317ec465586dc37f86afedbaccafce6a4e..f532888947b91e726eec6ab6df0631998e8964d4 100644
+index 2c3fe531..f5328889 100644
 --- a/src/ops/weight_input.cpp
 +++ b/src/ops/weight_input.cpp
 @@ -181,9 +181,11 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool
@@ -14591,7 +14612,7 @@ index 2c3fe5317ec465586dc37f86afedbaccafce6a4e..f532888947b91e726eec6ab6df063199
      const auto second = prepare_linear_weight(b);
      require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
 diff --git a/src/ops/wrapper/gdn_gating_proj.cpp b/src/ops/wrapper/gdn_gating_proj.cpp
-index 4b8900d75837478fe37f66e70faa6e69687abfcf..d1114e1caec40a8d168c5b9aa1c86672f51eb281 100644
+index 4b8900d7..d1114e1c 100644
 --- a/src/ops/wrapper/gdn_gating_proj.cpp
 +++ b/src/ops/wrapper/gdn_gating_proj.cpp
 @@ -49,15 +49,10 @@ struct GdnControlParentGeometry {
@@ -14670,7 +14691,7 @@ index 4b8900d75837478fe37f66e70faa6e69687abfcf..d1114e1caec40a8d168c5b9aa1c86672
  
      detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
 diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
-index ea13ecb385f1edc9d75587d6fe03668b5164c2d4..2ef5a7628fdae2977434c6622f7ae6f8c2ddfea2 100644
+index ea13ecb3..2ef5a762 100644
 --- a/src/ops/wrapper/gdn_input_proj.cpp
 +++ b/src/ops/wrapper/gdn_input_proj.cpp
 @@ -1445,11 +1445,9 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
@@ -14835,7 +14856,7 @@ index ea13ecb385f1edc9d75587d6fe03668b5164c2d4..2ef5a7628fdae2977434c6622f7ae6f8
                                conv_record, query, key, value, z, workspace);
 diff --git a/src/product/cuda_memory_options.h b/src/product/cuda_memory_options.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..6aec9a7edb679d64ccf32c70ff4bd68afdc7edb0
+index 00000000..6aec9a7e
 --- /dev/null
 +++ b/src/product/cuda_memory_options.h
 @@ -0,0 +1,68 @@
@@ -14908,7 +14929,7 @@ index 0000000000000000000000000000000000000000..6aec9a7edb679d64ccf32c70ff4bd68a
 +
 +} // namespace ninfer::product
 diff --git a/src/runtime/contract/execution.h b/src/runtime/contract/execution.h
-index 2b06a396f2f6dc0a520cf901dc7ec9d57b111361..462685799d32bd80893c794f66bdf252f0d5de66 100644
+index 2b06a396..46268579 100644
 --- a/src/runtime/contract/execution.h
 +++ b/src/runtime/contract/execution.h
 @@ -91,4 +91,24 @@ struct RoundBudget {
@@ -14937,7 +14958,7 @@ index 2b06a396f2f6dc0a520cf901dc7ec9d57b111361..462685799d32bd80893c794f66bdf252
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/contract/grammar_masks.h b/src/runtime/contract/grammar_masks.h
-index 362100902e4b71a44187ca16d8e80f184d1b3989..61858a77d6e1e6f3a43b6c8bb2fd08fe3ae6def5 100644
+index 36210090..61858a77 100644
 --- a/src/runtime/contract/grammar_masks.h
 +++ b/src/runtime/contract/grammar_masks.h
 @@ -1,14 +1,13 @@
@@ -14991,7 +15012,7 @@ index 362100902e4b71a44187ca16d8e80f184d1b3989..61858a77d6e1e6f3a43b6c8bb2fd08fe
  // at start: the next token's (no drafts), or a speculative round's columns after its drafts. The
  // job owns its result; a request that goes away leaves a running job to finish and be discarded.
 diff --git a/src/runtime/contract/request.h b/src/runtime/contract/request.h
-index e47e8d08b61e5b2b3473afada7c1943db9d7b68b..2e68331bb47fc65ba0ad773dd7d59432615686e1 100644
+index e47e8d08..2e68331b 100644
 --- a/src/runtime/contract/request.h
 +++ b/src/runtime/contract/request.h
 @@ -18,6 +18,8 @@ namespace ninfer::runtime {
@@ -15017,7 +15038,7 @@ index e47e8d08b61e5b2b3473afada7c1943db9d7b68b..2e68331bb47fc65ba0ad773dd7d59432
      StopPolicy stop;
      OutputOptions output;
 diff --git a/src/runtime/engine/context_cache/resource_manager.h b/src/runtime/engine/context_cache/resource_manager.h
-index 8b25d6c588e2d8b2e28c7d89f2b99ab6086c40de..68a8cc1b790393d26e80e1c781ac3a99f755fdc1 100644
+index 8b25d6c5..68a8cc1b 100644
 --- a/src/runtime/engine/context_cache/resource_manager.h
 +++ b/src/runtime/engine/context_cache/resource_manager.h
 @@ -373,6 +373,9 @@ public:
@@ -15031,7 +15052,7 @@ index 8b25d6c588e2d8b2e28c7d89f2b99ab6086c40de..68a8cc1b790393d26e80e1c781ac3a99
          for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
              if (lanes_[lane] == LogicalLaneState::Free) {
 diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
-index f6d6c2c2407a32ebcb20b75ed8ce57184dde0d0b..5d5b2beb0a02b75d6a258d6c30b8a640ede5b5a5 100644
+index f6d6c2c2..5d5b2beb 100644
 --- a/src/runtime/engine/engine.cpp
 +++ b/src/runtime/engine/engine.cpp
 @@ -45,17 +45,6 @@ DeviceContext initialize_device(const EngineOptions& options) {
@@ -15163,7 +15184,7 @@ index f6d6c2c2407a32ebcb20b75ed8ce57184dde0d0b..5d5b2beb0a02b75d6a258d6c30b8a640
  
  bool Engine::is_available() const {
 diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
-index b21adce775f3baccdd54057f395ffdd71ce1c3c2..6c90cd72a9c77dd74eaf1e6a0b3f0fd803aa07a3 100644
+index b21adce7..6c90cd72 100644
 --- a/src/runtime/engine/engine_core.h
 +++ b/src/runtime/engine/engine_core.h
 @@ -1,8 +1,10 @@
@@ -15579,7 +15600,7 @@ index b21adce775f3baccdd54057f395ffdd71ce1c3c2..6c90cd72a9c77dd74eaf1e6a0b3f0fd8
      const bool branch_anchors_;
      const bool endpoint_anchors_;
 diff --git a/src/runtime/engine/gemma4_core.cpp b/src/runtime/engine/gemma4_core.cpp
-index f7e6a397c2494a07525496f73dce16b0d71af129..49be2b002878e4f931d3443317a57cf5dfb1ea35 100644
+index f7e6a397..49be2b00 100644
 --- a/src/runtime/engine/gemma4_core.cpp
 +++ b/src/runtime/engine/gemma4_core.cpp
 @@ -351,7 +351,6 @@ struct Gemma4Core::Request {
@@ -15627,7 +15648,7 @@ index f7e6a397c2494a07525496f73dce16b0d71af129..49be2b002878e4f931d3443317a57cf5
                  if (mask_failures[j].empty()) {
                      // Columns past the row's own drafts are never taken; they stay unrestricted.
 diff --git a/src/runtime/engine/kv_capacity.cpp b/src/runtime/engine/kv_capacity.cpp
-index 9850bbd4f061e805d24246a331abb48a04416362..bc30fb482d778cc43b1b193dcbcf369ce48996b8 100644
+index 9850bbd4..bc30fb48 100644
 --- a/src/runtime/engine/kv_capacity.cpp
 +++ b/src/runtime/engine/kv_capacity.cpp
 @@ -222,4 +222,63 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
@@ -15695,7 +15716,7 @@ index 9850bbd4f061e805d24246a331abb48a04416362..bc30fb482d778cc43b1b193dcbcf369c
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/engine/kv_capacity.h b/src/runtime/engine/kv_capacity.h
-index c056b1f50025966fc6f804d680d2977ff73ae57a..5332603b7fa60096b0081b9fdebc008a981c4af2 100644
+index c056b1f5..5332603b 100644
 --- a/src/runtime/engine/kv_capacity.h
 +++ b/src/runtime/engine/kv_capacity.h
 @@ -16,4 +16,13 @@ resolve_kv_capacity(const KvCapacityPolicy& policy, const SequenceCapacityCurve&
@@ -15713,7 +15734,7 @@ index c056b1f50025966fc6f804d680d2977ff73ae57a..5332603b7fa60096b0081b9fdebc008a
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
-index d738cd25d51654a844224538418f7cf255c26d45..502c714e2faef8f087edc5db3e59295594d0c082 100644
+index d738cd25..502c714e 100644
 --- a/src/runtime/engine/model_instance.cpp
 +++ b/src/runtime/engine/model_instance.cpp
 @@ -1,4 +1,5 @@
@@ -16222,7 +16243,7 @@ index d738cd25d51654a844224538418f7cf255c26d45..502c714e2faef8f087edc5db3e592955
      const auto& stats = instance->model->storage_stats();
      LoadSummary summary;
 diff --git a/src/runtime/engine/model_instance.h b/src/runtime/engine/model_instance.h
-index cd7f87b002f20171e1106953d61a44411b3e15bf..53c6adac16c5487790f19fd6b1aaae9517fbc49a 100644
+index cd7f87b0..53c6adac 100644
 --- a/src/runtime/engine/model_instance.h
 +++ b/src/runtime/engine/model_instance.h
 @@ -6,6 +6,7 @@
@@ -16243,7 +16264,7 @@ index cd7f87b002f20171e1106953d61a44411b3e15bf..53c6adac16c5487790f19fd6b1aaae95
      const models::qwen3_5::execution::Parameters parameters;
      models::qwen3_5::Frontend frontend;
 diff --git a/src/runtime/engine/qwen4_exp_core.cpp b/src/runtime/engine/qwen4_exp_core.cpp
-index 1a495ef75c0bea5fd9955daed20830f784294ce6..dc43ff407fa26a91d59da2ec73b58f3d28ec336a 100644
+index 1a495ef7..dc43ff40 100644
 --- a/src/runtime/engine/qwen4_exp_core.cpp
 +++ b/src/runtime/engine/qwen4_exp_core.cpp
 @@ -405,7 +405,6 @@ struct Qwen4ExpCore::Request {
@@ -16309,7 +16330,7 @@ index 1a495ef75c0bea5fd9955daed20830f784294ce6..dc43ff407fa26a91d59da2ec73b58f3d
      request->prompt                           = std::move(prompt);
      request->options                          = std::move(options);
 diff --git a/src/runtime/engine/request_record.h b/src/runtime/engine/request_record.h
-index b9c3e6bac4ed3972735ad6a91fec530d26e4fa9e..c95d71dd56cee2b1e6212ce7ea611f690a1c7114 100644
+index b9c3e6ba..c95d71dd 100644
 --- a/src/runtime/engine/request_record.h
 +++ b/src/runtime/engine/request_record.h
 @@ -140,11 +140,11 @@ struct RequestRecord {
@@ -16338,7 +16359,7 @@ index b9c3e6bac4ed3972735ad6a91fec530d26e4fa9e..c95d71dd56cee2b1e6212ce7ea611f69
      bool lease_shortfall_reported         = false;
      EngineRequestState post_capture_state = EngineRequestState::Prefill;
 diff --git a/src/runtime/engine/scheduler.h b/src/runtime/engine/scheduler.h
-index 235ef38173a69f920b8580117c78492eed1a91d6..1ee14f4427d50b392c6dacce0e94cf9ce3b6d05d 100644
+index 235ef381..1ee14f44 100644
 --- a/src/runtime/engine/scheduler.h
 +++ b/src/runtime/engine/scheduler.h
 @@ -174,7 +174,8 @@ public:
@@ -16372,7 +16393,7 @@ index 235ef38173a69f920b8580117c78492eed1a91d6..1ee14f4427d50b392c6dacce0e94cf9c
              membership.sequences[membership.size] = *request->sequence;
 diff --git a/src/runtime/speculative_limits.h b/src/runtime/speculative_limits.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..f3f0ba12ef0d63081f442aac893ecb90ae2e53f4
+index 00000000..f3f0ba12
 --- /dev/null
 +++ b/src/runtime/speculative_limits.h
 @@ -0,0 +1,18 @@
@@ -16395,7 +16416,7 @@ index 0000000000000000000000000000000000000000..f3f0ba12ef0d63081f442aac893ecb90
 +
 +} // namespace ninfer::runtime
 diff --git a/src/serve/CMakeLists.txt b/src/serve/CMakeLists.txt
-index 609c2aac1ed78eefa7d10e6289443da798aed551..f83baf6994025375bc55c67330bab24792c79c43 100644
+index 609c2aac..f83baf69 100644
 --- a/src/serve/CMakeLists.txt
 +++ b/src/serve/CMakeLists.txt
 @@ -34,6 +34,7 @@ add_library(ninfer_serve STATIC
@@ -16407,7 +16428,7 @@ index 609c2aac1ed78eefa7d10e6289443da798aed551..f83baf6994025375bc55c67330bab247
    PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
    PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_product_prompt_input
 diff --git a/src/serve/anthropic_messages_http.cpp b/src/serve/anthropic_messages_http.cpp
-index e3e71b1cda34e22189a4ab3cc10392c2971c25fc..56579e6fed6b6c8cbf775b2acc1d3af58a9e216e 100644
+index e3e71b1c..56579e6f 100644
 --- a/src/serve/anthropic_messages_http.cpp
 +++ b/src/serve/anthropic_messages_http.cpp
 @@ -102,7 +102,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
@@ -16420,7 +16441,7 @@ index e3e71b1cda34e22189a4ab3cc10392c2971c25fc..56579e6fed6b6c8cbf775b2acc1d3af5
      if (!request.stream) {
          GenerationOutcome outcome;
 diff --git a/src/serve/anthropic_messages_request.cpp b/src/serve/anthropic_messages_request.cpp
-index 20ef6e25974c1b5a2060aa8057c7d92e060c7ce2..d6bea8d3d1b31774f904773dea8b6fdb2237face 100644
+index 20ef6e25..d6bea8d3 100644
 --- a/src/serve/anthropic_messages_request.cpp
 +++ b/src/serve/anthropic_messages_request.cpp
 @@ -784,6 +784,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
@@ -16477,7 +16498,7 @@ index 20ef6e25974c1b5a2060aa8057c7d92e060c7ce2..d6bea8d3d1b31774f904773dea8b6fdb
  
 diff --git a/src/serve/cuda_residency_json.h b/src/serve/cuda_residency_json.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b3913db7ca9028fa54bcfffb92fcb403b46fffcc
+index 00000000..b3913db7
 --- /dev/null
 +++ b/src/serve/cuda_residency_json.h
 @@ -0,0 +1,23 @@
@@ -16505,7 +16526,7 @@ index 0000000000000000000000000000000000000000..b3913db7ca9028fa54bcfffb92fcb403
 +
 +} // namespace ninfer::serve
 diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
-index 21abc50cc19d330e43e4dd9154debda2259d88af..92f541c62d272f8dd5b3ecd05ed6cf1512afb911 100644
+index 21abc50c..92f541c6 100644
 --- a/src/serve/generation_service.cpp
 +++ b/src/serve/generation_service.cpp
 @@ -56,6 +56,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
@@ -16596,7 +16617,7 @@ index 21abc50cc19d330e43e4dd9154debda2259d88af..92f541c62d272f8dd5b3ecd05ed6cf15
      ninfer::CancellationView cancellation;
      if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
 diff --git a/src/serve/generation_service.h b/src/serve/generation_service.h
-index b2544e2537f973e5ed8fb8e899659fa141fd7f99..64336c8c3966c471dde1e234505bc3436f9bc94d 100644
+index b2544e25..64336c8c 100644
 --- a/src/serve/generation_service.h
 +++ b/src/serve/generation_service.h
 @@ -4,6 +4,7 @@
@@ -16616,7 +16637,7 @@ index b2544e2537f973e5ed8fb8e899659fa141fd7f99..64336c8c3966c471dde1e234505bc343
      ninfer::ResolvedSamplingParameters sampling;
      double prepare_seconds     = 0.0;
 diff --git a/src/serve/http_server.cpp b/src/serve/http_server.cpp
-index b539c18e2e679ec305f53677297a68f20b426092..abb054a23343b5ae1288ff67d8842831a7379985 100644
+index b539c18e..abb054a2 100644
 --- a/src/serve/http_server.cpp
 +++ b/src/serve/http_server.cpp
 @@ -1,9 +1,13 @@
@@ -16827,7 +16848,7 @@ index b539c18e2e679ec305f53677297a68f20b426092..abb054a23343b5ae1288ff67d8842831
      facts.metadata                     = service.model_metadata();
      facts.vision                       = service.engine_options().enable_vision;
 diff --git a/src/serve/http_server.h b/src/serve/http_server.h
-index 1b940d6a2eb1e3f23730b089c0a5d8bf7bda4979..4e3d92100fda9771cedc2c0afe33a80cdd523834 100644
+index 1b940d6a..4e3d9210 100644
 --- a/src/serve/http_server.h
 +++ b/src/serve/http_server.h
 @@ -1,4 +1,5 @@
@@ -16864,7 +16885,7 @@ index 1b940d6a2eb1e3f23730b089c0a5d8bf7bda4979..4e3d92100fda9771cedc2c0afe33a80c
      httplib::Server server_;
 diff --git a/src/serve/kvmem_metrics.h b/src/serve/kvmem_metrics.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..3c188b9236a0ab46d409efe3c806090378d93f2d
+index 00000000..3c188b92
 --- /dev/null
 +++ b/src/serve/kvmem_metrics.h
 @@ -0,0 +1,32 @@
@@ -16902,7 +16923,7 @@ index 0000000000000000000000000000000000000000..3c188b9236a0ab46d409efe3c8060903
 +} // namespace ninfer::serve
 diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e317a8a2b36e2aaa80cc18ee973d7ace94c17979
+index 00000000..e317a8a2
 --- /dev/null
 +++ b/src/serve/kvmem_status_json.h
 @@ -0,0 +1,26 @@
@@ -16933,7 +16954,7 @@ index 0000000000000000000000000000000000000000..e317a8a2b36e2aaa80cc18ee973d7ace
 +}
 +} // namespace ninfer::serve
 diff --git a/src/serve/llamacpp_http.cpp b/src/serve/llamacpp_http.cpp
-index 3a048c6e291a89e3089b791318b7832341361a8d..838fb0e4007ba08e388dc617f2071668f7a1ee0d 100644
+index 3a048c6e..838fb0e4 100644
 --- a/src/serve/llamacpp_http.cpp
 +++ b/src/serve/llamacpp_http.cpp
 @@ -214,7 +214,7 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
@@ -16955,7 +16976,7 @@ index 3a048c6e291a89e3089b791318b7832341361a8d..838fb0e4007ba08e388dc617f2071668
      if (!request.response.stream) {
          GenerationOutcome outcome;
 diff --git a/src/serve/load_report.cpp b/src/serve/load_report.cpp
-index b16e09978347aba676ce14d0d605c63327a219a5..8fe1cbba7c935d9bffab24b4e60ca6fd5567c755 100644
+index b16e0997..8fe1cbba 100644
 --- a/src/serve/load_report.cpp
 +++ b/src/serve/load_report.cpp
 @@ -1,4 +1,6 @@
@@ -16982,7 +17003,7 @@ index b16e09978347aba676ce14d0d605c63327a219a5..8fe1cbba7c935d9bffab24b4e60ca6fd
          .interval_seconds = std::isfinite(sample.uptime_seconds) ? sample.uptime_seconds : 0.0,
          .computed_prefill_tokens = stats.computed_prefill_tokens,
 diff --git a/src/serve/openai_chat_http.cpp b/src/serve/openai_chat_http.cpp
-index ecece39edf32624df6828ce3078929e9828c2a4f..205a499625fbb36ad80b1ec4401c79bf20a613cd 100644
+index ecece39e..205a4996 100644
 --- a/src/serve/openai_chat_http.cpp
 +++ b/src/serve/openai_chat_http.cpp
 @@ -72,7 +72,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
@@ -16995,7 +17016,7 @@ index ecece39edf32624df6828ce3078929e9828c2a4f..205a499625fbb36ad80b1ec4401c79bf
      if (!request.stream) {
          GenerationOutcome outcome;
 diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
-index df71ac9c0ee2a5e4fce6851cf5b0c672a8a652a2..9fd5654b813a77234a4962b41f12a71345ccd739 100644
+index df71ac9c..9fd5654b 100644
 --- a/src/serve/openai_chat_request.cpp
 +++ b/src/serve/openai_chat_request.cpp
 @@ -690,26 +690,18 @@ void parse_tools(const Json& body, GenerationRequest& output) {
@@ -17097,7 +17118,7 @@ index df71ac9c0ee2a5e4fce6851cf5b0c672a8a652a2..9fd5654b813a77234a4962b41f12a713
      parse_messages(body, limits.assistant_prefill, output.generation);
      settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
 diff --git a/src/serve/openai_chat_response.cpp b/src/serve/openai_chat_response.cpp
-index 4800669fa3dec7341934730e4ba20f30d4adda69..9b9c96b268984bf8209740a84296be8f6096d72e 100644
+index 4800669f..9b9c96b2 100644
 --- a/src/serve/openai_chat_response.cpp
 +++ b/src/serve/openai_chat_response.cpp
 @@ -2,6 +2,7 @@
@@ -17133,7 +17154,7 @@ index 4800669fa3dec7341934730e4ba20f30d4adda69..9b9c96b268984bf8209740a84296be8f
  }
  
 diff --git a/src/serve/openai_common.cpp b/src/serve/openai_common.cpp
-index 2dcb4548d8fc0f5986eb6b40d3cf51a2128c9654..bf08c46635106b8f9a7a4f74ad2a68896da6135e 100644
+index 2dcb4548..bf08c466 100644
 --- a/src/serve/openai_common.cpp
 +++ b/src/serve/openai_common.cpp
 @@ -137,6 +137,19 @@ bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_
@@ -17157,7 +17178,7 @@ index 2dcb4548d8fc0f5986eb6b40d3cf51a2128c9654..bf08c46635106b8f9a7a4f74ad2a6889
      auto require_string_hint = [&](const char* field, std::optional<std::size_t> maximum = {}) {
          if (!body.contains(field) || body.at(field).is_null()) { return; }
 diff --git a/src/serve/openai_common.h b/src/serve/openai_common.h
-index ab01274c8a1f315ae3e86d0d48250cd990d3b114..d7927525b9b07fb98c2b665f8743ede535cf9edc 100644
+index ab01274c..d7927525 100644
 --- a/src/serve/openai_common.h
 +++ b/src/serve/openai_common.h
 @@ -30,6 +30,11 @@ struct OpenAIPromptCachePolicy {
@@ -17173,7 +17194,7 @@ index ab01274c8a1f315ae3e86d0d48250cd990d3b114..d7927525b9b07fb98c2b665f8743ede5
  // execution, hosted file search and the like. NInfer has no executor for any of them, and a client
  // never waits on one itself, so declaring one is silently dropped rather than failing the request:
 diff --git a/src/serve/openai_responses_http.cpp b/src/serve/openai_responses_http.cpp
-index a00e64f74a2da50604fb7ce16770f0d693f897ad..0e84e8b0f2d77ccf34cd706374aa565e967a5f5d 100644
+index a00e64f7..0e84e8b0 100644
 --- a/src/serve/openai_responses_http.cpp
 +++ b/src/serve/openai_responses_http.cpp
 @@ -295,7 +295,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
@@ -17186,7 +17207,7 @@ index a00e64f74a2da50604fb7ce16770f0d693f897ad..0e84e8b0f2d77ccf34cd706374aa565e
  
      if (!request.stream) {
 diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
-index dcc94aad67eef5f03afc99ab7e376111930836a7..0688675af8b468acfc31cbd858e9c8ac4a0fa3b6 100644
+index dcc94aad..0688675a 100644
 --- a/src/serve/openai_responses_request.cpp
 +++ b/src/serve/openai_responses_request.cpp
 @@ -754,11 +754,7 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
@@ -17304,7 +17325,7 @@ index dcc94aad67eef5f03afc99ab7e376111930836a7..0688675af8b468acfc31cbd858e9c8ac
                                                                    "truncation"};
      const auto& allowed = create ? create_fields : count_fields;
 diff --git a/src/serve/openai_responses_response.cpp b/src/serve/openai_responses_response.cpp
-index cd6841604ee694527c5663540a5e9ce20e0117a3..019a54d7718b368875fc47d3c5563c19dec879e0 100644
+index cd684160..019a54d7 100644
 --- a/src/serve/openai_responses_response.cpp
 +++ b/src/serve/openai_responses_response.cpp
 @@ -2,6 +2,7 @@
@@ -17407,7 +17428,7 @@ index cd6841604ee694527c5663540a5e9ce20e0117a3..019a54d7718b368875fc47d3c5563c19
          add_reasoning_encrypted_content(item, request, reasoning_text);
          return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
 diff --git a/src/serve/request.h b/src/serve/request.h
-index 7a617e7ee0d2dc794501b73bd830a84d4b6895cb..d7e2e6e2e86eaac8c3aea46e0d42b1638aad06ef 100644
+index 7a617e7e..d7e2e6e2 100644
 --- a/src/serve/request.h
 +++ b/src/serve/request.h
 @@ -87,7 +87,7 @@ struct ContentPart {
@@ -17444,7 +17465,7 @@ index 7a617e7ee0d2dc794501b73bd830a84d4b6895cb..d7e2e6e2e86eaac8c3aea46e0d42b163
      // exactly one callable tool. Empty leaves the choice to the model.
      std::string forced_name;
 diff --git a/src/serve/request_log.cpp b/src/serve/request_log.cpp
-index 6d9446026679f580a92ca3a9a8bc18c925468057..4f5d76b99298700b1178511084a548cc04b33892 100644
+index 6d944602..4f5d76b9 100644
 --- a/src/serve/request_log.cpp
 +++ b/src/serve/request_log.cpp
 @@ -1,4 +1,6 @@
@@ -17486,7 +17507,7 @@ index 6d9446026679f580a92ca3a9a8bc18c925468057..4f5d76b99298700b1178511084a548cc
               {"workspace", arena_json(memory.workspace)},
               {"vision_workspace", vision_workspace_json(memory.vision_workspace)},
 diff --git a/src/serve/request_validation.cpp b/src/serve/request_validation.cpp
-index 70e0b19e58ceacc823cc30e275597ffad920ddc9..2385d1e756e2ab3b71105d947e0762222f42ba0d 100644
+index 70e0b19e..2385d1e7 100644
 --- a/src/serve/request_validation.cpp
 +++ b/src/serve/request_validation.cpp
 @@ -23,17 +23,27 @@ void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& lim
@@ -17522,7 +17543,7 @@ index 70e0b19e58ceacc823cc30e275597ffad920ddc9..2385d1e756e2ab3b71105d947e076222
      if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
      const RequestJson& value = object.at(key);
 diff --git a/src/serve/request_validation.h b/src/serve/request_validation.h
-index 0cfbd04a077f2cd961f411b36c4bdebb76a09b5a..fddf5ac0198aac0c92cfbca1f71f42feb8953dff 100644
+index 0cfbd04a..fddf5ac0 100644
 --- a/src/serve/request_validation.h
 +++ b/src/serve/request_validation.h
 @@ -34,6 +34,8 @@ std::optional<std::string> parse_graft_field(const RequestJson& body);
@@ -17535,7 +17556,7 @@ index 0cfbd04a077f2cd961f411b36c4bdebb76a09b5a..fddf5ac0198aac0c92cfbca1f71f42fe
  
  // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
 diff --git a/src/serve/serve_metrics.cpp b/src/serve/serve_metrics.cpp
-index bae357d43fe4702e25661fb4245145b3267e5987..d3c9b331c85ced35b30f845db9efdfcb70d4116c 100644
+index bae357d4..d3c9b331 100644
 --- a/src/serve/serve_metrics.cpp
 +++ b/src/serve/serve_metrics.cpp
 @@ -119,6 +119,15 @@ void ServeMetrics::record_done(const GenerationOutcome& outcome) {
@@ -17555,7 +17576,7 @@ index bae357d43fe4702e25661fb4245145b3267e5987..d3c9b331c85ced35b30f845db9efdfcb
  
  void ServeMetrics::record_failure() {
 diff --git a/src/serve/serve_metrics.h b/src/serve/serve_metrics.h
-index e8245d645c1419441c2397bd7381edf216c75a57..ddf618d92b29234a35f6bf5a05456dcb722e0701 100644
+index e8245d64..ddf618d9 100644
 --- a/src/serve/serve_metrics.h
 +++ b/src/serve/serve_metrics.h
 @@ -9,6 +9,7 @@
@@ -17581,7 +17602,7 @@ index e8245d645c1419441c2397bd7381edf216c75a57..ddf618d92b29234a35f6bf5a05456dcb
      std::uint64_t requests_failed_total_         = 0;
      std::uint64_t requests_rejected_total_       = 0;
 diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
-index 8fc5043c46b464507bb1bd5cc898936dbab34510..ab038875cbb258d80532af6531846e262b3ce235 100644
+index 8fc5043c..ab038875 100644
 --- a/src/serve/serve_options.cpp
 +++ b/src/serve/serve_options.cpp
 @@ -1,6 +1,9 @@
@@ -17939,7 +17960,7 @@ index 8fc5043c46b464507bb1bd5cc898936dbab34510..ab038875cbb258d80532af6531846e26
  }
  
 diff --git a/src/serve/serve_options.h b/src/serve/serve_options.h
-index 2e5ae9e7629db4058a95bcccd007574a1339850c..965249f4c0207c140e8944958b4a701cc724ca64 100644
+index 2e5ae9e7..965249f4 100644
 --- a/src/serve/serve_options.h
 +++ b/src/serve/serve_options.h
 @@ -19,6 +19,8 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
@@ -17970,7 +17991,7 @@ index 2e5ae9e7629db4058a95bcccd007574a1339850c..965249f4c0207c140e8944958b4a701c
      // device memory.
      ModelSuspendOptions suspend;
 diff --git a/src/serve/translate.cpp b/src/serve/translate.cpp
-index 4b335940410e15427c16a1262c416833f4054246..01d1ee983faa132e88761bc8d689b5886b2b4ea9 100644
+index 4b335940..01d1ee98 100644
 --- a/src/serve/translate.cpp
 +++ b/src/serve/translate.cpp
 @@ -119,7 +119,7 @@ resolve_post_thinking_overrides(const std::optional<SamplingParams>& request,
@@ -18056,7 +18077,7 @@ index 4b335940410e15427c16a1262c416833f4054246..01d1ee983faa132e88761bc8d689b588
          (request.uses_tools() || request.has_tool_history());
      options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
 diff --git a/src/text/structured_output.cpp b/src/text/structured_output.cpp
-index 4e43d8d175cd3388bfbaa6c80f4e96cbb65de20f..da603d6c92890151b4fb9cb37f9b06fa771545db 100644
+index 4e43d8d1..da603d6c 100644
 --- a/src/text/structured_output.cpp
 +++ b/src/text/structured_output.cpp
 @@ -424,4 +424,32 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
@@ -18093,7 +18114,7 @@ index 4e43d8d175cd3388bfbaa6c80f4e96cbb65de20f..da603d6c92890151b4fb9cb37f9b06fa
 +}
  } // namespace ninfer::text
 diff --git a/src/text/structured_output.h b/src/text/structured_output.h
-index b8d4e3dabc5fbb82bab450c135816c465c1f4167..8d8e528cf59fbc6416ce8acec4068748e97ca2ec 100644
+index b8d4e3da..8d8e528c 100644
 --- a/src/text/structured_output.h
 +++ b/src/text/structured_output.h
 @@ -47,6 +47,10 @@ public:
@@ -18108,7 +18129,7 @@ index b8d4e3dabc5fbb82bab450c135816c465c1f4167..8d8e528cf59fbc6416ce8acec4068748
      struct Impl;
      std::unique_ptr<Impl> impl_;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..42d8ff906b3784fb0e891c6f4d1e83225978850c 100644
+index 02cfe051..42d8ff90 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -9,10 +9,38 @@ include(cmake/BenchSupportTests.cmake)
@@ -18270,7 +18291,7 @@ index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..42d8ff906b3784fb0e891c6f4d1e8322
 +ninfer_add_test(ninfer_checkpoint_buffer_resident_test STANDALONE
 +  SOURCES host/test_checkpoint_buffer_resident.cpp)
 diff --git a/tests/README.md b/tests/README.md
-index 2a5ca0eb92d7c45741eaad388f0d2f9f789b00c7..7d010d046055e9427595db94b5ab48055ba0ced4 100644
+index 2a5ca0eb..7d010d04 100644
 --- a/tests/README.md
 +++ b/tests/README.md
 @@ -22,6 +22,12 @@ benchmark-report, and external protocol behavior. Repository verification princi
@@ -18582,7 +18603,7 @@ index 2a5ca0eb92d7c45741eaad388f0d2f9f789b00c7..7d010d046055e9427595db94b5ab4805
 +and more decode row-rounds than decode rounds; exact token/byte/resource checks remain unchanged.
 +See the [fast-prefill report](../../../docs/fast-prefill-admission-validation-20261006.md).
 diff --git a/tests/artifact/test_materialization.cpp b/tests/artifact/test_materialization.cpp
-index 265dd9e0f2130ce7445dc8f935f13e80d4da7d3f..425c9b86b7957a3cc494baf3da93b34d21c4d0b8 100644
+index 265dd9e0..425c9b86 100644
 --- a/tests/artifact/test_materialization.cpp
 +++ b/tests/artifact/test_materialization.cpp
 @@ -10,6 +10,7 @@
@@ -18700,7 +18721,7 @@ index 265dd9e0f2130ce7445dc8f935f13e80d4da7d3f..425c9b86b7957a3cc494baf3da93b34d
          ninfer::test::materialization_cuda_errors(device);
  #else
 diff --git a/tests/artifact/writer_interop.py b/tests/artifact/writer_interop.py
-index fed543e95f5ae434a294db0a343c0d244d8b28ca..f1a7da0cc6a68207da5777a1451134749c8dfeee 100644
+index fed543e9..f1a7da0c 100644
 --- a/tests/artifact/writer_interop.py
 +++ b/tests/artifact/writer_interop.py
 @@ -10,6 +10,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -18734,7 +18755,7 @@ index fed543e95f5ae434a294db0a343c0d244d8b28ca..f1a7da0cc6a68207da5777a145113474
  
  if __name__ == "__main__":
 diff --git a/tests/cmake/BenchSupportTests.cmake b/tests/cmake/BenchSupportTests.cmake
-index 02e48ccc8dc2672e5b736342b87d81960b14f3fa..24389c9d21d6f7b5cf9b58a51ededda1568b1e1a 100644
+index 02e48ccc..24389c9d 100644
 --- a/tests/cmake/BenchSupportTests.cmake
 +++ b/tests/cmake/BenchSupportTests.cmake
 @@ -2,7 +2,7 @@ ninfer_add_test(ninfer_bench_support_test
@@ -18747,7 +18768,7 @@ index 02e48ccc8dc2672e5b736342b87d81960b14f3fa..24389c9d21d6f7b5cf9b58a51ededda1
  target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/inference)
  
 diff --git a/tests/cmake/RuntimeTests.cmake b/tests/cmake/RuntimeTests.cmake
-index d0c447f4dc227e989d530b8c4a499711041107c5..3d1ec5052b89022dd73c774abdbc991d70ad5602 100644
+index d0c447f4..3d1ec505 100644
 --- a/tests/cmake/RuntimeTests.cmake
 +++ b/tests/cmake/RuntimeTests.cmake
 @@ -1,6 +1,9 @@
@@ -18762,7 +18783,7 @@ index d0c447f4dc227e989d530b8c4a499711041107c5..3d1ec5052b89022dd73c774abdbc991d
  
 diff --git a/tests/convert/test_dense_geometry.py b/tests/convert/test_dense_geometry.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b71be6573302f5a338a813c5b2f3ddcf1358eb56
+index 00000000..b71be657
 --- /dev/null
 +++ b/tests/convert/test_dense_geometry.py
 @@ -0,0 +1,102 @@
@@ -18870,7 +18891,7 @@ index 0000000000000000000000000000000000000000..b71be6573302f5a338a813c5b2f3ddcf
 +    assert torch.equal(actual, torch.from_numpy(values[order]).to(torch.bfloat16))
 diff --git a/tests/convert/test_dflash2_gguf.py b/tests/convert/test_dflash2_gguf.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..848bafb65fd32392b58633702e00f827dd7f193c
+index 00000000..848bafb6
 --- /dev/null
 +++ b/tests/convert/test_dflash2_gguf.py
 @@ -0,0 +1,100 @@
@@ -18975,7 +18996,7 @@ index 0000000000000000000000000000000000000000..848bafb65fd32392b58633702e00f827
 +    path,_=fixture(tmp_path,**overrides)
 +    with pytest.raises(ValueError):DraftSource(path)
 diff --git a/tests/convert/test_gguf_blocks.py b/tests/convert/test_gguf_blocks.py
-index d0cd4786b0fa581867696ad2b2666cce4d4330f6..0c8959cbb83c81b7698bbba23ee6fa9272d7d6eb 100644
+index d0cd4786..0c8959cb 100644
 --- a/tests/convert/test_gguf_blocks.py
 +++ b/tests/convert/test_gguf_blocks.py
 @@ -1,5 +1,8 @@
@@ -19117,7 +19138,7 @@ index d0cd4786b0fa581867696ad2b2666cce4d4330f6..0c8959cbb83c81b7698bbba23ee6fa92
 +        actual = source.rows(0, 48).view(torch.int16).numpy().view(np.uint16)
 +        assert np.array_equal(actual, expected)
 diff --git a/tests/convert/test_ternary.py b/tests/convert/test_ternary.py
-index 53fe91302de61b5e3f9d570543dcc54b375989c6..c890d64fbccdfe5638c7d66f7aa85b869c474971 100644
+index 53fe9130..c890d64f 100644
 --- a/tests/convert/test_ternary.py
 +++ b/tests/convert/test_ternary.py
 @@ -1,31 +1,36 @@
@@ -19165,7 +19186,7 @@ index 53fe91302de61b5e3f9d570543dcc54b375989c6..c890d64fbccdfe5638c7d66f7aa85b86
          words = source.read_encoded(2, 7)
 diff --git a/tests/experimental/active_kv_ssd.cpp b/tests/experimental/active_kv_ssd.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7c09881384da69cbb71dbe5db75d641550acdb29
+index 00000000..7c098813
 --- /dev/null
 +++ b/tests/experimental/active_kv_ssd.cpp
 @@ -0,0 +1,144 @@
@@ -19315,7 +19336,7 @@ index 0000000000000000000000000000000000000000..7c09881384da69cbb71dbe5db75d6415
 +}
 diff --git a/tests/experimental/kvmem_test_options.h b/tests/experimental/kvmem_test_options.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..42a5eee03d1418dc8c1f30e54ed72f95a556da0d
+index 00000000..42a5eee0
 --- /dev/null
 +++ b/tests/experimental/kvmem_test_options.h
 @@ -0,0 +1,68 @@
@@ -19389,7 +19410,7 @@ index 0000000000000000000000000000000000000000..42a5eee03d1418dc8c1f30e54ed72f95
 +} // namespace ninfer::test
 diff --git a/tests/experimental/memory_concurrency.cpp b/tests/experimental/memory_concurrency.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..65e6f8c33d45e2e67f2d4d65ffae7f411ced7d92
+index 00000000..65e6f8c3
 --- /dev/null
 +++ b/tests/experimental/memory_concurrency.cpp
 @@ -0,0 +1,304 @@
@@ -19699,7 +19720,7 @@ index 0000000000000000000000000000000000000000..65e6f8c33d45e2e67f2d4d65ffae7f41
 +}
 diff --git a/tests/experimental/memory_disk.cpp b/tests/experimental/memory_disk.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f388eb8712f57d58ab93ac09bbb26aed4f5a0e80
+index 00000000..f388eb87
 --- /dev/null
 +++ b/tests/experimental/memory_disk.cpp
 @@ -0,0 +1,156 @@
@@ -19861,7 +19882,7 @@ index 0000000000000000000000000000000000000000..f388eb8712f57d58ab93ac09bbb26aed
 +}
 diff --git a/tests/experimental/memory_ngram.cpp b/tests/experimental/memory_ngram.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dbbb34d9944497dde168c88345e275a7cdc22d20
+index 00000000..dbbb34d9
 --- /dev/null
 +++ b/tests/experimental/memory_ngram.cpp
 @@ -0,0 +1,366 @@
@@ -20233,7 +20254,7 @@ index 0000000000000000000000000000000000000000..dbbb34d9944497dde168c88345e275a7
 +}
 diff --git a/tests/experimental/memory_ram_budget.cpp b/tests/experimental/memory_ram_budget.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8222dc71e6ba4df3691736cf7056bbe2cda8fc21
+index 00000000..8222dc71
 --- /dev/null
 +++ b/tests/experimental/memory_ram_budget.cpp
 @@ -0,0 +1,156 @@
@@ -20395,7 +20416,7 @@ index 0000000000000000000000000000000000000000..8222dc71e6ba4df3691736cf7056bbe2
 +}
 diff --git a/tests/experimental/memory_sessions.cpp b/tests/experimental/memory_sessions.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a04109bdda08cfb9f1f52ffdf11601bf604924ae
+index 00000000..a04109bd
 --- /dev/null
 +++ b/tests/experimental/memory_sessions.cpp
 @@ -0,0 +1,175 @@
@@ -20576,7 +20597,7 @@ index 0000000000000000000000000000000000000000..a04109bdda08cfb9f1f52ffdf11601bf
 +}
 diff --git a/tests/experimental/memory_vision.cpp b/tests/experimental/memory_vision.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..446e6e0bad172383417233f974de738cfff7b810
+index 00000000..446e6e0b
 --- /dev/null
 +++ b/tests/experimental/memory_vision.cpp
 @@ -0,0 +1,285 @@
@@ -20867,7 +20888,7 @@ index 0000000000000000000000000000000000000000..446e6e0bad172383417233f974de738c
 +}
 diff --git a/tests/experimental/migration_concurrency.cpp b/tests/experimental/migration_concurrency.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac816726c383013471f88808d633d2d820f7014d
+index 00000000..ac816726
 --- /dev/null
 +++ b/tests/experimental/migration_concurrency.cpp
 @@ -0,0 +1,81 @@
@@ -20954,7 +20975,7 @@ index 0000000000000000000000000000000000000000..ac816726c383013471f88808d633d2d8
 +}
 diff --git a/tests/experimental/p1_engine.cpp b/tests/experimental/p1_engine.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..eee56744a0ce72bd09681b0980f138a60bd340cf
+index 00000000..eee56744
 --- /dev/null
 +++ b/tests/experimental/p1_engine.cpp
 @@ -0,0 +1,99 @@
@@ -21059,7 +21080,7 @@ index 0000000000000000000000000000000000000000..eee56744a0ce72bd09681b0980f138a6
 +}
 diff --git a/tests/experimental/p1_options.cpp b/tests/experimental/p1_options.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..06d2a1bf8af6571a9c05ad83f09f654805c028cb
+index 00000000..06d2a1bf
 --- /dev/null
 +++ b/tests/experimental/p1_options.cpp
 @@ -0,0 +1,428 @@
@@ -21493,7 +21514,7 @@ index 0000000000000000000000000000000000000000..06d2a1bf8af6571a9c05ad83f09f6548
 +}
 diff --git a/tests/experimental/p1_payload.cpp b/tests/experimental/p1_payload.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..47cdb8fcdff6e7f7baff94888d7efe545f3d53db
+index 00000000..47cdb8fc
 --- /dev/null
 +++ b/tests/experimental/p1_payload.cpp
 @@ -0,0 +1,93 @@
@@ -21592,7 +21613,7 @@ index 0000000000000000000000000000000000000000..47cdb8fcdff6e7f7baff94888d7efe54
 +}
 diff --git a/tests/experimental/p1_rope.cpp b/tests/experimental/p1_rope.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..0edc7e07a8e1cf86aa4747e2d4ce2767226468f3
+index 00000000..0edc7e07
 --- /dev/null
 +++ b/tests/experimental/p1_rope.cpp
 @@ -0,0 +1,18 @@
@@ -21616,7 +21637,7 @@ index 0000000000000000000000000000000000000000..0edc7e07a8e1cf86aa4747e2d4ce2767
 +}
 diff --git a/tests/experimental/p1_sparse.cpp b/tests/experimental/p1_sparse.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d286564fdf55343ed4fd0848b2e18a52f1937f32
+index 00000000..d286564f
 --- /dev/null
 +++ b/tests/experimental/p1_sparse.cpp
 @@ -0,0 +1,176 @@
@@ -21798,7 +21819,7 @@ index 0000000000000000000000000000000000000000..d286564fdf55343ed4fd0848b2e18a52
 +}
 diff --git a/tests/experimental/p4_history.cpp b/tests/experimental/p4_history.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b478762550104cde672b29d6b8306aac1f4cf99
+index 00000000..8b478762
 --- /dev/null
 +++ b/tests/experimental/p4_history.cpp
 @@ -0,0 +1,489 @@
@@ -22293,7 +22314,7 @@ index 0000000000000000000000000000000000000000..8b478762550104cde672b29d6b8306aa
 +}
 diff --git a/tests/experimental/p4_quality.cpp b/tests/experimental/p4_quality.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d0cda6f2ebfdfd70f19c20a6a917d2a4fe5dd96c
+index 00000000..d0cda6f2
 --- /dev/null
 +++ b/tests/experimental/p4_quality.cpp
 @@ -0,0 +1,155 @@
@@ -22454,7 +22475,7 @@ index 0000000000000000000000000000000000000000..d0cda6f2ebfdfd70f19c20a6a917d2a4
 +}
 diff --git a/tests/experimental/p4_retrieval.cpp b/tests/experimental/p4_retrieval.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9a2b11d55c4b417900186dd89cf521377180311
+index 00000000..f9a2b11d
 --- /dev/null
 +++ b/tests/experimental/p4_retrieval.cpp
 @@ -0,0 +1,67 @@
@@ -22527,7 +22548,7 @@ index 0000000000000000000000000000000000000000..f9a2b11d55c4b417900186dd89cf5213
 +}
 diff --git a/tests/experimental/ssd_failure.cpp b/tests/experimental/ssd_failure.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b33dd013f374d155f4df4dfddbf874fade6897fc
+index 00000000..b33dd013
 --- /dev/null
 +++ b/tests/experimental/ssd_failure.cpp
 @@ -0,0 +1,264 @@
@@ -22797,7 +22818,7 @@ index 0000000000000000000000000000000000000000..b33dd013f374d155f4df4dfddbf874fa
 +#endif
 diff --git a/tests/experimental/token_sums.cpp b/tests/experimental/token_sums.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd5f61073c604a3a2c0ea2b968be070cdcde4893
+index 00000000..dd5f6107
 --- /dev/null
 +++ b/tests/experimental/token_sums.cpp
 @@ -0,0 +1,114 @@
@@ -22917,11 +22938,11 @@ index 0000000000000000000000000000000000000000..dd5f61073c604a3a2c0ea2b968be070c
 +}
 diff --git a/tests/host/test_checkpoint_buffer_resident.cpp b/tests/host/test_checkpoint_buffer_resident.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8894a1d3cedc7f134cc37eed0275510b24a90cf
+index 00000000..0da0ee9b
 --- /dev/null
 +++ b/tests/host/test_checkpoint_buffer_resident.cpp
-@@ -0,0 +1,41 @@
-+#include "models/qwen3_5/program/storage/bounded_checkpoint_buffer_pool.h"
+@@ -0,0 +1,117 @@
++#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
 +#include <algorithm>
 +
 +#include <cstring>
@@ -22937,11 +22958,87 @@ index 0000000000000000000000000000000000000000..c8894a1d3cedc7f134cc37eed0275510
 +};
 +#define REQUIRE(condition) do { if (!(condition)) throw std::runtime_error(#condition); } while (false)
 +using Pool=ninfer::models::qwen3_5::detail::BoundedCheckpointBufferPool<Image>;
++using IntegratedPool=ninfer::models::qwen3_5::detail::CheckpointBufferPool<Image>;
++using ninfer::models::qwen3_5::detail::checkpoint_auxiliary_host_bytes;
++
++void check_reconstruction_and_accounting() {
++    constexpr std::size_t bytes=4096;
++    {
++        // Disabled residency keeps lazy two-buffer caching and all old modes.
++        const auto before=Image::allocations;
++        IntegratedPool pool(2,bytes,false);
++        REQUIRE(Image::allocations==before && pool.idle_bytes()==0);
++        for (int mode=0;mode<=2;++mode) REQUIRE(pool.reconstruction_scratch_mode(mode)==mode);
++        auto scratch=pool.acquire(bytes);
++        auto alias=scratch;
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==bytes);
++        alias.reset();
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==bytes);
++        scratch.reset();
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==bytes);
++        pool.close();
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==0);
++    }
++    {
++        const auto before=Image::allocations;
++        IntegratedPool pool(23,bytes,true);
++        REQUIRE(Image::allocations==before+23);
++        REQUIRE(pool.reconstruction_scratch_mode(0)==1);
++        REQUIRE(pool.reconstruction_scratch_mode(1)==1);
++        REQUIRE(pool.reconstruction_scratch_mode(2)==2);
++        std::shared_ptr<Image> scratch;
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==23*bytes);
++        // New resident mode alone selects pooled MTP backups, with no runtime
++        // allocation across serial lane visits. Contents remain independent.
++        for (unsigned round=0;round<100;++round) {
++            for (unsigned lane=0;lane<3;++lane) {
++                REQUIRE(pool.reconstruction_scratch_mode(0)==1);
++                auto backup=pool.acquire(bytes);
++                REQUIRE(pool.idle_bytes()==22*bytes);
++                std::fill(backup->bytes.begin(),backup->bytes.end(),std::byte(lane));
++                REQUIRE(backup->bytes.back()==std::byte(lane));
++            }
++        }
++        REQUIRE(Image::allocations==before+23 && pool.idle_bytes()==23*bytes);
++        scratch=pool.acquire(bytes);
++        auto scratch_alias=scratch;
++        std::vector<std::shared_ptr<Image>> catalog;
++        for (unsigned i=0;i<6;++i) catalog.push_back(pool.acquire(bytes));
++        REQUIRE(pool.idle_bytes()==16*bytes);
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==17*bytes);
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)+catalog.size()*bytes==23*bytes);
++        scratch_alias.reset();
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==17*bytes);
++        scratch.reset();
++        REQUIRE(pool.idle_bytes()==17*bytes);
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)+catalog.size()*bytes==23*bytes);
++        auto catalog_alias=catalog.front();
++        catalog.clear();
++        REQUIRE(pool.idle_bytes()==22*bytes);
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)+catalog_alias->size()==23*bytes);
++        catalog_alias.reset();
++        REQUIRE(pool.idle_bytes()==23*bytes);
++        pool.close();
++        REQUIRE(checkpoint_auxiliary_host_bytes(&pool,scratch)==0);
++    }
++    {
++        // A retained scratch can exist with the experimental pool disabled.
++        auto scratch=std::make_shared<Image>(bytes);
++        auto alias=scratch;
++        REQUIRE(checkpoint_auxiliary_host_bytes<Image>(nullptr,scratch)==bytes);
++        alias.reset();scratch.reset();
++        REQUIRE(checkpoint_auxiliary_host_bytes<Image>(nullptr,scratch)==0);
++    }
++    REQUIRE(Image::allocations==Image::releases);
++}
++
 +int main(){
++    check_reconstruction_and_accounting();
++    const auto before=Image::allocations;
 +    {
 +        auto pool=std::make_shared<Pool>(23,4096);
 +        pool->prewarm(23,[](Image& i){std::memset(i.data(),0,i.size());});
-+        REQUIRE(Image::allocations==23 && pool->statistics().cached==23);
++        REQUIRE(Image::allocations==before+23 && pool->statistics().cached==23);
 +        for(unsigned round=0;round<100;++round){
 +            std::vector<std::shared_ptr<Image>> live;
 +            for(unsigned i=0;i<23;++i){auto p=pool->acquire(4096);std::fill(p->bytes.begin(),p->bytes.end(),std::byte(i));live.push_back(p);}
@@ -22949,7 +23046,7 @@ index 0000000000000000000000000000000000000000..c8894a1d3cedc7f134cc37eed0275510
 +            auto alias=live.front();live.clear();REQUIRE(pool->statistics().cached==22);
 +            REQUIRE(alias->bytes[0]==std::byte(0));
 +        }
-+        REQUIRE(Image::allocations==23 && Image::releases==0);
++        REQUIRE(Image::allocations==before+23 && Image::releases==before);
 +        bool rejected=false;try{pool->prewarm(24,[](Image&){});}catch(const std::invalid_argument&){rejected=true;}REQUIRE(rejected);
 +        auto held=pool->acquire(4096);pool->close();REQUIRE(held->bytes.size()==4096);
 +    }
@@ -22960,11 +23057,11 @@ index 0000000000000000000000000000000000000000..c8894a1d3cedc7f134cc37eed0275510
 +        REQUIRE(failed && pool->statistics().cached==3);
 +    }
 +    REQUIRE(Image::allocations==Image::releases);
-+    std::cout<<"PASS:23 independent warmed leases,100 churn cycles,no runtime allocation/free,shared aliases,close lifetime,touch-failure cleanup,bounds\n";
++    std::cout<<"PASS:resident-only MTP policy,legacy modes,idle/catalog/scratch accounting,no-pool scratch,23 independent warmed leases,100 churn cycles,no runtime allocation/free,shared aliases,close lifetime,touch-failure cleanup,bounds\n";
 +}
 diff --git a/tests/host/test_prefill_service_work.cpp b/tests/host/test_prefill_service_work.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a1eb9dc784330f343c780a33fd5789b7b47ef72
+index 00000000..9a1eb9dc
 --- /dev/null
 +++ b/tests/host/test_prefill_service_work.cpp
 @@ -0,0 +1,79 @@
@@ -23048,7 +23145,7 @@ index 0000000000000000000000000000000000000000..9a1eb9dc784330f343c780a33fd5789b
 +    }
 +}
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
-index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
+index d439f60a..f73303ed 100644
 --- a/tests/models/qwen3_5/test_engine_stages_real.cpp
 +++ b/tests/models/qwen3_5/test_engine_stages_real.cpp
 @@ -108,6 +108,7 @@ bool flag(const char* name) {
@@ -23105,7 +23202,7 @@ index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f50763
              while (first < want.size() && first < got.size() && want[first] == got[first]) { ++first; }
              std::cerr << "  first difference at token " << first << '\n';
 diff --git a/tests/models/qwen3_5/test_frontend.cpp b/tests/models/qwen3_5/test_frontend.cpp
-index e6e9bebeecee327126cf049f3a507f5ab78ea1f5..e1f87bf434eebec79731603a2baac185b5d709ee 100644
+index e6e9bebe..e1f87bf4 100644
 --- a/tests/models/qwen3_5/test_frontend.cpp
 +++ b/tests/models/qwen3_5/test_frontend.cpp
 @@ -7,6 +7,8 @@
@@ -23603,7 +23700,7 @@ index e6e9bebeecee327126cf049f3a507f5ab78ea1f5..e1f87bf434eebec79731603a2baac185
 +    }
  }
 diff --git a/tests/models/qwen3_5/test_loading.cpp b/tests/models/qwen3_5/test_loading.cpp
-index 5210c7c6a53926cd360203f67fed844577f4670f..94a61a649b1211d00ecee30b27af27348b44d817 100644
+index 5210c7c6..94a61a64 100644
 --- a/tests/models/qwen3_5/test_loading.cpp
 +++ b/tests/models/qwen3_5/test_loading.cpp
 @@ -2,6 +2,7 @@
@@ -23669,7 +23766,7 @@ index 5210c7c6a53926cd360203f67fed844577f4670f..94a61a649b1211d00ecee30b27af2734
          std::cout << "model config, binding, resources and Use checks passed\n";
 diff --git a/tests/models/qwen3_5/test_tool_constraints.cpp b/tests/models/qwen3_5/test_tool_constraints.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a4190cd9f32dd3335ef523d275f0ba3f5a7be4d2
+index 00000000..a4190cd9
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_tool_constraints.cpp
 @@ -0,0 +1,217 @@
@@ -23891,7 +23988,7 @@ index 0000000000000000000000000000000000000000..a4190cd9f32dd3335ef523d275f0ba3f
 +    return 0;
 +} catch (const std::exception& e) { std::cerr << e.what()<<"\n"; return 1; }
 diff --git a/tests/ops/linear/test_gguf.cpp b/tests/ops/linear/test_gguf.cpp
-index 363d4a13f1f02b2728b9328f2dc3d66edf95ce69..db12cf51e50554483e5ba3939b247ccfeb2d9e46 100644
+index 363d4a13..db12cf51 100644
 --- a/tests/ops/linear/test_gguf.cpp
 +++ b/tests/ops/linear/test_gguf.cpp
 @@ -17,13 +17,17 @@
@@ -24054,7 +24151,7 @@ index 363d4a13f1f02b2728b9328f2dc3d66edf95ce69..db12cf51e50554483e5ba3939b247ccf
                  failures += f;
 diff --git a/tests/ops/linear/test_joint_nvfp4_a4.cpp b/tests/ops/linear/test_joint_nvfp4_a4.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2857816708e21186db02fc17635130f153d5e0c5
+index 00000000..28578167
 --- /dev/null
 +++ b/tests/ops/linear/test_joint_nvfp4_a4.cpp
 @@ -0,0 +1,26 @@
@@ -24085,7 +24182,7 @@ index 0000000000000000000000000000000000000000..2857816708e21186db02fc17635130f1
 +    }
 +}
 diff --git a/tests/ops/linear_add/test_fp8.cpp b/tests/ops/linear_add/test_fp8.cpp
-index 7d5cb25e58724f74f2ca6945e102716d79c90393..a4d58fd4e46a2414667004c8a40d9a310e6deb2e 100644
+index 7d5cb25e..a4d58fd4 100644
 --- a/tests/ops/linear_add/test_fp8.cpp
 +++ b/tests/ops/linear_add/test_fp8.cpp
 @@ -128,7 +128,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
@@ -24106,7 +24203,7 @@ index 7d5cb25e58724f74f2ca6945e102716d79c90393..a4d58fd4e46a2414667004c8a40d9a31
      return failures == 0 ? 0 : 1;
  }
 diff --git a/tests/ops/linear_add/test_nvfp4.cpp b/tests/ops/linear_add/test_nvfp4.cpp
-index dab1a0ab06fe6e165d6d85d87bceb1c0008cd28b..a62ad34339c400dc7245a2664469e7a0c6abdc85 100644
+index dab1a0ab..a62ad343 100644
 --- a/tests/ops/linear_add/test_nvfp4.cpp
 +++ b/tests/ops/linear_add/test_nvfp4.cpp
 @@ -107,6 +107,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
@@ -24145,7 +24242,7 @@ index dab1a0ab06fe6e165d6d85d87bceb1c0008cd28b..a62ad34339c400dc7245a2664469e7a0
      return failures == 0 ? 0 : 1;
  }
 diff --git a/tests/ops/linear_swiglu/test_fp8.cpp b/tests/ops/linear_swiglu/test_fp8.cpp
-index a8f340e98d0b2cb717312b684a9ac87ac31dcf24..6c2b04437237a0c0f617d08d58d41bb5ee2e10f0 100644
+index a8f340e9..6c2b0443 100644
 --- a/tests/ops/linear_swiglu/test_fp8.cpp
 +++ b/tests/ops/linear_swiglu/test_fp8.cpp
 @@ -88,7 +88,7 @@ int main() {
@@ -24166,7 +24263,7 @@ index a8f340e98d0b2cb717312b684a9ac87ac31dcf24..6c2b04437237a0c0f617d08d58d41bb5
          return failures == 0 ? 0 : 1;
      } catch (const std::exception& error) {
 diff --git a/tests/ops/linear_swiglu/test_nvfp4.cpp b/tests/ops/linear_swiglu/test_nvfp4.cpp
-index 561abb853cbe368560293f14a1b5830a26ad179e..7d7a02a16b9771d3d08db4a7c5ac0889f184a07a 100644
+index 561abb85..7d7a02a1 100644
 --- a/tests/ops/linear_swiglu/test_nvfp4.cpp
 +++ b/tests/ops/linear_swiglu/test_nvfp4.cpp
 @@ -108,9 +108,9 @@ int main() {
@@ -24190,7 +24287,7 @@ index 561abb853cbe368560293f14a1b5830a26ad179e..7d7a02a16b9771d3d08db4a7c5ac0889
          return failures == 0 ? 0 : 1;
      } catch (const std::exception& error) {
 diff --git a/tests/ops/softmax_attention/causal_cache.cpp b/tests/ops/softmax_attention/causal_cache.cpp
-index 0a619e6816de3a3965b9bb4868804e88e13a8a7d..7ff40072ffc9a5d92f2b69397030e1a6012c55bc 100644
+index 0a619e68..7ff40072 100644
 --- a/tests/ops/softmax_attention/causal_cache.cpp
 +++ b/tests/ops/softmax_attention/causal_cache.cpp
 @@ -4424,6 +4424,13 @@ int run_softmax_attention_dflash2_tests() {
@@ -24246,7 +24343,7 @@ index 0a619e6816de3a3965b9bb4868804e88e13a8a7d..7ff40072ffc9a5d92f2b69397030e1a6
 +    return failures ? 1 : 0;
 +}
 diff --git a/tests/ops/softmax_attention/main.cpp b/tests/ops/softmax_attention/main.cpp
-index 5f1825d18b97fbbaeb04ce2ab210b1046bf07c5e..9622daa1a54376edcb99edb036699a23f0622b3b 100644
+index 5f1825d1..9622daa1 100644
 --- a/tests/ops/softmax_attention/main.cpp
 +++ b/tests/ops/softmax_attention/main.cpp
 @@ -10,6 +10,7 @@ int run_softmax_attention_fp8_prompt_tests();
@@ -24294,7 +24391,7 @@ index 5f1825d18b97fbbaeb04ce2ab210b1046bf07c5e..9622daa1a54376edcb99edb036699a23
                       "--wide-only|--parallel-tiles-only|--quantized-depth-only]\n";
          return 2;
 diff --git a/tests/ops/test_gdn_gating_proj.cpp b/tests/ops/test_gdn_gating_proj.cpp
-index 8241e7996351b46c5d8d322700462d794eec05d8..246838d2051239b9ca5a21baef1f79fd50e1f0df 100644
+index 8241e799..246838d2 100644
 --- a/tests/ops/test_gdn_gating_proj.cpp
 +++ b/tests/ops/test_gdn_gating_proj.cpp
 @@ -757,6 +757,16 @@ int main() {
@@ -24315,7 +24412,7 @@ index 8241e7996351b46c5d8d322700462d794eec05d8..246838d2051239b9ca5a21baef1f79fd
      // sides of each sm_86 residency boundary (768/769, 1664/1665, 3456/3457).
      for (const std::int32_t tokens :
 diff --git a/tests/ops/test_gdn_replay_fold.cpp b/tests/ops/test_gdn_replay_fold.cpp
-index e31e747b02731bf92b5807a96fb26132cd5b590d..f57a4b3b3a5c52699907788c673424525d387c19 100644
+index e31e747b..f57a4b3b 100644
 --- a/tests/ops/test_gdn_replay_fold.cpp
 +++ b/tests/ops/test_gdn_replay_fold.cpp
 @@ -662,6 +662,7 @@ int run_record_fold_rounds() {
@@ -24354,7 +24451,7 @@ index e31e747b02731bf92b5807a96fb26132cd5b590d..f57a4b3b3a5c52699907788c67342452
      failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
 diff --git a/tests/ops/test_joint_attn_norm.cpp b/tests/ops/test_joint_attn_norm.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..da155cbe2134219714b851a00b7c773089ccf167
+index 00000000..da155cbe
 --- /dev/null
 +++ b/tests/ops/test_joint_attn_norm.cpp
 @@ -0,0 +1,14 @@
@@ -24374,7 +24471,7 @@ index 0000000000000000000000000000000000000000..da155cbe2134219714b851a00b7c7730
 +}
 diff --git a/tests/ops/test_joint_attn_projection.cpp b/tests/ops/test_joint_attn_projection.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b038a843d1225ab83a31386dce9108597c680621
+index 00000000..b038a843
 --- /dev/null
 +++ b/tests/ops/test_joint_attn_projection.cpp
 @@ -0,0 +1,18 @@
@@ -24397,7 +24494,7 @@ index 0000000000000000000000000000000000000000..b038a843d1225ab83a31386dce910859
 +    } catch (const std::exception& e) { std::cerr << e.what() << "\n";return 1; }
 +}
 diff --git a/tests/ops/test_sliding_window_attention.cpp b/tests/ops/test_sliding_window_attention.cpp
-index af68951e0f7ad4863bcd59b4428057578b70048a..78dba9e8c4e1b09e77272deba54046597b75b4ef 100644
+index af68951e..78dba9e8 100644
 --- a/tests/ops/test_sliding_window_attention.cpp
 +++ b/tests/ops/test_sliding_window_attention.cpp
 @@ -2,6 +2,7 @@
@@ -24599,7 +24696,7 @@ index af68951e0f7ad4863bcd59b4428057578b70048a..78dba9e8c4e1b09e77272deba5404659
          std::cerr << "sliding_window_attention threw: " << error.what() << (char)10;
          return 1;
 diff --git a/tests/test_anthropic_schema.cpp b/tests/test_anthropic_schema.cpp
-index 202e4e1073f62d94d8593cc2c5b6091bd6da2a6c..f2af5b8959f570904cb0bb7bb26093a2f27dde85 100644
+index 202e4e10..f2af5b89 100644
 --- a/tests/test_anthropic_schema.cpp
 +++ b/tests/test_anthropic_schema.cpp
 @@ -499,20 +499,27 @@ int test_tools() {
@@ -24665,7 +24762,7 @@ index 202e4e1073f62d94d8593cc2c5b6091bd6da2a6c..f2af5b8959f570904cb0bb7bb26093a2
      for (const Json& choice : {Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
                                 Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
 diff --git a/tests/test_cli_options.cpp b/tests/test_cli_options.cpp
-index 19fafcaa1c996a609a41a099b59e5f12ab3ef03d..ce998dd56bcc9134525c9022f144e3585d2362d6 100644
+index 19fafcaa..ce998dd5 100644
 --- a/tests/test_cli_options.cpp
 +++ b/tests/test_cli_options.cpp
 @@ -2,6 +2,7 @@
@@ -24769,7 +24866,7 @@ index 19fafcaa1c996a609a41a099b59e5f12ab3ef03d..ce998dd56bcc9134525c9022f144e358
          for (unsigned width = 0; width <= 63; ++width) {
              const auto mixed =
 diff --git a/tests/test_context_cache_defaults.cpp b/tests/test_context_cache_defaults.cpp
-index 1217c4d7d2e73dab2d5597ef5c3a146e38438ee4..f5a002803458f55a80c0dc26879835bd6b566e2b 100644
+index 1217c4d7..f5a00280 100644
 --- a/tests/test_context_cache_defaults.cpp
 +++ b/tests/test_context_cache_defaults.cpp
 @@ -69,6 +69,84 @@ int main() {
@@ -24858,7 +24955,7 @@ index 1217c4d7d2e73dab2d5597ef5c3a146e38438ee4..f5a002803458f55a80c0dc26879835bd
      // distinct shared-prefix candidates on its own: four explicit markers plus the engine's
      // tool/leading-instruction/full-prompt automatic candidates. The default
 diff --git a/tests/test_kv_cache.cpp b/tests/test_kv_cache.cpp
-index 12d4543a028eec60f280ac1a9fdd379643081f35..5df62ee22971ece7f985e73e3fad7c6af9b3dce9 100644
+index 12d4543a..5df62ee2 100644
 --- a/tests/test_kv_cache.cpp
 +++ b/tests/test_kv_cache.cpp
 @@ -467,6 +467,28 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
@@ -24891,7 +24988,7 @@ index 12d4543a028eec60f280ac1a9fdd379643081f35..5df62ee22971ece7f985e73e3fad7c6a
                                             context.stream);
          std::optional<ninfer::HostKVAllocation> record_roundtrip =
 diff --git a/tests/test_kv_cache_ranks.cpp b/tests/test_kv_cache_ranks.cpp
-index 4202802dab819e816594d2d4cf7bad1c1de17b9e..18aae4d52560c6f7e6f1745b9a7f17bdcbf4a943 100644
+index 4202802d..18aae4d5 100644
 --- a/tests/test_kv_cache_ranks.cpp
 +++ b/tests/test_kv_cache_ranks.cpp
 @@ -19,12 +19,14 @@
@@ -25009,7 +25106,7 @@ index 4202802dab819e816594d2d4cf7bad1c1de17b9e..18aae4d52560c6f7e6f1745b9a7f17bd
      std::cout << "multi-rank kv pool matches the single-rank pool\n";
      return 0;
 diff --git a/tests/test_kv_capacity.cpp b/tests/test_kv_capacity.cpp
-index 7284d51c7766745daa1a0d116d0b18be16a2c6e8..695db764d87c78f9409ff8cb78ffbdb13f3f480b 100644
+index 7284d51c..695db764 100644
 --- a/tests/test_kv_capacity.cpp
 +++ b/tests/test_kv_capacity.cpp
 @@ -1,6 +1,7 @@
@@ -25110,7 +25207,7 @@ index 7284d51c7766745daa1a0d116d0b18be16a2c6e8..695db764d87c78f9409ff8cb78ffbdb1
      return failures == 0 ? 0 : 1;
  }
 diff --git a/tests/test_ninfer_bench_support.cpp b/tests/test_ninfer_bench_support.cpp
-index d619f1a7f23431c2a10723af8f9883cedcce1871..dbe0901234d244966dded182d4399c170a01ff93 100644
+index d619f1a7..dbe09012 100644
 --- a/tests/test_ninfer_bench_support.cpp
 +++ b/tests/test_ninfer_bench_support.cpp
 @@ -61,6 +61,15 @@ qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
@@ -25148,7 +25245,7 @@ index d619f1a7f23431c2a10723af8f9883cedcce1871..dbe0901234d244966dded182d4399c17
                         "rep SpeculativeStats");
      return failures;
 diff --git a/tests/test_openai_responses.cpp b/tests/test_openai_responses.cpp
-index b9397a3f3552fdd73ccebcfc2c95475503f3c35e..a788c84a87f1f3c0e9c049c4b823278200c4db33 100644
+index b9397a3f..a788c84a 100644
 --- a/tests/test_openai_responses.cpp
 +++ b/tests/test_openai_responses.cpp
 @@ -20,9 +20,6 @@ namespace {
@@ -25476,7 +25573,7 @@ index b9397a3f3552fdd73ccebcfc2c95475503f3c35e..a788c84a87f1f3c0e9c049c4b8232782
      failures += test_contiguous_assistant_items();
      failures += test_response_output_history_round_trip();
 diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
-index 79825fd3e4be54941464587df11c0e952a25fea4..0b699b1fa9fa7db3eecd919683e198dea3145878 100644
+index 79825fd3..0b699b1f 100644
 --- a/tests/test_openai_schema.cpp
 +++ b/tests/test_openai_schema.cpp
 @@ -479,16 +479,19 @@ int test_tools() {
@@ -25700,7 +25797,7 @@ index 79825fd3e4be54941464587df11c0e952a25fea4..0b699b1fa9fa7db3eecd919683e198de
      failures += test_graft_extension();
      failures += test_thinking_budget_extension();
 diff --git a/tests/test_resource_manager.cpp b/tests/test_resource_manager.cpp
-index 982f4ec8969c36b08bac58727d230fe7f2ac1c18..7444638be6959fd867f6039233c34c28fcb533e7 100644
+index 982f4ec8..7444638b 100644
 --- a/tests/test_resource_manager.cpp
 +++ b/tests/test_resource_manager.cpp
 @@ -723,6 +723,10 @@ public:
@@ -25742,7 +25839,7 @@ index 982f4ec8969c36b08bac58727d230fe7f2ac1c18..7444638be6959fd867f6039233c34c28
      run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
      run_test("session publication order", test_session_publication_order_controls_tied_source);
 diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
-index a257ca089f1634b494dc9229d33335aa3ac01f39..0eeb8746f671708b46ba8a1febaa35a59ccea33b 100644
+index a257ca08..0eeb8746 100644
 --- a/tests/test_serve_options.cpp
 +++ b/tests/test_serve_options.cpp
 @@ -2,9 +2,12 @@
@@ -26375,7 +26472,7 @@ index a257ca089f1634b494dc9229d33335aa3ac01f39..0eeb8746f671708b46ba8a1febaa35a5
 +    }
 +}
 diff --git a/third_party/xgrammar/CMakeLists.txt b/third_party/xgrammar/CMakeLists.txt
-index 7a116b014e36d550fd3213979b35ed42b224e86b..d9ec02255fed0b69c34c36303dfb5aa707a85d1a 100644
+index 7a116b01..d9ec0225 100644
 --- a/third_party/xgrammar/CMakeLists.txt
 +++ b/third_party/xgrammar/CMakeLists.txt
 @@ -13,6 +13,7 @@ add_library(ninfer_xgrammar STATIC
@@ -26387,7 +26484,7 @@ index 7a116b014e36d550fd3213979b35ed42b224e86b..d9ec02255fed0b69c34c36303dfb5aa7
    cpp/regex_converter.cc
    cpp/structural_tag.cc
 diff --git a/third_party/xgrammar/cpp/json_schema_converter_ext.cc b/third_party/xgrammar/cpp/json_schema_converter_ext.cc
-index 23b03e83ba7a07fc013e970d408b6df31c959f3a..4604331fe9823b771a2f70226de5cfb2faaa9a88 100644
+index 23b03e83..4604331f 100644
 --- a/third_party/xgrammar/cpp/json_schema_converter_ext.cc
 +++ b/third_party/xgrammar/cpp/json_schema_converter_ext.cc
 @@ -4,6 +4,8 @@
@@ -26532,7 +26629,7 @@ index 23b03e83ba7a07fc013e970d408b6df31c959f3a..4604331fe9823b771a2f70226de5cfb2
          ByteString(xml_wrapper_.key_wrapper_prefix),
          key_pattern_expr,
 diff --git a/third_party/xgrammar/cpp/json_schema_converter_ext.h b/third_party/xgrammar/cpp/json_schema_converter_ext.h
-index 1386225d184b9850d45d404032675981f9457fba..52bd8b2b932752fc44b6981c1bad1d56da247a9a 100644
+index 1386225d..52bd8b2b 100644
 --- a/third_party/xgrammar/cpp/json_schema_converter_ext.h
 +++ b/third_party/xgrammar/cpp/json_schema_converter_ext.h
 @@ -88,6 +88,8 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
@@ -26546,7 +26643,7 @@ index 1386225d184b9850d45d404032675981f9457fba..52bd8b2b932752fc44b6981c1bad1d56
        const ObjectSpec& spec, const std::string& rule_name, bool dummy_need_braces = false
 diff --git a/third_party/xgrammar/cpp/json_string_grammar.cc b/third_party/xgrammar/cpp/json_string_grammar.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..f5513e698c48e7164903761d7a288b3a36f15b55
+index 00000000..f5513e69
 --- /dev/null
 +++ b/third_party/xgrammar/cpp/json_string_grammar.cc
 @@ -0,0 +1,447 @@
@@ -26999,7 +27096,7 @@ index 0000000000000000000000000000000000000000..f5513e698c48e7164903761d7a288b3a
 +}  // namespace xgrammar
 diff --git a/third_party/xgrammar/cpp/json_string_grammar.h b/third_party/xgrammar/cpp/json_string_grammar.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..17dca9333f81063c8435c7bc9ba4938bd15c884b
+index 00000000..17dca933
 --- /dev/null
 +++ b/third_party/xgrammar/cpp/json_string_grammar.h
 @@ -0,0 +1,26 @@
@@ -27030,7 +27127,7 @@ index 0000000000000000000000000000000000000000..17dca9333f81063c8435c7bc9ba4938b
 +}  // namespace xgrammar
 +#endif
 diff --git a/tools/convert/__main__.py b/tools/convert/__main__.py
-index 08a9358be49a29994e8942360734a891db713648..aac03d81fb175dbd3e0b6ca9e3aac4c5478e94e7 100644
+index 08a9358b..aac03d81 100644
 --- a/tools/convert/__main__.py
 +++ b/tools/convert/__main__.py
 @@ -33,6 +33,10 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
@@ -27046,7 +27143,7 @@ index 08a9358be49a29994e8942360734a891db713648..aac03d81fb175dbd3e0b6ca9e3aac4c5
          return GGUFSource(path)
 diff --git a/tools/convert/dense_geometry.py b/tools/convert/dense_geometry.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c47433ef3112d0836a6f9ad357ae533cd59144b5
+index 00000000..c47433ef
 --- /dev/null
 +++ b/tools/convert/dense_geometry.py
 @@ -0,0 +1,93 @@
@@ -27145,7 +27242,7 @@ index 0000000000000000000000000000000000000000..c47433ef3112d0836a6f9ad357ae533c
 +        return select
 diff --git a/tools/convert/dflash2_gguf.py b/tools/convert/dflash2_gguf.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e271fc6cc4466cfe0cfb156d1a656b9c5b0e235
+index 00000000..0e271fc6
 --- /dev/null
 +++ b/tools/convert/dflash2_gguf.py
 @@ -0,0 +1,405 @@
@@ -27555,7 +27652,7 @@ index 0000000000000000000000000000000000000000..0e271fc6cc4466cfe0cfb156d1a656b9
 +
 +__all__ = ["DraftSource", "TensorSignature", "draft_blocks", "validate"]
 diff --git a/tools/convert/gguf_blocks.py b/tools/convert/gguf_blocks.py
-index 23174618a8c4fefb292d10f1247057cfbe4ceb28..67862b6f517059e40548d56f9d4f57207b7499cf 100644
+index 23174618..67862b6f 100644
 --- a/tools/convert/gguf_blocks.py
 +++ b/tools/convert/gguf_blocks.py
 @@ -1,17 +1,19 @@
@@ -28094,7 +28191,7 @@ index 23174618a8c4fefb292d10f1247057cfbe4ceb28..67862b6f517059e40548d56f9d4f5720
      "q8_native_source",
      "text_sources",
 diff --git a/tools/convert/ternary.py b/tools/convert/ternary.py
-index 204dda382192976fcdb89849ba9dcff701baa275..85196616a5509c41307d972f5de0795343ec7816 100644
+index 204dda38..85196616 100644
 --- a/tools/convert/ternary.py
 +++ b/tools/convert/ternary.py
 @@ -157,7 +157,10 @@ def validate(gguf: GGUFFile) -> None:

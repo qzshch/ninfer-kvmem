@@ -10,6 +10,16 @@ set before serving requests. It retains the original direct D2H/H2D copies and
 last-shared-reference lifetime. No model arithmetic, KV selection, or prompt
 representation changes. The default remains `0`.
 
+Resident mode also covers the MTP reconstruction backup when
+`NINFER_EXPERIMENT_REWRITE_SCRATCH_REUSE` is unset or `0`. Explicit `1` and `2`
+keep pooled-per-use and retained-single-backup behavior respectively. With
+resident mode off, the existing experimental settings retain their behavior.
+
+The KVMem memory summary includes catalog images, idle checkpoint-pool buffers,
+and the independent retained reconstruction backup in `checkpoint_bytes`.
+Borrowed buffers leave the idle count until their last shared reference returns,
+so the same allocation is not counted as both an idle buffer and a live image.
+
 Capacity is five checkpoint kinds times active plus retained windows, two
 transient leases (capture replacement and idle I/O), and reconstruction scratch.
 MTP reconstruction uses one image: lanes are backed up serially on the executor.
