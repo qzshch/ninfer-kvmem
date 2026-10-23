@@ -194,7 +194,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
       - name: Prepare and verify the pinned ninfer-all integration
         run: |
           python scripts/prepare-backends.py --backend ninfer
@@ -203,6 +203,19 @@ jobs:
         run: |
           python scripts/prepare-backends.py --backend ninfer
           python scripts/prepare-backends.py --backend ninfer --check
+      - name: Check the Gaudi2 checkpoint inventory
+        run: python tests/test_gaudi2_checkpoint.py
+      - name: Configure Gaudi2 host preparation without CUDA or SynapseAI
+        run: >-
+          cmake -S backends/ninfer -B build-gaudi2-host
+          -DNINFER_GAUDI2_PREPARATION_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-gaudi2-host --config Release -j
+      - run: ctest --test-dir build-gaudi2-host -C Release --output-on-failure --timeout 30 --no-tests=error
+      - name: Exercise checkpoint offsets through the native tile executable
+        run: >-
+          python -c "import os, pathlib, subprocess, sys;
+          os.environ['NINFER_GAUDI2_TILE_EXE'] = pathlib.Path('build-gaudi2-host/gaudi2-tile-executable-Release.txt').read_text(encoding='utf-8');
+          sys.exit(subprocess.call([sys.executable, 'tests/test_gaudi2_checkpoint.py']))"
   # Keep required status names; only verified documentation changes may skip builds.
   host-and-server-units-linux:
     if: ${{ always() }}

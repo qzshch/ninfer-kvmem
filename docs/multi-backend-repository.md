@@ -1,7 +1,8 @@
 # Multi-backend repository
 
-The `master` branch contains the 0.18.0 multi-backend KVMem framework.
-The `v0.18.0` tag preserves the release source snapshot. Both engines are
+This fork's `main` branch contains the multi-backend KVMem development baseline;
+`feat/gaudi2` holds the Gaudi2 preparation work. Upstream release packages describe
+their tagged release source, not these development branches. Both engines are
 Git submodules referencing existing upstream projects. The parent commit pins the
 core, adapters, engine revisions and integration patches together.
 
@@ -35,8 +36,8 @@ migration record; the earlier release results apply to their dated baseline.
 
 ```sh
 git clone --recurse-submodules \
-  https://github.com/kvmem/kvmem.git
-cd kvmem
+  https://github.com/qzshch/ninfer-kvmem.git
+cd ninfer-kvmem
 python scripts/prepare-backends.py
 python scripts/prepare-backends.py --check
 ```
@@ -144,4 +145,4 @@ restart persistence. See [tiering qualification](active-kv-tiering-plan.md). The
 matrix and a package that matches this source are not finished. Current patch
 hashes are in `backends/versions.json`. See [validation status](multi-backend-validation.md)
 and [supported backend combinations](multi-backend.md). Once accepted, merge into
-`master` through normal Git history; do not force-replace the main branch.
+`main` through normal Git history; do not force-replace the main branch.

@@ -2,6 +2,9 @@
 
 # KVMem 0.18.0 · llama.cpp & NInfer
 
+Gaudi2 适配在 `feat/gaudi2` 分支开发。首批交付是无需 CUDA/SynapseAI 即可构建的
+[有限内存 C++ block-FP8 准备工具](docs/gaudi2-development.md)；HPU 完整模型生成仍在实现中。
+
 > 本仓库的 `main` 作为 P+D 混合计算的开发基线；
 > [`upstream` 分支](https://github.com/qzshch/ninfer-kvmem/tree/upstream)
 > 保留纯官方源码，用于同步和性能对照。
