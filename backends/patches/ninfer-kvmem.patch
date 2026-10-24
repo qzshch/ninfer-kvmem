@@ -5329,10 +5329,10 @@ index 0000000000000000000000000000000000000000..9a26ffd9155440b596a9008e9a1a6c68
 +
 +} // namespace ninfer::core
 diff --git a/src/models/CMakeLists.txt b/src/models/CMakeLists.txt
-index 85cb08f40dcb2f0325cf6ba151cc7db36da13c97..daf222a2354b42b9050881a759fa8a54ec45f43a 100644
+index 85cb08f40dcb2f0325cf6ba151cc7db36da13c97..80fe81a52dafe1a09507bc954a0cf19963353f54 100644
 --- a/src/models/CMakeLists.txt
 +++ b/src/models/CMakeLists.txt
-@@ -10,7 +10,8 @@ add_library(ninfer_model_runtime STATIC)
+@@ -10,11 +10,13 @@ add_library(ninfer_model_runtime STATIC)
  ninfer_internal_includes(ninfer_model_runtime)
  target_link_libraries(ninfer_model_runtime
    PUBLIC ninfer_model_loading ninfer_ops ninfer_runtime_support
@@ -5342,6 +5342,345 @@ index 85cb08f40dcb2f0325cf6ba151cc7db36da13c97..daf222a2354b42b9050881a759fa8a54
  
  include(qwen3_5/loading_sources.cmake)
  include(qwen3_5/frontend_sources.cmake)
+ include(qwen3_5/execution_sources.cmake)
+ include(qwen3_5/program_sources.cmake)
+ include(qwen4_exp/loading_sources.cmake)
++include(glm5/loading_sources.cmake)
+ include(gemma4/sources.cmake)
+diff --git a/src/models/glm5/config.cpp b/src/models/glm5/config.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..65935e8ee91bb297d7b2a6fa6cfcdf0cee16125f
+--- /dev/null
++++ b/src/models/glm5/config.cpp
+@@ -0,0 +1,216 @@
++#include "models/glm5/config.h"
++
++#include "artifact/schema.h"
++
++#include <cmath>
++#include <limits>
++#include <string>
++
++namespace ninfer::models::glm5 {
++namespace {
++
++using artifact::ArtifactError;
++using artifact::Json;
++
++std::uint32_t integer(const Json& config, const char* name, bool positive = true) {
++    const auto n = artifact::require_u64(config.at(name), name, positive);
++    if (n > std::numeric_limits<std::uint32_t>::max()) {
++        throw ArtifactError(std::string(name) + ": exceeds u32");
++    }
++    return static_cast<std::uint32_t>(n);
++}
++
++float positive_float(const Json& config, const char* name) {
++    const auto& value = config.at(name);
++    if (!value.is_number()) { throw ArtifactError(std::string(name) + " must be a real value"); }
++    const float result = value.get<float>();
++    if (!std::isfinite(result) || result <= 0) {
++        throw ArtifactError(std::string(name) + " must be positive finite FP32");
++    }
++    return result;
++}
++
++// The KDA gate lower bound is negative by construction (a safe lower bound on
++// a log-space decay); positive or zero would grow the state.
++float negative_float(const Json& config, const char* name) {
++    const auto& value = config.at(name);
++    if (!value.is_number()) { throw ArtifactError(std::string(name) + " must be a real value"); }
++    const float result = value.get<float>();
++    if (!std::isfinite(result) || result >= 0) {
++        throw ArtifactError(std::string(name) + " must be negative finite FP32");
++    }
++    return result;
++}
++
++void require_value(std::uint32_t actual, std::uint32_t implemented, const char* name) {
++    if (actual != implemented) {
++        throw ArtifactError(std::string(name) + " is " + std::to_string(actual) +
++                            "; this engine implements " + std::to_string(implemented));
++    }
++}
++
++void require_flag(const Json& config, const char* name, bool implemented) {
++    const auto& value = config.at(name);
++    if (!value.is_boolean() || value.get<bool>() != implemented) {
++        throw ArtifactError(std::string(name) + " must be " + (implemented ? "true" : "false") +
++                            " for the geometry this engine implements");
++    }
++}
++
++void require_string(const Json& config, const char* name, const char* implemented) {
++    if (config.at(name) != implemented) {
++        throw ArtifactError(std::string(name) + " must be \"" + implemented + '"');
++    }
++}
++
++} // namespace
++
++TextConfig parse_text_config(const Json& value) {
++    artifact::require_members(
++        value,
++        {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
++         "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "eos_token_id",
++         "layer_types", "first_k_dense_replace", "intermediate_size", "swiglu_limit",
++         "linear_attn_config", "num_attention_heads", "num_key_value_heads",
++         "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "q_lora_rank", "kv_lora_rank",
++         "attention_bias", "mla_use_nope", "index_n_heads", "index_head_dim", "index_kpool",
++         "index_top_k", "index_kpool_always_select_tail", "index_kpool_compress", "mhc",
++         "hc_mult", "hc_sinkhorn_iters", "hc_eps", "n_routed_experts", "num_experts_per_tok",
++         "moe_intermediate_size", "n_shared_experts", "routed_scaling_factor",
++         "norm_topk_prob", "scoring_func", "topk_method", "n_group", "topk_group",
++         "moe_router_dtype", "attention_dropout", "num_nextn_predict_layers"},
++        {}, "GLM5 text config");
++    const auto& architectures = value.at("architectures");
++    if (!architectures.is_array() || architectures.size() != 1 ||
++        architectures[0] != "Glm5NextForCausalLM" || value.at("model_type") != "glm5_next_text") {
++        throw ArtifactError("GLM5 text config: architecture/model_type mismatch");
++    }
++    TextConfig out;
++    out.hidden_size             = integer(value, "hidden_size");
++    out.vocab_size              = integer(value, "vocab_size");
++    out.num_hidden_layers       = integer(value, "num_hidden_layers");
++    out.max_position_embeddings = integer(value, "max_position_embeddings");
++    out.rms_norm_eps            = positive_float(value, "rms_norm_eps");
++    if (!value.at("tie_word_embeddings").is_boolean()) {
++        throw ArtifactError("tie_word_embeddings must be boolean");
++    }
++    out.tie_word_embeddings = value.at("tie_word_embeddings").get<bool>();
++
++    const auto& eos = value.at("eos_token_id");
++    if (eos.is_number()) {
++        const auto id = artifact::require_u64(eos, "eos_token_id", false);
++        if (id >= out.vocab_size) { throw ArtifactError("eos_token_id exceeds the vocabulary"); }
++        out.eos_token_ids.push_back(static_cast<std::int32_t>(id));
++    } else if (eos.is_array() && !eos.empty()) {
++        for (const auto& id : eos) {
++            const auto token = artifact::require_u64(id, "eos_token_id", false);
++            if (token >= out.vocab_size) {
++                throw ArtifactError("eos_token_id exceeds the vocabulary");
++            }
++            out.eos_token_ids.push_back(static_cast<std::int32_t>(token));
++        }
++    } else {
++        throw ArtifactError("eos_token_id must be one id or a non-empty list");
++    }
++
++    const auto& layers = value.at("layer_types");
++    if (!layers.is_array() || layers.size() != out.num_hidden_layers) {
++        throw ArtifactError("layer_types must describe every block");
++    }
++    for (const auto& layer : layers) {
++        if (layer == "linear_attention") {
++            out.layer_types.push_back(MixerKind::Kda);
++        } else if (layer == "deepseek_sparse_attention") {
++            out.layer_types.push_back(MixerKind::Dsa);
++        } else {
++            throw ArtifactError("unknown layer_type");
++        }
++    }
++
++    out.first_k_dense_replace = integer(value, "first_k_dense_replace", false);
++    if (out.first_k_dense_replace > out.num_hidden_layers) {
++        throw ArtifactError("first_k_dense_replace exceeds the block count");
++    }
++    out.intermediate_size = integer(value, "intermediate_size");
++    out.swiglu_limit      = positive_float(value, "swiglu_limit");
++
++    // KDA geometry: the audited profile only (64 heads of 128, 4-tap conv).
++    const auto& linear = value.at("linear_attn_config");
++    artifact::require_members(linear, {"num_heads", "head_dim", "short_conv_kernel_size",
++                                       "gate_lower_bound"},
++                              {}, "GLM5 linear_attn_config");
++    out.linear_num_heads   = integer(linear, "num_heads");
++    out.linear_head_dim    = integer(linear, "head_dim");
++    out.linear_conv_kernel = integer(linear, "short_conv_kernel_size");
++    out.linear_gate_lower_bound = negative_float(linear, "gate_lower_bound");
++    require_value(out.linear_conv_kernel, 4, "short_conv_kernel_size");
++    // d_inner = heads * head_dim (8192) legitimately exceeds the hidden size:
++    // the KDA q/k/v projections are 4096 -> 8192 each.
++
++    // MLA: NoPE-only, uniform heads, no attention bias.
++    out.num_attention_heads = integer(value, "num_attention_heads");
++    out.num_key_value_heads = integer(value, "num_key_value_heads");
++    out.qk_nope_head_dim    = integer(value, "qk_nope_head_dim");
++    out.qk_rope_head_dim    = integer(value, "qk_rope_head_dim", false);
++    out.v_head_dim          = integer(value, "v_head_dim");
++    out.q_lora_rank         = integer(value, "q_lora_rank");
++    out.kv_lora_rank        = integer(value, "kv_lora_rank");
++    require_value(out.qk_rope_head_dim, 0, "qk_rope_head_dim");
++    require_flag(value, "mla_use_nope", true);
++    require_flag(value, "attention_bias", false);
++    if (out.num_attention_heads != out.num_key_value_heads) {
++        throw ArtifactError("GLM5 MLA implements uniform query/key heads (no GQA)");
++    }
++
++    // Indexer: the audited 4-pool selection with its mandatory tail.
++    out.index_n_heads  = integer(value, "index_n_heads");
++    out.index_head_dim = integer(value, "index_head_dim");
++    out.index_kpool    = integer(value, "index_kpool");
++    out.index_top_k    = integer(value, "index_top_k");
++    require_value(out.index_kpool, 4, "index_kpool");
++    if (out.index_top_k % out.index_kpool != 0) {
++        throw ArtifactError("index_top_k must be a whole number of pools");
++    }
++    require_flag(value, "index_kpool_always_select_tail", true);
++    require_flag(value, "index_kpool_compress", true);
++    out.index_select_tail = true;
++
++    // mHC: 4 streams is what the kernels pin.
++    require_flag(value, "mhc", true);
++    out.hc_mult           = integer(value, "hc_mult");
++    out.hc_sinkhorn_iters = integer(value, "hc_sinkhorn_iters");
++    out.hc_eps            = positive_float(value, "hc_eps");
++    require_value(out.hc_mult, 4, "hc_mult");
++
++    // MoE: sigmoid + noaux_tc correction bias, single group, one shared
++    // expert of the routed width, FP32 router.
++    out.num_experts           = integer(value, "n_routed_experts");
++    out.num_experts_per_tok   = integer(value, "num_experts_per_tok");
++    out.moe_intermediate_size = integer(value, "moe_intermediate_size");
++    out.num_shared_experts    = integer(value, "n_shared_experts", false);
++    out.routed_scaling_factor = positive_float(value, "routed_scaling_factor");
++    if (!value.at("norm_topk_prob").is_boolean()) {
++        throw ArtifactError("norm_topk_prob must be boolean");
++    }
++    out.norm_topk_prob = value.at("norm_topk_prob").get<bool>();
++    require_string(value, "scoring_func", "sigmoid");
++    require_string(value, "topk_method", "noaux_tc");
++    require_value(integer(value, "n_group", false), 1, "n_group");
++    require_value(integer(value, "topk_group", false), 1, "topk_group");
++    require_string(value, "moe_router_dtype", "float32");
++    if (!out.norm_topk_prob) {
++        throw ArtifactError("GLM5 routing implements normalized top-k weights");
++    }
++    if (out.num_experts_per_tok > out.num_experts) {
++        throw ArtifactError("num_experts_per_tok exceeds the expert count");
++    }
++
++    const auto& dropout = value.at("attention_dropout");
++    if (!dropout.is_number() || dropout.get<double>() != 0.0) {
++        throw ArtifactError("attention_dropout must be zero for inference");
++    }
++    out.num_nextn_predict_layers = integer(value, "num_nextn_predict_layers", false);
++    return out;
++}
++
++} // namespace ninfer::models::glm5
+diff --git a/src/models/glm5/config.h b/src/models/glm5/config.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1905f9da44de09298e494520eeed7c8f6968669
+--- /dev/null
++++ b/src/models/glm5/config.h
+@@ -0,0 +1,97 @@
++#pragma once
++
++// The text config of GLM-5.3-Flash (Glm5NextForCausalLM) as the converter will
++// write it into the artifact, parsed strictly: every field the mathematics
++// reads is required, and the shapes this engine implements are the only ones
++// accepted. The geometry mirrors the audited glm53-config evidence and the
++// reference stack (llama.cpp glm5-next, transformers glm5_next, Maya): 45
++// blocks of 34 KDA + 11 DSA, mHC residual streams, NoPE-only MLA with a
++// k-pool DSA indexer, and 3 dense + 42 sparse MLP blocks.
++
++#include "artifact/schema.h"
++#include "models/load_options.h"
++
++#include <cstdint>
++#include <vector>
++
++namespace ninfer::models::glm5 {
++
++enum class MixerKind : std::uint8_t { Kda, Dsa };
++
++struct TextConfig {
++    std::uint32_t hidden_size             = 0;
++    std::uint32_t vocab_size              = 0;
++    std::uint32_t num_hidden_layers       = 0;
++    std::uint32_t max_position_embeddings = 0;
++    bool tie_word_embeddings              = false;
++    float rms_norm_eps                    = 0;
++    std::vector<std::int32_t> eos_token_ids;
++    std::vector<MixerKind> layer_types;
++    // The first first_k_dense_replace MLP blocks are dense; the rest are MoE.
++    std::uint32_t first_k_dense_replace   = 0;
++    std::uint32_t intermediate_size       = 0;  // dense FFN width
++    float swiglu_limit                    = 0;
++
++    // KDA (linear attention): per-channel decay gates with the safe lower
++    // bound in LOG space (a negative finite FP32 value, unlike the engine's
++    // other positive-epsilons-only fields).
++    std::uint32_t linear_num_heads    = 0;
++    std::uint32_t linear_head_dim     = 0;
++    std::uint32_t linear_conv_kernel  = 0;
++    float linear_gate_lower_bound     = 0;
++
++    // DSA blocks: NoPE-only MLA. qk_rope_head_dim is pinned to 0 by the
++    // engine; a rope component is a different model.
++    std::uint32_t num_attention_heads = 0;
++    std::uint32_t num_key_value_heads = 0;
++    std::uint32_t qk_nope_head_dim    = 0;
++    std::uint32_t qk_rope_head_dim    = 0;
++    std::uint32_t v_head_dim          = 0;
++    std::uint32_t q_lora_rank         = 0;
++    std::uint32_t kv_lora_rank        = 0;
++    bool attention_bias               = false;
++
++    // The k-pool indexer: pools of index_kpool tokens, index_topk selected
++    // token slots plus the always-selected incomplete tail.
++    std::uint32_t index_n_heads   = 0;
++    std::uint32_t index_head_dim  = 0;
++    std::uint32_t index_kpool     = 0;
++    std::uint32_t index_top_k     = 0;
++    bool index_select_tail        = false;
++
++    // mHC residual streams: sigmoid(+eps) pre, 2*sigmoid post, softmax(+eps)
++    // comb driven to doubly stochastic by hc_sinkhorn_iters rounds.
++    std::uint32_t hc_mult           = 0;
++    std::uint32_t hc_sinkhorn_iters = 0;
++    float hc_eps                    = 0;
++
++    // MoE: sigmoid router with the correction bias (noaux_tc), original
++    // scores normalized then scaled by routed_scaling_factor.
++    std::uint32_t num_experts             = 0;
++    std::uint32_t num_experts_per_tok     = 0;
++    std::uint32_t moe_intermediate_size   = 0;  // routed AND shared expert width
++    std::uint32_t num_shared_experts      = 0;
++    float routed_scaling_factor           = 0;
++    bool norm_topk_prob                   = false;
++
++    // Recorded for state layout; the engine's first GLM generation runs
++    // ordinary AR only (no MTP execution).
++    std::uint32_t num_nextn_predict_layers = 0;
++
++    [[nodiscard]] std::uint32_t index_top_pools() const noexcept {
++        return index_top_k / index_kpool;
++    }
++    [[nodiscard]] std::uint32_t index_selection_width() const noexcept {
++        return index_select_tail ? index_top_k + index_kpool - 1 : index_top_k;
++    }
++    [[nodiscard]] std::uint32_t linear_inner_width() const noexcept {
++        return linear_num_heads * linear_head_dim;
++    }
++    [[nodiscard]] bool mlp_is_sparse(std::uint32_t layer) const noexcept {
++        return layer >= first_k_dense_replace;
++    }
++};
++
++[[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
++
++} // namespace ninfer::models::glm5
+diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..1c161be33737aca6b6532d9afdd74cfe65747773
+--- /dev/null
++++ b/src/models/glm5/loading_sources.cmake
+@@ -0,0 +1,3 @@
++target_sources(ninfer_model_loading PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
++)
 diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
 index 4533e7c6345451fd3d82a3ee2e64e4191368a47c..eee43ae316526e28cb872865caac8ce086cdc47b 100644
 --- a/src/models/qwen3_5/execution/attention.cpp
@@ -13362,6 +13701,37 @@ index 9d19d569e24b2aa6ca0232dee76c83313a534a65..b6f6f9fe52a47d74d1acc94af195736a
    "${CMAKE_CURRENT_LIST_DIR}/program/storage/disk_tier.cpp"
    "${CMAKE_CURRENT_LIST_DIR}/program/storage/session_snapshot.cpp"
    "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"
+diff --git a/src/models/registry.cpp b/src/models/registry.cpp
+index ec452c0acd7f7172dd4be3cd45cdd78eb39afefb..629da65abe92965767580337c805c7f36b51556d 100644
+--- a/src/models/registry.cpp
++++ b/src/models/registry.cpp
+@@ -26,6 +26,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
+         return "Qwen4ExpForCausalLM";
+     case Architecture::Gemma4:
+         return "Gemma4ForCausalLM";
++    case Architecture::Glm5:
++        return "Glm5NextForCausalLM";
+     }
+     return {};
+ }
+diff --git a/src/models/registry.h b/src/models/registry.h
+index e141b258f08ca1b57b807b11fdd621475ba11d06..11b8894e1b483e8dc5d45c08f57bb320cb428653 100644
+--- a/src/models/registry.h
++++ b/src/models/registry.h
+@@ -4,9 +4,10 @@
+ 
+ namespace ninfer::models {
+ 
+-// Qwen4Exp (Qwen3.8-Flash-Next) and Gemma 4 are their own families (models/qwen4_exp,
+-// models/gemma4); the Qwen3.5 config parser never resolves them.
+-enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp, Gemma4 };
++// Qwen4Exp (Qwen3.8-Flash-Next), Gemma 4 and GLM5 (GLM-5.3-Flash) are their own
++// families (models/qwen4_exp, models/gemma4, models/glm5); the Qwen3.5 config
++// parser never resolves them.
++enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp, Gemma4, Glm5 };
+ 
+ [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
+                                                 std::string_view model_type);
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
 index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840e500ee56 100644
 --- a/src/ops/CMakeLists.txt
@@ -20874,13 +21244,14 @@ index b8d4e3dabc5fbb82bab450c135816c465c1f4167..8d8e528cf59fbc6416ce8acec4068748
      struct Impl;
      std::unique_ptr<Impl> impl_;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..42d8ff906b3784fb0e891c6f4d1e83225978850c 100644
+index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..e4e8a6f7d6d729f053ec8cba8891352e18f86a3f 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -9,10 +9,38 @@ include(cmake/BenchSupportTests.cmake)
+@@ -9,10 +9,39 @@ include(cmake/BenchSupportTests.cmake)
  include(models/qwen3_5/tests.cmake)
  include(models/qwen4_exp/tests.cmake)
  include(models/gemma4/tests.cmake)
++include(models/glm5/tests.cmake)
 +ninfer_add_test(ninfer_tool_constraints_test STANDALONE
 +  SOURCES models/qwen3_5/test_tool_constraints.cpp LIBRARIES ninfer_serve ninfer_model_runtime ninfer_text)
 +ninfer_stage_runtime_dlls(ninfer_tool_constraints_test)
@@ -20916,7 +21287,7 @@ index 02cfe0513466f9f1e78a264eb9a01e360c7542c2..42d8ff906b3784fb0e891c6f4d1e8322
  # Exit code 77 is a skip for every test (tests/cuda_availability.h). Without a usable CUDA device --
  # no GPU, no driver, or only the toolkit's stub driver, as on a CI runner -- a test that has no check
  # of its own fails on its first CUDA call with one of these runtime messages; report that as skipped
-@@ -21,8 +49,118 @@ ninfer_finalize_bundle(ninfer_tests)
+@@ -21,8 +50,118 @@ ninfer_finalize_bundle(ninfer_tests)
  get_property(_ninfer_all_tests DIRECTORY PROPERTY TESTS)
  set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_REGULAR_EXPRESSION
    "CUDA driver is a stub library;no CUDA-capable device is detected;CUDA driver version is insufficient for CUDA runtime version")
@@ -25681,6 +26052,117 @@ index 0000000000000000000000000000000000000000..dd5f61073c604a3a2c0ea2b968be070c
 +        return 1;
 +    }
 +}
+diff --git a/tests/fixtures/glm5/text_config.json b/tests/fixtures/glm5/text_config.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..555c7e75a6c8f1d034ab45f0ea4f76b5aaf36856
+--- /dev/null
++++ b/tests/fixtures/glm5/text_config.json
+@@ -0,0 +1,105 @@
++{
++  "architectures": [
++    "Glm5NextForCausalLM"
++  ],
++  "model_type": "glm5_next_text",
++  "hidden_size": 4096,
++  "vocab_size": 154880,
++  "num_hidden_layers": 45,
++  "max_position_embeddings": 1048576,
++  "tie_word_embeddings": false,
++  "rms_norm_eps": 1e-05,
++  "eos_token_id": [
++    154820,
++    154827,
++    154829
++  ],
++  "layer_types": [
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention",
++    "linear_attention",
++    "linear_attention",
++    "deepseek_sparse_attention",
++    "linear_attention"
++  ],
++  "first_k_dense_replace": 3,
++  "intermediate_size": 12288,
++  "swiglu_limit": 10.0,
++  "linear_attn_config": {
++    "num_heads": 64,
++    "head_dim": 128,
++    "short_conv_kernel_size": 4,
++    "gate_lower_bound": -5.0
++  },
++  "num_attention_heads": 64,
++  "num_key_value_heads": 64,
++  "qk_nope_head_dim": 256,
++  "qk_rope_head_dim": 0,
++  "v_head_dim": 256,
++  "q_lora_rank": 1536,
++  "kv_lora_rank": 512,
++  "attention_bias": false,
++  "mla_use_nope": true,
++  "index_n_heads": 32,
++  "index_head_dim": 128,
++  "index_kpool": 4,
++  "index_top_k": 2048,
++  "index_kpool_always_select_tail": true,
++  "index_kpool_compress": true,
++  "mhc": true,
++  "hc_mult": 4,
++  "hc_sinkhorn_iters": 20,
++  "hc_eps": 1e-06,
++  "n_routed_experts": 288,
++  "num_experts_per_tok": 8,
++  "moe_intermediate_size": 2048,
++  "n_shared_experts": 1,
++  "routed_scaling_factor": 2.5,
++  "norm_topk_prob": true,
++  "scoring_func": "sigmoid",
++  "topk_method": "noaux_tc",
++  "n_group": 1,
++  "topk_group": 1,
++  "moe_router_dtype": "float32",
++  "attention_dropout": 0.0,
++  "num_nextn_predict_layers": 1
++}
 diff --git a/tests/host/test_checkpoint_buffer_resident.cpp b/tests/host/test_checkpoint_buffer_resident.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..0da0ee9bf70bcb65f7decf6dc52758bfafd1044e
@@ -25889,6 +26371,163 @@ index 0000000000000000000000000000000000000000..9a1eb9dc784330f343c780a33fd5789b
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_config.cpp b/tests/models/glm5/test_config.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173cf26b8a9
+--- /dev/null
++++ b/tests/models/glm5/test_config.cpp
+@@ -0,0 +1,141 @@
++// parse_text_config on the GLM-5.3-Flash text config (tests/fixtures/glm5/
++// text_config.json, generated from the audited glm53-config evidence of
++// 2026-10-23) and its refusals: the audited geometry passes unchanged, and
++// every shape this engine does not implement is rejected by name.
++#include "models/glm5/config.h"
++
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++
++using namespace ninfer::models::glm5;
++using ninfer::artifact::Json;
++
++namespace {
++
++void require(bool condition, const std::string& message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++Json fixture() {
++    std::ifstream file(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/glm5/text_config.json");
++    require(file.good(), "fixture missing");
++    return Json::parse(file);
++}
++
++void expect_refusal(const std::function<void(Json&)>& edit, const std::string& label) {
++    Json config = fixture();
++    edit(config);
++    bool refused = false;
++    try {
++        (void)parse_text_config(config);
++    } catch (const ninfer::artifact::ArtifactError&) { refused = true; }
++    require(refused, "not refused: " + label);
++}
++
++void audited_geometry() {
++    const TextConfig config = parse_text_config(fixture());
++    require(config.num_hidden_layers == 45 && config.layer_types.size() == 45, "45 blocks");
++    std::size_t kda = 0, dsa = 0;
++    for (std::size_t i = 0; i < config.layer_types.size(); ++i) {
++        const bool sparse = config.layer_types[i] == MixerKind::Dsa;
++        require(sparse == (i % 4 == 3), "DSA every fourth block");
++        kda += !sparse;
++        dsa += sparse;
++    }
++    require(kda == 34 && dsa == 11, "34 KDA + 11 DSA");
++    require(config.hidden_size == 4096 && config.vocab_size == 154880, "hidden/vocab");
++    require(config.max_position_embeddings == 1048576, "1M positions");
++    require(!config.tie_word_embeddings && config.rms_norm_eps == 1e-5f, "norm/untied");
++    require(config.eos_token_ids.size() == 3 && config.eos_token_ids[0] == 154820, "eos list");
++
++    require(config.first_k_dense_replace == 3, "3 leading dense blocks");
++    require(config.mlp_is_sparse(0) == false && config.mlp_is_sparse(2) == false, "dense lead");
++    require(config.mlp_is_sparse(3) && config.mlp_is_sparse(44), "sparse rest");
++    require(config.intermediate_size == 12288 && config.swiglu_limit == 10.0f, "dense FFN");
++
++    require(config.linear_num_heads == 64 && config.linear_head_dim == 128, "KDA heads");
++    require(config.linear_conv_kernel == 4, "4-tap conv");
++    require(config.linear_gate_lower_bound == -5.0f, "gate lower bound");
++    require(config.linear_inner_width() == 8192, "KDA inner width");
++
++    require(config.num_attention_heads == 64 && config.num_key_value_heads == 64, "MLA heads");
++    require(config.qk_nope_head_dim == 256 && config.qk_rope_head_dim == 0, "NoPE only");
++    require(config.v_head_dim == 256 && config.q_lora_rank == 1536 && config.kv_lora_rank == 512,
++            "MLA latents");
++    require(!config.attention_bias, "no attention bias");
++
++    require(config.index_n_heads == 32 && config.index_head_dim == 128, "indexer heads");
++    require(config.index_kpool == 4 && config.index_top_k == 2048, "kpool/topk");
++    require(config.index_top_pools() == 512 && config.index_selection_width() == 2051,
++            "selection shape");
++    require(config.index_select_tail, "tail always selected");
++
++    require(config.hc_mult == 4 && config.hc_sinkhorn_iters == 20 && config.hc_eps == 1e-6f,
++            "mHC");
++    require(config.num_experts == 288 && config.num_experts_per_tok == 8, "experts");
++    require(config.moe_intermediate_size == 2048 && config.num_shared_experts == 1, "MoE FFN");
++    require(config.routed_scaling_factor == 2.5f && config.norm_topk_prob, "router");
++    require(config.num_nextn_predict_layers == 1, "one MTP layer recorded");
++}
++
++void refusals() {
++    expect_refusal([](Json& c) { c["model_type"] = "glm5_text"; }, "model type");
++    expect_refusal([](Json& c) { c["architectures"] = Json::array({"Glm5ForCausalLM"}); },
++                   "architecture");
++    expect_refusal([](Json& c) { c["layer_types"] = Json::array({"linear_attention"}); },
++                   "layer count mismatch");
++    expect_refusal([](Json& c) { c["layer_types"][3] = "full_attention"; }, "unknown layer type");
++    expect_refusal([](Json& c) { c["qk_rope_head_dim"] = 64; }, "rope component");
++    expect_refusal([](Json& c) { c["mla_use_nope"] = false; }, "mla nope off");
++    expect_refusal([](Json& c) { c["attention_bias"] = true; }, "attention bias");
++    expect_refusal([](Json& c) { c["num_attention_heads"] = 32; }, "GQA heads");
++    expect_refusal([](Json& c) { c["index_kpool"] = 8; }, "kpool");
++    expect_refusal([](Json& c) { c["index_top_k"] = 2050; }, "topk not whole pools");
++    expect_refusal([](Json& c) { c["index_kpool_always_select_tail"] = false; }, "tail off");
++    expect_refusal([](Json& c) { c["index_kpool_compress"] = false; }, "compress off");
++    expect_refusal([](Json& c) { c["mhc"] = false; }, "mhc off");
++    expect_refusal([](Json& c) { c["hc_mult"] = 6; }, "hc mult");
++    expect_refusal([](Json& c) { c["scoring_func"] = "softmax"; }, "router scoring");
++    expect_refusal([](Json& c) { c["topk_method"] = "greedy"; }, "topk method");
++    expect_refusal([](Json& c) { c["n_group"] = 8; }, "expert groups");
++    expect_refusal([](Json& c) { c["norm_topk_prob"] = false; }, "unnormalized weights");
++    expect_refusal([](Json& c) { c["moe_router_dtype"] = "bfloat16"; }, "router dtype");
++    expect_refusal([](Json& c) { c["attention_dropout"] = 0.1; }, "dropout");
++    expect_refusal([](Json& c) { c["linear_attn_config"]["gate_lower_bound"] = 5.0; },
++                   "positive gate bound");
++    expect_refusal([](Json& c) { c["linear_attn_config"]["short_conv_kernel_size"] = 3; },
++                   "conv width");
++    expect_refusal([](Json& c) { c["eos_token_id"] = 999999999; }, "eos beyond vocab");
++    expect_refusal([](Json& c) { c["num_experts_per_tok"] = 289; }, "topk beyond experts");
++    expect_refusal([](Json& c) { c["routed_scaling_factor"] = -1.0; }, "negative scaling");
++    expect_refusal([](Json& c) { c["first_k_dense_replace"] = 46; }, "dense lead beyond blocks");
++    expect_refusal([](Json& c) { c["swiglu_limit"] = 0.0; }, "zero swiglu limit");
++    // A missing required member refuses before any default can apply.
++    expect_refusal([](Json& c) { c.erase("kv_lora_rank"); }, "missing kv_lora_rank");
++}
++
++void eos_single_value_form() {
++    Json config = fixture();
++    config["eos_token_id"] = 154820;
++    const auto parsed = parse_text_config(config);
++    require(parsed.eos_token_ids.size() == 1 && parsed.eos_token_ids[0] == 154820,
++            "single eos accepted");
++}
++
++} // namespace
++
++int main() {
++    try {
++        audited_geometry();
++        refusals();
++        eos_single_value_form();
++        std::puts("GLM5 text config parses the audited GLM-5.3-Flash geometry strictly");
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}
+diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..f080ebc943b8cb8202e63efd4ca3928168980f0b
+--- /dev/null
++++ b/tests/models/glm5/tests.cmake
+@@ -0,0 +1,4 @@
++ninfer_add_test(ninfer_glm5_config_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
++  NEEDS_SOURCE_DIR
++  LIBRARIES ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
 --- a/tests/models/qwen3_5/test_engine_stages_real.cpp
