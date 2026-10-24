@@ -52,6 +52,15 @@ The native rectangular GEMM smoke is built for explicitly invoked Gaudi2 testing
 it has not run on hardware. Its full contract is in the prepared backend's
 `docs/gaudi2-bf16-gemm.md`. FP32 MME accumulation still rounds each output to BF16.
 
+The GEMM and the block-FP8 decoder are composed into a W8A16 linear
+(`docs/gaudi2-w8a16-linear.md` in the prepared backend): official block-scaled
+weights stay compressed on the host, one row tile is decoded to pinned BF16,
+uploaded and consumed by the full-K GEMM per tile, so no BF16 weight plane is
+ever materialized and tiling adds no accumulation boundary. Host tests compare
+against a bit-layout-derived FP64 oracle across multi-tile, partial-block and
+sub-block-tile shapes, and verify that injected first-tile launch failures leave
+the caller's output untouched.
+
 Windows MSVC host checks cover exact FP8 decoding, BF16 cast boundaries,
 nonaligned tile scales, bounded allocation, malformed inputs and asynchronous
 resource lifetimes. CI builds and runs the host suite on Linux and Windows.

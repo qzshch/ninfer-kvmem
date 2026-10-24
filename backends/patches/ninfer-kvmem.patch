@@ -874,6 +874,74 @@ index 0000000000000000000000000000000000000000..14c744f4d18a2d606f25842e3f240eb6
 +implemented and offline tested; physical MME execution, TPC dequantization,
 +GDN/full-KV, model generation and KVMem device integration remain to be qualified
 +or implemented. No throughput or HPU memory-peak claim is made.
+diff --git a/docs/gaudi2-w8a16-linear.md b/docs/gaudi2-w8a16-linear.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..36dbb7568a0aa3b70edbdd80a6828f8ac2c303e5
+--- /dev/null
++++ b/docs/gaudi2-w8a16-linear.md
+@@ -0,0 +1,62 @@
++# Native Gaudi2 W8A16 Block-FP8 Linear
++
++`src/ops/gaudi2/block_fp8_linear.h` composes the block-FP8 preparation and the
++[BF16 GEMM](gaudi2-bf16-gemm.md) into one explicit linear operator:
++
++```text
++A[M,K] BF16 words, W[N,K] official 128x128 block-FP8, scales[Bn,Bk] FP32
++-> Y[M,N] BF16 = A * transpose(dequant(W))
++```
++
++`BlockFp8Linear(device, m, {n,k}, tile_rows, max_workspace_bytes)` fixes one
++static GEMM recipe of `{M, tile_rows, K}` shared by every tile; `tile_rows`
++must divide `N` exactly. Per row tile, the exact
++[block decoder](gaudi2-preparation.md) fills one pinned BF16 staging plane from
++the caller's host codes/scales, one DMA uploads it, one launch consumes it and
++one download returns the `M x tile_rows` output block, gathered into the
++caller's output columns. The weight plane never exists as BF16 on host or
++device, and `run` publishes `y` only after every tile validated and completed.
++
++## Numerical contract
++
++Weights decode through the exact E4M3FN path (bias 7, subnormal step 2^-9, no
++inf, original multiplicative block scales) and round to BF16 words before the
++MME; the GEMM runs the full `K` per tile, so tiling adds **no accumulation
++boundary** beyond the single GEMM's own FP32-accumulate/BF16-round contract.
++Original checkpoint scales are preserved. This is deliberately the
++representation-preserving W8A16 path; it is not an FP8-MME/W8A8 execution, does
++not re-encode Gaudi2's native E4M3 range, and makes no dequant-throughput claim.
++
++Host dequantization of the staging tile is the first version. Moving it into a
++TPC kernel that keeps compressed codes on device is the follow-up; this operator
++does not foreclose it, because the staging and GEMM contracts stay tile-bounded.
++
++## Ownership and failure
++
++Fixed per-instance footprint: `M*K + tile*K + M*tile` BF16 words on host and
++device each, plus the output-bounded publish image; nothing scales with `N`
++beyond `y` itself. Input validation (plane lengths, output/input disjointness,
++finite nonnegative scales) happens before the first DMA. Tile decode validates
++every code before touching staging; the upload/launch/download sequence holds
++the runtime's DMA and compute leases, so a staging tile is never overwritten
++while its previous submission can still read it. A launch failure drains
++before unwinding and leaves `y` untouched; a rerun after an injected failure
++reproduces the oracle. Output is written once at the end from the staged image.
++
++## Build and evidence
++
++`ninfer-gaudi2-block-fp8-linear-test` (host preparation build, no CUDA or
++SynapseAI) runs the real operator over the private asynchronous fake API and
++checks an independent oracle that re-derives E4M3FN decoding from the bit
++layout, applies block scales and accumulates in FP64, allowing one BF16 ulp for
++the fake's FP32-FMA association. Fixtures cover a rectangular multi-tile case
++with partial 128-block edges on both axes (`2x384x260`, tile 128), a single
++token whose tile spans several blocks (`1x256x512`, tile 256) and a sub-block
++tile exercising half-block scale coverage on the row axis (`3x192x128`, tile
++64). Failure coverage includes invalid geometry, plane-length mismatches,
++negative/NaN scales, a first-tile injected launch failure and a post-failure
++rerun; every rejected run must leave the output bytes untouched.
++
++The operator source also compiles against verified official SynapseAI 1.24.1-482
++headers in the strict SDK object check. Physical DMA/MME execution, real-check
++point end-to-end accuracy and throughput remain unverified on Gaudi2 hardware.
 diff --git a/docs/gemma4.md b/docs/gemma4.md
 index ce79ebe92acfe76124a6dbff076f641837042799..c46fd0027a6bf43a08225bef9d6c30f05ad4a041 100644
 --- a/docs/gemma4.md
@@ -2520,10 +2588,10 @@ index e684873a87e7af4bf6caf173397458e047ec2620..86281fc34d9134d45fe4cce890d4b0e6
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..299e638cdd9b3741dfe0ebf3410ed1f2c11bdaa5
+index 0000000000000000000000000000000000000000..527c35224e6e26ca77522afc1d46841451070df0
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,90 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -2563,13 +2631,26 @@ index 0000000000000000000000000000000000000000..299e638cdd9b3741dfe0ebf3410ed1f2
 +  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
 +add_test(NAME ninfer-gaudi2-bf16-gemm COMMAND ninfer-gaudi2-bf16-gemm-test)
 +
++add_executable(ninfer-gaudi2-block-fp8-linear-test block_fp8.cpp runtime.cpp
++  ../../ops/gaudi2/bf16_gemm.cpp ../../ops/gaudi2/block_fp8_linear.cpp
++  tests/block_fp8_linear_test.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
++target_compile_features(ninfer-gaudi2-block-fp8-linear-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-block-fp8-linear-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-block-fp8-linear-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-block-fp8-linear COMMAND ninfer-gaudi2-block-fp8-linear-test)
++
 +if(NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
 +  find_path(NINFER_SYNAPSE_INCLUDE_DIR synapse_api.h
 +    HINTS "${NINFER_SYNAPSE_ROOT}" PATH_SUFFIXES include/habanalabs include)
 +  if(NOT NINFER_SYNAPSE_INCLUDE_DIR)
 +    message(FATAL_ERROR "Actual SynapseAI headers required: set NINFER_SYNAPSE_INCLUDE_DIR")
 +  endif()
-+  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp)
++  # block_fp8.cpp is Synapse-free but belongs to the object set so the native
++  # runtime archive links a future on-device W8A16 smoke without reshuffling.
++  add_library(ninfer_gaudi2_runtime_sdk_check OBJECT runtime.cpp block_fp8.cpp
++    ../../ops/gaudi2/bf16_gemm.cpp ../../ops/gaudi2/block_fp8_linear.cpp)
 +  target_compile_features(ninfer_gaudi2_runtime_sdk_check PRIVATE cxx_std_20)
 +  if(MSVC)
 +    # The official SDK headers contain UTF-8 comments. Their decoding must not
@@ -3751,6 +3832,176 @@ index 0000000000000000000000000000000000000000..6c5aacb337d35ca3409bfc369310d480
 +        construction_failures(); fake_synapse::assert_clean(); launch_failures(); fake_synapse::assert_clean();
 +        std::cout << "offline GEMM graph, FP64 oracle and asynchronous ownership checks passed\n";
 +    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
++}
+diff --git a/src/core/gaudi2/tests/block_fp8_linear_test.cpp b/src/core/gaudi2/tests/block_fp8_linear_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..62d25a84c882c9d4089d429a60fa8200cd61073d
+--- /dev/null
++++ b/src/core/gaudi2/tests/block_fp8_linear_test.cpp
+@@ -0,0 +1,164 @@
++#include "ops/gaudi2/block_fp8_linear.h"
++#include "control.h"
++
++#include <bit>
++#include <cmath>
++#include <cstring>
++#include <cstdio>
++#include <iostream>
++#include <limits>
++#include <vector>
++
++using namespace ninfer::gaudi2;
++namespace {
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++template<class Exception, class F> void rejects(F&& f) {
++    try { f(); } catch (const Exception&) { return; }
++    throw std::runtime_error("block-FP8 linear expected exception was not raised");
++}
++float decode(std::uint16_t word) { return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16); }
++std::uint16_t nearest(double value) {
++    const auto f = static_cast<float>(value);
++    const auto prefix = std::bit_cast<std::uint32_t>(f) >> 16;
++    const double d0 = std::abs(value - decode(static_cast<std::uint16_t>(prefix)));
++    const double d1 = std::abs(value - decode(static_cast<std::uint16_t>(prefix + 1)));
++    return static_cast<std::uint16_t>(d0 < d1 || (d0 == d1 && !(prefix & 1)) ? prefix : prefix + 1);
++}
++
++// Deterministic planes: codes from a small signed grid (0x7f excluded by the
++// decoder), scales as exact powers of two so tile products stay in FP64 range.
++struct Fixture {
++    std::size_t m, n, k, tile;
++    std::vector<std::uint16_t> a;
++    std::vector<std::uint8_t> codes;
++    std::vector<float> scales;
++    Fixture(std::size_t m_, std::size_t n_, std::size_t k_, std::size_t tile_)
++        : m(m_), n(n_), k(k_), tile(tile_), a(m_ * k_), codes(n_ * k_), scales((n_ / 128 + (n_ % 128 != 0)) * (k_ / 128 + (k_ % 128 != 0))) {
++        for (std::size_t i = 0; i < a.size(); ++i) a[i] = nearest(-1.0 + 0.5 * static_cast<double>((i * 7) % 5));
++        for (std::size_t i = 0; i < codes.size(); ++i) codes[i] = static_cast<std::uint8_t>((i * 11 + 3) % 0x7e);
++        for (std::size_t i = 0; i < scales.size(); ++i)
++            scales[i] = std::exp2(static_cast<float>(static_cast<int>((i * 5) % 9) - 6));
++    }
++};
++
++// Independent oracle: per-element E4M3FN decode re-derived from the bit layout
++// (bias 7, subnormal step 2^-9, no inf in E4M3FN), block-scale lookup and an
++// FP64 dot per output element, rounded the way the fake MME rounds.
++std::vector<std::uint16_t> oracle(const Fixture& f) {
++    const auto element = [&](std::size_t index) {
++        const std::uint8_t code = f.codes[index];
++        const int exponent = (code >> 3) & 0x0f, mantissa = code & 7;
++        double value;
++        if (exponent == 0) value = std::ldexp(mantissa, -9);
++        else value = std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
++        if (code & 0x80) value = -value;
++        return value;
++    };
++    const auto scale_at = [&](std::size_t row, std::size_t column) {
++        return static_cast<double>(f.scales[(row / 128) * ((f.k + 127) / 128) + column / 128]);
++    };
++    std::vector<std::uint16_t> y(f.m * f.n);
++    for (std::size_t r = 0; r < f.m; ++r)
++        for (std::size_t c = 0; c < f.n; ++c) {
++            double sum = 0;
++            for (std::size_t inner = 0; inner < f.k; ++inner)
++                sum += decode(f.a[r * f.k + inner]) *
++                       decode(nearest(element(c * f.k + inner) * scale_at(c, inner)));
++            y[r * f.n + c] = nearest(sum);
++        }
++    return y;
++}
++
++// One signed-magnitude BF16 ulp of slack for the FP32-fma vs FP64 association.
++std::uint16_t monotonic(std::uint16_t word) {
++    return word ^ ((word >> 15) ? 0xffffu : 0u);
++}
++bool within_one_ulp(std::uint16_t got, std::uint16_t want) {
++    if (got == want) return true;
++    if (decode(got) == 0 && decode(want) == 0) return true;
++    const auto distance = static_cast<int>(monotonic(got)) - static_cast<int>(monotonic(want));
++    return distance >= -1 && distance <= 1;
++}
++
++void run_case(const Fixture& f) {
++    {
++        Device device; auto stream = device.create_stream();
++        BlockFp8Linear linear(device, f.m, BlockFp8Matrix{f.n, f.k}, f.tile, 1 << 20);
++        require(linear.rows() == f.n && linear.columns() == f.k && linear.tile_rows() == f.tile,
++                "linear geometry");
++        std::vector<std::uint16_t> y(f.m * f.n, 0xdead);
++        linear.run(stream, f.a, f.codes, f.scales, y);
++        const auto expected = oracle(f);
++        for (std::size_t i = 0; i < y.size(); ++i)
++            if (!within_one_ulp(y[i], expected[i])) {
++                std::fprintf(stderr, "m=%zu n=%zu k=%zu tile=%zu i=%zu (r=%zu,c=%zu) got=%04x want=%04x "
++                                     "(%g vs %g)\n", f.m, f.n, f.k, f.tile, i, i / f.n, i % f.n,
++                             y[i], expected[i], decode(y[i]), decode(expected[i]));
++                throw std::runtime_error("W8A16 result differs from the independent oracle");
++            }
++    }
++    fake_synapse::assert_clean();
++}
++
++void math_and_tiling() {
++    // Rectangular multi-tile case with partial 128-block edges on both axes.
++    run_case(Fixture{2, 384, 260, 128});
++    // Decode-like shape: one token, single tile spanning several blocks.
++    run_case(Fixture{1, 256, 512, 256});
++    // tile < 128 exercises half-block scale coverage on the row axis.
++    run_case(Fixture{3, 192, 128, 64});
++}
++
++void invalid_and_failure_paths() {
++    const Fixture f{1, 256, 128, 128};
++    std::vector<std::uint16_t> y(f.m * f.n, 0xdead);
++    {
++        Device device; auto stream = device.create_stream();
++        rejects<std::invalid_argument>([&] {
++            BlockFp8Linear linear(device, 0, BlockFp8Matrix{f.n, f.k}, f.tile, 1 << 20); (void)linear;
++        });
++        rejects<std::invalid_argument>([&] {
++            BlockFp8Linear linear(device, f.m, BlockFp8Matrix{257, f.k}, 128, 1 << 20); (void)linear;
++        });
++        BlockFp8Linear linear(device, f.m, BlockFp8Matrix{f.n, f.k}, f.tile, 1 << 20);
++        rejects<std::invalid_argument>([&] {
++            (void)linear.run(stream, std::span(f.a).first(f.a.size() - 1), f.codes, f.scales, y);
++        });
++        rejects<std::invalid_argument>([&] {
++            (void)linear.run(stream, f.a, std::span(f.codes).first(f.codes.size() - 1), f.scales, y);
++        });
++        auto poisoned = f.scales; poisoned[1] = -1;
++        rejects<std::invalid_argument>([&] { (void)linear.run(stream, f.a, f.codes, poisoned, y); });
++        poisoned = f.scales; poisoned[0] = std::numeric_limits<float>::quiet_NaN();
++        rejects<std::invalid_argument>([&] { (void)linear.run(stream, f.a, f.codes, poisoned, y); });
++        require(y == std::vector<std::uint16_t>(f.m * f.n, 0xdead), "rejected runs must not publish");
++
++        // A failed launch in the FIRST tile must leave y untouched.
++        fake_synapse::fail_next("synLaunchWithExternalEventsExt");
++        try {
++            linear.run(stream, f.a, f.codes, f.scales, y);
++            throw std::runtime_error("injected launch failure was not raised");
++        } catch (const SynapseError&) {
++        }
++        require(y == std::vector<std::uint16_t>(f.m * f.n, 0xdead), "failed run published output");
++
++        // Happy path again after the injection, to prove no state leaked.
++        linear.run(stream, f.a, f.codes, f.scales, y);
++        const auto expected = oracle(f);
++        for (std::size_t i = 0; i < y.size(); ++i)
++            require(within_one_ulp(y[i], expected[i]), "post-failure rerun diverges from the oracle");
++    }
++    fake_synapse::assert_clean();
++}
++} // namespace
++
++int main() {
++    try {
++        math_and_tiling();
++        invalid_and_failure_paths();
++        std::puts("block-FP8 W8A16 linear matches the independent oracle across tiles");
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n'; return 1;
++    }
 +}
 diff --git a/src/core/gaudi2/tests/fake_synapse/control.h b/src/core/gaudi2/tests/fake_synapse/control.h
 new file mode 100644
@@ -13306,6 +13557,162 @@ index 0000000000000000000000000000000000000000..a1a318e0b5a233cf5cf0212eda38569b
 +        return 0;
 +    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 +}
+diff --git a/src/ops/gaudi2/block_fp8_linear.cpp b/src/ops/gaudi2/block_fp8_linear.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf562feca1194d12db9449ccc17fdc29dda843f8
+--- /dev/null
++++ b/src/ops/gaudi2/block_fp8_linear.cpp
+@@ -0,0 +1,96 @@
++#include "block_fp8_linear.h"
++
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <utility>
++
++namespace ninfer::gaudi2 {
++namespace {
++std::size_t multiply(std::size_t a, std::size_t b) {
++    if (!a || !b || b > std::numeric_limits<std::size_t>::max() / a)
++        throw std::overflow_error("block-FP8 linear size overflow");
++    return a * b;
++}
++bool disjoint(std::uintptr_t left_begin, std::uintptr_t left_end,
++             std::uintptr_t right_begin, std::uintptr_t right_end) {
++    return left_begin >= right_end || right_begin >= left_end;
++}
++}
++
++BlockFp8Linear::BlockFp8Linear(const Device& device, std::size_t m, const BlockFp8Matrix& weights,
++                               std::size_t tile_rows, std::size_t max_workspace_bytes)
++    : device_(device), weights_(weights), m_(m), tile_rows_(tile_rows),
++      gemm_(device, Bf16GemmShape{m, tile_rows, weights.columns}, max_workspace_bytes) {
++    if (!m) throw std::invalid_argument("block-FP8 linear needs a positive token count");
++    if (!tile_rows || weights.rows % tile_rows)
++        throw std::invalid_argument("block-FP8 linear tile must divide the weight rows exactly");
++    // Every tile shares one static GEMM recipe, so the staged planes are fixed.
++    a_host_ = device.allocate_host(multiply(m_, weights_.columns) * 2);
++    w_host_ = device.allocate_host(multiply(tile_rows_, weights_.columns) * 2);
++    y_host_ = device.allocate_host(multiply(m_, tile_rows_) * 2);
++    a_device_ = device.allocate_device(a_host_.size());
++    w_device_ = device.allocate_device(w_host_.size());
++    y_device_ = device.allocate_device(y_host_.size());
++    y_result_.resize(multiply(m_, weights_.rows));
++}
++
++std::size_t BlockFp8Linear::device_bytes() const noexcept {
++    return a_device_.size() + w_device_.size() + y_device_.size();
++}
++std::size_t BlockFp8Linear::host_bytes() const noexcept {
++    // Pinned staging plus the output-bounded publish image (same order as y).
++    return a_host_.size() + w_host_.size() + y_host_.size() + y_result_.size() * 2;
++}
++
++void BlockFp8Linear::run(Stream& stream, std::span<const std::uint16_t> a,
++                         std::span<const std::uint8_t> codes, std::span<const float> scales,
++                         std::span<std::uint16_t> y) {
++    if (a.size() != multiply(m_, weights_.columns) || codes.size() != weights_.code_bytes() ||
++        scales.size() * sizeof(float) != weights_.scale_bytes() || y.size() != y_result_.size())
++        throw std::invalid_argument("block-FP8 linear plane length mismatch");
++    const auto y_begin = reinterpret_cast<std::uintptr_t>(y.data());
++    const auto y_end = y_begin + y.size() * sizeof(std::uint16_t);
++    if (!disjoint(y_begin, y_end, reinterpret_cast<std::uintptr_t>(codes.data()),
++                  reinterpret_cast<std::uintptr_t>(codes.data() + codes.size())) ||
++        !disjoint(y_begin, y_end, reinterpret_cast<std::uintptr_t>(scales.data()),
++                  reinterpret_cast<std::uintptr_t>(scales.data() + scales.size())))
++        throw std::invalid_argument("block-FP8 linear output must not overlap its input planes");
++    for (const auto scale : scales)
++        if (!std::isfinite(scale) || scale < 0)
++            throw std::invalid_argument("block-FP8 linear scales must be finite and nonnegative");
++
++    std::memcpy(a_host_.bytes().data(), a.data(), a_host_.size());
++    auto upload_a = stream.upload(a_device_, a_host_, a_host_.size());
++    upload_a.wait();
++
++    const std::size_t scale_columns = weights_.scale_columns();
++    for (std::size_t row = 0; row < weights_.rows; row += tile_rows_) {
++        const BlockFp8Tile tile{weights_, row, 0, tile_rows_, weights_.columns};
++        // decode_block_fp8_tile validates every code and scale of this tile and
++        // leaves the staging plane untouched until all values pass.
++        decode_block_fp8_tile(tile,
++                              std::span<const std::uint8_t>(codes.data() + row * weights_.columns,
++                                                            tile.elements()),
++                              std::span<const float>(scales.data() + (row / 128) * scale_columns,
++                                                     tile.scale_elements()),
++                              std::span<std::uint16_t>(reinterpret_cast<std::uint16_t*>(
++                                                           w_host_.bytes().data()),
++                                                       w_host_.size() / 2));
++        auto upload_w = stream.upload(w_device_, w_host_, w_host_.size());
++        upload_w.wait();
++        auto execution = gemm_.launch(stream, a_device_, w_device_, y_device_);
++        execution.wait();
++        auto download = stream.download(y_host_, y_device_, y_host_.size());
++        download.wait();
++        // Column block [row, row+tile_rows) of every output row: strided gather.
++        const auto staged = reinterpret_cast<const std::uint16_t*>(y_host_.bytes().data());
++        for (std::size_t token = 0; token < m_; ++token)
++            std::memcpy(y_result_.data() + token * weights_.rows + row,
++                        staged + token * tile_rows_, tile_rows_ * sizeof(std::uint16_t));
++    }
++    std::memcpy(y.data(), y_result_.data(), y_result_.size() * sizeof(std::uint16_t));
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/ops/gaudi2/block_fp8_linear.h b/src/ops/gaudi2/block_fp8_linear.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3145b213678604258b3af956eeba2fd362a60283
+--- /dev/null
++++ b/src/ops/gaudi2/block_fp8_linear.h
+@@ -0,0 +1,48 @@
++#pragma once
++#include "core/gaudi2/runtime.h"
++#include "core/gaudi2/block_fp8.h"
++#include "bf16_gemm.h"
++
++#include <cstddef>
++#include <span>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++// One W8A16 linear against an official 128x128 block-FP8 checkpoint plane:
++// Y[M,N] = A[M,K] * dequant(W[N,K])^T with A/Y in BF16 words.
++//
++// The weight plane never exists as BF16 anywhere. Per row tile of tile_rows
++// weights, the exact block decoder fills one pinned BF16 staging tile, one DMA
++// uploads it and one closed BF16 GEMM (full K, so no cross-tile accumulation
++// rounding) consumes it. Original block scales are preserved; this is NOT an
++// FP8-MME/W8A8 execution and never re-encodes Gaudi2's native FP8 range.
++class BlockFp8Linear {
++public:
++    BlockFp8Linear(const Device& device, std::size_t m, const BlockFp8Matrix& weights,
++                   std::size_t tile_rows, std::size_t max_workspace_bytes);
++    [[nodiscard]] std::size_t rows() const noexcept { return weights_.rows; }
++    [[nodiscard]] std::size_t columns() const noexcept { return weights_.columns; }
++    [[nodiscard]] std::size_t tile_rows() const noexcept { return tile_rows_; }
++    // Fixed per-instance footprint: activation upload + weight tile + output tile
++    // on both host and device, independent of N; host_bytes additionally counts
++    // the output-bounded publish image (same order as y itself).
++    [[nodiscard]] std::size_t device_bytes() const noexcept;
++    [[nodiscard]] std::size_t host_bytes() const noexcept;
++
++    // a is [m,k] row-major BF16 words, codes the full [n,k] plane, scales the
++    // full block-scale plane; y is [m,n] row-major and is published only after
++    // every tile validated and completed. Any throw leaves y untouched.
++    void run(Stream& stream, std::span<const std::uint16_t> a, std::span<const std::uint8_t> codes,
++             std::span<const float> scales, std::span<std::uint16_t> y);
++private:
++    Device device_;
++    BlockFp8Matrix weights_;
++    std::size_t m_, tile_rows_;
++    Bf16Gemm gemm_;
++    PinnedBuffer a_host_, w_host_, y_host_;
++    DeviceBuffer a_device_, w_device_, y_device_;
++    std::vector<std::uint16_t> y_result_;
++};
++
++} // namespace ninfer::gaudi2
 diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
 index 80ee5321d2b1b221c3ada74a7471b38751cbed6b..80b0242580da3f3a35eae487698ae7d718927b2d 100644
 --- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
