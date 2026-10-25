@@ -1832,6 +1832,73 @@ index 04fd6f91228536646cb58dcf784382e3c8a74960..6bddc8ff2fbd4b2920b611b0a24c683a
   * allocation, and does not read query or generate token output. The four record planes are
   * read-only, disjoint, and do not overlap either state region.
   */
+diff --git a/include/ninfer/ops/glm5_kda.h b/include/ninfer/ops/glm5_kda.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..f86b73551ff41f501e11234e98c7a89b4ee2dfac
+--- /dev/null
++++ b/include/ninfer/ops/glm5_kda.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cuda_runtime.h> // cudaStream_t
++
++namespace ninfer::ops {
++
++/**
++ * Prepares GLM-5.3-Flash KDA gates for T tokens (the safe path):
++ *
++ *   gate[t, h*D+i] = lower_bound * sigmoid(exp(A_log[h]) * a[t, h*D+i])   (LOG space, <= 0)
++ *   beta[t, h]     = sigmoid(b[t, h]).
++ *
++ * `a` is the already-summed f_b(f_a(x)) + dt_bias plane as contiguous BF16 [D_inner, T]
++ * (fastest dimension the inner width), `b` contiguous BF16 [H, T], `A_log` contiguous FP32 [H]
++ * and `lower_bound` negative finite FP32. `gate` is contiguous FP32 [D_inner, T] and `beta`
++ * contiguous FP32 [H, T]. The oracle evaluates the formula naively in FP64 from the represented
++ * input; transcendental implementation and intermediate precision are private kernel choices.
++ * Inputs and outputs must be mutually non-overlapping. No workspace or persistent state.
++ */
++void glm5_kda_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, float lower_bound,
++                     Tensor& gate, Tensor& beta, cudaStream_t stream);
++
++/**
++ * One KDA block's causal per-channel short conv followed by SiLU, over T tokens:
++ *
++ *   out[t, c] = silu(sum_tap w[c, tap] * window(t - (K-1) + tap, c))
++ *
++ * with the window reading the [K-1, D_inner] FP32 conv_state (oldest tap first) before the
++ * token plane, and conv_state advanced to the last K-1 columns of [conv_state | x]. `x` and
++ * `out` are contiguous BF16 [D_inner, T], `w` is the GGUF layout contiguous BF16 [K, D_inner]
++ * (fastest dimension the taps: w[c*K + tap]), `conv_state` is contiguous FP32 [D_inner, K-1]
++ * and is updated in place only after the whole plane computes. Padding-free: T >= 1.
++ */
++void glm5_kda_conv(const Tensor& x, const Tensor& w, Tensor& conv_state, Tensor& out,
++                   cudaStream_t stream);
++
++/**
++ * One single-token KDA decode step over every head at once (the recurrent
++ * algorithm; chunk prefill is a separate future op):
++ *
++ *   qh = l2norm(q_h) * dk^-0.5 ; kh = l2norm(k_h)                  (eps 1e-6)
++ *   S[i, :] *= exp(gate_h[i])                                       (key-axis rows)
++ *   u[j]    = sum_i S[i, j] * kh[i]
++ *   delta[j]= beta_h * (v_h[j] - u[j])
++ *   S[i, j]+= kh[i] * delta[j]
++ *   o_h[j]  = sum_i S[i, j] * qh[i]
++ *   out_h   = rms(o_h) * o_norm_w * sigmoid(g2_h)                   (eps 1e-6, FP32)
++ *
++ * `q`, `k`, `v`, `g2` are contiguous BF16 [D_inner] (head h at h*D..h*D+D), `gate` is
++ * contiguous FP32 [D_inner] in LOG space, `beta` contiguous FP32 [H], `o_norm_w` contiguous
++ * FP32 [D], and `state` is contiguous FP32 [H, D, D] (row = key axis), updated in place.
++ * `out` is contiguous BF16 [D_inner]. D must be <= 256. The oracle is the host reference
++ * (models/glm5/reference/kda_reference) in FP32; kernel reduction order is a private choice.
++ */
++void glm5_kda_decode_step(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
++                          const Tensor& beta, const Tensor& g2, const Tensor& o_norm_w,
++                          Tensor& state, Tensor& out, cudaStream_t stream);
++
++} // namespace ninfer::ops
 diff --git a/include/ninfer/ops/sliding_window_attention.h b/include/ninfer/ops/sliding_window_attention.h
 index 970484a9f364f2df4f864356c7120238ba7159d6..d1b4aef49a7a9355d2ca0e667011694116284edc 100644
 --- a/include/ninfer/ops/sliding_window_attention.h
@@ -15019,10 +15086,10 @@ index e141b258f08ca1b57b807b11fdd621475ba11d06..11b8894e1b483e8dc5d45c08f57bb320
  [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
                                                  std::string_view model_type);
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
-index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840e500ee56 100644
+index 0a3dc7967cd900c2744ebf48914438e68815f1c4..511ee2bded26318f02b399f4dfcea9078042a752 100644
 --- a/src/ops/CMakeLists.txt
 +++ b/src/ops/CMakeLists.txt
-@@ -22,6 +22,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+@@ -22,11 +22,13 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
  endif()
  
  include(basic_sources.cmake)
@@ -15030,6 +15097,12 @@ index 0a3dc7967cd900c2744ebf48914438e68815f1c4..5b1e8e9fff32e092e6e51b743d27c840
  include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj/sources.cmake")
++include("${CMAKE_CURRENT_LIST_DIR}/glm5_kda/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/kv_cache/sources.cmake")
+ include("${CMAKE_CURRENT_LIST_DIR}/linear/sources.cmake")
 diff --git a/src/ops/gaudi2/bf16_gemm.cpp b/src/ops/gaudi2/bf16_gemm.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..d609be982ea18c3147601310dfba13a6e1c92471
@@ -15549,6 +15622,352 @@ index d2fab2d6b02eb12b86f80292965196f0f27d234a..b7d07fd0faf5d08a71d082e2e9a9bd80
 +    CUDA_CHECK(cudaMemcpyAsync(record.data,projected.data,projected.bytes(),cudaMemcpyDeviceToDevice,stream));
 +    detail::gdn_projected_conv_record_launch(record,weight,states,valid,initial_slots,query,key,value,stream);
 +}
++} // namespace ninfer::ops
+diff --git a/src/ops/glm5_kda/glm5_kda.cu b/src/ops/glm5_kda/glm5_kda.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bf2bed9522a2d0c5f3575d545a7fb9a2330c3fd
+--- /dev/null
++++ b/src/ops/glm5_kda/glm5_kda.cu
+@@ -0,0 +1,147 @@
++// ninfer::ops - GLM-5.3-Flash KDA launchers (decode path).
++#include "ninfer/ops/glm5_kda.h"
++
++#include "ops/kernel/glm5_kda.cuh"
++#include "core/device.h"
++
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::ops {
++
++namespace {
++
++void require_contiguous(const Tensor& tensor, const char* what) {
++    if (!tensor.is_contiguous()) { throw std::invalid_argument(std::string(what) + " must be contiguous"); }
++}
++
++void require_shape(const Tensor& tensor, DType dtype, std::initializer_list<std::int32_t> shape,
++                   const char* what) {
++    require_contiguous(tensor, what);
++    if (tensor.dtype != dtype) {
++        throw std::invalid_argument(std::string(what) + " has the wrong dtype");
++    }
++    int index = 0;
++    for (const auto extent : shape) {
++        if (tensor.ne[index] != extent) {
++            throw std::invalid_argument(std::string(what) + " has the wrong shape");
++        }
++        ++index;
++    }
++}
++
++std::int32_t dim0(const Tensor& tensor) { return tensor.ne[0]; }
++std::int32_t dim1(const Tensor& tensor) { return tensor.ne[1]; }
++
++void require_disjoint(const Tensor& a, const Tensor& b) {
++    const auto a_begin = reinterpret_cast<std::uintptr_t>(a.data);
++    const auto b_begin = reinterpret_cast<std::uintptr_t>(b.data);
++    const auto a_end = a_begin + a.bytes();
++    const auto b_end = b_begin + b.bytes();
++    if (a_begin < b_end && b_begin < a_end) {
++        throw std::invalid_argument("glm5_kda operands must not overlap");
++    }
++}
++
++} // namespace
++
++void glm5_kda_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, float lower_bound,
++                     Tensor& gate, Tensor& beta, cudaStream_t stream) {
++    const std::int32_t d_inner = dim1(a);
++    const std::int32_t tokens = dim0(a);
++    const std::int32_t heads = dim1(b);
++    if (d_inner <= 0 || tokens <= 0 || heads <= 0 || d_inner % heads != 0) {
++        throw std::invalid_argument("glm5_kda_gating: a [T, d_inner] and b [T, heads] disagree");
++    }
++    require_shape(a, DType::BF16, {tokens, d_inner}, "glm5_kda_gating: a");
++    require_shape(b, DType::BF16, {tokens, heads}, "glm5_kda_gating: b");
++    require_shape(A_log, DType::FP32, {heads}, "glm5_kda_gating: A_log");
++    require_shape(gate, DType::FP32, {tokens, d_inner}, "glm5_kda_gating: gate");
++    require_shape(beta, DType::FP32, {tokens, heads}, "glm5_kda_gating: beta");
++    if (!std::isfinite(lower_bound) || lower_bound >= 0) {
++        throw std::invalid_argument("glm5_kda_gating: lower_bound must be negative finite");
++    }
++    require_disjoint(a, gate); require_disjoint(a, beta);
++    require_disjoint(b, gate); require_disjoint(b, beta);
++
++    const std::int64_t gate_elements = static_cast<std::int64_t>(tokens) * d_inner;
++    const auto gate_blocks = static_cast<unsigned int>(
++        (gate_elements + glm5_kda_detail::kElementThreads - 1) / glm5_kda_detail::kElementThreads);
++    glm5_kda_detail::decay_gate_kernel<<<gate_blocks, glm5_kda_detail::kElementThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(a.data), static_cast<const float*>(A_log.data),
++        lower_bound, d_inner, d_inner / heads, gate_elements,
++        static_cast<float*>(gate.data));
++    const std::int64_t beta_elements = static_cast<std::int64_t>(tokens) * heads;
++    const auto beta_blocks = static_cast<unsigned int>(
++        (beta_elements + glm5_kda_detail::kElementThreads - 1) / glm5_kda_detail::kElementThreads);
++    glm5_kda_detail::beta_kernel<<<beta_blocks, glm5_kda_detail::kElementThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(b.data), beta_elements,
++        static_cast<float*>(beta.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_kda_conv(const Tensor& x, const Tensor& w, Tensor& conv_state, Tensor& out,
++                   cudaStream_t stream) {
++    const std::int32_t d_inner = dim1(x);
++    const std::int32_t tokens = dim0(x);
++    const std::int32_t taps = dim0(w);
++    if (d_inner <= 0 || tokens <= 0 || taps < 2 || taps > 8) {
++        throw std::invalid_argument("glm5_kda_conv: bad x/w geometry");
++    }
++    require_shape(x, DType::BF16, {tokens, d_inner}, "glm5_kda_conv: x");
++    require_shape(w, DType::BF16, {taps, d_inner}, "glm5_kda_conv: w");
++    require_shape(conv_state, DType::FP32, {taps - 1, d_inner}, "glm5_kda_conv: conv_state");
++    require_shape(out, DType::BF16, {tokens, d_inner}, "glm5_kda_conv: out");
++    require_disjoint(x, out); require_disjoint(x, conv_state); require_disjoint(w, out);
++
++    const std::int64_t elements = static_cast<std::int64_t>(tokens) * d_inner;
++    const auto blocks = static_cast<unsigned int>(
++        (elements + glm5_kda_detail::kElementThreads - 1) / glm5_kda_detail::kElementThreads);
++    glm5_kda_detail::conv_kernel<<<blocks, glm5_kda_detail::kElementThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(w.data),
++        static_cast<const float*>(conv_state.data), d_inner, taps, tokens,
++        static_cast<__nv_bfloat16*>(out.data));
++    const auto slide_blocks = static_cast<unsigned int>(
++        (d_inner + glm5_kda_detail::kElementThreads - 1) / glm5_kda_detail::kElementThreads);
++    glm5_kda_detail::conv_slide_kernel<<<slide_blocks, glm5_kda_detail::kElementThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(conv_state.data),
++        d_inner, taps, tokens, static_cast<float*>(conv_state.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_kda_decode_step(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
++                          const Tensor& beta, const Tensor& g2, const Tensor& o_norm_w,
++                          Tensor& state, Tensor& out, cudaStream_t stream) {
++    const std::int32_t d_inner = dim0(q);
++    const std::int32_t heads = dim0(beta);
++    if (d_inner <= 0 || heads <= 0 || d_inner % heads != 0) {
++        throw std::invalid_argument("glm5_kda_decode_step: bad q/beta geometry");
++    }
++    const std::int32_t dk = d_inner / heads;
++    if (dk <= 0 || dk > glm5_kda_detail::kDecodeBlock) {
++        throw std::invalid_argument("glm5_kda_decode_step: head dim must be <= 256");
++    }
++    require_shape(q, DType::BF16, {d_inner}, "glm5_kda_decode_step: q");
++    require_shape(k, DType::BF16, {d_inner}, "glm5_kda_decode_step: k");
++    require_shape(v, DType::BF16, {d_inner}, "glm5_kda_decode_step: v");
++    require_shape(gate, DType::FP32, {d_inner}, "glm5_kda_decode_step: gate");
++    require_shape(beta, DType::FP32, {heads}, "glm5_kda_decode_step: beta");
++    require_shape(g2, DType::BF16, {d_inner}, "glm5_kda_decode_step: g2");
++    require_shape(o_norm_w, DType::FP32, {dk}, "glm5_kda_decode_step: o_norm_w");
++    require_shape(state, DType::FP32, {dk, dk, heads}, "glm5_kda_decode_step: state");
++    require_shape(out, DType::BF16, {d_inner}, "glm5_kda_decode_step: out");
++    require_disjoint(q, out); require_disjoint(k, out); require_disjoint(v, out);
++    require_disjoint(g2, out);
++
++    glm5_kda_detail::decode_step_kernel<<<static_cast<unsigned int>(heads),
++                                          glm5_kda_detail::kDecodeBlock, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
++        static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(gate.data),
++        static_cast<const float*>(beta.data), static_cast<const __nv_bfloat16*>(g2.data),
++        static_cast<const float*>(o_norm_w.data), static_cast<float*>(state.data),
++        static_cast<__nv_bfloat16*>(out.data), dk);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/glm5_kda/sources.cmake b/src/ops/glm5_kda/sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..99bb2a821f6eb210f7fddedc5595d6445a2db8f6
+--- /dev/null
++++ b/src/ops/glm5_kda/sources.cmake
+@@ -0,0 +1,3 @@
++target_sources(ninfer_ops PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/glm5_kda.cu"
++)
+diff --git a/src/ops/kernel/glm5_kda.cuh b/src/ops/kernel/glm5_kda.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c6a1b44686ae3c7936cec990ccd82b635de5e68
+--- /dev/null
++++ b/src/ops/kernel/glm5_kda.cuh
+@@ -0,0 +1,178 @@
++#pragma once
++
++// ninfer::ops - GLM-5.3-Flash KDA kernels: safe-path gating, the causal short conv with SiLU,
++// and the single-token recurrent decode step. All arithmetic FP32; inputs are BF16 where the
++// engine's tensor flow carries them. The math follows models/glm5/reference (the audited GLM-5.3
++// semantics cross-checked against FLA, llama.cpp and Maya). This is the decode path: clarity
++// over throughput, one token at a time.
++
++#include "ops/common/warp.cuh"
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops {
++namespace glm5_kda_detail {
++
++constexpr int kDecodeBlock = 256;   // one head per block, dk <= 256
++constexpr int kElementThreads = 256;
++
++__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
++
++// gate[t, c] = lower_bound * sigmoid(exp(A_log[c / dk]) * a[t, c]) over the [d_inner, T] plane.
++__global__ void decay_gate_kernel(const __nv_bfloat16* __restrict__ a,
++                                  const float* __restrict__ a_log, float lower_bound,
++                                  std::int32_t d_inner, std::int32_t dk, std::int64_t elements,
++                                  float* __restrict__ gate) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= elements) { return; }
++    const std::int32_t channel = static_cast<std::int32_t>(index % d_inner);
++    const float rate = __expf(a_log[channel / dk]);
++    gate[index] = lower_bound * sigmoid_f(rate * __bfloat162float(a[index]));
++}
++
++__global__ void beta_kernel(const __nv_bfloat16* __restrict__ b, std::int64_t elements,
++                            float* __restrict__ beta) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= elements) { return; }
++    beta[index] = sigmoid_f(__bfloat162float(b[index]));
++}
++
++// out[t, c] = silu(sum_tap w[c*K + tap] * window(t - (K-1) + tap, c)); one thread per (t, c).
++__global__ void conv_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
++                            const float* __restrict__ conv_state, std::int32_t d_inner,
++                            std::int32_t taps, std::int32_t tokens,
++                            __nv_bfloat16* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const std::int32_t channel = static_cast<std::int32_t>(index % d_inner);
++    const std::int32_t t = static_cast<std::int32_t>(index / d_inner);
++    if (t >= tokens) { return; }
++    const std::int32_t history = taps - 1;
++    float acc = 0.0f;
++    for (std::int32_t tap = 0; tap < taps; ++tap) {
++        const std::int64_t s = static_cast<std::int64_t>(t) - history + tap;
++        const float sample = s >= 0 ? __bfloat162float(x[s * d_inner + channel])
++                                    : conv_state[(s + history) * d_inner + channel];
++        acc = fmaf(__bfloat162float(w[channel * taps + tap]), sample, acc);
++    }
++    out[index] = __float2bfloat16(acc * sigmoid_f(acc));
++}
++
++// conv_state := last `taps-1` columns of [conv_state | x]; staged per channel so overlapping
++// reads never see partially updated rows (T shorter than the history still reaches back).
++__global__ void conv_slide_kernel(const __nv_bfloat16* __restrict__ x,
++                                  const float* __restrict__ conv_state, std::int32_t d_inner,
++                                  std::int32_t taps, std::int32_t tokens,
++                                  float* __restrict__ state_out) {
++    const std::int32_t channel = static_cast<std::int32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (channel >= d_inner) { return; }
++    const std::int32_t history = taps - 1;
++    float staged[8];
++    for (std::int32_t j = 0; j < history; ++j) {
++        const std::int64_t s = static_cast<std::int64_t>(tokens) - history + j;
++        staged[j] = s >= 0 ? __bfloat162float(x[s * d_inner + channel])
++                           : conv_state[(s + history) * d_inner + channel];
++    }
++    for (std::int32_t j = 0; j < history; ++j) { state_out[j * d_inner + channel] = staged[j]; }
++}
++
++// One head per block; the head slice never leaves registers/shared memory. Reductions stage
++// through shared memory and reduce on one thread: the decode path is one token, correctness
++// and clarity over latency.
++__global__ void decode_step_kernel(const __nv_bfloat16* __restrict__ q,
++                                   const __nv_bfloat16* __restrict__ k,
++                                   const __nv_bfloat16* __restrict__ v,
++                                   const float* __restrict__ gate, const float* __restrict__ beta,
++                                   const __nv_bfloat16* __restrict__ g2,
++                                   const float* __restrict__ o_norm_w, float* __restrict__ state,
++                                   __nv_bfloat16* __restrict__ out, std::int32_t dk) {
++    const std::int32_t h = static_cast<std::int32_t>(blockIdx.x);
++    const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
++    const bool live = tid < dk;
++    const std::int64_t base = static_cast<std::int64_t>(h) * dk;
++
++    __shared__ float s_stage[kDecodeBlock];
++    __shared__ float s_qh[kDecodeBlock], s_kh[kDecodeBlock];
++    __shared__ float s_u[kDecodeBlock], s_delta[kDecodeBlock], s_o[kDecodeBlock];
++    __shared__ float s_scalar;
++
++    const float qv = live ? __bfloat162float(q[base + tid]) : 0.0f;
++    const float kv = live ? __bfloat162float(k[base + tid]) : 0.0f;
++    s_stage[tid] = qv * qv;
++    __syncthreads();
++    if (tid == 0) {
++        float acc = 1e-6f;   // eps inside the sqrt, matching the host reference accumulation
++        for (std::int32_t i = 0; i < dk; ++i) { acc += s_stage[i]; }
++        s_scalar = rsqrtf(acc);
++    }
++    __syncthreads();
++    const float q_inv = s_scalar * rsqrtf(static_cast<float>(dk));   // dk^-0.5 folded in
++
++    s_stage[tid] = kv * kv;
++    __syncthreads();
++    if (tid == 0) {
++        float acc = 1e-6f;
++        for (std::int32_t i = 0; i < dk; ++i) { acc += s_stage[i]; }
++        s_scalar = rsqrtf(acc);
++    }
++    __syncthreads();
++
++    if (live) {
++        s_qh[tid] = qv * q_inv;
++        s_kh[tid] = kv * s_scalar;
++    }
++    __syncthreads();
++
++    float* S = state + static_cast<std::int64_t>(h) * dk * dk;   // row = key axis
++    if (live) {
++        const float decay = __expf(gate[base + tid]);
++        for (std::int32_t j = 0; j < dk; ++j) {
++            S[static_cast<std::int64_t>(tid) * dk + j] *= decay;
++        }
++    }
++    __syncthreads();
++
++    if (live) {
++        float u = 0.0f;
++        for (std::int32_t i = 0; i < dk; ++i) {
++            u = fmaf(S[static_cast<std::int64_t>(i) * dk + tid], s_kh[i], u);
++        }
++        s_u[tid] = u;
++    }
++    __syncthreads();
++    if (live) { s_delta[tid] = beta[h] * (__bfloat162float(v[base + tid]) - s_u[tid]); }
++    __syncthreads();
++    if (live) {
++        for (std::int32_t j = 0; j < dk; ++j) {
++            float& cell = S[static_cast<std::int64_t>(tid) * dk + j];
++            cell = fmaf(s_kh[tid], s_delta[j], cell);
++        }
++    }
++    __syncthreads();
++
++    if (live) {
++        float o = 0.0f;
++        for (std::int32_t i = 0; i < dk; ++i) {
++            o = fmaf(S[static_cast<std::int64_t>(i) * dk + tid], s_qh[i], o);
++        }
++        s_o[tid] = o;
++    }
++    __syncthreads();
++
++    s_stage[tid] = live ? s_o[tid] * s_o[tid] : 0.0f;
++    __syncthreads();
++    if (tid == 0) {
++        float acc = 0.0f;
++        for (std::int32_t i = 0; i < dk; ++i) { acc += s_stage[i]; }
++        s_scalar = rsqrtf(acc / static_cast<float>(dk) + 1e-6f);
++    }
++    __syncthreads();
++    if (live) {
++        out[base + tid] = __float2bfloat16(
++            s_o[tid] * s_scalar * o_norm_w[tid] * sigmoid_f(__bfloat162float(g2[base + tid])));
++    }
++}
++
++} // namespace glm5_kda_detail
 +} // namespace ninfer::ops
 diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
 index 888492ceaa2e0d61678b86b01365df863ffe8395..e5be4992aae53ba892eaea9054343bbb6cdcee82 100644
@@ -29567,10 +29986,10 @@ index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f6677
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..fa6ce66a1e695034b68552d3b3c82e78dc751235
+index 0000000000000000000000000000000000000000..49e51d037fe0ca1ba7de4d3eb93443710de3d71c
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,29 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -29596,6 +30015,10 @@ index 0000000000000000000000000000000000000000..fa6ce66a1e695034b68552d3b3c82e78
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state.cpp"
 +  NEEDS_SOURCE_DIR
 +  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_kda_kernels_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../ops/test_glm5_kda.cu"
++  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
 --- a/tests/models/qwen3_5/test_engine_stages_real.cpp
@@ -30901,6 +31324,239 @@ index e31e747b02731bf92b5807a96fb26132cd5b590d..f57a4b3b3a5c52699907788c67342452
          return 2;
      }
      failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
+diff --git a/tests/ops/test_glm5_kda.cu b/tests/ops/test_glm5_kda.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..04c022e0418eeabf3d76e95bd2503532a33410bf
+--- /dev/null
++++ b/tests/ops/test_glm5_kda.cu
+@@ -0,0 +1,227 @@
++// GLM-5.3-Flash KDA decode ops against the ported host reference (models/glm5/reference),
++// on the real device. Small shapes pin the semantics; the audited 64x128 profile runs the
++// whole decode chain (conv -> gate -> recurrent step -> output gate) end to end.
++#include "ninfer/ops/glm5_kda.h"
++#include "models/glm5/reference/kda_reference.h"
++
++#include "core/device.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <string>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++using namespace ninfer::ops;
++namespace Reference = ninfer::models::glm5::reference;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 19u) - 9) / 8.0f;
++}
++
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& values) {
++    std::vector<__nv_bfloat16> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __float2bfloat16(values[i]); }
++    return out;
++}
++
++std::vector<float> represented(const std::vector<__nv_bfloat16>& values) {
++    std::vector<float> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __bfloat162float(values[i]); }
++    return out;
++}
++
++int failures = 0;
++
++void check_close(const std::string& what, const std::vector<float>& got,
++                 const std::vector<float>& want, float tolerance) {
++    if (got.size() != want.size()) {
++        std::fprintf(stderr, "%s: size %zu vs %zu\n", what.c_str(), got.size(), want.size());
++        ++failures;
++        return;
++    }
++    for (std::size_t i = 0; i < got.size(); ++i) {
++        const float error = std::abs(got[i] - want[i]);
++        const float scale = std::max(1.0f, std::abs(want[i]));
++        if (error > tolerance * scale) {
++            if (failures < 10) {
++                std::fprintf(stderr, "%s[%zu]: %.7g vs %.7g\n", what.c_str(), i, got[i], want[i]);
++            }
++            ++failures;
++        }
++    }
++}
++
++// Upload/download helpers over the guarded buffer's byte-level API.
++test::GuardedDeviceBuffer upload(const void* data, std::size_t bytes) {
++    test::GuardedDeviceBuffer buffer(bytes);
++    buffer.copy_from_host(data, bytes);
++    return buffer;
++}
++template <typename T> test::GuardedDeviceBuffer upload(const std::vector<T>& values) {
++    return upload(values.data(), values.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download(const test::GuardedDeviceBuffer& buffer) {
++    std::vector<T> out(buffer.bytes() / sizeof(T));
++    buffer.copy_to_host(out.data(), out.size() * sizeof(T));
++    return out;
++}
++
++void run_case(std::uint32_t heads, std::uint32_t dk, std::uint32_t taps, std::uint32_t tokens) {
++    const Reference::KdaProfile profile{heads, dk, taps, -5.0f};
++    const std::uint32_t d_inner = heads * dk;
++    const std::string label = "h" + std::to_string(heads) + " d" + std::to_string(dk) +
++                              " t" + std::to_string(tokens);
++
++    // ---- gating: decay gate (log space) and beta ----
++    std::vector<float> a_plane(tokens * d_inner), b_plane(tokens * heads), a_log(heads);
++    for (std::size_t i = 0; i < a_plane.size(); ++i) { a_plane[i] = source(static_cast<std::uint32_t>(i)); }
++    for (std::size_t i = 0; i < b_plane.size(); ++i) { b_plane[i] = source(static_cast<std::uint32_t>(i) * 3 + 1); }
++    for (std::uint32_t h = 0; h < heads; ++h) { a_log[h] = -0.5f + 0.25f * static_cast<float>(h); }
++    const auto a_bf = round_trip(a_plane);
++    const auto b_bf = round_trip(b_plane);
++
++    std::vector<float> gate_want(tokens * d_inner), beta_want(tokens * heads);
++    Reference::kda_decay_gate_reference(represented(a_bf), a_log, gate_want, profile);
++    {
++        const auto b_repr = represented(b_bf);
++        for (std::size_t i = 0; i < beta_want.size(); ++i) {
++            beta_want[i] = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(b_repr[i]))));
++        }
++    }
++
++    auto d_a = upload(a_bf);
++    auto d_b = upload(b_bf);
++    auto d_a_log = upload(a_log);
++    test::GuardedDeviceBuffer d_gate(gate_want.size() * sizeof(float));
++    test::GuardedDeviceBuffer d_beta(beta_want.size() * sizeof(float));
++    {
++        Tensor a(const_cast<void*>(d_a.data()), DType::BF16,
++                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
++        Tensor b(const_cast<void*>(d_b.data()), DType::BF16,
++                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(heads)});
++        Tensor log_t(const_cast<void*>(d_a_log.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor g(const_cast<void*>(d_gate.data()), DType::FP32,
++                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
++        Tensor be(const_cast<void*>(d_beta.data()), DType::FP32,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(heads)});
++        glm5_kda_gating(a, b, log_t, -5.0f, g, be, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    check_close("gate[" + label + "]", download<float>(d_gate), gate_want, 5e-5f);
++    check_close("beta[" + label + "]", download<float>(d_beta), beta_want, 5e-5f);
++
++    // ---- conv + state slide ----
++    std::vector<float> x_plane(tokens * d_inner), w_plane(d_inner * taps),
++        conv_state((taps - 1) * d_inner);
++    for (std::size_t i = 0; i < x_plane.size(); ++i) { x_plane[i] = source(static_cast<std::uint32_t>(i) * 5 + 3); }
++    for (std::size_t i = 0; i < w_plane.size(); ++i) { w_plane[i] = source(static_cast<std::uint32_t>(i) * 7 + 1) / 4; }
++    for (std::size_t i = 0; i < conv_state.size(); ++i) { conv_state[i] = source(static_cast<std::uint32_t>(i) + 5) / 3; }
++    const auto x_bf = round_trip(x_plane);
++    const auto w_bf = round_trip(w_plane);
++    std::vector<float> out_want(tokens * d_inner), state_want = conv_state;
++    Reference::kda_conv_reference(represented(x_bf), represented(w_bf), state_want, out_want,
++                                  profile);
++
++    auto d_x = upload(x_bf);
++    auto d_w = upload(w_bf);
++    auto d_state = upload(conv_state);
++    test::GuardedDeviceBuffer d_out(out_want.size() * sizeof(__nv_bfloat16));
++    {
++        Tensor x(const_cast<void*>(d_x.data()), DType::BF16,
++                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
++        Tensor w(const_cast<void*>(d_w.data()), DType::BF16,
++                 {static_cast<std::int32_t>(taps), static_cast<std::int32_t>(d_inner)});
++        Tensor st(const_cast<void*>(d_state.data()), DType::FP32,
++                  {static_cast<std::int32_t>(taps - 1), static_cast<std::int32_t>(d_inner)});
++        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
++        glm5_kda_conv(x, w, st, ot, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    check_close("conv[" + label + "]", represented(download<__nv_bfloat16>(d_out)), out_want, 2e-2f);
++    check_close("conv_state[" + label + "]", download<float>(d_state), state_want, 1e-5f);
++
++    // ---- decode step: feed the last token's conv output as q/k/v ----
++    std::vector<float> q(d_inner), k(d_inner), v(d_inner), g2(d_inner), o_norm_w(dk),
++        state0(Reference::kda_state_values(profile));
++    for (std::uint32_t i = 0; i < d_inner; ++i) {
++        q[i] = out_want[(tokens - 1) * d_inner + i];
++        k[i] = out_want[(tokens - 1) * d_inner + i];
++        v[i] = out_want[(tokens - 1) * d_inner + i];
++        g2[i] = source(i * 11 + 7) / 4;
++    }
++    for (std::uint32_t i = 0; i < dk; ++i) { o_norm_w[i] = 1.0f + source(i) / 8; }
++    for (std::size_t i = 0; i < state0.size(); ++i) { state0[i] = source(static_cast<std::uint32_t>(i)) / 5; }
++    std::vector<float> beta_last(heads);
++    for (std::uint32_t h = 0; h < heads; ++h) { beta_last[h] = beta_want[(tokens - 1) * heads + h]; }
++    std::vector<float> gate_last(gate_want.end() - d_inner, gate_want.end());
++
++    std::vector<float> step_out(d_inner), step_state = state0,
++        scratch(Reference::kda_scan_scratch_values(profile, 1));
++    Reference::kda_gated_delta_reference(q, k, v, gate_last, beta_last, step_state, step_out,
++                                         scratch, profile);
++    std::vector<float> gated(d_inner);
++    Reference::kda_out_gate_reference(step_out, g2, o_norm_w, gated, profile);
++
++    auto d_q = upload(round_trip(q));
++    auto d_k = upload(round_trip(k));
++    auto d_v = upload(round_trip(v));
++    auto d_g2 = upload(round_trip(g2));
++    auto d_onw = upload(o_norm_w);
++    auto d_glast = upload(gate_last);
++    auto d_blast = upload(beta_last);
++    auto dstep_state = upload(state0);
++    test::GuardedDeviceBuffer d_step_out(d_inner * sizeof(__nv_bfloat16));
++    {
++        Tensor qt(const_cast<void*>(d_q.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor kt(const_cast<void*>(d_k.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor vt(const_cast<void*>(d_v.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor gt(const_cast<void*>(d_glast.data()), DType::FP32, {static_cast<std::int32_t>(d_inner)});
++        Tensor bt(const_cast<void*>(d_blast.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor g2t(const_cast<void*>(d_g2.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor wt(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(dk)});
++        Tensor st(const_cast<void*>(dstep_state.data()), DType::FP32,
++                  {static_cast<std::int32_t>(dk), static_cast<std::int32_t>(dk), static_cast<std::int32_t>(heads)});
++        Tensor ot(const_cast<void*>(d_step_out.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        glm5_kda_decode_step(qt, kt, vt, gt, bt, g2t, wt, st, ot, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    check_close("decode_state[" + label + "]", download<float>(dstep_state), step_state, 2e-3f);
++    check_close("decode_out[" + label + "]", represented(download<__nv_bfloat16>(d_step_out)),
++                gated, 2e-2f);
++}
++
++int run() {
++    run_case(2, 4, 4, 3);      // small probe, sub-warp head
++    run_case(3, 8, 4, 5);      // multi-warp reduction path
++    run_case(64, 128, 4, 2);   // the audited GLM-5.3-Flash profile
++    if (failures == 0) {
++        std::puts("GLM5 KDA gating/conv/decode-step kernels match the host reference on device");
++        return 0;
++    }
++    std::fprintf(stderr, "%d numeric failures\n", failures);
++    return 1;
++}
++
++} // namespace
++
++int main() {
++    try {
++        return run();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FATAL: %s\n", error.what());
++        return 1;
++    } catch (...) {
++        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
 diff --git a/tests/ops/test_joint_attn_norm.cpp b/tests/ops/test_joint_attn_norm.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..da155cbe2134219714b851a00b7c773089ccf167
