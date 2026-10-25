@@ -1899,6 +1899,60 @@ index 0000000000000000000000000000000000000000..f86b73551ff41f501e11234e98c7a89b
 +                          Tensor& state, Tensor& out, cudaStream_t stream);
 +
 +} // namespace ninfer::ops
+diff --git a/include/ninfer/ops/glm5_mhc.h b/include/ninfer/ops/glm5_mhc.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..0680d540410d2c4458b05616ad4b9e7bcfffce4f
+--- /dev/null
++++ b/include/ninfer/ops/glm5_mhc.h
+@@ -0,0 +1,48 @@
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cuda_runtime.h> // cudaStream_t
++
++namespace ninfer::ops {
++
++/**
++ * One mHC site's weight generation and stream collapse for T tokens (GLM-5.3-Flash,
++ * 4 streams, 24 mix lanes), fused:
++ *
++ *   flat       = streams[t] viewed as [4*H]
++ *   mixes[m]   = (rmsnorm(flat) . fn[m])                       (FP32, unweighted RMS, eps inside)
++ *   pre[n]     = sigmoid(mixes[n]*scale[0] + base[n]) + hc_eps
++ *   post[n]    = 2*sigmoid(mixes[4+n]*scale[1] + base[4+n])
++ *   comb[s,d]  = sinkhorn(softmax_d(mixes[8 + d + 4*s]*scale[2] + base[8 + d + 4*s]) + hc_eps)
++ *                one column normalization (sum over src + eps), then iters-1 rounds of
++ *                {row over dst, column over src}
++ *   collapsed  = sum_n pre[n] * streams[t][n*H + :]            (published from FP32 math)
++ *
++ * `streams` is contiguous BF16 [T, 4*H], `fn` contiguous BF16 [24, 4*H] (row-major lanes),
++ * `base` contiguous FP32 [24] in the pre|post|comb order, `scale` contiguous FP32 [3],
++ * `lower`-style epsilons are compile constants: rms eps is the caller's `rms_eps`, hc_eps is
++ * `hc_eps`, and `sinkhorn_iters` repeats as stated (>= 1). Outputs `pre` [T,4], `post` [T,4],
++ * `comb` [T,4,4] (row = src, col = dst) are FP32; `collapsed` is BF16 [T, H]. All operands
++ * must be mutually non-overlapping. The oracle is models/glm5/reference/mhc_reference.
++ */
++void glm5_mhc_pre(const Tensor& streams, const Tensor& fn, const Tensor& base, const Tensor& scale,
++                  float rms_eps, float hc_eps, std::int32_t sinkhorn_iters, Tensor& pre,
++                  Tensor& post, Tensor& comb, Tensor& collapsed, cudaStream_t stream);
++
++/**
++ * The stream update after the block: out[t, dst, :] = post[t,dst] * block[t, :] +
++ * sum_src comb[t,src,dst] * residual[t, src, :]. `block` is BF16 [T,H], `residual` BF16
++ * [T,4*H], `post` FP32 [T,4], `comb` FP32 [T,4,4] (src rows, dst columns), `out` BF16
++ * [T,4*H]; out may alias residual (each element reads only its own inputs).
++ */
++void glm5_mhc_post(const Tensor& block, const Tensor& residual, const Tensor& post,
++                   const Tensor& comb, Tensor& out, cudaStream_t stream);
++
++/**
++ * The final unweighted mean over the streams: out[t,:] = mean_n streams[t, n*H, :].
++ * `streams` is BF16 [T,4*H]; `out` is BF16 [T,H] and may alias streams' first quarter.
++ */
++void glm5_mhc_head(const Tensor& streams, Tensor& out, cudaStream_t stream);
++
++} // namespace ninfer::ops
 diff --git a/include/ninfer/ops/sliding_window_attention.h b/include/ninfer/ops/sliding_window_attention.h
 index 970484a9f364f2df4f864356c7120238ba7159d6..d1b4aef49a7a9355d2ca0e667011694116284edc 100644
 --- a/include/ninfer/ops/sliding_window_attention.h
@@ -15086,10 +15140,10 @@ index e141b258f08ca1b57b807b11fdd621475ba11d06..11b8894e1b483e8dc5d45c08f57bb320
  [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
                                                  std::string_view model_type);
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
-index 0a3dc7967cd900c2744ebf48914438e68815f1c4..511ee2bded26318f02b399f4dfcea9078042a752 100644
+index 0a3dc7967cd900c2744ebf48914438e68815f1c4..9fd716c84bcdce6537540ddf83a85a0e6ee4f6df 100644
 --- a/src/ops/CMakeLists.txt
 +++ b/src/ops/CMakeLists.txt
-@@ -22,11 +22,13 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+@@ -22,11 +22,14 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
  endif()
  
  include(basic_sources.cmake)
@@ -15100,6 +15154,7 @@ index 0a3dc7967cd900c2744ebf48914438e68815f1c4..511ee2bded26318f02b399f4dfcea907
  include("${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj/sources.cmake")
 +include("${CMAKE_CURRENT_LIST_DIR}/glm5_kda/sources.cmake")
++include("${CMAKE_CURRENT_LIST_DIR}/glm5_mhc/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/kv_cache/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/linear/sources.cmake")
@@ -15785,6 +15840,154 @@ index 0000000000000000000000000000000000000000..99bb2a821f6eb210f7fddedc5595d644
 +target_sources(ninfer_ops PRIVATE
 +  "${CMAKE_CURRENT_LIST_DIR}/glm5_kda.cu"
 +)
+diff --git a/src/ops/glm5_mhc/glm5_mhc.cu b/src/ops/glm5_mhc/glm5_mhc.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..68fb0fea454a3babdf10033f1dc6bad581f7e59d
+--- /dev/null
++++ b/src/ops/glm5_mhc/glm5_mhc.cu
+@@ -0,0 +1,133 @@
++// ninfer::ops - GLM-5.3-Flash mHC launchers (decode path).
++#include "ninfer/ops/glm5_mhc.h"
++
++#include "ops/kernel/glm5_mhc.cuh"
++#include "core/device.h"
++
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::ops {
++
++namespace {
++
++void require_contiguous(const Tensor& tensor, const char* what) {
++    if (!tensor.is_contiguous()) { throw std::invalid_argument(std::string(what) + " must be contiguous"); }
++}
++
++void require_shape(const Tensor& tensor, DType dtype, std::initializer_list<std::int32_t> shape,
++                   const char* what) {
++    require_contiguous(tensor, what);
++    if (tensor.dtype != dtype) {
++        throw std::invalid_argument(std::string(what) + " has the wrong dtype");
++    }
++    int index = 0;
++    for (const auto extent : shape) {
++        if (tensor.ne[index] != extent) {
++            throw std::invalid_argument(std::string(what) + " has the wrong shape");
++        }
++        ++index;
++    }
++}
++
++void require_positive_eps(float value, const char* what) {
++    if (!std::isfinite(value) || value <= 0) {
++        throw std::invalid_argument(std::string(what) + " must be positive finite");
++    }
++}
++
++void require_disjoint(const Tensor& a, const Tensor& b) {
++    const auto a_begin = reinterpret_cast<std::uintptr_t>(a.data);
++    const auto b_begin = reinterpret_cast<std::uintptr_t>(b.data);
++    const auto a_end = a_begin + a.bytes();
++    const auto b_end = b_begin + b.bytes();
++    if (a_begin < b_end && b_begin < a_end) {
++        throw std::invalid_argument("glm5_mhc operands must not overlap");
++    }
++}
++
++} // namespace
++
++void glm5_mhc_pre(const Tensor& streams, const Tensor& fn, const Tensor& base, const Tensor& scale,
++                  float rms_eps, float hc_eps, std::int32_t sinkhorn_iters, Tensor& pre,
++                  Tensor& post, Tensor& comb, Tensor& collapsed, cudaStream_t stream) {
++    const std::int32_t tokens = streams.ne[0];
++    const std::int32_t hc = 4;
++    const std::int32_t hidden = streams.ne[1] / hc;
++    if (streams.ne[1] % hc != 0 || hidden <= 0 || tokens <= 0) {
++        throw std::invalid_argument("glm5_mhc_pre: streams must be [T, 4*H]");
++    }
++    require_shape(streams, DType::BF16, {tokens, hc * hidden}, "glm5_mhc_pre: streams");
++    require_shape(fn, DType::BF16, {(2 + hc) * hc, hc * hidden}, "glm5_mhc_pre: fn");
++    require_shape(base, DType::FP32, {(2 + hc) * hc}, "glm5_mhc_pre: base");
++    require_shape(scale, DType::FP32, {3}, "glm5_mhc_pre: scale");
++    require_shape(pre, DType::FP32, {tokens, hc}, "glm5_mhc_pre: pre");
++    require_shape(post, DType::FP32, {tokens, hc}, "glm5_mhc_pre: post");
++    require_shape(comb, DType::FP32, {tokens, hc, hc}, "glm5_mhc_pre: comb");
++    require_shape(collapsed, DType::BF16, {tokens, hidden}, "glm5_mhc_pre: collapsed");
++    require_positive_eps(rms_eps, "glm5_mhc_pre: rms_eps");
++    require_positive_eps(hc_eps, "glm5_mhc_pre: hc_eps");
++    if (sinkhorn_iters < 1) {
++        throw std::invalid_argument("glm5_mhc_pre: sinkhorn_iters must be >= 1");
++    }
++    require_disjoint(streams, pre); require_disjoint(streams, post);
++    require_disjoint(streams, comb); require_disjoint(streams, collapsed);
++    require_disjoint(fn, collapsed);
++
++    glm5_mhc_detail::pre_kernel<<<static_cast<unsigned int>(tokens),
++                                  glm5_mhc_detail::kPreBlock, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(streams.data),
++        static_cast<const __nv_bfloat16*>(fn.data), static_cast<const float*>(base.data),
++        static_cast<const float*>(scale.data), rms_eps, hc_eps, sinkhorn_iters, hidden, hc,
++        static_cast<float*>(pre.data), static_cast<float*>(post.data),
++        static_cast<float*>(comb.data), static_cast<__nv_bfloat16*>(collapsed.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_mhc_post(const Tensor& block, const Tensor& residual, const Tensor& post,
++                   const Tensor& comb, Tensor& out, cudaStream_t stream) {
++    const std::int32_t tokens = residual.ne[0];
++    const std::int32_t hc = 4;
++    const std::int32_t hidden = residual.ne[1] / hc;
++    if (residual.ne[1] % hc != 0 || hidden <= 0 || tokens <= 0) {
++        throw std::invalid_argument("glm5_mhc_post: residual must be [T, 4*H]");
++    }
++    require_shape(residual, DType::BF16, {tokens, hc * hidden}, "glm5_mhc_post: residual");
++    require_shape(block, DType::BF16, {tokens, hidden}, "glm5_mhc_post: block");
++    require_shape(post, DType::FP32, {tokens, hc}, "glm5_mhc_post: post");
++    require_shape(comb, DType::FP32, {tokens, hc, hc}, "glm5_mhc_post: comb");
++    require_shape(out, DType::BF16, {tokens, hc * hidden}, "glm5_mhc_post: out");
++    require_disjoint(block, out);
++
++    const std::int64_t elements = static_cast<std::int64_t>(tokens) * hc * hidden;
++    constexpr std::int32_t threads = 256;
++    const auto blocks = static_cast<unsigned int>((elements + threads - 1) / threads);
++    glm5_mhc_detail::post_kernel<<<blocks, threads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(block.data),
++        static_cast<const __nv_bfloat16*>(residual.data), static_cast<const float*>(post.data),
++        static_cast<const float*>(comb.data), hidden, hc,
++        static_cast<__nv_bfloat16*>(out.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_mhc_head(const Tensor& streams, Tensor& out, cudaStream_t stream) {
++    const std::int32_t tokens = streams.ne[0];
++    const std::int32_t hc = 4;
++    const std::int32_t hidden = streams.ne[1] / hc;
++    if (streams.ne[1] % hc != 0 || hidden <= 0 || tokens <= 0) {
++        throw std::invalid_argument("glm5_mhc_head: streams must be [T, 4*H]");
++    }
++    require_shape(streams, DType::BF16, {tokens, hc * hidden}, "glm5_mhc_head: streams");
++    require_shape(out, DType::BF16, {tokens, hidden}, "glm5_mhc_head: out");
++
++    const std::int64_t elements = static_cast<std::int64_t>(tokens) * hidden;
++    constexpr std::int32_t threads = 256;
++    const auto blocks = static_cast<unsigned int>((elements + threads - 1) / threads);
++    glm5_mhc_detail::head_kernel<<<blocks, threads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(streams.data), hidden, hc,
++        static_cast<__nv_bfloat16*>(out.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/glm5_mhc/sources.cmake b/src/ops/glm5_mhc/sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4d65b366a43c68b58e8bfb497ed6799ab0beb62
+--- /dev/null
++++ b/src/ops/glm5_mhc/sources.cmake
+@@ -0,0 +1,3 @@
++target_sources(ninfer_ops PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/glm5_mhc.cu"
++)
 diff --git a/src/ops/kernel/glm5_kda.cuh b/src/ops/kernel/glm5_kda.cuh
 new file mode 100644
 index 0000000000000000000000000000000000000000..4c6a1b44686ae3c7936cec990ccd82b635de5e68
@@ -15968,6 +16171,214 @@ index 0000000000000000000000000000000000000000..4c6a1b44686ae3c7936cec990ccd82b6
 +}
 +
 +} // namespace glm5_kda_detail
++} // namespace ninfer::ops
+diff --git a/src/ops/kernel/glm5_mhc.cuh b/src/ops/kernel/glm5_mhc.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..01e79d26d646af727fe740260bcd8bfda80ac2e5
+--- /dev/null
++++ b/src/ops/kernel/glm5_mhc.cuh
+@@ -0,0 +1,202 @@
++#pragma once
++
++// ninfer::ops - GLM-5.3-Flash mHC kernels: the fused weight generation + collapse for one
++// hyper-connection site (decode path: one block per token, correctness over latency), the
++// post-block stream update, and the final head mean. Math follows models/glm5/reference.
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops {
++namespace glm5_mhc_detail {
++
++constexpr int kPreBlock = 256;
++constexpr int kMaxLanes = 24;   // (2 + hc) * hc with hc = 4
++
++__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
++
++// One token per block. Phase order: unweighted RMS norm over the flattened streams, the
++// 24 mix dots (each thread strides the plane, one accumulator per lane), the gates and
++// Sinkhorn on thread 0 (a 4x4 in registers), then the pre-weighted collapse.
++__global__ void pre_kernel(const __nv_bfloat16* __restrict__ streams,
++                           const __nv_bfloat16* __restrict__ fn, const float* __restrict__ base,
++                           const float* __restrict__ scale, float rms_eps, float hc_eps,
++                           std::int32_t sinkhorn_iters, std::int32_t hidden, std::int32_t hc,
++                           float* __restrict__ pre, float* __restrict__ post,
++                           float* __restrict__ comb, __nv_bfloat16* __restrict__ collapsed) {
++    const std::int64_t token = blockIdx.x;
++    const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
++    const std::int32_t threads = blockDim.x;
++    const std::int64_t plane = static_cast<std::int64_t>(hc) * hidden;
++    const __nv_bfloat16* row = streams + token * plane;
++    const std::int32_t lanes = (2 + hc) * hc;
++
++    __shared__ float s_reduce[kPreBlock];
++    __shared__ float s_mix[kMaxLanes];
++    __shared__ float s_pre[4], s_post[4], s_comb[4 * 4];
++
++    // Unweighted RMS norm: eps inside the sqrt, one shared-staged block reduction.
++    float square = 0.0f;
++    for (std::int64_t i = tid; i < plane; i += threads) {
++        const float value = __bfloat162float(row[i]);
++        square = fmaf(value, value, square);
++    }
++    s_reduce[tid] = square;
++    __syncthreads();
++    if (tid == 0) {
++        float acc = 0.0f;
++        for (std::int32_t i = 0; i < threads; ++i) { acc += s_reduce[i]; }
++        s_reduce[0] = rsqrtf(acc / static_cast<float>(plane) + rms_eps);
++    }
++    __syncthreads();
++    const float inverse = s_reduce[0];
++
++    // 24 lane dots: each thread walks its stride of the normalized plane once per lane,
++    // keeping lane accumulators in registers; the per-lane block reduction reuses staging.
++    float lane_acc[kMaxLanes];
++#pragma unroll
++    for (std::int32_t m = 0; m < kMaxLanes; ++m) { lane_acc[m] = 0.0f; }
++    for (std::int64_t i = tid; i < plane; i += threads) {
++        const float x = __bfloat162float(row[i]) * inverse;
++        const __nv_bfloat16* weights = fn + i;
++#pragma unroll
++        for (std::int32_t m = 0; m < kMaxLanes; ++m) {
++            lane_acc[m] = fmaf(x, __bfloat162float(weights[static_cast<std::int64_t>(m) * plane]),
++                               lane_acc[m]);
++        }
++    }
++#pragma unroll
++    for (std::int32_t m = 0; m < kMaxLanes; ++m) {
++        s_reduce[tid] = lane_acc[m];
++        __syncthreads();
++        if (tid == 0) {
++            float acc = 0.0f;
++            for (std::int32_t i = 0; i < threads; ++i) { acc += s_reduce[i]; }
++            s_mix[m] = acc;
++        }
++        __syncthreads();
++    }
++    // Lanes beyond this profile stay zero; thread 0 finishes every gate from s_mix.
++    if (tid == 0) {
++#pragma unroll
++        for (std::int32_t n = 0; n < 4; ++n) {
++            if (n < hc) {
++                s_pre[n] = sigmoid_f(s_mix[n] * scale[0] + base[n]) + hc_eps;
++                s_post[n] = 2.0f * sigmoid_f(s_mix[hc + n] * scale[1] + base[hc + n]);
++            }
++        }
++        // comb[src][dst] from the flat layout comb[dst + hc*src]; softmax over dst per src.
++        float comb_w[4][4];
++#pragma unroll
++        for (std::int32_t src = 0; src < 4; ++src) {
++#pragma unroll
++            for (std::int32_t dst = 0; dst < 4; ++dst) {
++                comb_w[src][dst] = 0.0f;
++            }
++        }
++        for (std::int32_t src = 0; src < hc; ++src) {
++            float logits[4], maximum = 0.0f;
++            for (std::int32_t dst = 0; dst < hc; ++dst) {
++                const std::int32_t flat = 2 * hc + dst + hc * src;
++                logits[dst] = s_mix[flat] * scale[2] + base[flat];
++                if (dst == 0 || logits[dst] > maximum) { maximum = logits[dst]; }
++            }
++            float denominator = 0.0f;
++            for (std::int32_t dst = 0; dst < hc; ++dst) {
++                logits[dst] = __expf(logits[dst] - maximum);
++                denominator += logits[dst];
++            }
++            for (std::int32_t dst = 0; dst < hc; ++dst) {
++                comb_w[src][dst] = logits[dst] / denominator + hc_eps;
++            }
++        }
++        // Sinkhorn: one column normalization (sum over src), then iters-1 of {row, column}.
++        auto normalize_columns = [&]() {
++            for (std::int32_t dst = 0; dst < hc; ++dst) {
++                float sum = 0.0f;
++                for (std::int32_t src = 0; src < hc; ++src) { sum += comb_w[src][dst]; }
++                const float inverse_sum = 1.0f / (sum + hc_eps);
++                for (std::int32_t src = 0; src < hc; ++src) { comb_w[src][dst] *= inverse_sum; }
++            }
++        };
++        auto normalize_rows = [&]() {
++            for (std::int32_t src = 0; src < hc; ++src) {
++                float sum = 0.0f;
++                for (std::int32_t dst = 0; dst < hc; ++dst) { sum += comb_w[src][dst]; }
++                const float inverse_sum = 1.0f / (sum + hc_eps);
++                for (std::int32_t dst = 0; dst < hc; ++dst) { comb_w[src][dst] *= inverse_sum; }
++            }
++        };
++        normalize_columns();
++        for (std::int32_t round = 1; round < sinkhorn_iters; ++round) {
++            normalize_rows();
++            normalize_columns();
++        }
++        for (std::int32_t src = 0; src < hc; ++src) {
++            for (std::int32_t dst = 0; dst < hc; ++dst) {
++                s_comb[src * 4 + dst] = comb_w[src][dst];
++            }
++        }
++    }
++    __syncthreads();
++
++    for (std::int32_t n = 0; n < hc; ++n) {
++        pre[token * hc + n] = s_pre[n];
++        post[token * hc + n] = s_post[n];
++    }
++    for (std::int32_t i = 0; i < hc * hc; ++i) { comb[token * hc * hc + i] = s_comb[i]; }
++
++    // Collapse: out[d] = sum_n pre[n] * row[n*hidden + d], published from FP32 math.
++    for (std::int64_t d = tid; d < hidden; d += threads) {
++        float acc = 0.0f;
++        for (std::int32_t n = 0; n < hc; ++n) {
++            acc = fmaf(s_pre[n], __bfloat162float(row[static_cast<std::int64_t>(n) * hidden + d]),
++                       acc);
++        }
++        collapsed[token * hidden + d] = __float2bfloat16(acc);
++    }
++}
++
++// One thread per (t, dst, d): mix four residual reads, add post*block.
++__global__ void post_kernel(const __nv_bfloat16* __restrict__ block,
++                            const __nv_bfloat16* __restrict__ residual, const float* __restrict__ post,
++                            const float* __restrict__ comb, std::int32_t hidden, std::int32_t hc,
++                            __nv_bfloat16* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const std::int64_t plane = static_cast<std::int64_t>(hc) * hidden;
++    // Grid is 1D over [T * hc * hidden]; decompose cheaply.
++    const std::int32_t t = static_cast<std::int32_t>(index / plane);
++    const std::int64_t within = index % plane;
++    const std::int32_t dst = static_cast<std::int32_t>(within / hidden);
++    const std::int32_t d = static_cast<std::int32_t>(within % hidden);
++    const __nv_bfloat16* residual_t = residual + static_cast<std::int64_t>(t) * plane;
++    float mix = 0.0f;
++    for (std::int32_t src = 0; src < hc; ++src) {
++        mix = fmaf(comb[static_cast<std::int64_t>(t) * hc * hc + src * hc + dst],
++                   __bfloat162float(residual_t[static_cast<std::int64_t>(src) * hidden + d]), mix);
++    }
++    const float gated =
++        fmaf(post[static_cast<std::int64_t>(t) * hc + dst], __bfloat162float(block[static_cast<std::int64_t>(t) * hidden + d]), mix);
++    out[static_cast<std::int64_t>(t) * plane + static_cast<std::int64_t>(dst) * hidden + d] =
++        __float2bfloat16(gated);
++}
++
++// One thread per (t, d): unweighted mean of the four streams.
++__global__ void head_kernel(const __nv_bfloat16* __restrict__ streams, std::int32_t hidden,
++                            std::int32_t hc, __nv_bfloat16* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const std::int32_t t = static_cast<std::int32_t>(index / hidden);
++    const std::int32_t d = static_cast<std::int32_t>(index % hidden);
++    const std::int64_t plane = static_cast<std::int64_t>(hc) * hidden;
++    float acc = 0.0f;
++    for (std::int32_t n = 0; n < hc; ++n) {
++        acc += __bfloat162float(streams[static_cast<std::int64_t>(t) * plane +
++                                        static_cast<std::int64_t>(n) * hidden + d]);
++    }
++    out[static_cast<std::int64_t>(t) * hidden + d] =
++        __float2bfloat16(acc * (1.0f / static_cast<float>(hc)));
++}
++
++} // namespace glm5_mhc_detail
 +} // namespace ninfer::ops
 diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
 index 888492ceaa2e0d61678b86b01365df863ffe8395..e5be4992aae53ba892eaea9054343bbb6cdcee82 100644
@@ -29986,10 +30397,10 @@ index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f6677
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..49e51d037fe0ca1ba7de4d3eb93443710de3d71c
+index 0000000000000000000000000000000000000000..8bf215f5bc7a57458cda69a5939c956743c1bcbd
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,33 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -30018,6 +30429,10 @@ index 0000000000000000000000000000000000000000..49e51d037fe0ca1ba7de4d3eb9344371
 +
 +ninfer_add_test(ninfer_glm5_kda_kernels_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../ops/test_glm5_kda.cu"
++  LIBRARIES ninfer_ops ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_mhc_kernels_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../ops/test_glm5_mhc.cu"
 +  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
@@ -31538,6 +31953,201 @@ index 0000000000000000000000000000000000000000..04c022e0418eeabf3d76e95bd2503532
 +    run_case(64, 128, 4, 2);   // the audited GLM-5.3-Flash profile
 +    if (failures == 0) {
 +        std::puts("GLM5 KDA gating/conv/decode-step kernels match the host reference on device");
++        return 0;
++    }
++    std::fprintf(stderr, "%d numeric failures\n", failures);
++    return 1;
++}
++
++} // namespace
++
++int main() {
++    try {
++        return run();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FATAL: %s\n", error.what());
++        return 1;
++    } catch (...) {
++        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
+diff --git a/tests/ops/test_glm5_mhc.cu b/tests/ops/test_glm5_mhc.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..faae966ceb9c872bf8edc23d9eb368501163b9e0
+--- /dev/null
++++ b/tests/ops/test_glm5_mhc.cu
+@@ -0,0 +1,189 @@
++// GLM-5.3-Flash mHC ops against the ported host reference (models/glm5/reference), on the
++// device. A small hidden pins the semantics including the Sinkhorn iteration count; the
++// audited 16384-wide profile runs one full pre/post/head chain.
++#include "ninfer/ops/glm5_mhc.h"
++#include "models/glm5/reference/mhc_reference.h"
++
++#include "core/device.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <string>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++using namespace ninfer::ops;
++namespace Reference = ninfer::models::glm5::reference;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& values) {
++    std::vector<__nv_bfloat16> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __float2bfloat16(values[i]); }
++    return out;
++}
++std::vector<float> represented(const std::vector<__nv_bfloat16>& values) {
++    std::vector<float> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __bfloat162float(values[i]); }
++    return out;
++}
++
++test::GuardedDeviceBuffer upload(const void* data, std::size_t bytes) {
++    test::GuardedDeviceBuffer buffer(bytes);
++    buffer.copy_from_host(data, bytes);
++    return buffer;
++}
++template <typename T> test::GuardedDeviceBuffer upload(const std::vector<T>& values) {
++    return upload(values.data(), values.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download(const test::GuardedDeviceBuffer& buffer) {
++    std::vector<T> out(buffer.bytes() / sizeof(T));
++    buffer.copy_to_host(out.data(), out.size() * sizeof(T));
++    return out;
++}
++
++int failures = 0;
++
++void check_close(const std::string& what, const std::vector<float>& got,
++                 const std::vector<float>& want, float tolerance) {
++    if (got.size() != want.size()) {
++        std::fprintf(stderr, "%s: size %zu vs %zu\n", what.c_str(), got.size(), want.size());
++        ++failures;
++        return;
++    }
++    for (std::size_t i = 0; i < got.size(); ++i) {
++        const float error = std::abs(got[i] - want[i]);
++        const float scale = std::max(1.0f, std::abs(want[i]));
++        if (error > tolerance * scale) {
++            if (failures < 10) {
++                std::fprintf(stderr, "%s[%zu]: %.7g vs %.7g\n", what.c_str(), i, got[i], want[i]);
++            }
++            ++failures;
++        }
++    }
++}
++
++void run_case(std::uint32_t hidden, std::uint32_t tokens) {
++    const Reference::MhcProfile profile{4, 1e-5f, 1e-6f, 20};
++    const std::uint32_t hc = 4, lanes = 24, plane = hc * hidden;
++    const std::string label = "h" + std::to_string(hidden);
++
++    std::vector<float> streams(tokens * plane), fn(lanes * plane), base(lanes),
++        scale{0.7f, 0.5f, 0.9f}, block(tokens * hidden);
++    for (std::size_t i = 0; i < streams.size(); ++i) {
++        streams[i] = source(static_cast<std::uint32_t>(i) * 3 + 1) / 4;
++    }
++    for (std::size_t i = 0; i < fn.size(); ++i) { fn[i] = source(static_cast<std::uint32_t>(i) + 2) / 16; }
++    for (std::size_t i = 0; i < base.size(); ++i) { base[i] = source(static_cast<std::uint32_t>(i) * 5 + 3) / 8; }
++    for (std::size_t i = 0; i < block.size(); ++i) { block[i] = source(static_cast<std::uint32_t>(i) * 7 + 2) / 3; }
++
++    // Host reference on the represented (rounded) inputs.
++    std::vector<float> pre_want(tokens * hc), post_want(tokens * hc), comb_want(tokens * hc * hc),
++        collapsed_want(tokens * hidden);
++    Reference::mhc_pre_reference(represented(round_trip(streams)), represented(round_trip(fn)),
++                                 base, scale, pre_want, post_want, comb_want, collapsed_want,
++                                 profile, hidden);
++
++    auto d_streams = upload(round_trip(streams));
++    auto d_fn = upload(round_trip(fn));
++    auto d_base = upload(base);
++    auto d_scale = upload(scale);
++    test::GuardedDeviceBuffer d_pre(pre_want.size() * sizeof(float));
++    test::GuardedDeviceBuffer d_post(post_want.size() * sizeof(float));
++    test::GuardedDeviceBuffer d_comb(comb_want.size() * sizeof(float));
++    test::GuardedDeviceBuffer d_collapsed(collapsed_want.size() * sizeof(__nv_bfloat16));
++    {
++        Tensor st(const_cast<void*>(d_streams.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
++        Tensor ft(const_cast<void*>(d_fn.data()), DType::BF16,
++                  {static_cast<std::int32_t>(lanes), static_cast<std::int32_t>(plane)});
++        Tensor bt(const_cast<void*>(d_base.data()), DType::FP32, {static_cast<std::int32_t>(lanes)});
++        Tensor sc(const_cast<void*>(d_scale.data()), DType::FP32, {3});
++        Tensor pt(const_cast<void*>(d_pre.data()), DType::FP32,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
++        Tensor pot(const_cast<void*>(d_post.data()), DType::FP32,
++                   {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
++        Tensor ct(const_cast<void*>(d_comb.data()), DType::FP32,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc), static_cast<std::int32_t>(hc)});
++        Tensor co(const_cast<void*>(d_collapsed.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
++        glm5_mhc_pre(st, ft, bt, sc, 1e-5f, 1e-6f, 20, pt, pot, ct, co, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    check_close("pre[" + label + "]", download<float>(d_pre), pre_want, 2e-4f);
++    check_close("post[" + label + "]", download<float>(d_post), post_want, 2e-4f);
++    check_close("comb[" + label + "]", download<float>(d_comb), comb_want, 2e-3f);
++    check_close("collapsed[" + label + "]", represented(download<__nv_bfloat16>(d_collapsed)),
++                collapsed_want, 2e-2f);
++
++    // Post + head.
++    std::vector<float> post_out_want(tokens * plane);
++    Reference::mhc_post_reference(block, represented(round_trip(streams)), post_want, comb_want,
++                                  post_out_want, profile, hidden);
++    std::vector<float> head_want(tokens * hidden);
++    Reference::mhc_head_reference(post_out_want, head_want, profile, hidden);
++
++    auto d_block = upload(round_trip(block));
++    auto d_post_in = upload(post_want);
++    auto d_comb_in = upload(comb_want);
++    auto d_residual = upload(round_trip(streams));
++    test::GuardedDeviceBuffer d_streams_out(tokens * plane * sizeof(__nv_bfloat16));
++    test::GuardedDeviceBuffer d_head(tokens * hidden * sizeof(__nv_bfloat16));
++    {
++        Tensor bt(const_cast<void*>(d_block.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
++        Tensor rt(const_cast<void*>(d_residual.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
++        Tensor pt(const_cast<void*>(d_post_in.data()), DType::FP32,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
++        Tensor ct(const_cast<void*>(d_comb_in.data()), DType::FP32,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc), static_cast<std::int32_t>(hc)});
++        Tensor ot(const_cast<void*>(d_streams_out.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
++        glm5_mhc_post(bt, rt, pt, ct, ot, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        Tensor ht(const_cast<void*>(d_head.data()), DType::BF16,
++                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
++        glm5_mhc_head(ot, ht, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    check_close("post[" + label + "]", represented(download<__nv_bfloat16>(d_streams_out)),
++                post_out_want, 2e-2f);
++    check_close("head[" + label + "]", represented(download<__nv_bfloat16>(d_head)), head_want,
++                2e-2f);
++}
++
++int run() {
++    run_case(32, 3);        // small probe
++    run_case(4096, 2);      // the audited hidden width
++    if (failures == 0) {
++        std::puts("GLM5 mHC pre/post/head kernels match the host reference on device");
 +        return 0;
 +    }
 +    std::fprintf(stderr, "%d numeric failures\n", failures);
