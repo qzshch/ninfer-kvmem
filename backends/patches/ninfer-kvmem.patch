@@ -5674,13 +5674,1299 @@ index 0000000000000000000000000000000000000000..c1905f9da44de09298e494520eeed7c8
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..1c161be33737aca6b6532d9afdd74cfe65747773
+index 0000000000000000000000000000000000000000..acee475e8aa8513338c97fea664fcc70b26aa42b
 --- /dev/null
 +++ b/src/models/glm5/loading_sources.cmake
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,23 @@
 +target_sources(ninfer_model_loading PRIVATE
 +  "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_reference.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_chunk_reference.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/reference/mhc_reference.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/reference/dsa_reference.cpp"
 +)
++# Host reference math is deterministic FP32; keep compiler contraction out of the oracle.
++if(MSVC)
++  set_source_files_properties(
++    "${CMAKE_CURRENT_LIST_DIR}/reference/kda_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/kda_chunk_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/mhc_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/dsa_reference.cpp"
++    PROPERTIES COMPILE_OPTIONS "/fp:strict")
++else()
++  set_source_files_properties(
++    "${CMAKE_CURRENT_LIST_DIR}/reference/kda_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/kda_chunk_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/mhc_reference.cpp"
++    "${CMAKE_CURRENT_LIST_DIR}/reference/dsa_reference.cpp"
++    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
++endif()
+diff --git a/src/models/glm5/reference/dsa_reference.cpp b/src/models/glm5/reference/dsa_reference.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d86410c0ee0bc76ea71c5634804effe88c5c4f18
+--- /dev/null
++++ b/src/models/glm5/reference/dsa_reference.cpp
+@@ -0,0 +1,227 @@
++#include "models/glm5/reference/dsa_reference.h"
++
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace ninfer::models::glm5::reference {
++namespace {
++static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
++              "GLM DSA reference requires IEEE-754 binary32");
++
++size_t checked_mul(size_t a, size_t b) {
++    if (a && b > std::numeric_limits<size_t>::max() / a)
++        throw std::overflow_error("DSA reference size overflow");
++    return a * b;
++}
++
++void demand_finite(std::span<const float> plane, const char* what) {
++    for (const float value : plane)
++        if (!std::isfinite(value)) throw std::invalid_argument(what);
++}
++
++size_t token_count(std::span<const float> plane, size_t per_token, const char* what) {
++    if (per_token == 0 || plane.size() % per_token != 0)
++        throw std::invalid_argument(what);
++    return plane.size() / per_token;
++}
++}  // namespace
++
++void dsa_pool_reference(std::span<const float> keys, std::span<const float> gates,
++                        std::span<const float> ape, std::span<float> pooled,
++                        const DsaIndexerProfile& profile) {
++    const size_t dim = profile.head_dim;
++    const size_t kpool = profile.kpool;
++    if (dim == 0 || kpool == 0 || profile.top_k == 0 || profile.top_k % kpool)
++        throw std::invalid_argument("DSA indexer profile is degenerate");
++    const size_t tokens = token_count(keys, dim, "DSA keys are not whole token planes");
++    if (gates.size() != keys.size() || ape.size() != checked_mul(kpool, dim))
++        throw std::invalid_argument("DSA pool gate/ape plane mismatch");
++    if (tokens == 0 || tokens % kpool)
++        throw std::invalid_argument("DSA pooling requires tokens to be a positive multiple of kpool");
++    const size_t pools = tokens / kpool;
++    if (pooled.size() != checked_mul(pools, dim))
++        throw std::invalid_argument("DSA pooled plane does not match the pool count");
++    demand_finite(keys, "DSA keys must be finite");
++    demand_finite(gates, "DSA gates must be finite");
++    demand_finite(ape, "DSA ape must be finite");
++
++    for (size_t p = 0; p < pools; ++p)
++        for (size_t e = 0; e < dim; ++e) {
++            float logits[8], maximum = 0;
++            if (kpool > 8) throw std::invalid_argument("DSA pooling pins kpool at 8 members or fewer");
++            for (size_t m = 0; m < kpool; ++m) {
++                logits[m] = gates[(p * kpool + m) * dim + e] + ape[m * dim + e];
++                if (m == 0 || logits[m] > maximum) maximum = logits[m];
++            }
++            float denominator = 0, exps[8];
++            for (size_t m = 0; m < kpool; ++m) {
++                exps[m] = std::exp(logits[m] - maximum);
++                denominator += exps[m];
++            }
++            const float inverse = 1.0f / denominator;
++            float acc = 0;
++            for (size_t m = 0; m < kpool; ++m)
++                acc = std::fma(exps[m] * inverse, keys[(p * kpool + m) * dim + e], acc);
++            if (!std::isfinite(acc)) throw std::overflow_error("DSA pooling overflowed");
++            pooled[p * dim + e] = acc;
++        }
++}
++
++void dsa_score_reference(std::span<const float> iq, std::span<const float> weights,
++                         std::span<const float> pooled, std::span<float> scores,
++                         const DsaIndexerProfile& profile) {
++    const size_t heads = profile.heads;
++    const size_t dim = profile.head_dim;
++    const size_t head_plane = checked_mul(heads, dim);
++    const size_t tokens = token_count(iq, head_plane, "DSA iq is not whole token planes");
++    const size_t pools = token_count(pooled, dim, "DSA pooled is not whole pool planes");
++    if (weights.size() != checked_mul(tokens, heads))
++        throw std::invalid_argument("DSA weights must hold one value per token and head");
++    if (scores.size() != checked_mul(tokens, pools))
++        throw std::invalid_argument("DSA score plane does not match tokens x pools");
++    if (tokens == 0) throw std::invalid_argument("DSA scoring requires at least one token");
++    demand_finite(iq, "DSA iq must be finite");
++    demand_finite(weights, "DSA weights must be finite");
++    demand_finite(pooled, "DSA pooled must be finite");
++
++    const float dot_scale = 1.0f / std::sqrt(static_cast<float>(dim));
++    const float head_scale = 1.0f / std::sqrt(static_cast<float>(heads));
++    for (size_t t = 0; t < tokens; ++t)
++        for (size_t p = 0; p < pools; ++p) {
++            float acc = 0;
++            for (size_t h = 0; h < heads; ++h) {
++                const float* q = iq.data() + t * head_plane + h * dim;
++                const float* key = pooled.data() + p * dim;
++                float dot = 0;
++                for (size_t e = 0; e < dim; ++e) dot = std::fma(q[e], key[e], dot);
++                acc = std::fma(std::fmax(dot * dot_scale, 0.0f),
++                               weights[t * heads + h] * head_scale, acc);
++            }
++            if (!std::isfinite(acc)) throw std::overflow_error("DSA scoring overflowed");
++            scores[t * pools + p] = acc;
++        }
++}
++
++void dsa_select_reference(std::span<const float> scores, std::span<const uint32_t> pos,
++                          std::span<int32_t> cells, const DsaIndexerProfile& profile) {
++    const size_t kpool = profile.kpool;
++    const size_t tokens = pos.size();
++    const size_t top_pools = dsa_top_pools(profile);
++    const size_t width = dsa_selection_width(profile);
++    if (tokens == 0) throw std::invalid_argument("DSA selection requires at least one token");
++    if (scores.size() % tokens != 0)
++        throw std::invalid_argument("DSA score plane does not match the position count");
++    const size_t pools = scores.size() / tokens;
++    if (cells.size() != checked_mul(tokens, width))
++        throw std::invalid_argument("DSA cell plane does not match the selection width");
++    if (pools == 0) throw std::invalid_argument("DSA selection requires at least one scored pool");
++    demand_finite(scores, "DSA scores must be finite");
++    for (const auto position : pos)
++        if ((position + 1) / kpool > pools)
++            throw std::invalid_argument("DSA position sees more pools than were scored");
++
++    // 2051 is the production width; a generous bound keeps narrower probe
++    // profiles testable without dynamic allocation.
++    constexpr size_t kMaxSelectionWidth = 4096;
++    if (width > kMaxSelectionWidth)
++        throw std::invalid_argument("DSA selection width exceeds the staging bound");
++    for (size_t t = 0; t < tokens; ++t) {
++        const size_t visible = (pos[t] + 1) / kpool;
++        int32_t row[kMaxSelectionWidth];
++        for (size_t s = 0; s < width; ++s) row[s] = -1;
++
++        for (size_t p = 0; p < visible; ++p) {
++            const float value = scores[t * pools + p];
++            size_t rank = 0;
++            for (size_t q = 0; q < visible; ++q) {
++                const float other = scores[t * pools + q];
++                if (other > value) ++rank;
++                else if (q < p && other == value) ++rank;
++            }
++            if (rank < top_pools)
++                for (size_t m = 0; m < kpool; ++m) row[rank * kpool + m] = static_cast<int32_t>(p * kpool + m);
++        }
++        if (profile.select_tail)
++            for (size_t m = 0; m + 1 < kpool; ++m) {
++                const size_t cell = visible * kpool + m;
++                if (cell <= pos[t]) row[top_pools * kpool + m] = static_cast<int32_t>(cell);
++            }
++        for (size_t s = 0; s < width; ++s) cells[t * width + s] = row[s];
++    }
++}
++
++void dsa_attention_reference(std::span<const float> q_abs, std::span<const float> latents,
++                             std::span<const int32_t> cells, std::span<const float> wv_b,
++                             std::span<float> out, const DsaIndexerProfile& indexer,
++                             const DsaMlaProfile& mla, size_t cache_tokens) {
++    const size_t lora = mla.kv_lora;
++    const size_t heads = mla.heads;
++    const size_t v_head = mla.v_head;
++    const size_t head_plane = checked_mul(lora, heads);
++    const size_t tokens = token_count(q_abs, head_plane, "DSA q_abs is not whole token planes");
++    const size_t width = dsa_selection_width(indexer);
++    if (cells.size() != checked_mul(tokens, width))
++        throw std::invalid_argument("DSA cells do not match tokens x selection width");
++    if (latents.size() != checked_mul(cache_tokens, lora))
++        throw std::invalid_argument("DSA latents do not match the cache token count");
++    if (wv_b.size() != checked_mul(checked_mul(lora, v_head), heads))
++        throw std::invalid_argument("DSA wv_b does not match the GGUF geometry");
++    if (out.size() != checked_mul(tokens, checked_mul(heads, v_head)))
++        throw std::invalid_argument("DSA output does not match tokens x heads x v_head");
++    if (tokens == 0 || cache_tokens == 0)
++        throw std::invalid_argument("DSA attention requires tokens and cache");
++    demand_finite(q_abs, "DSA q_abs must be finite");
++    demand_finite(latents, "DSA latents must be finite");
++    demand_finite(wv_b, "DSA wv_b must be finite");
++    for (const auto cell : cells)
++        if (cell < -1 || cell >= static_cast<int64_t>(cache_tokens))
++            throw std::invalid_argument("DSA cell is outside the cache");
++
++    const float scale = 1.0f / std::sqrt(static_cast<float>(mla.qk_nope));
++    std::vector<float> probabilities(width), context(lora), staged(heads * v_head);
++    for (size_t t = 0; t < tokens; ++t) {
++        const int32_t* row = cells.data() + t * width;
++        for (size_t s = 0; s < width; ++s) probabilities[s] = 0.0f;
++        for (size_t h = 0; h < heads; ++h) {
++            const float* q = q_abs.data() + t * head_plane + h * lora;
++            float maximum = 0;
++            bool any = false;
++            for (size_t s = 0; s < width; ++s) {
++                if (row[s] < 0) continue;
++                const float* latent = latents.data() + static_cast<size_t>(row[s]) * lora;
++                float dot = 0;
++                for (size_t e = 0; e < lora; ++e) dot = std::fma(q[e], latent[e], dot);
++                probabilities[s] = dot * scale;
++                if (!any || probabilities[s] > maximum) { maximum = probabilities[s]; any = true; }
++            }
++            if (!any) throw std::invalid_argument("DSA attention row has no valid cell");
++            float denominator = 0;
++            for (size_t s = 0; s < width; ++s)
++                if (row[s] >= 0) {
++                    probabilities[s] = std::exp(probabilities[s] - maximum);
++                    denominator += probabilities[s];
++                }
++            const float inverse = 1.0f / denominator;
++            for (size_t e = 0; e < lora; ++e) context[e] = 0.0f;
++            for (size_t s = 0; s < width; ++s)
++                if (row[s] >= 0) {
++                    const float* latent = latents.data() + static_cast<size_t>(row[s]) * lora;
++                    const float weight = probabilities[s] * inverse;
++                    for (size_t e = 0; e < lora; ++e) context[e] = std::fma(weight, latent[e], context[e]);
++                }
++            // out[t][h][v] = sum_c wv_b[c + lora*v + lora*v_head*h] * context[c]
++            for (size_t v = 0; v < v_head; ++v) {
++                const float* column = wv_b.data() + static_cast<size_t>(lora * v + lora * v_head * h);
++                float acc = 0;
++                for (size_t c = 0; c < lora; ++c) acc = std::fma(column[c], context[c], acc);
++                if (!std::isfinite(acc)) throw std::overflow_error("DSA attention overflowed");
++                staged[h * v_head + v] = acc;
++            }
++        }
++        for (size_t i = 0; i < staged.size(); ++i) out[t * heads * v_head + i] = staged[i];
++    }
++}
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/dsa_reference.h b/src/models/glm5/reference/dsa_reference.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9a3fac9dd5c6e4e9d62118eb98c8464f32b3226
+--- /dev/null
++++ b/src/models/glm5/reference/dsa_reference.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++namespace ninfer::models::glm5::reference {
++
++inline constexpr const char* kDsaReferenceProfile = "glm53_dsa_fp32";
++
++// GLM-5.3-Flash's audited DSA indexer geometry: 32 index heads of 128, pools
++// of 4 tokens, a 2048-token selection budget (512 pools) plus the mandatory
++// 3-slot incomplete tail, giving the fixed 2051-wide selection rows.
++struct DsaIndexerProfile {
++    uint32_t heads;
++    uint32_t head_dim;
++    uint32_t kpool;
++    uint32_t top_k;
++    bool select_tail;
++};
++inline constexpr DsaIndexerProfile kGlm53DsaIndexerProfile{32, 128, 4, 2048, true};
++
++[[nodiscard]] constexpr uint32_t dsa_top_pools(const DsaIndexerProfile& p) {
++    return p.top_k / p.kpool;  // 2048/4 = 512
++}
++[[nodiscard]] constexpr size_t dsa_selection_width(const DsaIndexerProfile& p) {
++    return p.select_tail ? size_t(p.top_k) + p.kpool - 1 : size_t(p.top_k);
++}
++
++// Pool compression over COMPLETE pools: pool p covers tokens [p*kpool,
++// p*kpool+kpool). pooled[p][e] = sum_m softmax_m(gates[p*kpool+m][e] +
++// ape[m][e]) * keys[p*kpool+m][e] where the softmax runs SEPARATELY PER
++// KEY-DIM ELEMENT over the pool members - the parity-pinned quirk; a whole-row
++// softmax is the natural wrong reading. Stable max-subtracted softmax in FP32.
++// tokens must be a positive multiple of kpool (the caller keeps the tail);
++// ape is [kpool][head_dim]. Everything validates before any output is written.
++void dsa_pool_reference(std::span<const float> keys, std::span<const float> gates,
++                        std::span<const float> ape, std::span<float> pooled,
++                        const DsaIndexerProfile&);
++
++// index_scores[t][p] = sum_h relu(iq[t][h] . pooled[p] * head_dim^-0.5) *
++// (weights[t][h] * heads^-0.5), all FP32. The two scale factors follow the
++// transformers placement (inside the ReLU / on the head weights); llama.cpp
++// and Maya pre-multiply 1/sqrt(head_dim*heads) onto the weights instead,
++// which is the same product in exact arithmetic and differs only in rounding.
++// iq is [tokens][heads][head_dim], weights [tokens][heads].
++void dsa_score_reference(std::span<const float> iq, std::span<const float> weights,
++                         std::span<const float> pooled, std::span<float> scores,
++                         const DsaIndexerProfile&);
++
++// Selection for one sequence of aligned pools: token t at GLOBAL position
++// pos[t] sees the first n_vis = (pos[t]+1)/kpool completed pools (pool p is
++// visible iff its last member p*kpool+kpool-1 <= pos[t]; the tail includes the
++// query token itself). Visible pools are ranked stable-descending with exact
++// ties broken by lower pool index; the pool at rank r occupies slots
++// [r*kpool, r*kpool+kpool) with its member cells in position order (slot
++// order IS score order). The incomplete tail (cells n_vis*kpool .. pos[t])
++// then fills [top_pools*kpool, ...) in position order when select_tail.
++// Every unused slot is -1. Output rows have the fixed dsa_selection_width.
++// pools is the completed-pool count of scores' second axis; n_vis must stay
++// <= pools. scores/pos/cells inputs must be finite/valid; cells publish per
++// token after the whole row validates.
++void dsa_select_reference(std::span<const float> scores, std::span<const uint32_t> pos,
++                          std::span<int32_t> cells, const DsaIndexerProfile&);
++
++// GLM-5.3-Flash's audited absorbed-MLA geometry: 512 latent, 64 heads, 256
++// nope score dim (also the softmax scale base) and 256 value dim. NoPE only.
++struct DsaMlaProfile {
++    uint32_t kv_lora;
++    uint32_t heads;
++    uint32_t qk_nope;
++    uint32_t v_head;
++};
++inline constexpr DsaMlaProfile kGlm53DsaMlaProfile{512, 64, 256, 256};
++
++// Absorbed sparse attention over one layer's selection rows.
++// q_abs is [tokens][heads][kv_lora] (queries already absorbed through
++// W_K_B: q_abs = W_K_B_h^T q_h), latents [cache][kv_lora] (the only cached
++// per-token state; no per-head K/V exists), cells [tokens][selection_width]
++// with -1 padding from dsa_select_reference, and wv_b the GGUF tensor
++// {kv_lora, v_head, heads}: wv_b[c + kv_lora*v + kv_lora*v_head*h].
++// Per token and head: score_s = (q_abs . latent_{cells[s]}) * qk_nope^-0.5
++// (the model constant 256^-0.5, NOT kv_lora^-0.5); softmax EXCLUDES the -1
++// slots entirely (numerically the graph's -inf additive mask); ctx accumulates
++// only over valid slots; out[t][h][v] = sum_c wv_b[c,v,h] * ctx[c]. Output
++// is [tokens][heads][v_head]. Inputs validate first; out publishes per token
++// once the whole token's values are finite.
++void dsa_attention_reference(std::span<const float> q_abs, std::span<const float> latents,
++                             std::span<const int32_t> cells, std::span<const float> wv_b,
++                             std::span<float> out, const DsaIndexerProfile&,
++                             const DsaMlaProfile&, size_t cache_tokens);
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/kda_chunk_reference.cpp b/src/models/glm5/reference/kda_chunk_reference.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2b0d5316c51d250984616037e4a51483dc8c1fb0
+--- /dev/null
++++ b/src/models/glm5/reference/kda_chunk_reference.cpp
+@@ -0,0 +1,189 @@
++#include "models/glm5/reference/kda_chunk_reference.h"
++
++#include <array>
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::models::glm5::reference {
++namespace {
++constexpr float kL2Eps = 1e-6f;
++
++size_t checked_mul(size_t a, size_t b) {
++    if (a && b > std::numeric_limits<size_t>::max() / a)
++        throw std::overflow_error("KDA chunk reference size overflow");
++    return a * b;
++}
++
++void demand_finite(std::span<const float> plane, const char* what) {
++    for (const float value : plane)
++        if (!std::isfinite(value)) throw std::invalid_argument(what);
++}
++}  // namespace
++
++void kda_chunk_reference(std::span<const float> q, std::span<const float> k,
++                         std::span<const float> v, std::span<const float> gate,
++                         std::span<const float> beta, std::span<float> state,
++                         std::span<float> out, std::span<float> scratch, const KdaProfile& profile,
++                         uint32_t chunk) {
++    const size_t d_inner = checked_mul(profile.heads, profile.head_dim);
++    const size_t dk = profile.head_dim;
++    const size_t state_values = kda_state_values(profile);
++    if (d_inner == 0 || q.size() % d_inner != 0)
++        throw std::invalid_argument("KDA chunk query is not a whole token plane");
++    const size_t tokens = q.size() / d_inner;
++    if (chunk == 0 || chunk > kKdaMaxChunk || tokens % chunk != 0)
++        throw std::invalid_argument("KDA chunk requires tokens to be a positive multiple of chunk");
++    if (k.size() != q.size() || v.size() != q.size() || gate.size() != q.size())
++        throw std::invalid_argument("KDA chunk k/v/gate planes must match the query plane");
++    if (beta.size() != checked_mul(tokens, profile.heads))
++        throw std::invalid_argument("KDA chunk beta must hold one value per token and head");
++    if (state.size() != state_values)
++        throw std::invalid_argument("KDA chunk state does not match the profile");
++    if (out.size() != q.size()) throw std::invalid_argument("KDA chunk output size mismatch");
++    if (scratch.size() != kda_chunk_scratch_values(profile, tokens, chunk))
++        throw std::invalid_argument("KDA chunk scratch does not match the requirement");
++    if (tokens == 0) throw std::invalid_argument("KDA chunk requires at least one token");
++    for (const auto* plane : {&q, &k, &v, &gate, &beta})
++        demand_finite(*plane, "KDA chunk inputs must be finite");
++    demand_finite(state, "KDA chunk state must be finite");
++
++    const size_t c = chunk;
++    const float scale = 1.0f / std::sqrt(static_cast<float>(dk));
++    float* work = scratch.data();                        // state image ...
++    float* staged = work + state_values;                 // ... then output image ...
++    float* plane = staged + out.size();                  // ... then the per-head work plane
++    float* gsum = plane;                                 // [c][dk]
++    float* q_normed = gsum + c * dk;                     // [c][dk], scaled by head_dim^-0.5
++    float* k_normed = q_normed + c * dk;                 // [c][dk]
++    float* t_matrix = k_normed + c * dk;                 // [c][c]
++    float* w_rows = t_matrix + c * c;                    // [c][dk]
++    float* u_rows = w_rows + c * dk;                     // [c][dk]
++    float* v_fixed = u_rows + c * dk;                    // [c][dk]
++    float* staging = v_fixed + c * dk;                   // [c] substitution deltas / Aqk row
++
++    for (size_t i = 0; i < state_values; ++i) work[i] = state[i];
++    const size_t chunks = tokens / c;
++
++    for (size_t chunk_index = 0; chunk_index < chunks; ++chunk_index)
++        for (uint32_t head = 0; head < profile.heads; ++head) {
++            const size_t base = chunk_index * c * d_inner + size_t(head) * dk;
++            const size_t beta_base = chunk_index * c * profile.heads + head;  // + row*heads reaches row token
++
++            for (size_t row = 0; row < c; ++row)
++                for (size_t d = 0; d < dk; ++d) {
++                    const float value = gate[base + row * d_inner + d];
++                    gsum[row * dk + d] = value + (row ? gsum[(row - 1) * dk + d] : 0.0f);
++                }
++            for (size_t row = 0; row < c; ++row) {
++                float q_square = kL2Eps, k_square = kL2Eps;
++                for (size_t d = 0; d < dk; ++d) {
++                    const float qv = q[base + row * d_inner + d];
++                    const float kv = k[base + row * d_inner + d];
++                    q_square = std::fma(qv, qv, q_square);
++                    k_square = std::fma(kv, kv, k_square);
++                }
++                const float q_inv = 1.0f / std::sqrt(q_square);
++                const float k_inv = 1.0f / std::sqrt(k_square);
++                for (size_t d = 0; d < dk; ++d) {
++                    q_normed[row * dk + d] = (q[base + row * d_inner + d] * q_inv) * scale;
++                    k_normed[row * dk + d] = k[base + row * d_inner + d] * k_inv;
++                }
++            }
++
++            // Decayed key Gram from differences only. Entries are
++            // [row = later token i][col = earlier token j], j < i, with the
++            // exponent gsum[i] - gsum[j] <= 0 (gsum is non-increasing), so no
++            // positive exponent is ever computed. The LATER token's beta
++            // scales the Gram row; exact forward substitution then produces
++            // (I+L)^-1 - I on the strict lower triangle.
++            for (size_t i = 0; i < c; ++i)
++                for (size_t j = 0; j < c; ++j) t_matrix[i * c + j] = 0.0f;
++            for (size_t i = 1; i < c; ++i)
++                for (size_t j = 0; j < i; ++j) {
++                    float acc = 0;
++                    for (size_t d = 0; d < dk; ++d)
++                        acc = std::fma(k_normed[i * dk + d] *
++                                           std::exp(gsum[i * dk + d] - gsum[j * dk + d]),
++                                       k_normed[j * dk + d], acc);
++                    t_matrix[i * c + j] = -beta[beta_base + i * profile.heads] * acc;
++                }
++            for (size_t i = 1; i < c; ++i) {
++                for (size_t j = 0; j < i; ++j) {
++                    float acc = 0;
++                    for (size_t m = 0; m < i; ++m) acc += t_matrix[i * c + m] * t_matrix[m * c + j];
++                    staging[j] = acc;
++                }
++                for (size_t j = 0; j < i; ++j) t_matrix[i * c + j] += staging[j];
++            }
++            // u = (T+I) @ (beta_key * v), w = (T+I) @ (beta_key * e^gsum * k):
++            // the diagonal of (T+I) is beta of the own token, the strict-lower
++            // columns carry the EARLIER (column) token's beta.
++            for (size_t row = 0; row < c; ++row)
++                for (size_t d = 0; d < dk; ++d) {
++                    const float b_diag = beta[beta_base + row * profile.heads];
++                    float w_acc = b_diag * k_normed[row * dk + d] * std::exp(gsum[row * dk + d]);
++                    float u_acc = b_diag * v[base + row * d_inner + d];
++                    for (size_t col = 0; col < row; ++col) {
++                        const float t = t_matrix[row * c + col] * beta[beta_base + col * profile.heads];
++                        w_acc = std::fma(t, k_normed[col * dk + d] * std::exp(gsum[col * dk + d]), w_acc);
++                        u_acc = std::fma(t, v[base + col * d_inner + d], u_acc);
++                    }
++                    w_rows[row * dk + d] = w_acc;
++                    u_rows[row * dk + d] = u_acc;
++                }
++
++            float* S = work + size_t(head) * dk * dk;
++            for (size_t row = 0; row < c; ++row) {
++                for (size_t d = 0; d < dk; ++d) {
++                    float acc = 0;
++                    for (size_t kd = 0; kd < dk; ++kd)
++                        acc = std::fma(w_rows[row * dk + kd], S[kd * dk + d], acc);
++                    v_fixed[row * dk + d] = u_rows[row * dk + d] - acc;
++                }
++                // Aqk row with diagonal kept, differences only.
++                for (size_t col = 0; col <= row; ++col) {
++                    float gram = 0;
++                    for (size_t d = 0; d < dk; ++d)
++                        gram = std::fma(q_normed[row * dk + d] *
++                                            std::exp(gsum[row * dk + d] - gsum[col * dk + d]),
++                                        k_normed[col * dk + d], gram);
++                    staging[col] = gram;
++                }
++                float* o_row = staged + base + row * d_inner;
++                for (size_t d = 0; d < dk; ++d) {
++                    float acc = 0;
++                    for (size_t kd = 0; kd < dk; ++kd)
++                        acc = std::fma(q_normed[row * dk + kd] * std::exp(gsum[row * dk + kd]),
++                                       S[kd * dk + d], acc);
++                    for (size_t col = 0; col <= row; ++col)
++                        acc = std::fma(staging[col], v_fixed[col * dk + d], acc);
++                    o_row[d] = acc;
++                }
++            }
++            // State: rows decay by the chunk's last cumsum, then the rank-c
++            // update with decay-shifted keys and the corrected values.
++            for (size_t kd = 0; kd < dk; ++kd) {
++                const float decay = std::exp(gsum[(c - 1) * dk + kd]);
++                for (size_t d = 0; d < dk; ++d) S[kd * dk + d] *= decay;
++            }
++            for (size_t kd = 0; kd < dk; ++kd)
++                for (size_t d = 0; d < dk; ++d) {
++                    float acc = 0;
++                    for (size_t row = 0; row < c; ++row)
++                        acc = std::fma(k_normed[row * dk + kd] *
++                                           std::exp(gsum[(c - 1) * dk + kd] - gsum[row * dk + kd]),
++                                       v_fixed[row * dk + d], acc);
++                    S[kd * dk + d] += acc;
++                }
++        }
++
++    for (size_t i = 0; i < state_values; ++i)
++        if (!std::isfinite(work[i])) throw std::overflow_error("KDA chunk state overflowed");
++    for (size_t i = 0; i < out.size(); ++i)
++        if (!std::isfinite(staged[i])) throw std::overflow_error("KDA chunk output overflowed");
++    for (size_t i = 0; i < state_values; ++i) state[i] = work[i];
++    for (size_t i = 0; i < out.size(); ++i) out[i] = staged[i];
++}
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/kda_chunk_reference.h b/src/models/glm5/reference/kda_chunk_reference.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ef3c14a31b2ca3ca4f6950f2191a07b91e49e19
+--- /dev/null
++++ b/src/models/glm5/reference/kda_chunk_reference.h
+@@ -0,0 +1,54 @@
++#pragma once
++
++#include "models/glm5/reference/kda_reference.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++namespace ninfer::models::glm5::reference {
++
++inline constexpr const char* kKdaChunkReferenceProfile = "glm53_kda_chunk_fp32";
++
++// Production chunk width of the reference stack (FLA/abotsis default).
++inline constexpr uint32_t kGlm53KdaChunk = 64;
++// Staging bound: 64 production, 256 keeps accidental wider profiles testable.
++inline constexpr uint32_t kKdaMaxChunk = 256;
++
++// Total scratch of kda_chunk_reference in floats: the staged state image and
++// output image (validate-then-commit, same contract as the recurrent scan)
++// plus one reusable per-head work plane of chunk*(chunk + 6*head_dim + 1)
++// values (rebased cumsum, normalized q/k, T, u, w, corrected values - six
++// chunk x head_dim planes - plus the forward-substitution/Aqk staging row).
++[[nodiscard]] constexpr size_t kda_chunk_scratch_values(const KdaProfile& profile,
++                                                         size_t tokens, uint32_t chunk) {
++    const size_t per_head = size_t(chunk) * (chunk + 6 * size_t(profile.head_dim) + 1);
++    return kda_scan_scratch_values(profile, tokens) + per_head;
++}
++
++// Chunked prefill over whole chunks: the FLA naive chunk algorithm with the
++// audited GLM-5.3 semantics. Inputs match kda_gated_delta_reference exactly
++// (q/k/v post-conv SiLU planes, gate in log space from the decay-gate
++// reference, already-sigmoided beta); tokens must be a multiple of chunk (the
++// caller pads tails with g=0/q=k=v=beta=0 rows, which contribute nothing).
++// q/k get the in-kernel l2 norm (eps 1e-6) and q the head_dim^-0.5 scale.
++//
++// Per chunk and head: a per-chunk rebased cumsum of the log gate; the decayed
++// key Gram taken from DIFFERENCES exp(gsum[c]-gsum[i]) (never the factored
++// product form, which overflows for long chunks); the unit-diagonal strict
++// lower system solved by exact forward substitution (no Neumann iteration);
++// beta of the earlier token scales the Gram rows and beta of the own token
++// scales the v/w operands; Aqk keeps its diagonal; the state affine update
++// carries the chunk recurrence. All arithmetic FP32 with /fp:strict.
++//
++// state and out commit together only after every value validates, exactly like
++// the recurrent scan; scratch must hold kda_chunk_scratch_values and must not
++// alias any plane. This is the reference chunk algorithm only: no varlen
++// packing, no HPU execution, no performance claim.
++void kda_chunk_reference(std::span<const float> q, std::span<const float> k,
++                         std::span<const float> v, std::span<const float> gate,
++                         std::span<const float> beta, std::span<float> state,
++                         std::span<float> out, std::span<float> scratch, const KdaProfile&,
++                         uint32_t chunk);
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/kda_reference.cpp b/src/models/glm5/reference/kda_reference.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d998a03d2e9ab5e139f1a8d2c936eae06811a318
+--- /dev/null
++++ b/src/models/glm5/reference/kda_reference.cpp
+@@ -0,0 +1,219 @@
++#include "models/glm5/reference/kda_reference.h"
++
++#include <array>
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::models::glm5::reference {
++namespace {
++constexpr float kL2Eps = 1e-6f;   // transformers l2norm/glm kernels add eps inside the sqrt
++constexpr float kNormEps = 1e-6f; // Glm5NextTextRMSNormGated default eps
++// Per-head staging bound: the reference head slice is 128 floats; twice that
++// keeps an accidental 256-dim profile testable instead of silently corrupt.
++constexpr size_t kMaxHeadDim = 256;
++
++static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
++              "GLM KDA reference requires IEEE-754 binary32");
++
++float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
++
++size_t checked_mul(size_t a, size_t b) {
++    if (a && b > std::numeric_limits<size_t>::max() / a)
++        throw std::overflow_error("KDA reference size overflow");
++    return a * b;
++}
++
++void demand_finite(std::span<const float> plane, const char* what) {
++    for (const float value : plane)
++        if (!std::isfinite(value)) throw std::invalid_argument(what);
++}
++
++size_t token_count(std::span<const float> plane, size_t d_inner, const char* what) {
++    if (d_inner == 0 || plane.size() % d_inner != 0)
++        throw std::invalid_argument(what);
++    return plane.size() / d_inner;
++}
++}  // namespace
++
++void kda_conv_reference(std::span<const float> x, std::span<const float> weights,
++                        std::span<float> conv_state, std::span<float> out, const KdaProfile& profile) {
++    if (profile.d_conv < 2) throw std::invalid_argument("KDA conv requires at least two taps");
++    const size_t d_inner = checked_mul(profile.heads, profile.head_dim);
++    const size_t hist = profile.d_conv - 1;
++    const size_t tokens = token_count(x, d_inner, "KDA conv input is not a whole token plane");
++    if (weights.size() != checked_mul(d_inner, profile.d_conv))
++        throw std::invalid_argument("KDA conv weights do not match the profile");
++    if (conv_state.size() != checked_mul(hist, d_inner))
++        throw std::invalid_argument("KDA conv state does not match the profile");
++    if (out.size() != x.size()) throw std::invalid_argument("KDA conv output size mismatch");
++    if (tokens == 0) throw std::invalid_argument("KDA conv requires at least one token");
++    demand_finite(x, "KDA conv input must be finite");
++    demand_finite(weights, "KDA conv weights must be finite");
++    demand_finite(conv_state, "KDA conv state must be finite");
++
++    // The virtual window [state | x]: sample s maps to state row s+hist for s<0
++    // and to x[s] otherwise. Each output element is published as soon as it is
++    // finite; the state is only advanced after every element succeeded.
++    const auto sample = [&](long long s, size_t channel) -> float {
++        return s >= 0 ? x[static_cast<size_t>(s) * d_inner + channel]
++                      : conv_state[static_cast<size_t>(s + static_cast<long long>(hist)) * d_inner + channel];
++    };
++    for (size_t t = 0; t < tokens; ++t)
++        for (size_t channel = 0; channel < d_inner; ++channel) {
++            float acc = 0;
++            for (size_t tap = 0; tap < profile.d_conv; ++tap) {
++                const float w = weights[channel * profile.d_conv + tap];
++                acc = std::fma(w, sample(static_cast<long long>(t) - static_cast<long long>(hist) +
++                                         static_cast<long long>(tap), channel), acc);
++            }
++            if (!std::isfinite(acc)) throw std::overflow_error("KDA conv tap sum overflowed");
++            const float silu = acc * sigmoid(acc);
++            if (!std::isfinite(silu)) throw std::overflow_error("KDA conv SiLU overflowed");
++            out[t * d_inner + channel] = silu;
++        }
++    for (size_t channel = 0; channel < d_inner; ++channel) {
++        // Stage first: with tokens < hist the new state still reads old rows
++        // that earlier writes of this loop would already have replaced.
++        std::array<float, 64> replacement{};
++        if (hist > replacement.size()) throw std::invalid_argument("KDA conv history exceeds the staging bound");
++        for (size_t tap = 0; tap < hist; ++tap) {
++            const long long s = static_cast<long long>(tokens) - static_cast<long long>(hist) +
++                                static_cast<long long>(tap);
++            replacement[tap] = sample(s, channel);
++        }
++        for (size_t tap = 0; tap < hist; ++tap) conv_state[tap * d_inner + channel] = replacement[tap];
++    }
++}
++
++void kda_decay_gate_reference(std::span<const float> g, std::span<const float> a_log,
++                              std::span<float> out, const KdaProfile& profile) {
++    const size_t d_inner = checked_mul(profile.heads, profile.head_dim);
++    const size_t tokens = token_count(g, d_inner, "KDA gate input is not a whole token plane");
++    if (a_log.size() != profile.heads)
++        throw std::invalid_argument("KDA gate requires one A_log per head");
++    if (out.size() != g.size()) throw std::invalid_argument("KDA gate output size mismatch");
++    if (!std::isfinite(profile.gate_lower_bound) || profile.gate_lower_bound >= 0)
++        throw std::invalid_argument("KDA safe gate lower bound must be finite and negative");
++    demand_finite(g, "KDA gate input must be finite");
++    demand_finite(a_log, "KDA gate A_log must be finite");
++    for (size_t t = 0; t < tokens; ++t)
++        for (uint32_t head = 0; head < profile.heads; ++head) {
++            const float decay_rate = std::exp(a_log[head]);
++            for (uint32_t i = 0; i < profile.head_dim; ++i) {
++                const size_t index = t * d_inner + size_t(head) * profile.head_dim + i;
++                out[index] = profile.gate_lower_bound * sigmoid(decay_rate * g[index]);
++            }
++        }
++    // The safe-path result lies in (lower_bound, 0] by construction; the loop
++    // above cannot produce a non-finite value from finite inputs because sigmoid
++    // saturates to 0 or 1 and lower_bound is finite.
++}
++
++void kda_gated_delta_reference(std::span<const float> q, std::span<const float> k,
++                               std::span<const float> v, std::span<const float> gate,
++                               std::span<const float> beta, std::span<float> state,
++                               std::span<float> out, std::span<float> scratch, const KdaProfile& profile) {
++    const size_t d_inner = checked_mul(profile.heads, profile.head_dim);
++    const size_t dk = profile.head_dim;
++    const size_t state_values = kda_state_values(profile);
++    const size_t tokens = token_count(q, d_inner, "KDA scan query is not a whole token plane");
++    if (k.size() != q.size() || v.size() != q.size() || gate.size() != q.size())
++        throw std::invalid_argument("KDA scan k/v/gate planes must match the query plane");
++    if (beta.size() != checked_mul(tokens, profile.heads))
++        throw std::invalid_argument("KDA scan beta must hold one value per token and head");
++    if (state.size() != state_values)
++        throw std::invalid_argument("KDA scan state does not match the profile");
++    if (out.size() != q.size()) throw std::invalid_argument("KDA scan output size mismatch");
++    if (scratch.size() != state_values + out.size())
++        throw std::invalid_argument("KDA scan scratch must hold one state and one output image");
++    if (tokens == 0) throw std::invalid_argument("KDA scan requires at least one token");
++    for (const auto* plane : {&q, &k, &v, &gate, &beta}) demand_finite(*plane, "KDA scan inputs must be finite");
++    demand_finite(state, "KDA scan state must be finite");
++
++    const float scale = 1.0f / std::sqrt(static_cast<float>(dk));
++    float* work = scratch.data();                       // state image, then output image
++    float* staged = scratch.data() + state_values;
++    for (size_t i = 0; i < state_values; ++i) work[i] = state[i];
++
++    for (size_t t = 0; t < tokens; ++t)
++        for (uint32_t head = 0; head < profile.heads; ++head) {
++            const float* qt = q.data() + t * d_inner + size_t(head) * dk;
++            const float* kt = k.data() + t * d_inner + size_t(head) * dk;
++            const float* vt = v.data() + t * d_inner + size_t(head) * dk;
++            const float* gt = gate.data() + t * d_inner + size_t(head) * dk;
++            const float b = beta[t * profile.heads + head];
++            float* S = work + size_t(head) * dk * dk;   // row = key axis
++
++            float q_norm = kL2Eps, k_norm = kL2Eps;     // eps inside the sqrt keeps a zero vector finite
++            for (size_t i = 0; i < dk; ++i) {
++                q_norm = std::fma(qt[i], qt[i], q_norm);
++                k_norm = std::fma(kt[i], kt[i], k_norm);
++            }
++            q_norm = std::sqrt(q_norm); k_norm = std::sqrt(k_norm);
++            if (dk > kMaxHeadDim) throw std::invalid_argument("KDA scan head_dim exceeds the staging bound");
++            std::array<float, kMaxHeadDim> qh{}, kh{};
++            for (size_t i = 0; i < dk; ++i) {
++                qh[i] = (qt[i] / q_norm) * scale;
++                kh[i] = kt[i] / k_norm;
++            }
++            for (size_t i = 0; i < dk; ++i) {           // decay applies to the key axis
++                const float decay = std::exp(gt[i]);
++                for (size_t j = 0; j < dk; ++j) S[i * dk + j] *= decay;
++            }
++            std::array<float, kMaxHeadDim> u{}, delta{};
++            for (size_t j = 0; j < dk; ++j) {
++                float acc = 0;
++                for (size_t i = 0; i < dk; ++i) acc = std::fma(S[i * dk + j], kh[i], acc);
++                u[j] = acc;
++            }
++            for (size_t j = 0; j < dk; ++j) delta[j] = b * (vt[j] - u[j]);
++            for (size_t i = 0; i < dk; ++i)
++                for (size_t j = 0; j < dk; ++j) S[i * dk + j] = std::fma(kh[i], delta[j], S[i * dk + j]);
++            float* ot = staged + t * d_inner + size_t(head) * dk;
++            for (size_t j = 0; j < dk; ++j) {
++                float acc = 0;
++                for (size_t i = 0; i < dk; ++i) acc = std::fma(S[i * dk + j], qh[i], acc);
++                ot[j] = acc;
++            }
++            for (size_t i = 0; i < dk * dk; ++i)
++                if (!std::isfinite(S[i])) throw std::overflow_error("KDA scan state overflowed");
++            for (size_t j = 0; j < dk; ++j)
++                if (!std::isfinite(ot[j])) throw std::overflow_error("KDA scan output overflowed");
++        }
++    for (size_t i = 0; i < state_values; ++i) state[i] = work[i];
++    for (size_t i = 0; i < out.size(); ++i) out[i] = staged[i];
++}
++
++void kda_out_gate_reference(std::span<const float> o, std::span<const float> g2,
++                            std::span<const float> norm_w, std::span<float> out,
++                            const KdaProfile& profile) {
++    const size_t dk = profile.head_dim;
++    const size_t d_inner = checked_mul(profile.heads, dk);
++    const size_t tokens = token_count(o, d_inner, "KDA out-gate input is not a whole token plane");
++    if (g2.size() != o.size()) throw std::invalid_argument("KDA out-gate gate plane mismatch");
++    if (norm_w.size() != dk) throw std::invalid_argument("KDA out-gate weight must hold head_dim values");
++    if (out.size() != o.size()) throw std::invalid_argument("KDA out-gate output size mismatch");
++    demand_finite(o, "KDA out-gate input must be finite");
++    demand_finite(g2, "KDA out-gate gate must be finite");
++    demand_finite(norm_w, "KDA out-gate weight must be finite");
++
++    // Publication is per element after it validates; o and out may alias, and
++    // each output element only reads its own head slice, so an alias is safe.
++    for (size_t t = 0; t < tokens; ++t)
++        for (uint32_t head = 0; head < profile.heads; ++head) {
++            const float* ot = o.data() + t * d_inner + size_t(head) * dk;
++            const float* gt = g2.data() + t * d_inner + size_t(head) * dk;
++            float mean = 0;
++            for (size_t i = 0; i < dk; ++i) mean = std::fma(ot[i], ot[i], mean);
++            mean /= static_cast<float>(dk);
++            const float inv = 1.0f / std::sqrt(mean + kNormEps);
++            for (size_t i = 0; i < dk; ++i) {
++                const float value = ot[i] * inv * norm_w[i] * sigmoid(gt[i]);
++                if (!std::isfinite(value)) throw std::overflow_error("KDA out-gate overflowed");
++                out[t * d_inner + size_t(head) * dk + i] = value;
++            }
++        }
++}
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/kda_reference.h b/src/models/glm5/reference/kda_reference.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..04c94621abdfbccbb4522960988af4f90748eb9d
+--- /dev/null
++++ b/src/models/glm5/reference/kda_reference.h
+@@ -0,0 +1,73 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++namespace ninfer::models::glm5::reference {
++
++inline constexpr const char* kKdaReferenceProfile = "glm53_kda_fp32";
++
++// GLM-5.3-Flash's audited linear-attention geometry: 34 KDA layers, 64 heads of
++// 128, causal short conv of 4 taps and the -5.0 safe gate lower bound
++// (glm53-config evidence, 2026-10-23 header audit).
++struct KdaProfile {
++    uint32_t heads;
++    uint32_t head_dim;
++    uint32_t d_conv;
++    float gate_lower_bound;
++};
++inline constexpr KdaProfile kGlm53KdaProfile{64, 128, 4, -5.0f};
++
++// Bounded scratch requirement of kda_gated_delta_reference, in floats: one full
++// state image for the validate-then-commit state update.
++[[nodiscard]] constexpr size_t kda_state_values(const KdaProfile& profile) {
++    return size_t(profile.heads) * profile.head_dim * profile.head_dim;
++}
++
++// Total scratch of kda_gated_delta_reference: the state image followed by one
++// output image, both committed only after the whole scan validates.
++[[nodiscard]] constexpr size_t kda_scan_scratch_values(const KdaProfile& profile, size_t tokens) {
++    return kda_state_values(profile) + tokens * size_t(profile.heads) * profile.head_dim;
++}
++
++// Causal per-channel short conv followed by SiLU. x is [tokens][d_inner] with
++// d_inner = heads*head_dim, weights [d_inner][d_conv], conv_state [d_conv-1][d_inner]
++// oldest tap first. Each out element is published once it is finite; conv_state
++// is advanced to the last d_conv-1 columns of [conv_state | x] only after every
++// element succeeded. No projections, activation gating or HPU dispatch.
++void kda_conv_reference(std::span<const float> x, std::span<const float> weights,
++                        std::span<float> conv_state, std::span<float> out, const KdaProfile&);
++
++// Safe-path decay gate in LOG space: out[t][h*head_dim+i] =
++// gate_lower_bound * sigmoid(exp(a_log[h]) * g[t][h*head_dim+i]), i.e. values in
++// (gate_lower_bound, 0] that the scan exponentiates. g is the already-summed
++// f_b(f_a(x)) + dt_bias plane; A_log is per head. FP32 sigmoid and exp, no
++// softplus fallback: GLM-5.3-Flash fixes the safe path.
++void kda_decay_gate_reference(std::span<const float> g, std::span<const float> a_log,
++                              std::span<float> out, const KdaProfile&);
++
++// Gated delta rule scan over tokens. q/k/v are post-conv SiLU [tokens][d_inner];
++// q and k get FLA l2 norm (eps 1e-6 inside the sqrt) and q additionally the
++// head_dim^-0.5 scale, both in FP32, matching the fused kernel's in-kernel path.
++// gate is the kda_decay_gate_reference output (log space, decay applied as
++// exp(gate) on the KEY axis); beta is ALREADY sigmoided [tokens][heads].
++// state is [heads][head_dim key][head_dim value], row = key axis; scratch must
++// hold kda_scan_scratch_values(profile, tokens) floats (one state image then
++// one output image) and must not alias any plane. out is [tokens][d_inner];
++// out and state change together, only after the whole scan validates (a
++// non-finite intermediate rejects the call leaving both untouched). This is
++// the recurrent algorithm only; chunk prefill is a separate future module.
++void kda_gated_delta_reference(std::span<const float> q, std::span<const float> k,
++                               std::span<const float> v, std::span<const float> gate,
++                               std::span<const float> beta, std::span<float> state,
++                               std::span<float> out, std::span<float> scratch, const KdaProfile&);
++
++// Output gate: per token and head, o is RMS-normalized over head_dim (eps 1e-6,
++// FP32), multiplied by norm_w and by sigmoid(g2), writing [tokens][d_inner].
++// o and out may alias: publication happens only after all values validate.
++void kda_out_gate_reference(std::span<const float> o, std::span<const float> g2,
++                            std::span<const float> norm_w, std::span<float> out,
++                            const KdaProfile&);
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/mhc_reference.cpp b/src/models/glm5/reference/mhc_reference.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc8141455608c3e447382781b900af71c48e4db7
+--- /dev/null
++++ b/src/models/glm5/reference/mhc_reference.cpp
+@@ -0,0 +1,216 @@
++#include "models/glm5/reference/mhc_reference.h"
++
++#include <cmath>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++namespace ninfer::models::glm5::reference {
++namespace {
++constexpr uint32_t kGlmHc = 4;
++static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
++              "GLM mHC reference requires IEEE-754 binary32");
++
++float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
++
++size_t checked_mul(size_t a, size_t b) {
++    if (a && b > std::numeric_limits<size_t>::max() / a)
++        throw std::overflow_error("mHC reference size overflow");
++    return a * b;
++}
++
++void demand_finite(std::span<const float> plane, const char* what) {
++    for (const float value : plane)
++        if (!std::isfinite(value)) throw std::invalid_argument(what);
++}
++
++size_t token_count(std::span<const float> plane, size_t per_token, const char* what) {
++    if (per_token == 0 || plane.size() % per_token != 0)
++        throw std::invalid_argument(what);
++    return plane.size() / per_token;
++}
++}  // namespace
++
++void mhc_pre_reference(std::span<const float> streams, std::span<const float> fn,
++                       std::span<const float> base, std::span<const float> scale,
++                       std::span<float> pre, std::span<float> post, std::span<float> comb,
++                       std::span<float> collapsed, const MhcProfile& profile, uint32_t hidden) {
++    if (profile.hc != kGlmHc)
++        throw std::invalid_argument("mHC reference pins the audited 4-stream geometry");
++    if (profile.hc == 0 || hidden == 0 || profile.sinkhorn_iters == 0)
++        throw std::invalid_argument("mHC profile is degenerate");
++    if (!std::isfinite(profile.rms_eps) || profile.rms_eps < 0 ||
++        !std::isfinite(profile.hc_eps) || profile.hc_eps < 0)
++        throw std::invalid_argument("mHC profile epsilons must be finite and nonnegative");
++    const size_t hc = profile.hc;
++    const size_t stream_values = checked_mul(hc, hidden);
++    const size_t mix_values = checked_mul(2 + hc, hc);
++    const size_t tokens = token_count(streams, stream_values,
++                                      "mHC streams are not whole flattened token planes");
++    if (fn.size() != checked_mul(mix_values, stream_values) || base.size() != mix_values ||
++        scale.size() != 3)
++        throw std::invalid_argument("mHC parameters do not match the profile");
++    if (pre.size() != checked_mul(tokens, hc) || post.size() != pre.size() ||
++        comb.size() != checked_mul(tokens, checked_mul(hc, hc)) ||
++        collapsed.size() != checked_mul(tokens, hidden))
++        throw std::invalid_argument("mHC weight plane sizes do not match the token count");
++    if (tokens == 0) throw std::invalid_argument("mHC requires at least one token");
++    demand_finite(streams, "mHC streams must be finite");
++    demand_finite(fn, "mHC fn must be finite");
++    demand_finite(base, "mHC base must be finite");
++    demand_finite(scale, "mHC scale must be finite");
++
++    for (size_t t = 0; t < tokens; ++t) {
++        const float* row = streams.data() + t * stream_values;
++        float mean_square = 0;
++        for (size_t i = 0; i < stream_values; ++i) mean_square += row[i] * row[i];
++        const float inverse = 1.0f / std::sqrt(mean_square / static_cast<float>(stream_values) +
++                                               profile.rms_eps);
++
++        // Mix projection on the normalized plane, left-to-right accumulation.
++        static_assert((2 + kGlmHc) * kGlmHc == 24);
++        float mix_row[24];
++        for (size_t m = 0; m < mix_values; ++m) {
++            const float* weights = fn.data() + m * stream_values;
++            float acc = 0;
++            for (size_t i = 0; i < stream_values; ++i) acc = std::fma(weights[i], row[i], acc);
++            mix_row[m] = acc * inverse;
++        }
++        for (size_t m = 0; m < mix_values; ++m)
++            if (!std::isfinite(mix_row[m])) throw std::overflow_error("mHC mix overflowed");
++
++        float* pre_t = pre.data() + t * hc;
++        float* post_t = post.data() + t * hc;
++        for (size_t n = 0; n < hc; ++n) {
++            const float pre_logit = mix_row[n] * scale[0] + base[n];
++            const float post_logit = mix_row[hc + n] * scale[1] + base[hc + n];
++            pre_t[n] = sigmoid(pre_logit) + profile.hc_eps;
++            post_t[n] = 2.0f * sigmoid(post_logit);
++        }
++
++        // comb[src][dst], flat checkpoint layout comb[dst + hc*src]; softmax
++        // over dst per src row, +eps, then the pinned Sinkhorn order.
++        float* comb_t = comb.data() + t * hc * hc;
++        for (size_t src = 0; src < hc; ++src) {
++            float logits[4], maximum = 0;
++            for (size_t dst = 0; dst < hc; ++dst) {
++                const size_t flat = 2 * hc + dst + hc * src;
++                logits[dst] = mix_row[flat] * scale[2] + base[flat];
++                if (dst == 0 || logits[dst] > maximum) maximum = logits[dst];
++            }
++            float denominator = 0;
++            float exps[4];
++            for (size_t dst = 0; dst < hc; ++dst) {
++                exps[dst] = std::exp(logits[dst] - maximum);
++                denominator += exps[dst];
++            }
++            for (size_t dst = 0; dst < hc; ++dst)
++                comb_t[src * hc + dst] = exps[dst] / denominator + profile.hc_eps;
++        }
++        auto column_normalize = [&]() {   // each dst sums to 1 over src
++            for (size_t dst = 0; dst < hc; ++dst) {
++                float sum = 0;
++                for (size_t src = 0; src < hc; ++src) sum += comb_t[src * hc + dst];
++                const float inverse_sum = 1.0f / (sum + profile.hc_eps);
++                for (size_t src = 0; src < hc; ++src)
++                    comb_t[src * hc + dst] *= inverse_sum;
++            }
++        };
++        auto row_normalize = [&]() {      // each src sums to 1 over dst
++            for (size_t src = 0; src < hc; ++src) {
++                float sum = 0;
++                for (size_t dst = 0; dst < hc; ++dst) sum += comb_t[src * hc + dst];
++                const float inverse_sum = 1.0f / (sum + profile.hc_eps);
++                for (size_t dst = 0; dst < hc; ++dst)
++                    comb_t[src * hc + dst] *= inverse_sum;
++            }
++        };
++        column_normalize();
++        for (uint32_t round = 1; round < profile.sinkhorn_iters; ++round) {
++            row_normalize();
++            column_normalize();
++        }
++
++        float* collapsed_t = collapsed.data() + t * hidden;
++        for (size_t d = 0; d < hidden; ++d) {
++            float acc = 0;
++            for (size_t n = 0; n < hc; ++n) acc = std::fma(pre_t[n], row[n * hidden + d], acc);
++            collapsed_t[d] = acc;
++        }
++        for (size_t n = 0; n < hc; ++n)
++            if (!std::isfinite(pre_t[n]) || !std::isfinite(post_t[n]))
++                throw std::overflow_error("mHC gate overflowed");
++        for (size_t i = 0; i < hc * hc; ++i)
++            if (!std::isfinite(comb_t[i])) throw std::overflow_error("mHC comb overflowed");
++        for (size_t d = 0; d < hidden; ++d)
++            if (!std::isfinite(collapsed_t[d])) throw std::overflow_error("mHC collapse overflowed");
++    }
++}
++
++void mhc_post_reference(std::span<const float> block, std::span<const float> residual,
++                        std::span<const float> post, std::span<const float> comb,
++                        std::span<float> out, const MhcProfile& profile, uint32_t hidden) {
++    const size_t hc = profile.hc;
++    const size_t stream_values = checked_mul(hc, hidden);
++    const size_t tokens = token_count(residual, stream_values,
++                                      "mHC residual is not whole flattened token planes");
++    if (block.size() != checked_mul(tokens, hidden) || post.size() != checked_mul(tokens, hc) ||
++        comb.size() != checked_mul(tokens, checked_mul(hc, hc)) || out.size() != residual.size())
++        throw std::invalid_argument("mHC post plane sizes do not match the token count");
++    if (tokens == 0) throw std::invalid_argument("mHC requires at least one token");
++    demand_finite(block, "mHC block output must be finite");
++    demand_finite(residual, "mHC residual must be finite");
++    demand_finite(post, "mHC post must be finite");
++    demand_finite(comb, "mHC comb must be finite");
++
++    // Per token: compute the whole output row, validate, then publish, so that
++    // an out aliasing residual never mixes old and new stream values.
++    std::vector<float> staged;
++    staged.resize(stream_values);
++    for (size_t t = 0; t < tokens; ++t) {
++        const float* block_t = block.data() + t * hidden;
++        const float* residual_t = residual.data() + t * stream_values;
++        const float* post_t = post.data() + t * hc;
++        const float* comb_t = comb.data() + t * hc * hc;
++        for (size_t dst = 0; dst < hc; ++dst) {
++            for (size_t d = 0; d < hidden; ++d) {
++                float mix = 0;
++                for (size_t src = 0; src < hc; ++src)
++                    mix = std::fma(comb_t[src * hc + dst], residual_t[src * hidden + d], mix);
++                staged[dst * hidden + d] = std::fma(post_t[dst], block_t[d], mix);
++            }
++        }
++        for (size_t i = 0; i < stream_values; ++i)
++            if (!std::isfinite(staged[i])) throw std::overflow_error("mHC post overflowed");
++        float* out_t = out.data() + t * stream_values;
++        for (size_t i = 0; i < stream_values; ++i) out_t[i] = staged[i];
++    }
++}
++
++void mhc_head_reference(std::span<const float> streams, std::span<float> out,
++                        const MhcProfile& profile, uint32_t hidden) {
++    const size_t hc = profile.hc;
++    const size_t stream_values = checked_mul(hc, hidden);
++    const size_t tokens = token_count(streams, stream_values,
++                                      "mHC streams are not whole flattened token planes");
++    if (out.size() != checked_mul(tokens, hidden))
++        throw std::invalid_argument("mHC head output size mismatch");
++    if (tokens == 0) throw std::invalid_argument("mHC requires at least one token");
++    demand_finite(streams, "mHC streams must be finite");
++    const float inverse_count = 1.0f / static_cast<float>(hc);
++    for (size_t t = 0; t < tokens; ++t) {
++        const float* row = streams.data() + t * stream_values;
++        float* out_t = out.data() + t * hidden;
++        // hidden-major accumulation keeps an out alias safe: element d reads
++        // only the d-th column of every stream.
++        for (size_t d = 0; d < hidden; ++d) {
++            float acc = 0;
++            for (size_t n = 0; n < hc; ++n) acc += row[n * hidden + d];
++            const float mean = acc * inverse_count;
++            if (!std::isfinite(mean)) throw std::overflow_error("mHC head overflowed");
++            out_t[d] = mean;
++        }
++    }
++}
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/reference/mhc_reference.h b/src/models/glm5/reference/mhc_reference.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..99753425cd97486a346e53fb292e6ce3877feae0
+--- /dev/null
++++ b/src/models/glm5/reference/mhc_reference.h
+@@ -0,0 +1,65 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++
++namespace ninfer::models::glm5::reference {
++
++inline constexpr const char* kMhcReferenceProfile = "glm53_mhc_fp32";
++
++// GLM-5.3-Flash's audited mHC geometry: 4 hyper-connection streams, 20 Sinkhorn
++// iterations, epsilon 1e-6 on every gate/denominator and the unweighted RMS
++// norm over the flattened streams (eps 1e-5). hc is pinned to 4 by both
++// production references; the parameterization only keeps test sizes honest.
++struct MhcProfile {
++    uint32_t hc;
++    float rms_eps;
++    float hc_eps;
++    uint32_t sinkhorn_iters;
++};
++inline constexpr MhcProfile kGlm53MhcProfile{4, 1e-5f, 1e-6f, 20};
++
++// Size of one token's flattened stream plane / mix vector for a profile.
++[[nodiscard]] constexpr size_t mhc_stream_values(const MhcProfile& p, uint32_t hidden) {
++    return size_t(p.hc) * hidden;
++}
++[[nodiscard]] constexpr size_t mhc_mix_values(const MhcProfile& p) {
++    return (2 + p.hc) * p.hc;  // pre | post | comb, in this flat order
++}
++
++// Weight generation for one mHC site (attn or ffn; parameters are per-site).
++// streams is [tokens][hc*hidden] FP32; fn is [mix_values][hc*hidden] row-major,
++// base [mix_values] and scale exactly [pre, post, comb]. All arithmetic FP32:
++// the flattened streams get the UNWEIGHTED RMS norm (eps inside the sqrt), the
++// mix projection is a plain left-to-right FP32 dot, pre = sigmoid+scaled by
++// pre_scale + base then +hc_eps, post = 2*sigmoid(...), and comb is built from
++// the flat layout comb[dst + hc*src] as a softmax over dst (each src row)
++// followed by Sinkhorn: one column normalization (sum over src, +hc_eps), then
++// sinkhorn_iters-1 rounds of {row over dst, column over src}, each +hc_eps.
++//
++// pre/post/comb are [tokens][hc]/[tokens][hc]/[tokens][hc*hc] in that same
++// comb[src,dst] order; collapsed is [tokens][hidden] = sum_n pre[n]*streams[n]
++// rounded from the FP32 accumulation. Inputs must be finite (validated); each
++// token's planes publish once all of its values validate, so an adversarial
++// overflow leaves only earlier tokens written.
++void mhc_pre_reference(std::span<const float> streams, std::span<const float> fn,
++                       std::span<const float> base, std::span<const float> scale,
++                       std::span<float> pre, std::span<float> post, std::span<float> comb,
++                       std::span<float> collapsed, const MhcProfile&, uint32_t hidden);
++
++// Stream update after the block: out[dst] = post[dst]*block_output +
++// sum_src comb[src,dst] * residual[src]. block is [tokens][hidden]; residual
++// and out are [tokens][hc*hidden] FP32 and may alias each other (publication
++// is per token after the whole token validates). pre/post/comb come from
++// mhc_pre_reference on that same residual.
++void mhc_post_reference(std::span<const float> block, std::span<const float> residual,
++                        std::span<const float> post, std::span<const float> comb,
++                        std::span<float> out, const MhcProfile&, uint32_t hidden);
++
++// Final head: the UNWEIGHTED mean of the streams, [tokens][hc*hidden] ->
++// [tokens][hidden]. out may alias the input.
++void mhc_head_reference(std::span<const float> streams, std::span<float> out,
++                        const MhcProfile&, uint32_t hidden);
++
++}  // namespace ninfer::models::glm5::reference
+diff --git a/src/models/glm5/state.h b/src/models/glm5/state.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..62f6fe9d6666ca19934cd56d55910a04f122c5d8
+--- /dev/null
++++ b/src/models/glm5/state.h
+@@ -0,0 +1,76 @@
++#pragma once
++
++// Per-sequence persistent state layout of GLM-5.3-Flash, derived from the
++// parsed text config and cross-checked against the audited capacity plan:
++// KDA carries an FP32 matrix state plus three causal-conv planes per block;
++// each DSA block caches ONLY the compressed MLA latent (NoPE) plus the
++// indexer's packed [key|gate|valid] row and one pooled key per completed
++// 4-token pool. The layout counts values; bytes come from the caller's dtype.
++
++#include "models/glm5/config.h"
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::models::glm5 {
++
++class Glm5StateLayout {
++public:
++    explicit Glm5StateLayout(const TextConfig& config) : config_(config) {
++        kda_blocks_ = 0;
++        dsa_blocks_ = 0;
++        for (const auto kind : config.layer_types) {
++            kda_blocks_ += kind == MixerKind::Kda;
++            dsa_blocks_ += kind == MixerKind::Dsa;
++        }
++        if ((kda_blocks_ + dsa_blocks_) != config.num_hidden_layers) {
++            throw std::invalid_argument("GLM5 state: layer types do not cover every block");
++        }
++    }
++
++    // ---- per-sequence, position-independent state ----
++    // FP32 gated-delta matrix S, [heads][head_dim key][head_dim value] per KDA block.
++    [[nodiscard]] std::uint64_t kda_matrix_floats() const {
++        return std::uint64_t(kda_blocks_) * config_.linear_num_heads * config_.linear_head_dim *
++               config_.linear_head_dim;
++    }
++    // Three causal conv planes (q/k/v), (kernel-1) taps over the KDA inner width.
++    [[nodiscard]] std::uint64_t kda_conv_values() const {
++        return std::uint64_t(kda_blocks_) * 3 * (config_.linear_conv_kernel - 1) *
++               config_.linear_inner_width();
++    }
++
++    // ---- per-sequence, per-logical-position state ----
++    // The MLA latent is the ONLY attention cache: NoPE means no rope component.
++    [[nodiscard]] std::uint64_t mla_latent_values_per_position() const {
++        return std::uint64_t(dsa_blocks_) * config_.kv_lora_rank;
++    }
++    // The indexer's packed row [key | gate | valid] per DSA block.
++    [[nodiscard]] std::uint64_t indexer_packed_values_per_position() const {
++        return std::uint64_t(dsa_blocks_) * (2 * config_.index_head_dim + 1);
++    }
++
++    // ---- per-sequence, per-completed-pool state ----
++    [[nodiscard]] std::uint64_t indexer_pool_key_values_per_pool() const {
++        return std::uint64_t(dsa_blocks_) * config_.index_head_dim;
++    }
++    [[nodiscard]] std::uint64_t completed_pools(std::uint64_t positions) const {
++        return positions / config_.index_kpool;
++    }
++
++    // The decode step's working set for one block boundary (single token):
++    // the mHC residual streams are the model's running hidden state.
++    [[nodiscard]] std::uint64_t mhc_stream_values() const {
++        return std::uint64_t(config_.hc_mult) * config_.hidden_size;
++    }
++
++    [[nodiscard]] std::uint32_t kda_blocks() const noexcept { return kda_blocks_; }
++    [[nodiscard]] std::uint32_t dsa_blocks() const noexcept { return dsa_blocks_; }
++
++private:
++    TextConfig config_;
++    std::uint32_t kda_blocks_ = 0;
++    std::uint32_t dsa_blocks_ = 0;
++};
++
++} // namespace ninfer::models::glm5
 diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
 index 4533e7c6345451fd3d82a3ee2e64e4191368a47c..eee43ae316526e28cb872865caac8ce086cdc47b 100644
 --- a/src/models/qwen3_5/execution/attention.cpp
@@ -22253,6 +23539,96 @@ index d0cd4786b0fa581867696ad2b2666cce4d4330f6..0c8959cbb83c81b7698bbba23ee6fa92
 +        source = gguf_blocks.gdn_control_source(gguf, "w", GEOM27)
 +        actual = source.rows(0, 48).view(torch.int16).numpy().view(np.uint16)
 +        assert np.array_equal(actual, expected)
+diff --git a/tests/convert/test_glm5.py b/tests/convert/test_glm5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ac807ae4c3b75264305050943a219ab16efcd4f
+--- /dev/null
++++ b/tests/convert/test_glm5.py
+@@ -0,0 +1,84 @@
++from __future__ import annotations
++
++from copy import deepcopy
++import json
++from pathlib import Path
++import struct
++
++import pytest
++
++from tools.convert.glm5 import text_config
++
++_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "glm5"
++
++
++def _checkpoint():
++    return json.loads((_FIXTURES / "config.json").read_text())
++
++
++def _f32(value):
++    # The converter stores FP32-rounded reals; the artifact fixture keeps the checkpoint's
++    # decimal spelling. Round the expected side the same way before comparing.
++    return struct.unpack("<f", struct.pack("<f", value))[0]
++
++
++def test_text_config_matches_the_artifact_fixture():
++    # The C++ parser's test reads the same artifact fixture, so the two stay in step.
++    expected = json.loads((_FIXTURES / "text_config.json").read_text())
++    actual = text_config(_checkpoint())
++    assert actual.keys() == expected.keys()
++    for key, want in expected.items():
++        got = actual[key]
++        if isinstance(want, float):
++            assert got == _f32(want), key
++        else:
++            assert got == want, key
++
++
++def test_layer_lists_cross_check_against_layer_types():
++    config = text_config(_checkpoint())
++    assert config["layer_types"].count("deepseek_sparse_attention") == 11
++    assert config["layer_types"].count("linear_attention") == 34
++    # A full_attn_layers entry disagreeing with layer_types refuses.
++    source = deepcopy(_checkpoint())
++    text = source["text_config"]
++    text["layer_types"][3] = "linear_attention"
++    with pytest.raises(ValueError, match="disagree"):
++        text_config(source)
++
++
++@pytest.mark.parametrize(
++    "edit, message",
++    [
++        (lambda t: t.update(mla_use_nope=False), "mla_use_nope"),
++        (lambda t: t.update(scoring_func="softmax"), "scoring_func"),
++        (lambda t: t.update(mhc=False), "mhc"),
++        (lambda t: t.update(qk_rope_head_dim=64), "NoPE-only"),
++        (lambda t: t.update(index_topk=2050), "whole number of pools"),
++        (lambda t: t.update(num_experts_per_tok=289), "expert count"),
++        (lambda t: t.update(first_k_dense_replace=46), "block count"),
++        (lambda t: t.update(eos_token_id=[999999]), "vocabulary"),
++        (lambda t: t["layer_types"].pop(), "every block"),
++        (lambda t: t["linear_attn_config"].update(gate_lower_bound=1.0), "lower bound"),
++        (lambda t: t.update(indexer_rope_interleave=False), "indexer_rope_interleave"),
++    ],
++)
++def test_text_config_refuses(edit, message):
++    source = deepcopy(_checkpoint())
++    edit(source["text_config"])
++    with pytest.raises(ValueError, match=message):
++        text_config(source)
++
++
++def test_single_eos_id_is_normalized_to_a_list():
++    source = deepcopy(_checkpoint())
++    source["text_config"]["eos_token_id"] = 154820
++    config = text_config(source)
++    assert config["eos_token_id"] == [154820]
++
++
++def test_unsupported_architecture_refuses():
++    source = deepcopy(_checkpoint())
++    source["architectures"] = ["Glm5NextMoeForConditionalGeneration"]
++    with pytest.raises(ValueError, match="architecture"):
++        text_config(source)
 diff --git a/tests/convert/test_ternary.py b/tests/convert/test_ternary.py
 index 53fe91302de61b5e3f9d570543dcc54b375989c6..c890d64fbccdfe5638c7d66f7aa85b869c474971 100644
 --- a/tests/convert/test_ternary.py
@@ -26052,6 +27428,273 @@ index 0000000000000000000000000000000000000000..dd5f61073c604a3a2c0ea2b968be070c
 +        return 1;
 +    }
 +}
+diff --git a/tests/fixtures/glm5/config.json b/tests/fixtures/glm5/config.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f2afb5fc69680fb5d268984bb67024bd9167223
+--- /dev/null
++++ b/tests/fixtures/glm5/config.json
+@@ -0,0 +1,261 @@
++{
++  "architectures": [
++    "Glm5NextForConditionalGeneration"
++  ],
++  "text_config": {
++    "attention_bias": false,
++    "attention_dropout": 0.0,
++    "dtype": "bfloat16",
++    "eos_token_id": [
++      154820,
++      154827,
++      154829
++    ],
++    "first_k_dense_replace": 3,
++    "hc_eps": 1e-06,
++    "hc_mult": 4,
++    "hc_sinkhorn_iters": 20,
++    "head_dim": 0,
++    "hidden_act": "silu",
++    "hidden_size": 4096,
++    "index_head_dim": 128,
++    "index_kpool": 4,
++    "index_kpool_always_select_tail": true,
++    "index_kpool_compress": true,
++    "index_n_heads": 32,
++    "index_topk": 2048,
++    "index_share_for_mtp_iteration": true,
++    "indexer_rope_interleave": true,
++    "indexer_types": [
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full",
++      "full"
++    ],
++    "initializer_range": 0.02,
++    "intermediate_size": 12288,
++    "kv_lora_rank": 512,
++    "layer_types": [
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention",
++      "linear_attention",
++      "linear_attention",
++      "deepseek_sparse_attention",
++      "linear_attention"
++    ],
++    "linear_attn_config": {
++      "num_heads": 64,
++      "gate_lower_bound": -5.0,
++      "head_dim": 128,
++      "short_conv_kernel_size": 4,
++      "kda_layers": [
++        0,
++        1,
++        2,
++        4,
++        5,
++        6,
++        8,
++        9,
++        10,
++        12,
++        13,
++        14,
++        16,
++        17,
++        18,
++        20,
++        21,
++        22,
++        24,
++        25,
++        26,
++        28,
++        29,
++        30,
++        32,
++        33,
++        34,
++        36,
++        37,
++        38,
++        40,
++        41,
++        42,
++        44
++      ],
++      "full_attn_layers": [
++        3,
++        7,
++        11,
++        15,
++        19,
++        23,
++        27,
++        31,
++        35,
++        39,
++        43
++      ]
++    },
++    "max_position_embeddings": 1048576,
++    "mhc": true,
++    "mla_use_nope": true,
++    "mlp_layer_types": [
++      "dense",
++      "dense",
++      "dense",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse",
++      "sparse"
++    ],
++    "model_type": "glm5_next_text",
++    "moe_intermediate_size": 2048,
++    "moe_router_dtype": "float32",
++    "n_group": 1,
++    "n_routed_experts": 288,
++    "n_shared_experts": 1,
++    "norm_topk_prob": true,
++    "num_attention_heads": 64,
++    "num_experts_per_tok": 8,
++    "num_hidden_layers": 45,
++    "num_key_value_heads": 64,
++    "num_nextn_predict_layers": 1,
++    "output_router_logits": false,
++    "pad_token_id": 154820,
++    "q_lora_rank": 1536,
++    "qk_head_dim": 256,
++    "qk_nope_head_dim": 256,
++    "qk_rope_head_dim": 0,
++    "rms_norm_eps": 1e-05,
++    "routed_scaling_factor": 2.5,
++    "router_aux_loss_coef": 0.001,
++    "scoring_func": "sigmoid",
++    "swiglu_limit": 10.0,
++    "tie_word_embeddings": false,
++    "topk_group": 1,
++    "topk_method": "noaux_tc",
++    "use_cache": true,
++    "v_head_dim": 256,
++    "vocab_size": 154880
++  }
++}
 diff --git a/tests/fixtures/glm5/text_config.json b/tests/fixtures/glm5/text_config.json
 new file mode 100644
 index 0000000000000000000000000000000000000000..555c7e75a6c8f1d034ab45f0ea4f76b5aaf36856
@@ -26371,6 +28014,1308 @@ index 0000000000000000000000000000000000000000..9a1eb9dc784330f343c780a33fd5789b
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/dsa_reference_test.cpp b/tests/models/glm5/dsa_reference_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..731a5daa67b020bdb525449fedc678c29dc2be16
+--- /dev/null
++++ b/tests/models/glm5/dsa_reference_test.cpp
+@@ -0,0 +1,354 @@
++#include "models/glm5/reference/dsa_reference.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++#define CHECK(expression) do { if (!(expression)) throw std::runtime_error("check failed: " #expression); } while (false)
++using namespace ninfer::models::glm5::reference;
++
++namespace {
++
++float source(uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++void compare(float got, long double want, long double tolerance, const char* what) {
++    const long double error = std::abs(static_cast<long double>(got) - want);
++    if (!(error <= tolerance * std::max<long double>(1, std::abs(want))))
++        std::fprintf(stderr, "%s: got %.9g want %.9Le\n", what, got, want);
++    CHECK(error <= tolerance * std::max<long double>(1, std::abs(want)));
++}
++
++// ---------------------------------------------------------------------------
++void pool_matches_oracle() {
++    // Small probe profile: kpool 4 matches production; dim 5 keeps the oracle cheap.
++    const DsaIndexerProfile profile{2, 5, 4, 8, true};
++    const size_t tokens = 12, dim = profile.head_dim, kpool = profile.kpool;
++    const size_t pools = tokens / kpool;
++    std::vector<float> keys(tokens * dim), gates(tokens * dim), ape(kpool * dim), pooled(pools * dim);
++    for (size_t i = 0; i < keys.size(); ++i) {
++        keys[i] = source(static_cast<uint32_t>(i) + 3);
++        gates[i] = source(static_cast<uint32_t>(i) * 2 + 1) / 2;
++    }
++    for (size_t i = 0; i < ape.size(); ++i) ape[i] = source(static_cast<uint32_t>(i) * 5 + 7) / 4;
++    dsa_pool_reference(keys, gates, ape, pooled, profile);
++
++    for (size_t p = 0; p < pools; ++p)
++        for (size_t e = 0; e < dim; ++e) {
++            // independent long-double per-element softmax
++            long double logits[4];
++            for (size_t m = 0; m < kpool; ++m)
++                logits[m] = gates[(p * kpool + m) * dim + e] + ape[m * dim + e];
++            long double maximum = logits[0];
++            for (size_t m = 1; m < kpool; ++m) maximum = std::max(maximum, logits[m]);
++            long double denominator = 0, exps[4];
++            for (size_t m = 0; m < kpool; ++m) {
++                exps[m] = std::exp(logits[m] - maximum);
++                denominator += exps[m];
++            }
++            long double expected = 0;
++            for (size_t m = 0; m < kpool; ++m)
++                expected += exps[m] / denominator * keys[(p * kpool + m) * dim + e];
++            compare(pooled[p * dim + e], expected, 1e-6L, "pooled");
++        }
++}
++
++// ---------------------------------------------------------------------------
++void score_matches_oracle_and_relu_boundary() {
++    const DsaIndexerProfile profile{3, 4, 4, 8, true};
++    const size_t heads = profile.heads, dim = profile.head_dim;
++    const size_t tokens = 3, pools = 2;
++    std::vector<float> iq(tokens * heads * dim), weights(tokens * heads),
++        pooled(pools * dim), scores(tokens * pools);
++    for (size_t i = 0; i < iq.size(); ++i) iq[i] = source(static_cast<uint32_t>(i) + 1) / 2;
++    for (size_t i = 0; i < weights.size(); ++i) weights[i] = source(static_cast<uint32_t>(i) * 3 + 2) / 2;
++    for (size_t i = 0; i < pooled.size(); ++i) pooled[i] = source(static_cast<uint32_t>(i) * 7 + 5) / 3;
++    dsa_score_reference(iq, weights, pooled, scores, profile);
++
++    const long double dot_scale = std::sqrt(1.0L / dim);
++    const long double head_scale = std::sqrt(1.0L / heads);
++    for (size_t t = 0; t < tokens; ++t)
++        for (size_t p = 0; p < pools; ++p) {
++            long double expected = 0;
++            for (size_t h = 0; h < heads; ++h) {
++                long double dot = 0;
++                for (size_t e = 0; e < dim; ++e)
++                    dot += static_cast<long double>(iq[t * heads * dim + h * dim + e]) *
++                           pooled[p * dim + e];
++                expected += std::max(dot * dot_scale, 0.0L) *
++                            weights[t * heads + h] * head_scale;
++            }
++            compare(scores[t * pools + p], expected, 1e-6L, "score");
++        }
++
++    // ReLU boundary: an exactly-orthogonal head contributes nothing even with
++    // a large weight; a negative dot also contributes nothing.
++    std::fill(iq.begin(), iq.end(), 0.0f);
++    std::fill(weights.begin(), weights.end(), 10.0f);
++    for (size_t e = 0; e < dim; ++e) iq[0 * heads * dim + 0 * dim + e] = 1.0f;   // positive dot
++    for (size_t e = 0; e < dim; ++e) iq[0 * heads * dim + 1 * dim + e] = -1.0f;  // negative dot
++    dsa_score_reference(iq, weights, pooled, scores, profile);
++    // head0 dot = sum(pooled), head1 = -sum(pooled): whichever sign is
++    // positive passes the ReLU, the other is clipped to zero.
++    long double sum = 0;
++    for (size_t e = 0; e < dim; ++e) sum += pooled[e];
++    const long double expected = std::max(std::abs(sum) * dot_scale, 0.0L) * 10.0f * head_scale;
++    compare(scores[0], expected, 1e-6L, "relu boundary");
++}
++
++// ---------------------------------------------------------------------------
++void select_rank_ties_tail_and_boundaries() {
++    // top_k 8 -> 2 pools; width 8 + 3 = 11.
++    const DsaIndexerProfile profile{1, 4, 4, 8, true};
++    const size_t kpool = profile.kpool, top_pools = 2, width = 11;
++    CHECK(dsa_selection_width(profile) == 11 && dsa_top_pools(profile) == 2);
++
++    // 4 complete pools (16 tokens), query at position 17 -> n_vis = 4 > top 2.
++    std::vector<float> scores{30, 20, 40, 10};   // pool ranks: 2 > 0 > 1 > 3
++    std::vector<uint32_t> pos{17};
++    std::vector<int32_t> cells(width);
++    dsa_select_reference(scores, pos, cells, profile);
++    // rank0 pool2 -> slots 0..3 = cells 8..11; rank1 pool0 -> slots 4..7 = 0..3;
++    // tail: n_vis*kpool=16..17 -> slots 8..10 = {16,17,-1}
++    const std::vector<int32_t> expected{8, 9, 10, 11, 0, 1, 2, 3, 16, 17, -1};
++    CHECK((std::vector<int32_t>(cells.begin(), cells.end()) == expected));
++
++    // Exact ties break by lower pool index, stably.
++    std::vector<float> tied{5, 5, 5, 1};
++    dsa_select_reference(tied, pos, cells, profile);
++    CHECK(cells[0] == 0 && cells[4] == 4);   // pools 0 then 1 in rank order
++
++    // top_pools == 0 visible pools (query at position 1): tail only + padding.
++    std::vector<uint32_t> early{1};
++    dsa_select_reference(scores, early, cells, profile);
++    const std::vector<int32_t> tail_only{-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, -1};
++    CHECK((std::vector<int32_t>(cells.begin(), cells.end()) == tail_only));
++
++    // Every tail width: positions 0..3 -> n_tail 1..4/0.
++    for (uint32_t p = 0; p < 8; ++p) {
++        std::vector<uint32_t> one{p};
++        dsa_select_reference(scores, one, cells, profile);
++        const size_t n_tail = (p + 1) % kpool;
++        for (size_t m = 0; m + 1 < kpool; ++m) {
++            const int32_t want = m < n_tail ? static_cast<int32_t>(((p + 1) / kpool) * kpool + m) : -1;
++            CHECK(cells[top_pools * kpool + m] == want);
++        }
++    }
++
++    // All visible pools fit: n_vis <= top_pools selects everything, in rank order.
++    std::vector<uint32_t> mid{7};   // n_vis = 2 (pools 0,1 visible)
++    dsa_select_reference(scores, mid, cells, profile);
++    CHECK(cells[0] == 0 && cells[4] == 4);   // pools 0 (30) then 1 (20)
++    CHECK(cells[8] == -1 && cells[9] == -1 && cells[10] == -1);   // tail starts at 8 > pos 7: none
++}
++
++// ---------------------------------------------------------------------------
++// Independent dense (materialized) attention oracle for the eager cross-check.
++struct DenseOracle {
++    const DsaIndexerProfile& indexer;
++    const DsaMlaProfile& mla;
++    // materialized per-head attention in long double over the selected cells
++    // attention restricted to the query's visible set.
++    std::vector<float> run(const std::vector<float>& q_abs, const std::vector<float>& latents,
++                           const std::vector<int32_t>& cells, const std::vector<float>& wv_b,
++                           size_t tokens) {
++        const size_t lora = mla.kv_lora, heads = mla.heads, v_head = mla.v_head;
++        const size_t width = dsa_selection_width(indexer);
++        std::vector<float> out(tokens * heads * v_head, 0);
++        const float scale = 1.0f / std::sqrt(static_cast<float>(mla.qk_nope));
++        for (size_t t = 0; t < tokens; ++t)
++            for (size_t h = 0; h < heads; ++h) {
++                // scores over all selected cells, fp64
++                std::vector<long double> probs;
++                long double maximum = 0;
++                for (size_t s = 0; s < width; ++s) {
++                    const int32_t cell = cells[t * width + s];
++                    if (cell < 0) { probs.push_back(-1e300L); continue; }
++                    long double dot = 0;
++                    for (size_t e = 0; e < lora; ++e)
++                        dot += static_cast<long double>(q_abs[t * heads * lora + h * lora + e]) *
++                               latents[static_cast<size_t>(cell) * lora + e];
++                    const long double score = dot * scale;
++                    probs.push_back(score);
++                    maximum = std::max(maximum, score);
++                }
++                long double denominator = 0;
++                for (auto& value : probs)
++                    if (value > -1e299L) { value = std::exp(value - maximum); denominator += value; }
++                std::vector<long double> ctx(lora, 0);
++                for (size_t s = 0; s < width; ++s)
++                    if (cells[t * width + s] >= 0)
++                        for (size_t e = 0; e < lora; ++e)
++                            ctx[e] += probs[s] / denominator *
++                                      latents[static_cast<size_t>(cells[t * width + s]) * lora + e];
++                for (size_t v = 0; v < v_head; ++v) {
++                    long double acc = 0;
++                    for (size_t c = 0; c < lora; ++c)
++                        acc += static_cast<long double>(wv_b[c + lora * v + lora * v_head * h]) * ctx[c];
++                    out[t * heads * v_head + h * v_head + v] = static_cast<float>(acc);
++                }
++            }
++        return out;
++    }
++};
++
++void attention_matches_dense_oracle_and_full_selection() {
++    const DsaIndexerProfile indexer{1, 4, 4, 8, true};
++    const DsaMlaProfile mla{6, 2, 4, 3};   // tiny geometry, same structure
++    const size_t tokens = 2, cache = 8, width = dsa_selection_width(indexer);
++    std::vector<float> q_abs(tokens * mla.heads * mla.kv_lora),
++        latents(cache * mla.kv_lora), wv_b(mla.kv_lora * mla.v_head * mla.heads);
++    for (size_t i = 0; i < q_abs.size(); ++i) q_abs[i] = source(static_cast<uint32_t>(i) + 1) / 2;
++    for (size_t i = 0; i < latents.size(); ++i) latents[i] = source(static_cast<uint32_t>(i) * 3 + 2) / 3;
++    for (size_t i = 0; i < wv_b.size(); ++i) wv_b[i] = source(static_cast<uint32_t>(i) * 7 + 1) / 4;
++
++    // Hand-built selection: token0 sees cells {0,2,5} (+padding), token1 sees {7,1}.
++    std::vector<int32_t> cells(tokens * width, -1);
++    cells[0] = 0; cells[1] = 2; cells[2] = 5;
++    cells[width + 0] = 7; cells[width + 1] = 1;
++
++    std::vector<float> out(tokens * mla.heads * mla.v_head);
++    dsa_attention_reference(q_abs, latents, cells, wv_b, out, indexer, mla, cache);
++    const auto expected = DenseOracle{indexer, mla}.run(q_abs, latents, cells, wv_b, tokens);
++    for (size_t i = 0; i < out.size(); ++i) compare(out[i], expected[i], 1e-5L, "attention");
++
++    // FULL selection (every cache cell, no padding except the tail slots):
++    // the sparse path must equal a plain dense softmax over the same cells.
++    std::vector<int32_t> full(tokens * width, -1);
++    for (size_t t = 0; t < tokens; ++t)
++        for (size_t c = 0; c < cache && c < width; ++c) full[t * width + c] = static_cast<int32_t>(c);
++    dsa_attention_reference(q_abs, latents, full, wv_b, out, indexer, mla, cache);
++    const auto dense = DenseOracle{indexer, mla}.run(q_abs, latents, full, wv_b, tokens);
++    for (size_t i = 0; i < out.size(); ++i) compare(out[i], dense[i], 1e-5L, "full selection");
++
++    // Duplicate cells are legal (selections can overlap pools/tail in none of
++    // the production paths, but the reference must not double-count vs oracle).
++    std::vector<int32_t> dup(tokens * width, -1);
++    dup[0] = 3; dup[1] = 3; dup[2] = 4;
++    dup[width + 0] = 5; dup[width + 1] = 5;
++    dsa_attention_reference(q_abs, latents, dup, wv_b, out, indexer, mla, cache);
++    const auto dup_expected = DenseOracle{indexer, mla}.run(q_abs, latents, dup, wv_b, tokens);
++    for (size_t i = 0; i < out.size(); ++i) compare(out[i], dup_expected[i], 1e-5L, "duplicate cells");
++}
++
++// End-to-end: pool -> score -> select -> attention on a mid-size profile with
++// the dense equivalence guaranteed at n_vis*kpool+tail <= top_k.
++void end_to_end_dense_equivalence() {
++    const DsaIndexerProfile indexer{3, 8, 4, 8, true};
++    const DsaMlaProfile mla{16, 2, 8, 6};
++    const size_t tokens = 8, cache = tokens, dim = indexer.head_dim, heads = indexer.heads;
++    const size_t pools = tokens / indexer.kpool, width = dsa_selection_width(indexer);
++
++    std::vector<float> keys(tokens * dim), gates(tokens * dim), ape(indexer.kpool * dim),
++        pooled(pools * dim), iq(tokens * heads * dim), weights(tokens * heads),
++        scores(tokens * pools);
++    std::vector<uint32_t> pos(tokens);
++    for (size_t i = 0; i < keys.size(); ++i) {
++        keys[i] = source(static_cast<uint32_t>(i) + 2);
++        gates[i] = source(static_cast<uint32_t>(i) * 3 + 1) / 2;
++    }
++    for (size_t i = 0; i < ape.size(); ++i) ape[i] = source(static_cast<uint32_t>(i) * 5 + 3) / 4;
++    for (size_t i = 0; i < iq.size(); ++i) iq[i] = source(static_cast<uint32_t>(i) + 7) / 2;
++    for (size_t i = 0; i < weights.size(); ++i) weights[i] = source(static_cast<uint32_t>(i) * 3 + 5) / 2;
++    for (size_t t = 0; t < tokens; ++t) pos[t] = static_cast<uint32_t>(t);
++    std::vector<float> q_abs(tokens * mla.heads * mla.kv_lora),
++        latents(cache * mla.kv_lora), wv_b(mla.kv_lora * mla.v_head * mla.heads);
++    for (size_t i = 0; i < q_abs.size(); ++i) q_abs[i] = source(static_cast<uint32_t>(i) * 2 + 3) / 3;
++    for (size_t i = 0; i < latents.size(); ++i) latents[i] = source(static_cast<uint32_t>(i) + 4) / 3;
++    for (size_t i = 0; i < wv_b.size(); ++i) wv_b[i] = source(static_cast<uint32_t>(i) * 7 + 2) / 4;
++
++    dsa_pool_reference(keys, gates, ape, pooled, indexer);
++    dsa_score_reference(iq, weights, pooled, scores, indexer);
++    std::vector<int32_t> cells(tokens * width);
++    dsa_select_reference(scores, pos, cells, indexer);
++
++    // Every token sees <= 8 cells total (n_vis pools of 4 + tail of 3 <= top_k 8?
++    // top_k/kpool = 2 pools = 8 slots; the selection may drop early pools for
++    // late tokens, so compare against the DENSE-over-selected-cells oracle,
++    // and separately assert the <= (top_k + tail) budget.
++    std::vector<float> out(tokens * mla.heads * mla.v_head);
++    dsa_attention_reference(q_abs, latents, cells, wv_b, out, indexer, mla, cache);
++    const auto expected = DenseOracle{indexer, mla}.run(q_abs, latents, cells, wv_b, tokens);
++    for (size_t i = 0; i < out.size(); ++i) compare(out[i], expected[i], 1e-5L, "end-to-end");
++    for (size_t t = 0; t < tokens; ++t) {
++        size_t live = 0;
++        for (size_t s = 0; s < width; ++s) live += cells[t * width + s] >= 0;
++        CHECK(live <= size_t(indexer.top_k) + indexer.kpool - 1);
++        CHECK(live <= pos[t] + 1);   // causality: never more cells than tokens so far
++    }
++}
++
++// ---------------------------------------------------------------------------
++template<class F> void rejects(F action) {
++    try { action(); } catch (const std::invalid_argument&) { return; }
++    throw std::runtime_error("invalid DSA input accepted");
++}
++
++void invalid_inputs() {
++    const DsaIndexerProfile indexer{1, 4, 4, 8, true};
++    const DsaMlaProfile mla{6, 2, 4, 3};
++    const size_t tokens = 4, dim = 4, pools = 1, width = dsa_selection_width(indexer);
++    std::vector<float> keys(tokens * dim), gates(tokens * dim), ape(4 * dim), pooled(pools * dim);
++    rejects([&] { (void)dsa_pool_reference(std::span(keys).first(tokens * dim - 1), gates, ape, pooled, indexer); });
++    rejects([&] { (void)dsa_pool_reference(keys, gates, std::span(ape).first(3 * dim), pooled, indexer); });
++    rejects([&] { (void)dsa_pool_reference(std::span(keys).first(3 * dim), gates, ape, pooled, indexer); });  // not a kpool multiple
++    auto poisoned = gates;
++    poisoned[2] = std::numeric_limits<float>::quiet_NaN();
++    rejects([&] { (void)dsa_pool_reference(keys, poisoned, ape, pooled, indexer); });
++
++    std::vector<float> iq(tokens * dim), weights(tokens), scores(tokens * pools);
++    rejects([&] { (void)dsa_score_reference(std::span(iq).first(iq.size() - 1), weights, pooled, scores, indexer); });
++    rejects([&] { (void)dsa_score_reference(iq, std::span(weights).first(tokens - 1), pooled, scores, indexer); });
++
++    std::vector<float> one{1, 2, 3, 4};
++    std::vector<uint32_t> pos{99};   // sees 25 pools > 4 scored
++    std::vector<int32_t> cells(width);
++    rejects([&] { (void)dsa_select_reference(one, pos, cells, indexer); });
++    std::vector<float> nan_scores{1, std::numeric_limits<float>::quiet_NaN(), 3, 4};
++    std::vector<uint32_t> small_pos{3};
++    rejects([&] { (void)dsa_select_reference(nan_scores, small_pos, cells, indexer); });
++
++    std::vector<float> q_abs(mla.heads * mla.kv_lora), latents(4 * mla.kv_lora),
++        wv_b(mla.kv_lora * mla.v_head * mla.heads), out(mla.heads * mla.v_head);
++    std::vector<int32_t> row(width, -1);
++    row[0] = 4;   // == cache size: out of range
++    rejects([&] { (void)dsa_attention_reference(q_abs, latents, row, wv_b, out, indexer, mla, 4); });
++    std::vector<int32_t> empty(width, -1);
++    rejects([&] { (void)dsa_attention_reference(q_abs, latents, empty, wv_b, out, indexer, mla, 4); });
++    row[0] = 1;
++    auto bad_wv = wv_b;
++    bad_wv[0] = std::numeric_limits<float>::infinity();
++    rejects([&] { (void)dsa_attention_reference(q_abs, latents, row, bad_wv, out, indexer, mla, 4); });
++}
++
++void glm53_constants() {
++    CHECK(kGlm53DsaIndexerProfile.heads == 32 && kGlm53DsaIndexerProfile.head_dim == 128);
++    CHECK(kGlm53DsaIndexerProfile.kpool == 4 && kGlm53DsaIndexerProfile.top_k == 2048);
++    CHECK(kGlm53DsaIndexerProfile.select_tail);
++    CHECK(dsa_selection_width(kGlm53DsaIndexerProfile) == 2051);
++    CHECK(dsa_top_pools(kGlm53DsaIndexerProfile) == 512);
++    CHECK(kGlm53DsaMlaProfile.kv_lora == 512 && kGlm53DsaMlaProfile.heads == 64);
++    CHECK(kGlm53DsaMlaProfile.qk_nope == 256 && kGlm53DsaMlaProfile.v_head == 256);
++}
++
++}  // namespace
++
++int main() {
++    try {
++        glm53_constants();
++        pool_matches_oracle();
++        score_matches_oracle_and_relu_boundary();
++        select_rank_ties_tail_and_boundaries();
++        attention_matches_dense_oracle_and_full_selection();
++        end_to_end_dense_equivalence();
++        invalid_inputs();
++        std::puts("GLM DSA indexer pool/score/select and absorbed MLA match independent oracles");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what()); return 1;
++    }
++}
+diff --git a/tests/models/glm5/kda_chunk_reference_test.cpp b/tests/models/glm5/kda_chunk_reference_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d7226d5fe6598308b7792773e3f2fd77a401971
+--- /dev/null
++++ b/tests/models/glm5/kda_chunk_reference_test.cpp
+@@ -0,0 +1,265 @@
++#include "models/glm5/reference/kda_chunk_reference.h"
++
++#include <cmath>
++#include <cstdio>
++#include <limits>
++#include <span>
++#include <stdexcept>
++#include <vector>
++
++#define CHECK(expression) do { if (!(expression)) throw std::runtime_error("check failed: " #expression); } while (false)
++using namespace ninfer::models::glm5::reference;
++
++namespace {
++
++float source(uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 19u) - 9) / 4.0f;
++}
++
++struct Planes {
++    KdaProfile profile{2, 4, 4, -5.0f};
++    size_t tokens = 8, d_inner, state_values;
++    std::vector<float> q, k, v, gate, beta, state;
++    explicit Planes(size_t t = 8) : tokens(t) {
++        d_inner = size_t(profile.heads) * profile.head_dim;
++        state_values = kda_state_values(profile);
++        q.resize(tokens * d_inner); k.resize(tokens * d_inner); v.resize(tokens * d_inner);
++        gate.resize(tokens * d_inner);
++        beta.resize(tokens * profile.heads);
++        for (size_t i = 0; i < tokens * d_inner; ++i) {
++            q[i] = source(static_cast<uint32_t>(i) * 2 + 1);
++            k[i] = source(static_cast<uint32_t>(i) * 2 + 2);
++            v[i] = source(static_cast<uint32_t>(i) * 2 + 3) / 2;
++            gate[i] = source(static_cast<uint32_t>(i) * 2 + 4) / 3 - 0.25f;   // log-space, <= 0-ish
++        }
++        for (size_t i = 0; i < beta.size(); ++i) beta[i] = 0.25f + 0.5f * (i % 3) / 3.0f;
++        state.resize(state_values);
++        for (size_t i = 0; i < state.size(); ++i) state[i] = source(static_cast<uint32_t>(i)) / 5;
++    }
++};
++
++// Independent long-double oracle: the RECURRENT math (not the chunk algorithm),
++// so agreement proves the chunk reorganization, not a shared bug.
++struct RecurrentOracle {
++    explicit RecurrentOracle(const KdaProfile& p) : profile(p) {}
++    long double l2(const float* x) const {
++        long double sum = 1e-6L;
++        for (uint32_t i = 0; i < profile.head_dim; ++i) sum += x[i] * static_cast<long double>(x[i]);
++        return std::sqrt(sum);
++    }
++    void run(const Planes& planes, std::vector<float>& out, std::vector<float>& final_state) const {
++        const uint32_t dk = profile.head_dim;
++        const size_t d_inner = size_t(profile.heads) * dk;
++        const long double scale = 1.0L / std::sqrt(static_cast<long double>(dk));
++        std::vector<long double> S(planes.state_values);
++        for (size_t i = 0; i < planes.state_values; ++i) S[i] = planes.state[i];
++        out.assign(planes.tokens * d_inner, 0);
++        for (size_t t = 0; t < planes.tokens; ++t)
++            for (uint32_t h = 0; h < profile.heads; ++h) {
++                const size_t base = t * d_inner + size_t(h) * dk;
++                const float* qt = &planes.q[base]; const float* kt = &planes.k[base];
++                const float* vt = &planes.v[base]; const float* gt = &planes.gate[base];
++                const long double qn = l2(qt), kn = l2(kt);
++                std::vector<long double> qh(dk), kh(dk);
++                for (uint32_t i = 0; i < dk; ++i) {
++                    qh[i] = qt[i] / qn * scale;
++                    kh[i] = kt[i] / kn;
++                }
++                long double* Sh = S.data() + size_t(h) * dk * dk;
++                for (uint32_t i = 0; i < dk; ++i) {
++                    const long double decay = std::exp(static_cast<long double>(gt[i]));
++                    for (uint32_t j = 0; j < dk; ++j) Sh[static_cast<size_t>(i) * dk + j] *= decay;
++                }
++                for (uint32_t j = 0; j < dk; ++j) {
++                    long double u = 0;
++                    for (uint32_t i = 0; i < dk; ++i)
++                        u += kh[i] * Sh[static_cast<size_t>(i) * dk + j];
++                    const long double delta =
++                        planes.beta[t * profile.heads + h] * (vt[j] - u);
++                    for (uint32_t i = 0; i < dk; ++i)
++                        Sh[static_cast<size_t>(i) * dk + j] += kh[i] * delta;
++                }
++                for (uint32_t j = 0; j < dk; ++j) {
++                    long double acc = 0;
++                    for (uint32_t i = 0; i < dk; ++i)
++                        acc += qh[i] * Sh[static_cast<size_t>(i) * dk + j];
++                    out[base + j] = static_cast<float>(acc);
++                }
++            }
++        final_state.assign(planes.state_values, 0);
++        for (size_t i = 0; i < planes.state_values; ++i)
++            final_state[i] = static_cast<float>(S[i]);
++    }
++    KdaProfile profile;
++};
++
++void compare_span(const std::vector<float>& got, const std::vector<long double>& want,
++                  long double tolerance, const char* what) {
++    CHECK(got.size() == want.size());
++    for (size_t i = 0; i < got.size(); ++i) {
++        const long double error = std::abs(static_cast<long double>(got[i]) - want[i]);
++        if (!(error <= tolerance * std::max<long double>(1, std::abs(want[i]))))
++            std::fprintf(stderr, "%s[%zu]=%.9g want %.9Le\n", what, i, got[i], want[i]);
++        CHECK(error <= tolerance * std::max<long double>(1, std::abs(want[i])));
++    }
++}
++
++void chunk_matches_oracle_and_recurrent() {
++    const Planes planes;
++    const RecurrentOracle oracle(planes.profile);
++
++    std::vector<float> oracle_out, oracle_state;
++    oracle.run(planes, oracle_out, oracle_state);
++
++    // The chunk algorithm at several widths, all against the oracle.
++    for (const uint32_t chunk : {uint32_t{2}, uint32_t{4}, uint32_t{8}}) {
++        std::vector<float> state = planes.state, out(planes.tokens * planes.d_inner, -1e30f),
++            scratch(kda_chunk_scratch_values(planes.profile, planes.tokens, chunk));
++        kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta, state, out,
++                            scratch, planes.profile, chunk);
++        compare_span(out, {oracle_out.begin(), oracle_out.end()}, 2e-4L, "chunk out");
++        compare_span(state, {oracle_state.begin(), oracle_state.end()}, 2e-4L, "chunk state");
++    }
++
++    // The fp32 recurrent reference on the same inputs: both algorithms are
++    // FP32 with different associations; they must agree to the same band.
++    std::vector<float> recurrent_state = planes.state, recurrent_out(planes.tokens * planes.d_inner),
++        recurrent_scratch(kda_scan_scratch_values(planes.profile, planes.tokens));
++    kda_gated_delta_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                              recurrent_state, recurrent_out, recurrent_scratch, planes.profile);
++    std::vector<float> chunk_state = planes.state, chunk_out(planes.tokens * planes.d_inner),
++        chunk_scratch(kda_chunk_scratch_values(planes.profile, planes.tokens, 4));
++    kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta, chunk_state,
++                        chunk_out, chunk_scratch, planes.profile, 4);
++    compare_span(chunk_out, {recurrent_out.begin(), recurrent_out.end()}, 5e-4L, "chunk vs recurrent out");
++    compare_span(chunk_state, {recurrent_state.begin(), recurrent_state.end()}, 5e-4L,
++                 "chunk vs recurrent state");
++
++    // Continuation: 4 tokens chunked, then 4 more chunked must equal the
++    // 8-token single call to the same tolerance band.
++    Planes split(8);
++    std::vector<float> split_state = planes.state, split_out;
++    for (size_t part = 0; part < 2; ++part) {
++        std::vector<float> part_out(4 * planes.d_inner),
++            part_scratch(kda_chunk_scratch_values(planes.profile, 4, 4));
++        const size_t offset = part * 4 * planes.d_inner;
++        kda_chunk_reference(std::span(planes.q).subspan(offset, 4 * planes.d_inner),
++                            std::span(planes.k).subspan(offset, 4 * planes.d_inner),
++                            std::span(planes.v).subspan(offset, 4 * planes.d_inner),
++                            std::span(planes.gate).subspan(offset, 4 * planes.d_inner),
++                            std::span(planes.beta).subspan(part * 4 * planes.profile.heads, 4 * planes.profile.heads),
++                            split_state, part_out, part_scratch, planes.profile, 4);
++        split_out.insert(split_out.end(), part_out.begin(), part_out.end());
++    }
++    compare_span(split_out, {chunk_out.begin(), chunk_out.end()}, 5e-4L, "split vs whole out");
++    compare_span(split_state, {chunk_state.begin(), chunk_state.end()}, 5e-4L, "split vs whole state");
++}
++
++void zero_padding_rows_are_inert() {
++    // The documented tail contract: padding rows carry g=0 and q/k/v/beta=0
++    // and must not disturb real outputs or the state - bitwise.
++    Planes real(4);
++    std::vector<float> state_a = real.state, out_a(4 * real.d_inner),
++        scratch_a(kda_chunk_scratch_values(real.profile, 4, 4));
++    kda_chunk_reference(real.q, real.k, real.v, real.gate, real.beta, state_a, out_a, scratch_a,
++                        real.profile, 4);
++
++    Planes padded(8);   // rewrite the first 4 tokens from `real`
++    for (size_t i = 0; i < 4 * real.d_inner; ++i) {
++        padded.q[i] = real.q[i]; padded.k[i] = real.k[i];
++        padded.v[i] = real.v[i]; padded.gate[i] = real.gate[i];
++    }
++    for (size_t i = 0; i < 4 * real.profile.heads; ++i) padded.beta[i] = real.beta[i];
++    for (size_t i = 4 * real.d_inner; i < 8 * real.d_inner; ++i) {
++        padded.q[i] = 0; padded.k[i] = 0; padded.v[i] = 0; padded.gate[i] = 0;
++    }
++    for (size_t i = 4 * real.profile.heads; i < 8 * real.profile.heads; ++i) padded.beta[i] = 0;
++    std::vector<float> state_b = real.state, out_b(8 * real.d_inner),
++        scratch_b(kda_chunk_scratch_values(real.profile, 8, 4));
++    kda_chunk_reference(padded.q, padded.k, padded.v, padded.gate, padded.beta, state_b, out_b,
++                        scratch_b, real.profile, 4);
++    CHECK(state_b == state_a);
++    for (size_t t = 0; t < 4; ++t)
++        for (size_t i = 0; i < real.d_inner; ++i)
++            CHECK(out_b[t * real.d_inner + i] == out_a[t * real.d_inner + i]);
++    for (size_t i = 4 * real.d_inner; i < 8 * real.d_inner; ++i) CHECK(out_b[i] == 0.0f);
++}
++
++void glm53_dimensions_smoke() {
++    static_assert(kGlm53KdaChunk == 64, "production chunk width is part of the audited profile");
++    const KdaProfile profile = kGlm53KdaProfile;
++    const size_t tokens = 128, d_inner = size_t(profile.heads) * profile.head_dim;
++    Planes planes(128);
++    planes.profile = profile;
++    planes.d_inner = d_inner;
++    planes.q.resize(tokens * d_inner); planes.k.resize(tokens * d_inner);
++    planes.v.resize(tokens * d_inner); planes.gate.resize(tokens * d_inner);
++    planes.beta.resize(tokens * profile.heads);
++    planes.state.assign(kda_state_values(profile), 0);
++    for (size_t i = 0; i < tokens * d_inner; ++i) {
++        planes.q[i] = source(static_cast<uint32_t>(i));
++        planes.k[i] = source(static_cast<uint32_t>(i) + 1);
++        planes.v[i] = source(static_cast<uint32_t>(i) + 2) / 2;
++        planes.gate[i] = source(static_cast<uint32_t>(i) + 3) / 8 - 0.5f;
++    }
++    for (size_t i = 0; i < planes.beta.size(); ++i) planes.beta[i] = 0.5f;
++
++    std::vector<float> chunk_state = planes.state, chunk_out(tokens * d_inner),
++        chunk_scratch(kda_chunk_scratch_values(profile, tokens, 64));
++    kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta, chunk_state,
++                        chunk_out, chunk_scratch, profile, 64);
++    std::vector<float> recurrent_state = planes.state, recurrent_out(tokens * d_inner),
++        recurrent_scratch(kda_scan_scratch_values(profile, tokens));
++    kda_gated_delta_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                              recurrent_state, recurrent_out, recurrent_scratch, profile);
++    compare_span(chunk_out, {recurrent_out.begin(), recurrent_out.end()}, 3e-3L,
++                 "glm53 chunk vs recurrent out");
++    compare_span(chunk_state, {recurrent_state.begin(), recurrent_state.end()}, 3e-3L,
++                 "glm53 chunk vs recurrent state");
++}
++
++template<class F> void rejects(F action) {
++    try { action(); } catch (const std::invalid_argument&) { return; }
++    throw std::runtime_error("invalid KDA chunk input accepted");
++}
++
++void invalid_inputs() {
++    const Planes planes(8);
++    std::vector<float> state = planes.state, out(planes.tokens * planes.d_inner);
++    std::vector<float> scratch4(kda_chunk_scratch_values(planes.profile, 8, 4));
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                                            state, out, scratch4, planes.profile, 3); });   // 8 % 3 != 0
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                                            state, out, scratch4, planes.profile, 0); });
++    rejects([&] { (void)kda_chunk_reference(std::span(planes.q).first(planes.q.size() - 1), planes.k,
++                                            planes.v, planes.gate, planes.beta, state, out,
++                                            scratch4, planes.profile, 4); });
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate,
++                                            std::span(planes.beta).first(3), state, out,
++                                            scratch4, planes.profile, 4); });
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                                            std::span(state).first(state.size() - 1), out,
++                                            scratch4, planes.profile, 4); });
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, planes.gate, planes.beta,
++                                            state, out, std::span(scratch4).first(scratch4.size() - 1),
++                                            planes.profile, 4); });
++    auto poisoned = planes.gate;
++    poisoned[5] = std::numeric_limits<float>::quiet_NaN();
++    rejects([&] { (void)kda_chunk_reference(planes.q, planes.k, planes.v, poisoned, planes.beta,
++                                            state, out, scratch4, planes.profile, 4); });
++}
++
++}  // namespace
++
++int main() {
++    try {
++        chunk_matches_oracle_and_recurrent();
++        zero_padding_rows_are_inert();
++        glm53_dimensions_smoke();
++        invalid_inputs();
++        std::puts("GLM KDA chunk reference matches recurrent/oracle at every chunk width");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what()); return 1;
++    }
++}
+diff --git a/tests/models/glm5/kda_reference_test.cpp b/tests/models/glm5/kda_reference_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4aa4f72566b5779af5b8639ca49da3afe035e34
+--- /dev/null
++++ b/tests/models/glm5/kda_reference_test.cpp
+@@ -0,0 +1,377 @@
++#include "models/glm5/reference/kda_reference.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdint>
++#include <limits>
++#include <span>
++#include <stdexcept>
++#include <vector>
++
++#define CHECK(expression) do { if (!(expression)) throw std::runtime_error("check failed: " #expression); } while (false)
++using namespace ninfer::models::glm5::reference;
++
++namespace {
++
++// Deterministic fixture: exact values in binary32 keep oracle tolerances tight.
++float source(uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 19u) - 9) / 4.0f;
++}
++
++// ---------------------------------------------------------------------------
++// Independent long-double oracle assembled from the FLA naive formulation
++// (S *= exp(g); S += (beta*k) outer (v - S^T k); o = S^T q with q pre-scaled),
++// deliberately written in a different association order than the C++ loop.
++struct ScanOracle {
++    long double sq(long double v) const { return v * v; }
++    long double l2(const float* x) const {
++        long double sum = 1e-6L;
++        for (uint32_t i = 0; i < profile.head_dim; ++i) sum += sq(x[i]);
++        return std::sqrt(sum);
++    }
++    explicit ScanOracle(KdaProfile p) : profile(p) {}
++
++    void token(const float* q, const float* k, const float* v, const float* g, long double beta,
++               std::vector<long double>& S, float* o) const {
++        const uint32_t dk = profile.head_dim;
++        const long double scale = 1.0L / std::sqrt(static_cast<long double>(dk));
++        std::vector<long double> qh(dk), kh(dk);
++        for (uint32_t i = 0; i < dk; ++i) {
++            qh[i] = q[i] / l2(q) * scale;
++            kh[i] = k[i] / l2(k);
++        }
++        std::vector<long double> decay(dk);
++        for (uint32_t i = 0; i < dk; ++i) decay[i] = std::exp(static_cast<long double>(g[i]));
++        // S is [key][value]; FLA writes S = S*exp(g) then the rank-one update.
++        for (uint32_t i = 0; i < dk; ++i)
++            for (uint32_t j = 0; j < dk; ++j) S[static_cast<size_t>(i) * dk + j] *= decay[i];
++        for (uint32_t j = 0; j < dk; ++j) {
++            long double u = 0;
++            for (uint32_t i = 0; i < dk; ++i) u += kh[i] * S[static_cast<size_t>(i) * dk + j];
++            const long double delta = beta * (v[j] - u);
++            for (uint32_t i = 0; i < dk; ++i) S[static_cast<size_t>(i) * dk + j] += kh[i] * delta;
++        }
++        for (uint32_t j = 0; j < dk; ++j) {
++            long double out = 0;
++            for (uint32_t i = 0; i < dk; ++i) out += qh[i] * S[static_cast<size_t>(i) * dk + j];
++            o[j] = static_cast<float>(out);
++        }
++    }
++
++    KdaProfile profile;
++};
++
++void compare(const std::vector<float>& actual, const std::vector<long double>& expected,
++             long double tolerance, const char* what) {
++    CHECK(actual.size() == expected.size());
++    for (size_t i = 0; i < actual.size(); ++i) {
++        const long double reference = expected[i] == 0 ? 0 : expected[i];
++        const long double error = std::abs(static_cast<long double>(actual[i]) - reference);
++        CHECK(error <= tolerance * std::max<long double>(1, std::abs(reference)));
++        if (!(error <= tolerance * std::max<long double>(1, std::abs(reference))))
++            std::fprintf(stderr, "%s[%zu]=%e vs %Le\n", what, i, actual[i], reference);
++    }
++}
++
++// ---------------------------------------------------------------------------
++void conv_oracle_and_continuity() {
++    const KdaProfile profile{3, 4, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    const size_t hist = profile.d_conv - 1;
++
++    std::vector<float> weights(d_inner * profile.d_conv);
++    for (size_t i = 0; i < weights.size(); ++i) weights[i] = source(static_cast<uint32_t>(i) + 1);
++    std::vector<float> state(hist * d_inner);
++    for (size_t i = 0; i < state.size(); ++i) state[i] = source(static_cast<uint32_t>(i) * 3 + 5) / 2;
++
++    for (const size_t tokens : {size_t{1}, size_t{2}, size_t{5}}) {
++        std::vector<float> x(tokens * d_inner);
++        for (size_t i = 0; i < x.size(); ++i) x[i] = source(static_cast<uint32_t>(i) + 7);
++
++        std::vector<float> one_out(tokens * d_inner, -1e30f), one_state = state;
++        kda_conv_reference(x, weights, one_state, one_out, profile);
++
++        // Independent oracle over the virtual [state | x] window.
++        std::vector<float> expected(tokens * d_inner);
++        for (size_t t = 0; t < tokens; ++t)
++            for (size_t c = 0; c < d_inner; ++c) {
++                long double acc = 0;
++                for (uint32_t tap = 0; tap < profile.d_conv; ++tap) {
++                    const long long s = static_cast<long long>(t) - static_cast<long long>(hist) + tap;
++                    const long double sample = s >= 0 ? x[static_cast<size_t>(s) * d_inner + c]
++                                                      : state[static_cast<size_t>(s + static_cast<long long>(hist)) * d_inner + c];
++                    acc += weights[c * profile.d_conv + tap] * sample;
++                }
++                const long double silu = acc / (1.0L + std::exp(-acc));
++                expected[t * d_inner + c] = static_cast<float>(silu);
++            }
++        compare(one_out, std::vector<long double>(expected.begin(), expected.end()), 3e-6L, "conv out");
++
++        // One-shot must equal token-by-token, bit for bit, including the state.
++        std::vector<float> split_out, split_state = state;
++        for (size_t t = 0; t < tokens; ++t) {
++            std::vector<float> token(d_inner), out(d_inner);
++            for (size_t c = 0; c < d_inner; ++c) token[c] = x[t * d_inner + c];
++            kda_conv_reference(token, weights, split_state, out, profile);
++            split_out.insert(split_out.end(), out.begin(), out.end());
++        }
++        CHECK(one_out == split_out);
++        CHECK(one_state == split_state);
++    }
++}
++
++// ---------------------------------------------------------------------------
++void gate_matches_kernel_formula() {
++    const KdaProfile profile{2, 3, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    const size_t tokens = 2;
++    std::vector<float> g(tokens * d_inner), a_log(profile.heads), out(tokens * d_inner);
++    for (size_t i = 0; i < g.size(); ++i) g[i] = source(static_cast<uint32_t>(i) + 3);
++    a_log[0] = -0.5f; a_log[1] = 0.25f;
++    kda_decay_gate_reference(g, a_log, out, profile);
++    for (size_t t = 0; t < tokens; ++t)
++        for (uint32_t h = 0; h < profile.heads; ++h) {
++            const long double rate = std::exp(static_cast<long double>(a_log[h]));
++            for (uint32_t i = 0; i < profile.head_dim; ++i) {
++                const size_t index = t * d_inner + size_t(h) * profile.head_dim + i;
++                const long double expected = profile.gate_lower_bound /
++                    (1.0L + std::exp(-rate * g[index]));
++                CHECK(std::abs(static_cast<long double>(out[index]) - expected) < 1e-6L);
++                CHECK(out[index] < 0 && out[index] > profile.gate_lower_bound);
++            }
++        }
++}
++
++// ---------------------------------------------------------------------------
++void scan_oracle_split_and_state_contract() {
++    const KdaProfile profile{2, 4, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    const size_t state_values = kda_state_values(profile);
++    const size_t tokens = 5;
++
++    std::vector<float> q(tokens * d_inner), k(tokens * d_inner), v(tokens * d_inner),
++        gate(tokens * d_inner), beta(tokens * profile.heads);
++    for (size_t i = 0; i < tokens * d_inner; ++i) {
++        q[i] = source(static_cast<uint32_t>(i) * 2 + 1);
++        k[i] = source(static_cast<uint32_t>(i) * 2 + 2);
++        v[i] = source(static_cast<uint32_t>(i) * 2 + 3) / 2;
++        gate[i] = source(static_cast<uint32_t>(i) * 2 + 4) / 3;
++    }
++    for (size_t i = 0; i < beta.size(); ++i) beta[i] = 0.25f + 0.5f * (static_cast<float>(i % 3) / 3.0f);
++
++    std::vector<float> state(state_values), out(tokens * d_inner, -1e30f),
++        scratch(kda_scan_scratch_values(profile, tokens));
++    for (size_t i = 0; i < state.size(); ++i) state[i] = source(static_cast<uint32_t>(i)) / 5;
++    const std::vector<float> initial_state = state;
++
++    kda_gated_delta_reference(q, k, v, gate, beta, state, out, scratch, profile);
++
++    // Independent oracle per head, straight from the FLA naive recurrence.
++    const ScanOracle oracle(profile);
++    std::vector<float> expected(tokens * d_inner);
++    for (uint32_t h = 0; h < profile.heads; ++h) {
++        std::vector<long double> S(state_values);
++        for (size_t i = 0; i < state_values; ++i) S[i] = initial_state[h * profile.head_dim * profile.head_dim + i];
++        for (size_t t = 0; t < tokens; ++t) {
++            const size_t base = t * d_inner + size_t(h) * profile.head_dim;
++            oracle.token(&q[base], &k[base], &v[base], &gate[base], beta[t * profile.heads + h], S,
++                         &expected[base]);
++        }
++    }
++    compare(out, std::vector<long double>(expected.begin(), expected.end()), 2e-5L, "scan out");
++    // 20^2 accumulations over 5 tokens stay far from FP32 limits, but the state
++    // must equal running the oracle's FP32 rounding, checked via the split run.
++
++    // Token-by-token must reproduce the one-shot run bit for bit, including state.
++    std::vector<float> split_state = initial_state, split_out;
++    std::vector<float> one(q.begin(), q.begin() + d_inner), onek(k.begin(), k.begin() + d_inner),
++        onev(v.begin(), v.begin() + d_inner), oneg(gate.begin(), gate.begin() + d_inner);
++    std::vector<float> token_scratch(kda_scan_scratch_values(profile, 1)), token_out(d_inner);
++    for (size_t t = 0; t < tokens; ++t) {
++        for (size_t c = 0; c < d_inner; ++c) {
++            one[c] = q[t * d_inner + c]; onek[c] = k[t * d_inner + c];
++            onev[c] = v[t * d_inner + c]; oneg[c] = gate[t * d_inner + c];
++        }
++        std::vector<float> token_beta(beta.begin() + t * profile.heads,
++                                      beta.begin() + (t + 1) * profile.heads);
++        kda_gated_delta_reference(one, onek, onev, oneg, token_beta, split_state, token_out,
++                                  token_scratch, profile);
++        split_out.insert(split_out.end(), token_out.begin(), token_out.end());
++    }
++    CHECK(out == split_out);
++    CHECK(state == split_state);
++
++    // Fresh state stays zero-preserving: q=k=v=0 must leave the state untouched
++    // apart from decay and write o = decayed state times zero query... instead
++    // assert the practical invariant: zero inputs leave o finite and state decayed.
++    std::vector<float> zeros(tokens * d_inner, 0), zero_beta(tokens * profile.heads, 0),
++        zero_state = initial_state, zero_out(tokens * d_inner, -1e30f);
++    kda_gated_delta_reference(zeros, zeros, zeros, gate, zero_beta, zero_state, zero_out, scratch, profile);
++    CHECK(zero_out == std::vector<float>(tokens * d_inner, 0));  // q=0 => o=0 exactly
++}
++
++// ---------------------------------------------------------------------------
++void scan_failure_keeps_planes() {
++    const KdaProfile profile{1, 2, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    std::vector<float> q(d_inner, 1), k(d_inner, 1), v(d_inner, 1), gate(d_inner, -1),
++        beta(profile.heads, 0.5f), state(kda_state_values(profile), 0),
++        out(d_inner, -7), scratch(kda_scan_scratch_values(profile, 1));
++    // Non-finite input is rejected before anything is modified. A finite huge
++    // magnitude is NOT rejected at the gate: the l2 norm maps it toward zero,
++    // matching the FP32 kernel behaviour.
++    const auto nan = std::numeric_limits<float>::quiet_NaN();
++    q[0] = nan;
++    try {
++        kda_gated_delta_reference(q, k, v, gate, beta, state, out, scratch, profile);
++        throw std::runtime_error("NaN scan input accepted");
++    } catch (const std::invalid_argument&) {
++    }
++    q[0] = std::numeric_limits<float>::max();
++    k[1] = std::numeric_limits<float>::max();
++    kda_gated_delta_reference(q, k, v, gate, beta, state, out, scratch, profile);
++    CHECK(state == std::vector<float>(kda_state_values(profile), 0));  // k normalizes away
++    q[0] = 1; k[1] = 1;
++    // Arithmetic overflow: an out-of-range (still finite) beta multiplies the
++    // delta rule past binary32 range mid-scan; both planes must stay untouched.
++    // Unit-normalized q/k with in-range beta alone cannot overflow a dk=2 head
++    // (outputs stay below 0.71*FLT_MAX), so the guard is what stands between a
++    // caller-side sigmoid bug and a silently corrupt state.
++    CHECK(out != std::vector<float>(d_inner, -7));  // the run above published
++    std::fill(out.begin(), out.end(), -7.0f);
++    v[0] = std::numeric_limits<float>::max(); v[1] = std::numeric_limits<float>::max();
++    beta[0] = 4;
++    try {
++        kda_gated_delta_reference(q, k, v, gate, beta, state, out, scratch, profile);
++        throw std::runtime_error("overflowing scan accepted");
++    } catch (const std::overflow_error&) {
++    }
++    CHECK(out == std::vector<float>(d_inner, -7));
++    CHECK(state == std::vector<float>(kda_state_values(profile), 0));
++}
++
++// ---------------------------------------------------------------------------
++void out_gate_oracle_and_alias() {
++    const KdaProfile profile{2, 3, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    const size_t tokens = 3;
++    std::vector<float> o(tokens * d_inner), g2(tokens * d_inner), norm_w(profile.head_dim);
++    for (size_t i = 0; i < o.size(); ++i) o[i] = source(static_cast<uint32_t>(i) + 11) / 3;
++    for (size_t i = 0; i < g2.size(); ++i) g2[i] = source(static_cast<uint32_t>(i) + 13) / 2;
++    for (size_t i = 0; i < norm_w.size(); ++i) norm_w[i] = 1 + source(static_cast<uint32_t>(i)) / 9;
++
++    const std::vector<float> input = o;
++    kda_out_gate_reference(o, g2, norm_w, o, profile);  // in-place alias must work
++    for (size_t t = 0; t < tokens; ++t)
++        for (uint32_t h = 0; h < profile.heads; ++h) {
++            const size_t base = t * d_inner + size_t(h) * profile.head_dim;
++            long double mean = 0;
++            for (uint32_t i = 0; i < profile.head_dim; ++i)
++                mean += static_cast<long double>(input[base + i]) * input[base + i];
++            mean /= profile.head_dim;
++            const long double inv = 1.0L / std::sqrt(mean + 1e-6L);
++            for (uint32_t i = 0; i < profile.head_dim; ++i) {
++                const long double expected = input[base + i] * inv * norm_w[i] /
++                    (1.0L + std::exp(-static_cast<long double>(g2[base + i])));
++                CHECK(std::abs(static_cast<long double>(o[base + i]) - expected) < 1e-5L);
++            }
++        }
++}
++
++// ---------------------------------------------------------------------------
++void glm53_dimensions_smoke() {
++    // The real 64x128 profile at small T: bit-level split continuity plus the
++    // audited constant set, without a long-double oracle over the full geometry.
++    CHECK(kGlm53KdaProfile.heads == 64 && kGlm53KdaProfile.head_dim == 128);
++    CHECK(kGlm53KdaProfile.d_conv == 4 && kGlm53KdaProfile.gate_lower_bound == -5.0f);
++    const KdaProfile profile = kGlm53KdaProfile;
++    const size_t d_inner = size_t(profile.heads) * profile.head_dim;
++    const size_t tokens = 4;
++    std::vector<float> q(tokens * d_inner), k(tokens * d_inner), v(tokens * d_inner),
++        gate(tokens * d_inner), beta(tokens * profile.heads), state(kda_state_values(profile)),
++        out(tokens * d_inner), scratch(kda_scan_scratch_values(profile, tokens));
++    for (size_t i = 0; i < tokens * d_inner; ++i) {
++        q[i] = source(static_cast<uint32_t>(i));
++        k[i] = source(static_cast<uint32_t>(i) + 1);
++        v[i] = source(static_cast<uint32_t>(i) + 2);
++        gate[i] = source(static_cast<uint32_t>(i) + 3) / 4;
++    }
++    for (size_t i = 0; i < beta.size(); ++i) beta[i] = 0.5f;
++    kda_gated_delta_reference(q, k, v, gate, beta, state, out, scratch, profile);
++    std::vector<float> split_state(kda_state_values(profile)),
++        split_out, token_scratch(kda_scan_scratch_values(profile, 1));
++    for (size_t t = 0; t < tokens; ++t) {
++        std::vector<float> token_out(d_inner);
++        kda_gated_delta_reference(std::span(q).subspan(t * d_inner, d_inner),
++                                  std::span(k).subspan(t * d_inner, d_inner),
++                                  std::span(v).subspan(t * d_inner, d_inner),
++                                  std::span(gate).subspan(t * d_inner, d_inner),
++                                  std::span(beta).subspan(t * profile.heads, profile.heads),
++                                  split_state, token_out, token_scratch, profile);
++        split_out.insert(split_out.end(), token_out.begin(), token_out.end());
++    }
++    CHECK(out == split_out);
++    CHECK(state == split_state);
++}
++
++// ---------------------------------------------------------------------------
++template<class F> void rejects(F action) {
++    try { action(); } catch (const std::invalid_argument&) { return; }
++    throw std::runtime_error("invalid KDA reference input accepted");
++}
++
++void invalid_inputs() {
++    const KdaProfile profile{2, 3, 4, -5.0f};
++    const size_t d_inner = profile.heads * profile.head_dim;
++    std::vector<float> plane(d_inner), weights(d_inner * profile.d_conv),
++        conv_state((profile.d_conv - 1) * d_inner), out(d_inner);
++    rejects([&] { (void)kda_conv_reference(std::span(plane).first(d_inner - 1), weights, conv_state, out, profile); });
++    rejects([&] { (void)kda_conv_reference(plane, std::span(weights).first(weights.size() - 1), conv_state, out, profile); });
++    rejects([&] { (void)kda_conv_reference(plane, weights, std::span(conv_state).first(conv_state.size() - 1), out, profile); });
++    const auto bad = std::numeric_limits<float>::quiet_NaN();
++    std::vector<float> poisoned = plane; poisoned[0] = bad;
++    rejects([&] { (void)kda_conv_reference(poisoned, weights, conv_state, out, profile); });
++
++    std::vector<float> g(d_inner), a_log(profile.heads), gate_out(d_inner);
++    rejects([&] { (void)kda_decay_gate_reference(g, std::span(a_log).first(1), gate_out, profile); });
++    std::vector<float> poisoned_log = a_log; poisoned_log[0] = std::numeric_limits<float>::infinity();
++    rejects([&] { (void)kda_decay_gate_reference(g, poisoned_log, gate_out, profile); });
++
++    std::vector<float> state(kda_state_values(profile)), beta(profile.heads),
++        scratch(kda_scan_scratch_values(profile, 1));
++    rejects([&] { (void)kda_gated_delta_reference(std::span(plane).first(d_inner - 1), plane, plane, plane,
++                                                  beta, state, out, scratch, profile); });
++    rejects([&] { (void)kda_gated_delta_reference(plane, plane, plane, plane, std::span(beta).first(1),
++                                                  state, out, scratch, profile); });
++    rejects([&] { (void)kda_gated_delta_reference(plane, plane, plane, plane, beta,
++                                                  std::span(state).first(state.size() - 1), out, scratch, profile); });
++    rejects([&] { (void)kda_gated_delta_reference(plane, plane, plane, plane, beta, state, out,
++                                                  std::span(scratch).first(scratch.size() - 1), profile); });
++    std::vector<float> poisoned_gate = plane; poisoned_gate[1] = bad;
++    rejects([&] { (void)kda_gated_delta_reference(plane, plane, plane, poisoned_gate, beta, state, out,
++                                                  scratch, profile); });
++
++    std::vector<float> norm_w(profile.head_dim);
++    rejects([&] { (void)kda_out_gate_reference(plane, std::span(plane).first(d_inner - 1), norm_w, out, profile); });
++    rejects([&] { (void)kda_out_gate_reference(plane, plane, std::span(norm_w).first(1), out, profile); });
++    std::vector<float> poisoned_o = plane; poisoned_o[2] = bad;
++    rejects([&] { (void)kda_out_gate_reference(poisoned_o, plane, norm_w, out, profile); });
++}
++
++}  // namespace
++
++int main() {
++    try {
++        conv_oracle_and_continuity();
++        gate_matches_kernel_formula();
++        scan_oracle_split_and_state_contract();
++        scan_failure_keeps_planes();
++        out_gate_oracle_and_alias();
++        glm53_dimensions_smoke();
++        invalid_inputs();
++        std::puts("GLM KDA conv/gate/delta/out-gate references match independent oracles");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what()); return 1;
++    }
++}
+diff --git a/tests/models/glm5/mhc_reference_test.cpp b/tests/models/glm5/mhc_reference_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b4d2d34201dbcf2d4b5f51ae7d56e8cde5523aa8
+--- /dev/null
++++ b/tests/models/glm5/mhc_reference_test.cpp
+@@ -0,0 +1,282 @@
++#include "models/glm5/reference/mhc_reference.h"
++
++#include <array>
++#include <cmath>
++#include <cstdio>
++#include <limits>
++#include <stdexcept>
++#include <vector>
++
++#define CHECK(expression) do { if (!(expression)) throw std::runtime_error("check failed: " #expression); } while (false)
++using namespace ninfer::models::glm5::reference;
++
++namespace {
++
++float source(uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++template<class F> void rejects(F action) {
++    try { action(); } catch (const std::invalid_argument&) { return; }
++    throw std::runtime_error("invalid mHC input accepted");
++}
++
++struct Fixture {
++    MhcProfile profile = kGlm53MhcProfile;
++    uint32_t hidden = 12;
++    size_t tokens = 3, hc, stream_values, mix_values;
++    std::vector<float> streams, fn, base, scale;
++    explicit Fixture(uint32_t h = 12, size_t t = 3) : hidden(h), tokens(t) {
++        hc = profile.hc;
++        stream_values = hc * hidden;
++        mix_values = (2 + hc) * hc;
++        streams.resize(tokens * stream_values);
++        fn.resize(mix_values * stream_values);
++        base.resize(mix_values);
++        scale = {0.7f, 0.5f, 0.9f};
++        for (size_t i = 0; i < streams.size(); ++i) streams[i] = source(static_cast<uint32_t>(i) + 5) / 4;
++        for (size_t i = 0; i < fn.size(); ++i) fn[i] = source(static_cast<uint32_t>(i) * 3 + 1) / 16;
++        for (size_t i = 0; i < base.size(); ++i) base[i] = source(static_cast<uint32_t>(i) * 5 + 3) / 8;
++    }
++};
++
++// Independent long-double oracle, re-derived from the transformers module:
++// unweighted RMS norm over the flattened streams, sigmoid/2x-sigmoid gates,
++// softmax over dst per src row from the flat comb[dst + hc*src] layout, the
++// pinned Sinkhorn order, and the layer update. Written in a different
++// association order than the C++ loops.
++struct Oracle {
++    const Fixture& f;
++    long double sigmoid(long double x) const { return 1.0L / (1.0L + std::exp(-x)); }
++
++    void weights(size_t t, std::vector<long double>& pre, std::vector<long double>& post,
++                 std::vector<long double>& comb) const {
++        const size_t hc = f.hc, sv = f.stream_values;
++        long double square_sum = 0;
++        for (size_t i = 0; i < sv; ++i) {
++            const long double v = f.streams[t * sv + i];
++            square_sum += v * v;
++        }
++        const long double inv = 1.0L / std::sqrt(square_sum / static_cast<long double>(sv) + f.profile.rms_eps);
++        std::vector<long double> mixes(f.mix_values);
++        for (size_t m = 0; m < f.mix_values; ++m)
++            for (size_t i = 0; i < sv; ++i)
++                mixes[m] += static_cast<long double>(f.fn[m * sv + i]) * f.streams[t * sv + i];
++        for (auto& m : mixes) m *= inv;
++
++        pre.resize(hc); post.resize(hc); comb.assign(hc * hc, 0);
++        for (size_t n = 0; n < hc; ++n) {
++            pre[n] = sigmoid(mixes[n] * f.scale[0] + f.base[n]) + f.profile.hc_eps;
++            post[n] = 2.0L * sigmoid(mixes[hc + n] * f.scale[1] + f.base[hc + n]);
++        }
++        for (size_t src = 0; src < hc; ++src) {
++            long double denominator = 0;
++            std::vector<long double> exps(hc);
++            for (size_t dst = 0; dst < hc; ++dst) {
++                const size_t flat = 2 * hc + dst + hc * src;
++                exps[dst] = std::exp((mixes[flat] * f.scale[2] + f.base[flat]) -
++                                     (mixes[2 * hc + 0 + hc * src] * f.scale[2] + f.base[2 * hc + 0 + hc * src]));
++                denominator += exps[dst];
++            }
++            for (size_t dst = 0; dst < hc; ++dst)
++                comb[src * hc + dst] = exps[dst] / denominator + f.profile.hc_eps;
++        }
++        auto col = [&]() {
++            for (size_t dst = 0; dst < hc; ++dst) {
++                long double sum = 0;
++                for (size_t src = 0; src < hc; ++src) sum += comb[src * hc + dst];
++                const long double inv_sum = 1.0L / (sum + f.profile.hc_eps);
++                for (size_t src = 0; src < hc; ++src) comb[src * hc + dst] *= inv_sum;
++            }
++        };
++        auto row = [&]() {
++            for (size_t src = 0; src < hc; ++src) {
++                long double sum = 0;
++                for (size_t dst = 0; dst < hc; ++dst) sum += comb[src * hc + dst];
++                const long double inv_sum = 1.0L / (sum + f.profile.hc_eps);
++                for (size_t dst = 0; dst < hc; ++dst) comb[src * hc + dst] *= inv_sum;
++            }
++        };
++        col();
++        for (uint32_t r = 1; r < f.profile.sinkhorn_iters; ++r) { row(); col(); }
++    }
++};
++
++void compare(float got, long double want, long double tolerance, const char* what) {
++    const long double error = std::abs(static_cast<long double>(got) - want);
++    if (!(error <= tolerance * std::max<long double>(1, std::abs(want))))
++        std::fprintf(stderr, "%s: got %.9g want %.9Le\n", what, got, want);
++    CHECK(error <= tolerance * std::max<long double>(1, std::abs(want)));
++}
++
++void pre_matches_oracle_and_invariants() {
++    const Fixture f;
++    const Oracle oracle{f};
++    const size_t hc = f.hc;
++    std::vector<float> pre(f.tokens * hc), post(f.tokens * hc), comb(f.tokens * hc * hc),
++        collapsed(f.tokens * f.hidden);
++    mhc_pre_reference(f.streams, f.fn, f.base, f.scale, pre, post, comb, collapsed, f.profile, f.hidden);
++
++    for (size_t t = 0; t < f.tokens; ++t) {
++        std::vector<long double> pre_o, post_o, comb_o;
++        oracle.weights(t, pre_o, post_o, comb_o);
++        long double pre_sum = 0;
++        for (size_t n = 0; n < hc; ++n) {
++            compare(pre[t * hc + n], pre_o[n], 2e-6L, "pre");
++            compare(post[t * hc + n], post_o[n], 2e-6L, "post");
++            pre_sum += pre_o[n];
++        }
++        CHECK(pre_sum < static_cast<long double>(hc) * 2 + 1);  // sigmoid+eps, NOT softmax
++        CHECK(pre_sum > 1e-6L);
++        for (size_t i = 0; i < hc * hc; ++i) compare(comb[t * hc * hc + i], comb_o[i], 2e-6L, "comb");
++        // Sinkhorn target: columns (fixed dst over src) sum to 1 up to the eps slack.
++        for (size_t dst = 0; dst < hc; ++dst) {
++            float column = 0, row = 0;
++            for (size_t src = 0; src < hc; ++src) column += comb[t * hc * hc + src * hc + dst];
++            for (size_t d = 0; d < hc; ++d) row += comb[t * hc * hc + dst * hc + d];
++            CHECK(std::abs(column - 1.0f) < 1e-4f);
++            CHECK(std::abs(row - 1.0f) < 2e-3f);  // rows only approximately (eps + last-op asymmetry)
++        }
++        for (size_t d = 0; d < f.hidden; ++d) {
++            long double acc = 0;
++            for (size_t n = 0; n < hc; ++n)
++                acc += pre_o[n] * f.streams[t * f.stream_values + n * f.hidden + d];
++            compare(collapsed[t * f.hidden + d], acc, 2e-5L, "collapsed");
++        }
++    }
++}
++
++// The flat comb layout comb[dst + hc*src] is the easiest thing to transpose
++// silently; a probe with one large src-specific logit pins it: that src row's
++// softmax concentrates on the dst with the large base.
++void comb_flat_layout_probe() {
++    Fixture f(8, 1);
++    // Make base[2hc + dst + hc*src] strongly favor (src=2, dst=1).
++    for (size_t i = 0; i < f.base.size(); ++i) f.base[i] = -4;
++    const size_t hot = 2 * f.hc + 1 + f.hc * 2;
++    f.base[hot] = +8;
++    std::vector<float> pre(f.hc), post(f.hc), comb(f.hc * f.hc), collapsed(f.hidden);
++    mhc_pre_reference(f.streams, f.fn, f.base, f.scale, pre, post, comb, collapsed, f.profile, f.hidden);
++    // Before Sinkhorn the src=2 row is ~one-hot on dst=1; Sinkhorn's first
++    // move is a column normalization, so that row stays the row closest to a
++    // one-hot on dst=1 across all src rows.
++    size_t argmax = 0;
++    float entropy_best = 1e30f;
++    for (size_t src = 0; src < f.hc; ++src) {
++        float entropy = 0;
++        for (size_t dst = 0; dst < f.hc; ++dst) entropy -= comb[src * f.hc + dst] * std::log(comb[src * f.hc + dst]);
++        if (entropy < entropy_best) { entropy_best = entropy; argmax = src; }
++    }
++    CHECK(argmax == 2);
++    CHECK(comb[2 * f.hc + 1] > 0.9f);
++}
++
++void post_and_head_and_layer_chain() {
++    const Fixture f;
++    const Oracle oracle{f};
++    const size_t hc = f.hc;
++    std::vector<float> pre(f.tokens * hc), post(f.tokens * hc), comb(f.tokens * hc * hc),
++        collapsed(f.tokens * f.hidden);
++    mhc_pre_reference(f.streams, f.fn, f.base, f.scale, pre, post, comb, collapsed, f.profile, f.hidden);
++
++    // A deterministic stand-in block output.
++    std::vector<float> block(f.tokens * f.hidden);
++    for (size_t i = 0; i < block.size(); ++i) block[i] = source(static_cast<uint32_t>(i) * 7 + 2) / 3;
++
++    std::vector<float> out(f.tokens * f.stream_values, -1e30f);
++    mhc_post_reference(block, f.streams, post, comb, out, f.profile, f.hidden);
++    for (size_t t = 0; t < f.tokens; ++t) {
++        std::vector<long double> pre_o, post_o, comb_o;
++        oracle.weights(t, pre_o, post_o, comb_o);
++        for (size_t dst = 0; dst < hc; ++dst)
++            for (size_t d = 0; d < f.hidden; ++d) {
++                long double mix = 0;
++                for (size_t src = 0; src < hc; ++src)
++                    mix += comb_o[src * hc + dst] * f.streams[t * f.stream_values + src * f.hidden + d];
++                const long double expected = post_o[dst] * block[t * f.hidden + d] + mix;
++                compare(out[t * f.stream_values + dst * f.hidden + d], expected, 2e-5L, "post");
++            }
++    }
++
++    // Head: unweighted mean; in-place alias (output = prefix view of the same
++    // buffer) must work because each element's reads precede its write.
++    std::vector<float> streams_copy = f.streams;
++    mhc_head_reference(streams_copy, std::span(streams_copy).first(f.tokens * f.hidden),
++                       f.profile, f.hidden);
++    for (size_t t = 0; t < f.tokens; ++t)
++        for (size_t d = 0; d < f.hidden; ++d) {
++            const float expected = (f.streams[t * f.stream_values + 0 * f.hidden + d] +
++                                    f.streams[t * f.stream_values + 1 * f.hidden + d] +
++                                    f.streams[t * f.stream_values + 2 * f.hidden + d] +
++                                    f.streams[t * f.stream_values + 3 * f.hidden + d]) / 4.0f;
++            CHECK(streams_copy[t * f.hidden + d] == expected);
++        }
++}
++
++void sinkhorn_iteration_count_matters() {
++    // iters=1 (single column normalization) vs 20 must differ on a general
++    // input, pinning that the reference actually iterates.
++    Fixture f(8, 1);
++    std::vector<float> pre1(f.hc), post1(f.hc), comb1(f.hc * f.hc), col1(f.hidden);
++    MhcProfile one = f.profile; one.sinkhorn_iters = 1;
++    mhc_pre_reference(f.streams, f.fn, f.base, f.scale, pre1, post1, comb1, col1, one, f.hidden);
++    std::vector<float> pre20(f.hc), post20(f.hc), comb20(f.hc * f.hc), col20(f.hidden);
++    mhc_pre_reference(f.streams, f.fn, f.base, f.scale, pre20, post20, comb20, col20, f.profile, f.hidden);
++    CHECK(pre1 == pre20 && post1 == post20);   // gates do not depend on iterations
++    bool comb_differs = false;
++    for (size_t i = 0; i < f.hc * f.hc; ++i) comb_differs = comb_differs || comb1[i] != comb20[i];
++    CHECK(comb_differs);
++    float column_error = 0;
++    for (size_t dst = 0; dst < f.hc; ++dst) {
++        float sum = 0;
++        for (size_t src = 0; src < f.hc; ++src) sum += comb1[src * f.hc + dst];
++        column_error = std::max(column_error, std::abs(sum - 1.0f));
++    }
++    CHECK(column_error < 1e-4f);  // iters=1 already fixes columns exactly once
++}
++
++void glm53_smoke_and_invalid() {
++    // Real mix width: fn is 24x16384; geometry constants checked separately.
++    CHECK(mhc_mix_values(kGlm53MhcProfile) == 24);
++    CHECK(mhc_stream_values(kGlm53MhcProfile, 4096) == 16384);
++    CHECK(kGlm53MhcProfile.sinkhorn_iters == 20 && kGlm53MhcProfile.hc_eps == 1e-6f);
++    CHECK(kGlm53MhcProfile.rms_eps == 1e-5f);
++
++    const Fixture g;
++    std::vector<float> pre(g.hc), post(g.hc), comb(g.hc * g.hc), col(g.hidden);
++    rejects([&] { (void)mhc_pre_reference(std::span(g.streams).first(g.streams.size() - 1), g.fn,
++                                          g.base, g.scale, pre, post, comb, col, g.profile, g.hidden); });
++    rejects([&] { (void)mhc_pre_reference(g.streams, std::span(g.fn).first(g.fn.size() - 1),
++                                          g.base, g.scale, pre, post, comb, col, g.profile, g.hidden); });
++    rejects([&] { (void)mhc_pre_reference(g.streams, g.fn, g.base, std::span(g.scale).first(2),
++                                          pre, post, comb, col, g.profile, g.hidden); });
++    rejects([&] { (void)mhc_pre_reference(g.streams, g.fn, g.base, g.scale, std::span(pre).first(3),
++                                          post, comb, col, g.profile, g.hidden); });
++    MhcProfile broken = g.profile; broken.hc = 5;
++    rejects([&] { (void)mhc_pre_reference(g.streams, g.fn, g.base, g.scale, pre, post, comb, col,
++                                          broken, g.hidden); });
++    auto poisoned = g.streams;
++    poisoned[3] = std::numeric_limits<float>::quiet_NaN();
++    rejects([&] { (void)mhc_pre_reference(poisoned, g.fn, g.base, g.scale, pre, post, comb, col,
++                                          g.profile, g.hidden); });
++    std::vector<float> block(g.hidden), out(g.stream_values);
++    rejects([&] { (void)mhc_post_reference(std::span(block).first(g.hidden - 1), g.streams,
++                                           post, comb, out, g.profile, g.hidden); });
++    rejects([&] { (void)mhc_head_reference(g.streams, std::span(out).first(4), g.profile, g.hidden); });
++}
++
++}  // namespace
++
++int main() {
++    try {
++        pre_matches_oracle_and_invariants();
++        comb_flat_layout_probe();
++        post_and_head_and_layer_chain();
++        sinkhorn_iteration_count_matters();
++        glm53_smoke_and_invalid();
++        std::puts("GLM mHC pre/post/head references match independent oracles");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what()); return 1;
++    }
++}
 diff --git a/tests/models/glm5/test_config.cpp b/tests/models/glm5/test_config.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173cf26b8a9
@@ -26518,14 +29463,137 @@ index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_state.cpp b/tests/models/glm5/test_state.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f667750100034
+--- /dev/null
++++ b/tests/models/glm5/test_state.cpp
+@@ -0,0 +1,96 @@
++// Glm5StateLayout against the audited GLM-5.3-Flash geometry and the capacity
++// plan's numbers (FP32 KDA state, BF16 caches, 262144 logical positions).
++#include "models/glm5/config.h"
++#include "models/glm5/state.h"
++
++#include <cmath>
++#include <fstream>
++#include <functional>
++#include <iostream>
++#include <string>
++
++using namespace ninfer::models::glm5;
++using ninfer::artifact::Json;
++
++namespace {
++
++void require(bool condition, const std::string& message) {
++    if (!condition) { throw std::runtime_error(message); }
++}
++
++constexpr std::uint64_t kGib = 1ull << 30;
++
++TextConfig fixture_config() {
++    std::ifstream file(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/glm5/text_config.json");
++    require(file.good(), "fixture missing");
++    return parse_text_config(Json::parse(file));
++}
++
++void audited_layout() {
++    const TextConfig config = fixture_config();
++    const Glm5StateLayout layout(config);
++    require(layout.kda_blocks() == 34 && layout.dsa_blocks() == 11, "block split");
++
++    // KDA FP32 matrix state: 34 blocks x 64 x 128 x 128 floats = 136 MiB.
++    require(layout.kda_matrix_floats() == 34ull * 64 * 128 * 128, "kda matrix floats");
++    require(layout.kda_matrix_floats() * 4 == 142606336ull, "kda matrix FP32 bytes");
++
++    // Three conv planes of 3 taps over 8192 channels per KDA block.
++    require(layout.kda_conv_values() == 34ull * 3 * 3 * 8192, "kda conv values");
++
++    // MLA latent: the only attention cache, 11 * 512 per position (NoPE).
++    require(layout.mla_latent_values_per_position() == 11ull * 512, "mla latent values");
++    const std::uint64_t positions = 262144;
++    const double latent_gib =
++        double(layout.mla_latent_values_per_position() * positions) * 2.0 / kGib;
++    require(std::abs(latent_gib - 2.75) < 1e-9, "mla latent GiB at 262144 (BF16, capacity plan)");
++
++    // Indexer packed rows [128k|128g|1v] per position and pooled keys per pool.
++    require(layout.indexer_packed_values_per_position() == 11ull * 257, "indexer packed row");
++    const double packed_gib =
++        double(layout.indexer_packed_values_per_position() * positions) * 2.0 / kGib;
++    require(packed_gib > 1.30 && packed_gib < 1.40, "indexer packed GiB at 262144 (BF16)");
++    require(layout.completed_pools(positions) == 65536, "completed pools");
++    const double pools_gib =
++        double(layout.indexer_pool_key_values_per_pool() * layout.completed_pools(positions)) *
++        2.0 / kGib;
++    require(std::abs(pools_gib - 11.0 * 65536 * 128 * 2.0 / kGib) < 1e-9, "pooled key bytes");
++
++    require(layout.mhc_stream_values() == 4ull * 4096, "mHC residual streams");
++}
++
++void layer_counts_follow_the_config() {
++    // The layout derives its counts from the config's own layer list; a
++    // differently balanced but covering split is a different (hypothetical)
++    // model, not a layout error.
++    TextConfig config = fixture_config();
++    config.layer_types[3] = MixerKind::Kda;
++    const Glm5StateLayout rebalanced(config);
++    require(rebalanced.kda_blocks() == 35 && rebalanced.dsa_blocks() == 10,
++            "counts follow layer_types");
++
++    // A list that stops covering every block refuses.
++    TextConfig dropped = fixture_config();
++    dropped.layer_types.pop_back();
++    bool refused = false;
++    try {
++        (void)Glm5StateLayout(dropped);
++    } catch (const std::invalid_argument&) {
++        refused = true;
++    }
++    require(refused, "non-covering layer list must refuse");
++}
++
++} // namespace
++
++int main() {
++    try {
++        audited_layout();
++        layer_counts_follow_the_config();
++        std::puts("GLM5 state layout matches the audited geometry and capacity plan");
++        return 0;
++    } catch (const std::exception& e) {
++        std::cerr << e.what() << '\n';
++        return 1;
++    }
++}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..f080ebc943b8cb8202e63efd4ca3928168980f0b
+index 0000000000000000000000000000000000000000..fa6ce66a1e695034b68552d3b3c82e78dc751235
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,25 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
++  NEEDS_SOURCE_DIR
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_kda_reference_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kda_reference_test.cpp"
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_kda_chunk_reference_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/kda_chunk_reference_test.cpp"
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_mhc_reference_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/mhc_reference_test.cpp"
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_dsa_reference_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/dsa_reference_test.cpp"
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_state_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state.cpp"
 +  NEEDS_SOURCE_DIR
 +  LIBRARIES ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
@@ -31574,6 +34642,191 @@ index 23174618a8c4fefb292d10f1247057cfbe4ceb28..67862b6f517059e40548d56f9d4f5720
      "q2_native_source",
      "q8_native_source",
      "text_sources",
+diff --git a/tools/convert/glm5.py b/tools/convert/glm5.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..90e9aac757a6b140f7b92bd84753e094598d7b53
+--- /dev/null
++++ b/tools/convert/glm5.py
+@@ -0,0 +1,179 @@
++"""GLM-5.3-Flash (Glm5NextForConditionalGeneration) adapter: the mathematical text config.
++
++The architecture: 45 blocks of Kimi Delta Attention (KDA) linear mixers and 11 DeepSeek-style
++sparse-attention (DSA) mixers - NoPE-only MLA over a k-pool indexer's selection - every block
++half read from and written into a four-stream mHC residual; three dense FFN blocks then 42
++sigmoid-routed 288-expert MoE blocks; one MTP block is recorded but not executed by the first
++generation. The converter normalises the checkpoint's config into the text config that
++src/models/glm5/config.cpp parses strictly. Weight import (the llama.cpp GGUF tensor blocks)
++is a separate step and is not implemented yet.
++"""
++
++from __future__ import annotations
++
++from math import isfinite
++import struct
++
++from .config_fields import _f32, _fixed, _positive
++
++_ARCHITECTURES = ("Glm5NextForConditionalGeneration",)
++
++
++def _nonnegative(value, name):
++    if type(value) is not int or value < 0:
++        raise ValueError(f"{name}: expected a nonnegative integer")
++    return value
++
++
++def _negative_f32(value, name):
++    if type(value) not in (float, int):
++        raise ValueError(f"{name}: expected a real value")
++    try:
++        result = struct.unpack("<f", struct.pack("<f", value))[0]
++    except (OverflowError, struct.error) as error:
++        raise ValueError(f"{name}: not representable as F32") from error
++    if not isfinite(result) or result >= 0:
++        raise ValueError(f"{name}: the KDA gate lower bound is negative (a log-space floor)")
++    return result
++
++
++def _layers(raw, count):
++    layers = raw.get("layer_types")
++    if (
++        not isinstance(layers, list)
++        or len(layers) != count
++        or any(k not in ("linear_attention", "deepseek_sparse_attention") for k in layers)
++    ):
++        raise ValueError("text.layer_types must describe every block")
++    kda = raw.get("linear_attn_config", {}).get("kda_layers")
++    full = raw.get("linear_attn_config", {}).get("full_attn_layers")
++    if isinstance(kda, list) and isinstance(full, list):
++        derived = ["linear_attention"] * count
++        for index in full:
++            if type(index) is not int or not 0 <= index < count:
++                raise ValueError("text.linear_attn_config.full_attn_layers is out of range")
++            derived[index] = "deepseek_sparse_attention"
++        if derived != layers or sorted(kda) != [
++            i for i, k in enumerate(derived) if k == "linear_attention"
++        ]:
++            raise ValueError("text.linear_attn_config layer lists disagree with layer_types")
++    return list(layers)
++
++
++def text_config(source: dict) -> dict:
++    architectures = source.get("architectures")
++    if (
++        not isinstance(architectures, list)
++        or len(architectures) != 1
++        or architectures[0] not in _ARCHITECTURES
++    ):
++        raise ValueError(f"unsupported GLM5 architecture {architectures!r}")
++    raw = source.get("text_config", source)
++    _fixed(raw, "model_type", "glm5_next_text", "text")
++    _fixed(raw, "hidden_act", "silu", "text")
++    _fixed(raw, "attention_bias", False, "text")
++    _fixed(raw, "mla_use_nope", True, "text")
++    _fixed(raw, "mhc", True, "text")
++    _fixed(raw, "scoring_func", "sigmoid", "text")
++    _fixed(raw, "topk_method", "noaux_tc", "text")
++    _fixed(raw, "moe_router_dtype", "float32", "text")
++    _fixed(raw, "n_group", 1, "text")
++    _fixed(raw, "topk_group", 1, "text")
++    # NoPE model: the indexer rope flags exist in the checkpoint but nothing applies them.
++    _fixed(raw, "indexer_rope_interleave", True, "text")
++    _fixed(raw, "index_share_for_mtp_iteration", True, "text")
++    _fixed(raw, "index_kpool_always_select_tail", True, "text")
++    _fixed(raw, "index_kpool_compress", True, "text")
++
++    result = {
++        "architectures": ["Glm5NextForCausalLM"],
++        "model_type": "glm5_next_text",
++        # The fixed flags the strict parser requires verbatim.
++        "attention_bias": False,
++        "mla_use_nope": True,
++        "mhc": True,
++        "scoring_func": "sigmoid",
++        "topk_method": "noaux_tc",
++        "moe_router_dtype": "float32",
++        "n_group": 1,
++        "topk_group": 1,
++        "index_kpool_always_select_tail": True,
++        "index_kpool_compress": True,
++    }
++    for key in (
++        "hidden_size",
++        "vocab_size",
++        "num_hidden_layers",
++        "max_position_embeddings",
++        "num_attention_heads",
++        "num_key_value_heads",
++        "qk_nope_head_dim",
++        "v_head_dim",
++        "q_lora_rank",
++        "kv_lora_rank",
++        "index_n_heads",
++        "index_head_dim",
++        "index_kpool",
++        "n_routed_experts",
++        "num_experts_per_tok",
++        "moe_intermediate_size",
++        "n_shared_experts",
++        "hc_mult",
++        "hc_sinkhorn_iters",
++        "first_k_dense_replace",
++        "intermediate_size",
++    ):
++        result[key] = _positive(raw.get(key), "text." + key)
++    for key in ("qk_rope_head_dim", "num_nextn_predict_layers"):
++        result[key] = _nonnegative(raw.get(key), "text." + key)
++
++    tied = raw.get("tie_word_embeddings", False)
++    if type(tied) is not bool:
++        raise ValueError("text.tie_word_embeddings must be boolean")
++    result["tie_word_embeddings"] = tied
++    result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps"), "text.rms_norm_eps")
++    result["swiglu_limit"] = _f32(raw.get("swiglu_limit"), "text.swiglu_limit")
++    result["hc_eps"] = _f32(raw.get("hc_eps"), "text.hc_eps")
++    result["routed_scaling_factor"] = _f32(raw.get("routed_scaling_factor"),
++                                                "text.routed_scaling_factor")
++    dropout = raw.get("attention_dropout", 0.0)
++    if type(dropout) not in (float, int) or float(dropout) != 0.0:
++        raise ValueError("text.attention_dropout: inference requires zero")
++    result["attention_dropout"] = 0.0
++
++    eos = raw.get("eos_token_id")
++    if type(eos) is int:
++        eos = [eos]
++    if not isinstance(eos, list) or not eos or any(type(v) is not int for v in eos):
++        raise ValueError("text.eos_token_id must be one id or a non-empty list")
++    if any(v >= result["vocab_size"] for v in eos):
++        raise ValueError("text.eos_token_id exceeds the vocabulary")
++    result["eos_token_id"] = list(eos)
++
++    result["layer_types"] = _layers(raw, result["num_hidden_layers"])
++    if result["qk_rope_head_dim"] != 0:
++        raise ValueError("text.qk_rope_head_dim: GLM5 in this engine is NoPE-only")
++
++    linear = raw.get("linear_attn_config")
++    if not isinstance(linear, dict):
++        raise ValueError("text.linear_attn_config must be an object")
++    result["linear_attn_config"] = {
++        "num_heads": _positive(linear.get("num_heads"), "linear_attn_config.num_heads"),
++        "head_dim": _positive(linear.get("head_dim"), "linear_attn_config.head_dim"),
++        "short_conv_kernel_size": _positive(linear.get("short_conv_kernel_size"),
++                                            "linear_attn_config.short_conv_kernel_size"),
++        "gate_lower_bound": _negative_f32(linear.get("gate_lower_bound"),
++                                          "linear_attn_config.gate_lower_bound"),
++    }
++    result["index_top_k"] = _positive(raw.get("index_topk"), "text.index_topk")
++    if result["index_top_k"] % result["index_kpool"]:
++        raise ValueError("text.index_topk must be a whole number of pools")
++    if result["num_experts_per_tok"] > result["n_routed_experts"]:
++        raise ValueError("selected experts exceed expert count")
++    if result["first_k_dense_replace"] > result["num_hidden_layers"]:
++        raise ValueError("text.first_k_dense_replace exceeds the block count")
++    norm = raw.get("norm_topk_prob")
++    if type(norm) is not bool:
++        raise ValueError("text.norm_topk_prob must be boolean")
++    result["norm_topk_prob"] = norm
++    return result
 diff --git a/tools/convert/ternary.py b/tools/convert/ternary.py
 index 204dda382192976fcdb89849ba9dcff701baa275..85196616a5509c41307d972f5de0795343ec7816 100644
 --- a/tools/convert/ternary.py
