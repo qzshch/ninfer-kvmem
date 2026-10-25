@@ -5923,19 +5923,25 @@ index 0000000000000000000000000000000000000000..c1905f9da44de09298e494520eeed7c8
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..efe24939be86ba92b7900597ab0007bfd9e36149
+index 0000000000000000000000000000000000000000..98be90522e5044bcc4f0ffa8434720b0a02474b0
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,536 @@
 +#include "models/glm5/execution/block.h"
 +
 +#include "ninfer/ops/add_bias.h"
 +#include "ninfer/ops/glm5_kda.h"
++#include "ninfer/ops/glm5_dsa.h"
++#include "ninfer/ops/glm5_mlp.h"
++#include "ninfer/ops/layer_norm.h"
 +#include "ninfer/ops/linear.h"
 +#include "ninfer/ops/rmsnorm.h"
 +#include "core/device.h"
 +
++#include <cmath>
 +#include <stdexcept>
++#include <vector>
++#include <cuda_bf16.h>
 +
 +namespace ninfer::models::glm5::execution {
 +
@@ -6100,20 +6106,377 @@ index 0000000000000000000000000000000000000000..efe24939be86ba92b7900597ab0007bf
 +    ops::linear(prefill_t, w.wo, block_out, stream);
 +}
 +
++
++// ---------------------------------------------------------------------------
++// DSA mixer block
++
++std::size_t dsa_block_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
++                                    std::uint32_t head_dim, std::uint32_t q_lora,
++                                    std::uint32_t kv_lora, std::uint32_t v_head,
++                                    std::uint32_t index_heads, std::uint32_t index_dim,
++                                    std::uint32_t selection_width) {
++    const std::uint64_t bytes =
++        static_cast<std::uint64_t>(hidden) * 2 + static_cast<std::uint64_t>(q_lora) * 2 +
++        static_cast<std::uint64_t>(heads) * head_dim * 2 + static_cast<std::uint64_t>(kv_lora) * 2 +
++        static_cast<std::uint64_t>(index_heads) * index_dim * 2 + index_dim * 2 * 3 +
++        static_cast<std::uint64_t>(index_heads) * 4 * 2 +
++        static_cast<std::uint64_t>(heads) * kv_lora * 4 +
++        static_cast<std::uint64_t>(heads) * kv_lora * 2 +
++        static_cast<std::uint64_t>(selection_width) * 4 +
++        static_cast<std::uint64_t>(heads) * v_head * 2 +
++        static_cast<std::uint64_t>(1 << 20) * 4 +   // completed-pool scores bound
++        16 * 16 + 1024;
++    return static_cast<std::size_t>(bytes);
++}
++
++void dsa_block_decode(const DsaBlockWeights& w, const Tensor& hidden_in, const Tensor& indexer_ape,
++                      Tensor& latents, Tensor& ik_plane, Tensor& ig_plane, Tensor& pooled,
++                      Tensor& cells, std::uint32_t position, float rms_eps, std::uint32_t heads,
++                      std::uint32_t head_dim, std::uint32_t q_lora, std::uint32_t kv_lora,
++                      std::uint32_t v_head, std::uint32_t index_heads, std::uint32_t index_dim,
++                      std::uint32_t kpool, std::uint32_t top_k, Tensor& block_out, void* scratch,
++                      cudaStream_t stream) {
++    const std::int32_t hidden = hidden_in.ne[0];
++    if (hidden <= 0 || hidden_in.ne[1] != 1 || hidden_in.dtype != DType::BF16) {
++        throw std::invalid_argument("dsa_block_decode: hidden_in must be BF16 [hidden, 1]");
++    }
++    const std::uint32_t tokens = position + 1;
++    const std::uint32_t completed = tokens / kpool;
++
++    auto* cursor = static_cast<std::uint8_t*>(scratch);
++    auto take = [&](std::size_t bytes) {
++        cursor = reinterpret_cast<std::uint8_t*>(
++            (reinterpret_cast<std::uintptr_t>(cursor) + 15) & ~std::uintptr_t{15});
++        void* result = cursor;
++        cursor += bytes;
++        return result;
++    };
++    void* normed = take(hidden * 2);
++    void* q_latent = take(q_lora * 2);
++    void* q_heads = take(static_cast<std::size_t>(heads) * head_dim * 2);
++    void* latent = take(kv_lora * 2);
++    void* iq = take(static_cast<std::size_t>(index_heads) * index_dim * 2);
++    void* ik_raw = take(index_dim * 2);
++    void* ik_normed = take(index_dim * 2);
++    void* ig = take(index_dim * 2);
++    void* weights_bf = take(index_heads * 2);
++    void* weights_f32 = take(index_heads * 4);
++    void* q_abs = take(static_cast<std::size_t>(heads) * kv_lora * 4);
++    void* scores = take(static_cast<std::size_t>(completed ? completed : 1) * 4);
++    void* pool_scratch = take(static_cast<std::size_t>(completed ? completed : 1) * index_dim * 4);
++    void* attn_out = take(static_cast<std::size_t>(heads) * v_head * 2);
++
++    // norm(hidden) once; every projection reads it.
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    Tensor normed_t(normed, DType::BF16, {hidden, 1});
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++
++    // q side: q_a -> norm -> q_b, then absorb W_K_B per head (FP32 out).
++    Tensor q_latent_t(q_latent, DType::BF16, {static_cast<std::int32_t>(q_lora), 1});
++    ops::linear(normed_t, w.q_a, q_latent_t, stream);
++    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), DType::BF16,
++                               {static_cast<std::int32_t>(q_lora), 1});
++    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, stream);
++    Tensor q_heads_t(q_heads, DType::BF16, {static_cast<std::int32_t>(heads * head_dim), 1});
++    ops::linear(q_latent_t, w.q_b, q_heads_t, stream);
++    Tensor q_heads_view(q_heads, DType::BF16,
++                        {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(head_dim)});
++    Tensor q_abs_t(q_abs, DType::FP32,
++                   {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(kv_lora)});
++    const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), DType::BF16,
++                           {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(kv_lora),
++                            static_cast<std::int32_t>(heads)});
++    ops::glm5_dsa_absorb(q_heads_view, wk_b_view, q_abs_t, stream);
++
++    // kv side: compress, norm, write this token's latent row.
++    Tensor latent_t(latent, DType::BF16, {static_cast<std::int32_t>(kv_lora), 1});
++    ops::linear(normed_t, w.kv_a, latent_t, stream);
++    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), DType::BF16,
++                                {static_cast<std::int32_t>(kv_lora), 1});
++    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, stream);
++    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(latents.data) +
++                                   static_cast<std::size_t>(position) * kv_lora * 2,
++                               latent, kv_lora * 2, cudaMemcpyDeviceToDevice, stream));
++
++    // Indexer planes: query from the q latent, LayerNorm'd key and gate from the hidden.
++    Tensor iq_t(iq, DType::BF16, {static_cast<std::int32_t>(index_heads * index_dim), 1});
++    ops::linear(q_latent_t, w.indexer_q_b, iq_t, stream);
++    Tensor ik_raw_t(ik_raw, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
++    ops::linear(normed_t, w.indexer_k, ik_raw_t, stream);
++    Tensor ik_normed_t(ik_normed, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
++    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), DType::BF16,
++                      {static_cast<std::int32_t>(index_dim)});
++    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), DType::BF16,
++                      {static_cast<std::int32_t>(index_dim)});
++    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, stream);
++    Tensor ig_t(ig, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
++    ops::linear(normed_t, w.indexer_gate, ig_t, stream);
++    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ik_plane.data) +
++                                   static_cast<std::size_t>(position) * index_dim * 2,
++                               ik_normed, index_dim * 2, cudaMemcpyDeviceToDevice, stream));
++    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ig_plane.data) +
++                                   static_cast<std::size_t>(position) * index_dim * 2,
++                               ig, index_dim * 2, cudaMemcpyDeviceToDevice, stream));
++
++    // Re-pool every completed pool (decode path; incremental re-pooling is a later
++    // optimization that the streaming protocol in the research notes describes).
++    if (completed > 0) {
++        const std::int32_t pool_tokens = static_cast<std::int32_t>(completed) * kpool;
++        // Only the completed prefix feeds the pool op; the history plane is [cache, dim]
++        // but tokens % kpool == 0 must hold for the slice, so build it via a fresh Tensor
++        // over the same storage with the completed-prefix geometry (rows are contiguous).
++        Tensor ik_history(ik_plane.data, DType::BF16,
++                          {pool_tokens, static_cast<std::int32_t>(index_dim)});
++        Tensor ig_history(ig_plane.data, DType::BF16,
++                          {pool_tokens, static_cast<std::int32_t>(index_dim)});
++        Tensor pooled_t(pool_scratch, DType::FP32,
++                        {static_cast<std::int32_t>(completed), static_cast<std::int32_t>(index_dim)});
++        ops::glm5_dsa_pool(ik_history, ig_history, indexer_ape, pooled_t, stream);
++        CUDA_CHECK(cudaMemcpyAsync(pooled.data, pool_scratch,
++                                   static_cast<std::size_t>(completed) * index_dim * 4,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++
++    // Head weights: the linear op emits BF16; the score op wants FP32 pre-scaled by
++    // 1/sqrt(dim*heads). This decode path bridges through the host once per token (a
++    // [index_heads] plane); a fused cast kernel replaces it later.
++    {
++        Tensor weights_t(weights_bf, DType::BF16, {static_cast<std::int32_t>(index_heads), 1});
++        ops::linear(normed_t, w.indexer_proj, weights_t, stream);
++        std::vector<std::uint16_t> host_bf(index_heads);
++        CUDA_CHECK(cudaMemcpyAsync(host_bf.data(), weights_bf, index_heads * 2,
++                                   cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        std::vector<float> host_f32(index_heads);
++        const float scale = std::sqrt(1.0f / (static_cast<float>(index_dim) * index_heads));
++        for (std::uint32_t h = 0; h < index_heads; ++h) {
++            host_f32[h] = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host_bf[h])) * scale;
++        }
++        CUDA_CHECK(cudaMemcpyAsync(weights_f32, host_f32.data(), index_heads * 4,
++                                   cudaMemcpyHostToDevice, stream));
++    }
++
++    // Score -> select -> attention. With no completed pool the selection is tail-only.
++    if (completed > 0) {
++        Tensor pooled_t(pooled.data, DType::FP32,
++                        {static_cast<std::int32_t>(completed), static_cast<std::int32_t>(index_dim)});
++        Tensor iq_view(iq, DType::BF16,
++                       {static_cast<std::int32_t>(index_heads), static_cast<std::int32_t>(index_dim)});
++        Tensor score_t(scores, DType::FP32, {static_cast<std::int32_t>(completed)});
++        Tensor w_view(weights_f32, DType::FP32, {static_cast<std::int32_t>(index_heads)});
++        ops::glm5_dsa_score(iq_view, pooled_t, w_view, score_t, stream);
++        ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool), true,
++                             cells, stream);
++    } else {
++        std::vector<std::int32_t> tail_row(cells.ne[0], -1);
++        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
++            const std::uint32_t cell = m;
++            if (cell <= position) { tail_row[top_k + m] = static_cast<std::int32_t>(cell); }
++        }
++        CUDA_CHECK(cudaMemcpyAsync(cells.data, tail_row.data(),
++                                   static_cast<std::size_t>(cells.ne[0]) * 4,
++                                   cudaMemcpyHostToDevice, stream));
++    }
++
++    // The attention op takes BF16 queries; round the FP32 absorbed queries to BF16 (the
++    // same host bridge as the head weights: one [heads, kv_lora] plane per token).
++    {
++        std::vector<float> host_f32(static_cast<std::size_t>(heads) * kv_lora);
++        CUDA_CHECK(cudaMemcpyAsync(host_f32.data(), q_abs,
++                                   static_cast<std::size_t>(heads) * kv_lora * 4,
++                                   cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        std::vector<std::uint16_t> host_bf(host_f32.size());
++        for (std::size_t i = 0; i < host_f32.size(); ++i) {
++            *reinterpret_cast<float*>(&host_f32[i]) = host_f32[i];
++            host_bf[i] = __bfloat16_as_ushort(__float2bfloat16(host_f32[i]));
++        }
++        CUDA_CHECK(cudaMemcpyAsync(q_abs, host_bf.data(), host_bf.size() * 2,
++                                   cudaMemcpyHostToDevice, stream));
++    }
++    Tensor q_abs_bf(q_abs, DType::BF16,
++                    {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(kv_lora)});
++    const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), DType::BF16,
++                           {static_cast<std::int32_t>(kv_lora), static_cast<std::int32_t>(v_head),
++                            static_cast<std::int32_t>(heads)});
++    Tensor attn_t(attn_out, DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
++    ops::glm5_dsa_attention(q_abs_bf, latents, cells, wv_b_view, attn_t,
++                            static_cast<std::int32_t>(head_dim), stream);
++    ops::linear(attn_t, w.wo, block_out, stream);
++}
++
++
++// ---------------------------------------------------------------------------
++// MLP blocks
++
++std::size_t dense_mlp_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn) {
++    return static_cast<std::size_t>(hidden) * 2 + static_cast<std::size_t>(ffn) * 6 + 512;
++}
++
++void dense_mlp_decode(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
++                      float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
++                      cudaStream_t stream) {
++    const std::int32_t hidden = hidden_in.ne[0];
++    auto* cursor = static_cast<std::uint8_t*>(scratch);
++    auto take = [&](std::size_t bytes) {
++        cursor = reinterpret_cast<std::uint8_t*>(
++            (reinterpret_cast<std::uintptr_t>(cursor) + 15) & ~std::uintptr_t{15});
++        void* result = cursor;
++        cursor += bytes;
++        return result;
++    };
++    void* normed = take(hidden * 2);
++    void* gate = take(ffn * 2);
++    void* up = take(ffn * 2);
++    void* activated = take(ffn * 2);
++
++    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
++    Tensor normed_t(normed, DType::BF16, {hidden, 1});
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++    Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++    ops::linear(normed_t, w.gate, gate_t, stream);
++    ops::linear(normed_t, w.up, up_t, stream);
++    Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++    Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++    Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++    ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++    Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++    ops::linear(act_t, w.down, out, stream);
++}
++
++std::size_t moe_block_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn,
++                                    std::uint32_t experts, std::uint32_t top_k) {
++    return static_cast<std::size_t>(hidden) * 2 + static_cast<std::size_t>(ffn) * 8 +
++           static_cast<std::size_t>(top_k) * static_cast<std::size_t>(hidden) * 2 +
++           static_cast<std::size_t>(top_k) * 8 + static_cast<std::size_t>(experts) * 2 + 1024;
++}
++
++void moe_block_decode(const MoeBlockWeights& w, const Tensor& hidden_in, const Tensor& router_bias,
++                      float rms_eps, float swiglu_limit, float routed_scaling_factor,
++                      std::uint32_t experts, std::uint32_t top_k, std::uint32_t ffn, Tensor& out,
++                      void* scratch, cudaStream_t stream) {
++    const std::int32_t hidden = hidden_in.ne[0];
++    auto* cursor = static_cast<std::uint8_t*>(scratch);
++    auto take = [&](std::size_t bytes) {
++        cursor = reinterpret_cast<std::uint8_t*>(
++            (reinterpret_cast<std::uintptr_t>(cursor) + 15) & ~std::uintptr_t{15});
++        void* result = cursor;
++        cursor += bytes;
++        return result;
++    };
++    void* normed = take(hidden * 2);
++    void* logits = take(experts * 2);
++    void* gate = take(ffn * 2);
++    void* up = take(ffn * 2);
++    void* activated = take(ffn * 2);
++    void* expert_down = take(hidden * 2);
++    void* stacked = take(static_cast<std::size_t>(top_k) * hidden * 2);
++    void* weights_f32 = take(top_k * 4);
++    void* indices = take(top_k * 4);
++    void* shared_out = take(hidden * 2);
++
++    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
++    Tensor normed_t(normed, DType::BF16, {hidden, 1});
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++
++    Tensor logits_t(logits, DType::BF16, {static_cast<std::int32_t>(experts), 1});
++    ops::linear(normed_t, w.router, logits_t, stream);
++    Tensor weights_t(weights_f32, DType::FP32, {static_cast<std::int32_t>(top_k)});
++    Tensor indices_t(indices, DType::I32, {static_cast<std::int32_t>(top_k)});
++    ops::glm5_moe_route(logits_t, router_bias, static_cast<std::int32_t>(top_k),
++                        routed_scaling_factor, weights_t, indices_t, stream);
++
++    // Selected experts sequentially; each expert's weights are its row block of the
++    // stacked planes, addressed by offsetting the base Weight.
++    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++        std::int32_t expert = -1;
++        CUDA_CHECK(cudaMemcpyAsync(&expert, static_cast<const void*>(indices) + slot * 4, 4,
++                                   cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        if (expert < 0 || static_cast<std::uint32_t>(expert) >= experts) {
++            CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint8_t*>(stacked) +
++                                           static_cast<std::size_t>(slot) * hidden * 2,
++                                       0, static_cast<std::size_t>(hidden) * 2, stream));
++            continue;
++        }
++        const auto base = static_cast<std::uint32_t>(expert);
++        Weight gate_w = w.gate_exps;
++        gate_w.payload = static_cast<const std::uint8_t*>(w.gate_exps.payload) +
++                         static_cast<std::size_t>(base) * ffn * hidden * 2;
++        gate_w.payload_bytes = static_cast<std::uint64_t>(ffn) * hidden * 2;
++        gate_w.qdata = gate_w.payload;
++        gate_w.shape[0] = static_cast<std::int32_t>(ffn);
++        gate_w.padded_shape[0] = gate_w.shape[0];
++        gate_w.n = gate_w.shape[0];
++        Weight up_w = w.up_exps;
++        up_w.payload = static_cast<const std::uint8_t*>(w.up_exps.payload) +
++                       static_cast<std::size_t>(base) * ffn * hidden * 2;
++        up_w.payload_bytes = static_cast<std::uint64_t>(ffn) * hidden * 2;
++        up_w.qdata = up_w.payload;
++        up_w.shape[0] = static_cast<std::int32_t>(ffn);
++        up_w.padded_shape[0] = up_w.shape[0];
++        up_w.n = up_w.shape[0];
++        Weight down_w = w.down_exps;
++        down_w.payload = static_cast<const std::uint8_t*>(w.down_exps.payload) +
++                         static_cast<std::size_t>(base) * hidden * ffn * 2;
++        down_w.payload_bytes = static_cast<std::uint64_t>(hidden) * ffn * 2;
++        down_w.qdata = down_w.payload;
++        down_w.shape[0] = hidden;
++        down_w.padded_shape[0] = hidden;
++        down_w.n = hidden;
++
++        Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        ops::linear(normed_t, gate_w, gate_t, stream);
++        ops::linear(normed_t, up_w, up_t, stream);
++        Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++        Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        Tensor down_t(expert_down, DType::BF16, {hidden, 1});
++        ops::linear(act_t, down_w, down_t, stream);
++        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(stacked) +
++                                       static_cast<std::size_t>(slot) * hidden * 2,
++                                   expert_down, static_cast<std::size_t>(hidden) * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++
++    // Shared expert (unweighted) plus the weighted routed combine.
++    {
++        Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        ops::linear(normed_t, w.gate_shexp, gate_t, stream);
++        ops::linear(normed_t, w.up_shexp, up_t, stream);
++        Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
++        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++        Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
++        Tensor shared_t(shared_out, DType::BF16, {hidden, 1});
++        ops::linear(act_t, w.down_shexp, shared_t, stream);
++    }
++    Tensor stacked_t(stacked, DType::BF16, {static_cast<std::int32_t>(top_k), hidden});
++    Tensor shared_t2(shared_out, DType::BF16, {static_cast<std::int32_t>(hidden), 1});
++    ops::glm5_moe_combine(stacked_t, weights_t, shared_t2, out, stream);
++}
++
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7b22d512bd5d231db07bde58a25ce39701030e8d
+index 0000000000000000000000000000000000000000..5f6740959fa11faad9c09f9f0abc4078d6a1f87c
 --- /dev/null
 +++ b/src/models/glm5/execution/block.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,142 @@
 +#pragma once
 +
-+// The GLM-5.3-Flash single-token KDA block decode assembly: projections through the
-+// engine's BF16 A16 linear path (bias-free; the dt bias rides add_bias), the GLM ops
-+// (glm5_kda_conv / glm5_kda_gating / glm5_kda_prefill), and the block's output projection.
-+// Every piece is verified against models/glm5/reference; the block test runs the same
-+// chain on the host side as the oracle. Weight roles follow tools/convert/glm5_tensors.py.
++// GLM-5.3-Flash single-token block decode assemblies: the KDA mixer block (verified), the
++// DSA mixer block and the dense/MoE MLP blocks. Projections ride the engine's BF16 A16
++// linear path; every mixer piece is a verified ops/glm5_* kernel; each block has a device
++// test chaining the same ops as the oracle with BF16 rounding at every representation
++// boundary. Weight roles follow tools/convert/glm5_tensors.py. The caller owns all
++// persistent state planes.
 +
 +#include "core/tensor.h"
 +#include "core/weight.h"
@@ -6128,8 +6491,9 @@ index 0000000000000000000000000000000000000000..7b22d512bd5d231db07bde58a25ce397
 +// A [N, K] BF16 row-major plane bound as the engine's contiguous A16 Weight.
 +[[nodiscard]] Weight bf16_weight(const void* payload, std::int32_t rows, std::int32_t columns);
 +
-+// The KDA block's BF16 weight set (norm gammas included as [hidden] planes). The FP32
-+// scalars (dt bias, A_log, o_norm) arrive as Tensors at the call.
++// ---------------------------------------------------------------------------
++// KDA mixer block
++
 +struct KdaBlockWeights {
 +    Weight attn_norm;               // [hidden] RMSNorm gamma
 +    Weight wq, wk, wv;              // [d_inner, hidden]
@@ -6145,24 +6509,16 @@ index 0000000000000000000000000000000000000000..7b22d512bd5d231db07bde58a25ce397
 +[[nodiscard]] std::size_t kda_block_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
 +                                                  std::uint32_t head_dim);
 +
-+// One token through: norm(hidden) -> q/k/v projections + causal convs -> two-stage decay
-+// gate (+ dt bias) -> beta -> the recurrent prefill (one token) with its output gate ->
-+// wo. The persistent state (three conv planes FP32 [d_conv-1, d_inner] and the matrix
-+// FP32 [heads, D, D]) updates in place. `hidden_in` is the mHC-collapsed residual (BF16
-+// [hidden, 1]); `block_out` is BF16 [hidden, 1] and must not overlap the scratch.
-+// Optional test observability: when non-null, the decode copies five intermediates to
-+// these caller tensors instead of only into scratch (same shapes as the internal planes:
-+// normed [hidden,1] BF16, q_conv/k_conv/v_conv shared [d_inner,1] BF16, gate [d_inner,1]
-+// FP32 log space, beta [heads,1] FP32, prefill output [d_inner,1] BF16).
++// Optional test observability: intermediate planes copy out after each stage.
 +struct KdaBlockDebug {
 +    Tensor* normed = nullptr;
 +    Tensor* q_conv = nullptr;
 +    Tensor* k_conv = nullptr;
 +    Tensor* v_conv = nullptr;
-+    Tensor* gate = nullptr;
-+    Tensor* beta = nullptr;
++    Tensor* gate = nullptr;          // FP32 [1, d_inner] log space
++    Tensor* beta = nullptr;          // FP32 [1, heads]
 +    Tensor* prefill_out = nullptr;
-+    Tensor* gate_pre = nullptr;   // BF16 [1, d_inner]
++    Tensor* gate_pre = nullptr;      // BF16 [1, d_inner]
 +    Tensor* beta_logits = nullptr;   // BF16 [1, heads]
 +};
 +
@@ -6172,6 +6528,87 @@ index 0000000000000000000000000000000000000000..7b22d512bd5d231db07bde58a25ce397
 +                      float gate_lower_bound, std::uint32_t heads, std::uint32_t head_dim,
 +                      float rms_eps, Tensor& block_out, void* scratch, cudaStream_t stream,
 +                      KdaBlockDebug* debug = nullptr);
++
++// ---------------------------------------------------------------------------
++// DSA mixer block (NoPE MLA + k-pool indexer, single token)
++
++struct DsaBlockWeights {
++    Weight attn_norm;        // [hidden] RMSNorm gamma
++    Weight q_a;              // [q_lora, hidden]
++    Weight q_a_norm;         // [q_lora] RMSNorm gamma
++    Weight q_b;              // [heads*qk_nope, q_lora]
++    Weight kv_a;             // [kv_lora, hidden]
++    Weight kv_a_norm;        // [kv_lora] RMSNorm gamma
++    Weight wk_b;             // GGUF {qk_nope, kv_lora, heads}
++    Weight wv_b;             // GGUF {kv_lora, v_head, heads}
++    Weight wo;               // [hidden, heads*v_head]
++    Weight indexer_q_b;      // [index_heads*index_dim, q_lora]
++    Weight indexer_k;        // [index_dim, hidden]
++    Weight indexer_k_norm_w; // [index_dim] LayerNorm gamma (BF16)
++    Weight indexer_k_norm_b; // [index_dim] LayerNorm beta (BF16)
++    Weight indexer_gate;     // [index_dim, hidden]
++    Weight indexer_proj;     // [index_heads, hidden]
++};
++
++[[nodiscard]] std::size_t dsa_block_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
++                                                  std::uint32_t head_dim, std::uint32_t q_lora,
++                                                  std::uint32_t kv_lora, std::uint32_t v_head,
++                                                  std::uint32_t index_heads,
++                                                  std::uint32_t index_dim,
++                                                  std::uint32_t selection_width);
++
++// One token: norm -> q_a/norm/q_b/absorb; kv_a/norm latent written to `latents` row
++// `position`; the indexer's LayerNorm'd key and pool gate appended to the [position+1,
++// index_dim] planes; pools recomputed over the whole plane (the decode path re-pools
++// every completed pool for correctness - incremental re-pooling is a later optimization);
++// score, select, absorbed attention, wo. `pooled` is FP32 [completed_pools, index_dim]
++// (fully rewritten), `cells` Int32 [selection_width] output. `index_scale` is the caller's
++// 1/sqrt(index_dim*index_heads) factor applied to the head weights before the score op.
++void dsa_block_decode(const DsaBlockWeights& w, const Tensor& hidden_in,
++                      const Tensor& indexer_ape, Tensor& latents, Tensor& ik_plane,
++                      Tensor& ig_plane, Tensor& pooled, Tensor& cells, std::uint32_t position,
++                      float rms_eps, std::uint32_t heads, std::uint32_t head_dim,
++                      std::uint32_t q_lora, std::uint32_t kv_lora, std::uint32_t v_head,
++                      std::uint32_t index_heads, std::uint32_t index_dim, std::uint32_t kpool,
++                      std::uint32_t top_k, Tensor& block_out, void* scratch, cudaStream_t stream);
++
++// ---------------------------------------------------------------------------
++// MLP blocks
++
++struct DenseMlpWeights {
++    Weight ffn_norm;   // [hidden]
++    Weight gate;       // [ffn, hidden]
++    Weight up;         // [ffn, hidden]
++    Weight down;       // [hidden, ffn]
++};
++
++struct MoeBlockWeights {
++    Weight ffn_norm;      // [hidden]
++    Weight router;        // [experts, hidden]
++    Weight gate_exps;     // [experts*ffn, hidden]
++    Weight up_exps;       // [experts*ffn, hidden]
++    Weight down_exps;     // [experts*hidden, ffn] per-expert row blocks stacked
++    Weight gate_shexp;    // [ffn, hidden]
++    Weight up_shexp;      // [ffn, hidden]
++    Weight down_shexp;    // [hidden, ffn]
++};
++
++[[nodiscard]] std::size_t dense_mlp_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn);
++[[nodiscard]] std::size_t moe_block_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn,
++                                                  std::uint32_t experts, std::uint32_t top_k);
++
++// norm -> gate/up -> clamped SwiGLU -> down. `hidden_in` BF16 [hidden,1], `out` BF16 [hidden,1].
++void dense_mlp_decode(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
++                      float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
++                      cudaStream_t stream);
++
++// norm -> router -> sigmoid/noaux_tc top-k -> per-expert gate/up/SwiGLU/down (the decode
++// path runs the selected experts sequentially through the plain linear op) -> weighted
++// combine plus the unweighted shared expert. `router_bias` is FP32 [experts].
++void moe_block_decode(const MoeBlockWeights& w, const Tensor& hidden_in, const Tensor& router_bias,
++                      float rms_eps, float swiglu_limit, float routed_scaling_factor,
++                      std::uint32_t experts, std::uint32_t top_k, std::uint32_t ffn, Tensor& out,
++                      void* scratch, cudaStream_t stream);
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
@@ -31589,6 +32026,578 @@ index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_dsa_mlp_blocks.cpp b/tests/models/glm5/test_dsa_mlp_blocks.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb59be03475e9f115f69e0e385b4b1d5fa89659c
+--- /dev/null
++++ b/tests/models/glm5/test_dsa_mlp_blocks.cpp
+@@ -0,0 +1,566 @@
++// The GLM-5.3-Flash DSA block and the dense/MoE MLP blocks against chained host oracles
++// with BF16 rounding at every representation boundary (the pattern the verified KDA block
++// test established). Small probes pin the wiring; the audited geometry runs end to end.
++#include "models/glm5/execution/block.h"
++#include "models/glm5/reference/dsa_reference.h"
++
++#include "core/device.h"
++#include "ninfer/ops/linear.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <string>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++namespace execution = ninfer::models::glm5::execution;
++namespace DsaRef = ninfer::models::glm5::reference;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& values) {
++    std::vector<__nv_bfloat16> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __float2bfloat16(values[i]); }
++    return out;
++}
++std::vector<float> represented(const std::vector<__nv_bfloat16>& values) {
++    std::vector<float> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __bfloat162float(values[i]); }
++    return out;
++}
++std::vector<float> bf16(const std::vector<float>& values) {
++    return represented(round_trip(values));
++}
++
++test::GuardedDeviceBuffer upload(const void* data, std::size_t bytes) {
++    test::GuardedDeviceBuffer buffer(bytes);
++    buffer.copy_from_host(data, bytes);
++    return buffer;
++}
++template <typename T> test::GuardedDeviceBuffer upload(const std::vector<T>& values) {
++    return upload(values.data(), values.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download(const test::GuardedDeviceBuffer& buffer) {
++    std::vector<T> out(buffer.bytes() / sizeof(T));
++    buffer.copy_to_host(out.data(), out.size() * sizeof(T));
++    return out;
++}
++
++std::vector<double> gemv(const std::vector<float>& w, std::uint32_t rows, std::uint32_t cols,
++                         const std::vector<float>& x) {
++    std::vector<double> y(rows, 0.0);
++    for (std::uint32_t r = 0; r < rows; ++r) {
++        for (std::uint32_t c = 0; c < cols; ++c) { y[r] += w[r * cols + c] * x[c]; }
++    }
++    return y;
++}
++std::vector<float> projected(const std::vector<float>& w, std::uint32_t rows, std::uint32_t cols,
++                             const std::vector<float>& x) {
++    std::vector<float> y(rows);
++    const auto acc = gemv(w, rows, cols, x);
++    for (std::uint32_t r = 0; r < rows; ++r) { y[r] = static_cast<float>(acc[r]); }
++    return bf16(y);
++}
++
++int failures = 0;
++
++void check(const std::string& what, const std::vector<float>& got,
++           const std::vector<float>& want, double tolerance) {
++    if (got.size() != want.size()) {
++        std::fprintf(stderr, "%s: size %zu vs %zu\n", what.c_str(), got.size(), want.size());
++        ++failures;
++        return;
++    }
++    for (std::size_t i = 0; i < got.size(); ++i) {
++        if (std::abs((double)got[i] - want[i]) > tolerance * std::max(1.0, (double)std::abs(want[i]))) {
++            if (failures < 10) {
++                std::fprintf(stderr, "%s[%zu]: %.6g vs %.6g\n", what.c_str(), i, got[i], want[i]);
++            }
++            ++failures;
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++void run_dsa_case(std::uint32_t hidden, std::uint32_t heads, std::uint32_t head_dim,
++                  std::uint32_t q_lora, std::uint32_t kv_lora, std::uint32_t v_head,
++                  std::uint32_t index_heads, std::uint32_t index_dim, std::uint32_t kpool,
++                  std::uint32_t top_k, std::uint32_t cache) {
++    const std::uint32_t width = top_k + kpool - 1;
++    const std::string label = "h" + std::to_string(hidden);
++    auto plane = [&](std::uint32_t rows, std::uint32_t cols, std::uint32_t seed) {
++        std::vector<float> raw(rows * cols);
++        for (std::size_t i = 0; i < raw.size(); ++i) {
++            raw[i] = source(static_cast<std::uint32_t>(i) * 3 + seed) / 16.0f;
++        }
++        return bf16(raw);
++    };
++    auto gamma = [&](std::uint32_t n, std::uint32_t seed) {
++        std::vector<float> raw(n);
++        for (std::uint32_t i = 0; i < n; ++i) { raw[i] = 1.0f + source(i + seed) / 8; }
++        return bf16(raw);
++    };
++    std::vector<float> attn_norm(gamma(hidden, 1)), q_a(plane(q_lora, hidden, 2)),
++        q_a_norm(gamma(q_lora, 3)), q_b(plane(heads * head_dim, q_lora, 4)),
++        kv_a(plane(kv_lora, hidden, 5)), kv_a_norm(gamma(kv_lora, 6)),
++        wk_b(plane(head_dim * kv_lora * heads, 1, 7)), wv_b(plane(kv_lora * v_head * heads, 1, 8)),
++        wo(plane(hidden, heads * v_head, 9)),
++        indexer_q_b(plane(index_heads * index_dim, q_lora, 10)),
++        indexer_k(plane(index_dim, hidden, 11)), indexer_k_norm_w(gamma(index_dim, 12)),
++        indexer_k_norm_b(plane(index_dim, 1, 13)), indexer_gate(plane(index_dim, hidden, 14)),
++        indexer_proj_raw(plane(index_heads, hidden, 15));
++    std::vector<float> ape(kpool * index_dim);
++    for (std::size_t i = 0; i < ape.size(); ++i) { ape[i] = source(static_cast<std::uint32_t>(i) * 5 + 7) / 4; }
++
++    const std::uint32_t position = cache - 1;
++    std::vector<float> hidden_in(hidden);
++    for (std::uint32_t i = 0; i < hidden; ++i) { hidden_in[i] = source(i * 5 + 2) / 4; }
++    hidden_in = bf16(hidden_in);
++
++    // Host oracle: norm, projections, indexer chain, then the reference selection and
++    // absorbed attention over the same planes the device builds.
++    std::vector<float> x(hidden);
++    {
++        double square = 0;
++        for (std::uint32_t i = 0; i < hidden; ++i) { square += (double)hidden_in[i] * hidden_in[i]; }
++        const double inverse = 1.0 / std::sqrt(square / hidden + 1e-5);
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            x[i] = static_cast<float>(attn_norm[i] * hidden_in[i] * inverse);
++        }
++        x = bf16(x);
++    }
++    const std::vector<float> ql = projected(q_a, q_lora, hidden, x);
++    std::vector<float> qln(q_lora);
++    {
++        double square = 0;
++        for (std::uint32_t i = 0; i < q_lora; ++i) { square += (double)ql[i] * ql[i]; }
++        const double inverse = 1.0 / std::sqrt(square / q_lora + 1e-5);
++        for (std::uint32_t i = 0; i < q_lora; ++i) {
++            qln[i] = static_cast<float>(q_a_norm[i] * ql[i] * inverse);
++        }
++        qln = bf16(qln);
++    }
++    const std::vector<float> q_heads = projected(q_b, heads * head_dim, q_lora, qln);
++    const std::vector<float> lat = projected(kv_a, kv_lora, hidden, x);
++    std::vector<float> latn(kv_lora);
++    {
++        double square = 0;
++        for (std::uint32_t i = 0; i < kv_lora; ++i) { square += (double)lat[i] * lat[i]; }
++        const double inverse = 1.0 / std::sqrt(square / kv_lora + 1e-5);
++        for (std::uint32_t i = 0; i < kv_lora; ++i) {
++            latn[i] = static_cast<float>(kv_a_norm[i] * lat[i] * inverse);
++        }
++        latn = bf16(latn);
++    }
++    // Latent cache history (deterministic synthetic) with the current row appended.
++    std::vector<float> latents(cache * kv_lora);
++    for (std::uint32_t t = 0; t < cache; ++t) {
++        for (std::uint32_t e = 0; e < kv_lora; ++e) {
++            latents[t * kv_lora + e] =
++                bf16({source((t * 7 + e) * 3 + 21) / 3})[0];
++        }
++    }
++    for (std::uint32_t e = 0; e < kv_lora; ++e) { latents[position * kv_lora + e] = latn[e]; }
++    // Indexer planes.
++    const std::vector<float> iq = projected(indexer_q_b, index_heads * index_dim, q_lora, qln);
++    std::vector<float> ik_history(cache * index_dim), ig_history(cache * index_dim);
++    for (std::uint32_t t = 0; t < position; ++t) {
++        for (std::uint32_t e = 0; e < index_dim; ++e) {
++            ik_history[t * index_dim + e] = bf16({source((t * 11 + e) * 5 + 3) / 3})[0];
++            ig_history[t * index_dim + e] = bf16({source((t * 13 + e) * 3 + 9) / 2})[0];
++        }
++    }
++    const std::vector<float> ik_raw = projected(indexer_k, index_dim, hidden, x);
++    std::vector<float> ik_normed(index_dim);
++    {
++        // LayerNorm with weight and bias in fp64 then bf16.
++        double mean = 0;
++        for (std::uint32_t e = 0; e < index_dim; ++e) { mean += ik_raw[e]; }
++        mean /= index_dim;
++        double variance = 0;
++        for (std::uint32_t e = 0; e < index_dim; ++e) {
++            variance += (ik_raw[e] - mean) * (ik_raw[e] - mean);
++        }
++        variance /= index_dim;
++        const double inverse = 1.0 / std::sqrt(variance + 1e-6);
++        for (std::uint32_t e = 0; e < index_dim; ++e) {
++            ik_normed[e] = static_cast<float>((ik_raw[e] - mean) * inverse *
++                                              indexer_k_norm_w[e] + indexer_k_norm_b[e]);
++        }
++        ik_normed = bf16(ik_normed);
++    }
++    for (std::uint32_t e = 0; e < index_dim; ++e) {
++        ik_history[position * index_dim + e] = ik_normed[e];
++    }
++    const std::vector<float> ig_row = projected(indexer_gate, index_dim, hidden, x);
++    for (std::uint32_t e = 0; e < index_dim; ++e) { ig_history[position * index_dim + e] = ig_row[e]; }
++    // Pools, scores, selection and attention through the reference.
++    const DsaRef::DsaIndexerProfile iprofile{index_heads, index_dim, kpool, top_k, true};
++    const DsaRef::DsaMlaProfile mprofile{kv_lora, heads, head_dim, v_head};
++    const std::uint32_t completed = cache / kpool;
++    std::vector<float> pooled_want(completed * index_dim, 0.0f);
++    if (completed) {
++        // The pool reference consumes only the completed prefix.
++        const std::uint32_t pool_tokens = completed * kpool;
++        DsaRef::dsa_pool_reference(
++            std::vector<float>(ik_history.begin(), ik_history.begin() + pool_tokens * index_dim),
++            std::vector<float>(ig_history.begin(), ig_history.begin() + pool_tokens * index_dim),
++            ape, pooled_want, iprofile);
++    }
++    std::vector<float> weights_scaled(index_heads);
++    {
++        const std::vector<float> weights_raw = projected(indexer_proj_raw, index_heads, hidden, x);
++        const float scale = std::sqrt(1.0f / (static_cast<float>(index_dim) * index_heads));
++        for (std::uint32_t h = 0; h < index_heads; ++h) {
++            weights_scaled[h] = weights_raw[h] * scale;
++        }
++    }
++    std::vector<float> scores_want(completed, 0.0f);
++    std::vector<std::int32_t> cells_want(width, -1);
++    if (completed) {
++        DsaRef::dsa_score_reference(iq, weights_scaled, pooled_want, scores_want, iprofile);
++        const std::vector<float> transposed;   // one token: scores already [1, P]
++        std::vector<std::uint32_t> pos{position};
++        DsaRef::dsa_select_reference(scores_want, pos, cells_want, iprofile);
++    } else {
++        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
++            if (m <= position) { cells_want[top_k + m] = static_cast<std::int32_t>(m); }
++        }
++    }
++    // q_absorb per head in fp64.
++    std::vector<float> q_abs(heads * kv_lora);
++    for (std::uint32_t h = 0; h < heads; ++h) {
++        for (std::uint32_t e = 0; e < kv_lora; ++e) {
++            double acc = 0;
++            for (std::uint32_t d = 0; d < head_dim; ++d) {
++                acc += q_heads[h * head_dim + d] *
++                       wk_b[static_cast<std::size_t>(h) * head_dim * kv_lora +
++                            static_cast<std::size_t>(e) * head_dim + d];
++            }
++            q_abs[h * kv_lora + e] = static_cast<float>(acc);
++        }
++    }
++    q_abs = bf16(q_abs);
++    std::vector<float> attn_want(heads * v_head);
++    DsaRef::dsa_attention_reference(q_abs, latents, cells_want, wv_b, attn_want, iprofile,
++                                    mprofile, cache);
++    std::vector<double> out_want(hidden);
++    {
++        const auto acc = gemv(wo, hidden, heads * v_head, attn_want);
++        for (std::uint32_t i = 0; i < hidden; ++i) { out_want[i] = acc[i]; }
++    }
++
++    // ---- device run ----
++    auto d_attn_norm = upload(round_trip(attn_norm));
++    auto d_q_a = upload(round_trip(q_a));
++    auto d_q_a_norm = upload(round_trip(q_a_norm));
++    auto d_q_b = upload(round_trip(q_b));
++    auto d_kv_a = upload(round_trip(kv_a));
++    auto d_kv_a_norm = upload(round_trip(kv_a_norm));
++    auto d_wk_b = upload(round_trip(wk_b));
++    auto d_wv_b = upload(round_trip(wv_b));
++    auto d_wo = upload(round_trip(wo));
++    auto d_iqb = upload(round_trip(indexer_q_b));
++    auto d_ik = upload(round_trip(indexer_k));
++    auto d_iknw = upload(round_trip(indexer_k_norm_w));
++    auto d_iknb = upload(round_trip(indexer_k_norm_b));
++    auto d_igate = upload(round_trip(indexer_gate));
++    auto d_iproj = upload(round_trip(indexer_proj_raw));
++    auto d_ape = upload(ape);
++    auto d_hidden = upload(round_trip(hidden_in));
++    auto d_latents = upload(round_trip(latents));
++    auto d_ikh = upload(round_trip(ik_history));
++    auto d_igh = upload(round_trip(ig_history));
++    test::GuardedDeviceBuffer d_pooled(static_cast<std::size_t>(std::max<std::uint32_t>(completed, 1)) * index_dim * 4);
++    test::GuardedDeviceBuffer d_cells(width * 4);
++    test::GuardedDeviceBuffer d_out(hidden * 2);
++    const std::size_t scratch_bytes = execution::dsa_block_scratch_bytes(
++        hidden, heads, head_dim, q_lora, kv_lora, v_head, index_heads, index_dim, width);
++    test::GuardedDeviceBuffer d_scratch(scratch_bytes);
++
++    execution::DsaBlockWeights w{};
++    w.attn_norm = execution::bf16_weight(d_attn_norm.data(), hidden, 1);
++    w.q_a = execution::bf16_weight(d_q_a.data(), q_lora, hidden);
++    w.q_a_norm = execution::bf16_weight(d_q_a_norm.data(), q_lora, 1);
++    w.q_b = execution::bf16_weight(d_q_b.data(), heads * head_dim, q_lora);
++    w.kv_a = execution::bf16_weight(d_kv_a.data(), kv_lora, hidden);
++    w.kv_a_norm = execution::bf16_weight(d_kv_a_norm.data(), kv_lora, 1);
++    w.wk_b = execution::bf16_weight(d_wk_b.data(), head_dim * kv_lora * heads, 1);
++    w.wv_b = execution::bf16_weight(d_wv_b.data(), kv_lora * v_head * heads, 1);
++    w.wo = execution::bf16_weight(d_wo.data(), hidden, heads * v_head);
++    w.indexer_q_b = execution::bf16_weight(d_iqb.data(), index_heads * index_dim, q_lora);
++    w.indexer_k = execution::bf16_weight(d_ik.data(), index_dim, hidden);
++    w.indexer_k_norm_w = execution::bf16_weight(d_iknw.data(), index_dim, 1);
++    w.indexer_k_norm_b = execution::bf16_weight(d_iknb.data(), index_dim, 1);
++    w.indexer_gate = execution::bf16_weight(d_igate.data(), index_dim, hidden);
++    w.indexer_proj = execution::bf16_weight(d_iproj.data(), index_heads, hidden);
++
++    {
++        Tensor hidden_t(const_cast<void*>(d_hidden.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor ape_t(const_cast<void*>(d_ape.data()), DType::FP32,
++                     {static_cast<std::int32_t>(kpool), static_cast<std::int32_t>(index_dim)});
++        Tensor latents_t(const_cast<void*>(d_latents.data()), DType::BF16,
++                         {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(kv_lora)});
++        Tensor ikh_t(const_cast<void*>(d_ikh.data()), DType::BF16,
++                     {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(index_dim)});
++        Tensor igh_t(const_cast<void*>(d_igh.data()), DType::BF16,
++                     {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(index_dim)});
++        Tensor pooled_t(const_cast<void*>(d_pooled.data()), DType::FP32,
++                        {static_cast<std::int32_t>(std::max<std::uint32_t>(completed, 1)),
++                         static_cast<std::int32_t>(index_dim)});
++        Tensor cells_t(const_cast<void*>(d_cells.data()), DType::I32,
++                       {static_cast<std::int32_t>(width)});
++        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        execution::dsa_block_decode(w, hidden_t, ape_t, latents_t, ikh_t, igh_t, pooled_t,
++                                    cells_t, position, 1e-5f, heads, head_dim, q_lora, kv_lora,
++                                    v_head, index_heads, index_dim, kpool, top_k, out_t,
++                                    d_scratch.data(), nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++
++    if (completed) {
++        const auto pooled_got = download<float>(d_pooled);
++        double worst = 0;
++        for (std::size_t i = 0; i < pooled_want.size(); ++i) {
++            worst = std::max(worst, std::abs((double)pooled_got[i] - pooled_want[i]));
++        }
++        std::printf("[dsa:%s] pooled worst %.5f | ", label.c_str(), worst);
++    }
++    const auto cells_got = download<std::int32_t>(d_cells);
++    std::printf("cells %s\n", cells_got == cells_want ? "match" : "DIFFER");
++    if (cells_got != cells_want) {
++        for (std::size_t i = 0; i < width && i < 12; ++i) {
++            if (cells_got[i] != cells_want[i]) {
++                std::fprintf(stderr, "cells[%zu]: %d vs %d\n", i, cells_got[i], cells_want[i]);
++            }
++        }
++        ++failures;
++    }
++    check("dsa_block[" + label + "]", represented(download<__nv_bfloat16>(d_out)),
++          {out_want.begin(), out_want.end()}, 0.06);
++}
++
++// ---------------------------------------------------------------------------
++void run_mlp_cases() {
++    // Dense MLP, small + audited widths.
++    {
++        const std::uint32_t hidden = 64, ffn = 128;
++        std::vector<float> norm_w(hidden), gate(ffn * hidden), up(ffn * hidden),
++            down(hidden * ffn), hidden_in(hidden);
++        for (std::uint32_t i = 0; i < hidden; ++i) { norm_w[i] = 1.0f + source(i) / 8; }
++        for (std::size_t i = 0; i < gate.size(); ++i) { gate[i] = source(static_cast<std::uint32_t>(i) * 3 + 1) / 16; }
++        for (std::size_t i = 0; i < up.size(); ++i) { up[i] = source(static_cast<std::uint32_t>(i) * 5 + 2) / 16; }
++        for (std::size_t i = 0; i < down.size(); ++i) { down[i] = source(static_cast<std::uint32_t>(i) * 7 + 3) / 16; }
++        for (std::uint32_t i = 0; i < hidden; ++i) { hidden_in[i] = source(i * 5 + 2) / 4; }
++        std::vector<float> gw = bf16(gate), uw = bf16(up), dw = bf16(down), nw = bf16(norm_w),
++            hin = bf16(hidden_in);
++        std::vector<float> x(hidden);
++        {
++            double square = 0;
++            for (std::uint32_t i = 0; i < hidden; ++i) { square += (double)hin[i] * hin[i]; }
++            const double inverse = 1.0 / std::sqrt(square / hidden + 1e-5);
++            for (std::uint32_t i = 0; i < hidden; ++i) { x[i] = static_cast<float>(nw[i] * hin[i] * inverse); }
++            x = bf16(x);
++        }
++        const std::vector<float> g = projected(gw, ffn, hidden, x);
++        const std::vector<float> u = projected(uw, ffn, hidden, x);
++        std::vector<float> act(ffn);
++        for (std::uint32_t i = 0; i < ffn; ++i) {
++            const double clamped_g = std::min((double)g[i], 10.0);
++            const double clamped_u = std::max(-10.0, std::min((double)u[i], 10.0));
++            act[i] = static_cast<float>(clamped_g / (1.0 + std::exp(-clamped_g)) * clamped_u);
++        }
++        act = bf16(act);
++        std::vector<double> want(hidden);
++        {
++            const auto acc = gemv(dw, hidden, ffn, act);
++            for (std::uint32_t i = 0; i < hidden; ++i) { want[i] = acc[i]; }
++        }
++        auto d_nw = upload(round_trip(nw));
++        auto d_g = upload(round_trip(gw));
++        auto d_u = upload(round_trip(uw));
++        auto d_d = upload(round_trip(dw));
++        auto d_h = upload(round_trip(hin));
++        test::GuardedDeviceBuffer d_out(hidden * 2);
++        test::GuardedDeviceBuffer d_scratch(execution::dense_mlp_scratch_bytes(hidden, ffn));
++        execution::DenseMlpWeights w{};
++        w.ffn_norm = execution::bf16_weight(d_nw.data(), hidden, 1);
++        w.gate = execution::bf16_weight(d_g.data(), ffn, hidden);
++        w.up = execution::bf16_weight(d_u.data(), ffn, hidden);
++        w.down = execution::bf16_weight(d_d.data(), hidden, ffn);
++        Tensor ht(const_cast<void*>(d_h.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        execution::dense_mlp_decode(w, ht, 1e-5f, 10.0f, ffn, ot, d_scratch.data(), nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        check("dense_mlp", represented(download<__nv_bfloat16>(d_out)),
++              {want.begin(), want.end()}, 0.05);
++    }
++}
++
++void run_moe_case() {
++    const std::uint32_t hidden = 48, ffn = 64, experts = 8, top_k = 2;
++    std::vector<float> norm_w(hidden), router(experts * hidden), bias(experts),
++        gate_exps(static_cast<std::size_t>(experts) * ffn * hidden),
++        up_exps(gate_exps.size()), down_exps(static_cast<std::size_t>(experts) * hidden * ffn),
++        gate_sh(ffn * hidden), up_sh(ffn * hidden), down_sh(hidden * ffn), hidden_in(hidden);
++    for (std::uint32_t i = 0; i < hidden; ++i) { norm_w[i] = 1.0f + source(i) / 8; }
++    for (std::uint32_t e = 0; e < experts; ++e) {
++        for (std::size_t i = 0; i < static_cast<std::size_t>(ffn) * hidden; ++i) {
++            gate_exps[static_cast<std::size_t>(e) * ffn * hidden + i] =
++                source(static_cast<std::uint32_t>(i) * 3 + e * 7 + 1) / 16;
++            up_exps[static_cast<std::size_t>(e) * ffn * hidden + i] =
++                source(static_cast<std::uint32_t>(i) * 5 + e * 3 + 2) / 16;
++        }
++        for (std::size_t i = 0; i < static_cast<std::size_t>(hidden) * ffn; ++i) {
++            down_exps[static_cast<std::size_t>(e) * hidden * ffn + i] =
++                source(static_cast<std::uint32_t>(i) * 7 + e * 11 + 3) / 16;
++        }
++    }
++    for (std::size_t i = 0; i < router.size(); ++i) { router[i] = source(static_cast<std::uint32_t>(i) * 3 + 5) / 8; }
++    for (std::uint32_t e = 0; e < experts; ++e) { bias[e] = (e == 5) ? 4.0f : 0.0f; }
++    for (std::size_t i = 0; i < gate_sh.size(); ++i) { gate_sh[i] = source(static_cast<std::uint32_t>(i) + 7) / 16; }
++    for (std::size_t i = 0; i < up_sh.size(); ++i) { up_sh[i] = source(static_cast<std::uint32_t>(i) * 5 + 9) / 16; }
++    for (std::size_t i = 0; i < down_sh.size(); ++i) { down_sh[i] = source(static_cast<std::uint32_t>(i) * 7 + 11) / 16; }
++    for (std::uint32_t i = 0; i < hidden; ++i) { hidden_in[i] = source(i * 5 + 2) / 4; }
++
++    // host oracle: norm -> router logits -> GLM route (sigmoid + bias top-k, normalized
++    // original scores scaled by 2.5) -> selected experts + shared, all with bf16 rounding.
++    std::vector<float> gw = bf16(router), gex = bf16(gate_exps), uex = bf16(up_exps),
++        dex = bf16(down_exps), gsh = bf16(gate_sh), ush = bf16(up_sh), dsh = bf16(down_sh),
++        nw = bf16(norm_w), hin = bf16(hidden_in);
++    std::vector<float> x(hidden);
++    {
++        double square = 0;
++        for (std::uint32_t i = 0; i < hidden; ++i) { square += (double)hin[i] * hin[i]; }
++        const double inv = 1.0 / std::sqrt(square / hidden + 1e-5);
++        for (std::uint32_t i = 0; i < hidden; ++i) { x[i] = static_cast<float>(nw[i] * hin[i] * inv); }
++        x = bf16(x);
++    }
++    const std::vector<float> logits = projected(gw, experts, hidden, x);
++    // route: sigmoid scores; corrected = score + bias; rank desc ties lower index.
++    std::vector<double> score(experts);
++    for (std::uint32_t e = 0; e < experts; ++e) {
++        score[e] = 1.0 / (1.0 + std::exp(-(double)logits[e]));
++    }
++    std::vector<std::uint32_t> picked;
++    {
++        std::vector<std::uint32_t> order(experts);
++        for (std::uint32_t e = 0; e < experts; ++e) { order[e] = e; }
++        std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
++            const double ca = score[a] + bias[a], cb = score[b] + bias[b];
++            return ca != cb ? ca > cb : a < b;
++        });
++        picked.assign(order.begin(), order.begin() + top_k);
++    }
++    double sum = 0;
++    for (std::uint32_t i = 0; i < top_k; ++i) { sum += score[picked[i]]; }
++    std::vector<double> w_exp(top_k);
++    for (std::uint32_t i = 0; i < top_k; ++i) { w_exp[i] = 2.5 * score[picked[i]] / (sum + 1e-20); }
++    std::vector<double> want(hidden, 0.0);
++    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++        const auto e = picked[slot];
++        const std::vector<float> g = projected(
++            std::vector<float>(gex.begin() + static_cast<std::ptrdiff_t>(e) * ffn * hidden,
++                              gex.begin() + static_cast<std::ptrdiff_t>(e + 1) * ffn * hidden),
++            ffn, hidden, x);
++        const std::vector<float> u = projected(
++            std::vector<float>(uex.begin() + static_cast<std::ptrdiff_t>(e) * ffn * hidden,
++                              uex.begin() + static_cast<std::ptrdiff_t>(e + 1) * ffn * hidden),
++            ffn, hidden, x);
++        std::vector<float> act(ffn);
++        for (std::uint32_t i = 0; i < ffn; ++i) {
++            const double cg = std::min((double)g[i], 10.0);
++            const double cu = std::max(-10.0, std::min((double)u[i], 10.0));
++            act[i] = static_cast<float>(cg / (1.0 + std::exp(-cg)) * cu);
++        }
++        act = bf16(act);
++        const auto dacc = gemv(
++            std::vector<float>(dex.begin() + static_cast<std::ptrdiff_t>(e) * hidden * ffn,
++                               dex.begin() + static_cast<std::ptrdiff_t>(e + 1) * hidden * ffn),
++            hidden, ffn, act);
++        for (std::uint32_t i = 0; i < hidden; ++i) { want[i] += w_exp[slot] * dacc[i]; }
++    }
++    {
++        const std::vector<float> g = projected(gsh, ffn, hidden, x);
++        const std::vector<float> u = projected(ush, ffn, hidden, x);
++        std::vector<float> act(ffn);
++        for (std::uint32_t i = 0; i < ffn; ++i) {
++            const double cg = std::min((double)g[i], 10.0);
++            const double cu = std::max(-10.0, std::min((double)u[i], 10.0));
++            act[i] = static_cast<float>(cg / (1.0 + std::exp(-cg)) * cu);
++        }
++        act = bf16(act);
++        const auto dacc = gemv(dsh, hidden, ffn, act);
++        for (std::uint32_t i = 0; i < hidden; ++i) { want[i] += dacc[i]; }
++    }
++
++    // device run
++    auto d_nw = upload(round_trip(nw));
++    auto d_router = upload(round_trip(gw));
++    auto d_bias = upload(bias);
++    auto d_gex = upload(round_trip(gex));
++    auto d_uex = upload(round_trip(uex));
++    auto d_dex = upload(round_trip(dex));
++    auto d_gsh = upload(round_trip(gsh));
++    auto d_ush = upload(round_trip(ush));
++    auto d_dsh = upload(round_trip(dsh));
++    auto d_h = upload(round_trip(hin));
++    test::GuardedDeviceBuffer d_out(hidden * 2);
++    test::GuardedDeviceBuffer d_scratch(execution::moe_block_scratch_bytes(hidden, ffn, experts, top_k));
++    execution::MoeBlockWeights w{};
++    w.ffn_norm = execution::bf16_weight(d_nw.data(), hidden, 1);
++    w.router = execution::bf16_weight(d_router.data(), experts, hidden);
++    w.gate_exps = execution::bf16_weight(d_gex.data(), experts * ffn, hidden);
++    w.up_exps = execution::bf16_weight(d_uex.data(), experts * ffn, hidden);
++    w.down_exps = execution::bf16_weight(d_dex.data(), experts * hidden, ffn);
++    w.gate_shexp = execution::bf16_weight(d_gsh.data(), ffn, hidden);
++    w.up_shexp = execution::bf16_weight(d_ush.data(), ffn, hidden);
++    w.down_shexp = execution::bf16_weight(d_dsh.data(), hidden, ffn);
++    Tensor ht(const_cast<void*>(d_h.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++    Tensor bt(const_cast<void*>(d_bias.data()), DType::FP32, {static_cast<std::int32_t>(experts)});
++    Tensor ot(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++    execution::moe_block_decode(w, ht, bt, 1e-5f, 10.0f, 2.5f, experts, top_k, ffn, ot,
++                                d_scratch.data(), nullptr);
++    CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    check("moe_block", represented(download<__nv_bfloat16>(d_out)),
++          std::vector<float>(want.begin(), want.end()), 0.08);
++}
++
++int run() {
++    run_dsa_case(96, 2, 16, 24, 32, 16, 3, 12, 4, 8, 9);       // small probe (no completed pool edge first)
++    run_dsa_case(96, 2, 16, 24, 32, 16, 3, 12, 4, 8, 12);      // three completed pools
++    run_dsa_case(4096, 64, 256, 1536, 512, 256, 32, 128, 4, 2048, 16);   // audited geometry
++    run_mlp_cases();
++    run_moe_case();
++    if (failures == 0) {
++        std::puts("GLM5 DSA block and dense MLP match the chained host oracle on device");
++        return 0;
++    }
++    std::fprintf(stderr, "%d numeric failures\n", failures);
++    return 1;
++}
++
++} // namespace
++
++int main() {
++    try {
++        return run();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FATAL: %s\n", error.what());
++        return 1;
++    } catch (...) {
++        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..4c0ef269c5a09161b08d3e0e3622ce76f251cb17
@@ -32041,10 +33050,10 @@ index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f6677
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..421aac5e5f2a030d2c7d43d6b73bfc0aed28ff91
+index 0000000000000000000000000000000000000000..470d8524c2313a76331a90211591c592f87d021c
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,45 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -32085,6 +33094,10 @@ index 0000000000000000000000000000000000000000..421aac5e5f2a030d2c7d43d6b73bfc0a
 +
 +ninfer_add_test(ninfer_glm5_kda_block_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kda_block.cpp"
++  LIBRARIES ninfer_ops ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_dsa_mlp_blocks_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dsa_mlp_blocks.cpp"
 +  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
