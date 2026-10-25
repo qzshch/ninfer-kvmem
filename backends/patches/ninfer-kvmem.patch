@@ -6613,10 +6613,10 @@ index 0000000000000000000000000000000000000000..5f6740959fa11faad9c09f9f0abc4078
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b9457d451c3
+index 0000000000000000000000000000000000000000..37d1b5dcd8bc35303f8ec518a19a5ee74cd5f02b
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,172 @@
 +#include "models/glm5/execution/model.h"
 +
 +#include "ninfer/ops/glm5_mhc.h"
@@ -6690,6 +6690,9 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +        Tensor pre_t(pre_f, DType::FP32, {1, 4});
 +        Tensor post_t(post_f, DType::FP32, {1, 4});
 +        Tensor comb_t(comb_f, DType::FP32, {1, 4, 4});
++        // The mHC pre op takes [T=1, hidden] but the block executors take [hidden, 1] -
++        // same memory, two views.
++        Tensor collapsed_mhc(collapsed, DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
 +        Tensor collapsed_t(collapsed, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
 +
 +        // ---- attention half: mHC pre -> norm -> mixer -> mHC post ----
@@ -6699,7 +6702,7 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_t, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, stream);
 +        }
 +        Tensor block_out_t(block_out, DType::BF16, {hidden, 1});
 +        if (config.layer_is_dsa[layer]) {
@@ -6707,10 +6710,9 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +            Tensor ape_t(const_cast<void*>(ape_ptr), DType::FP32,
 +                         {static_cast<std::int32_t>(config.kpool),
 +                          static_cast<std::int32_t>(config.index_dim)});
-+            Tensor attn_norm_w(const_cast<void*>(lw.attn_norm.payload), DType::BF16, {hidden, 1});
-+            Tensor normed_t(collapsed, DType::BF16, {hidden, 1});
-+            ops::rmsnorm(collapsed_t, attn_norm_w, config.rms_eps, false, normed_t, stream);
-+            dsa_block_decode(lw.dsa, normed_t, ape_t, state.dsa_latents[dsa_index],
++            // The DSA block executor applies its own attn_norm internally; pass the
++            // collapsed stream directly (no double norm here).
++            dsa_block_decode(lw.dsa, collapsed_t, ape_t, state.dsa_latents[dsa_index],
 +                             state.dsa_ik_plane[dsa_index], state.dsa_ig_plane[dsa_index],
 +                             state.dsa_pooled[dsa_index], state.dsa_cells[dsa_index], position,
 +                             config.rms_eps, config.heads, config.head_dim, config.q_lora,
@@ -6719,16 +6721,16 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +            ++dsa_index;
 +        } else {
 +            const auto& scalars = w.kda_scalars[kda_index];
-+            Tensor dt(const_cast<void*>(scalars.dt_bias), DType::FP32,
-+                      {static_cast<std::int32_t>(config.heads * config.head_dim)});
++            Tensor dt(const_cast<void*>(scalars.dt_bias), DType::BF16,
++                      {static_cast<std::int32_t>(config.kda_heads * config.kda_head_dim)});
 +            Tensor alog(const_cast<void*>(scalars.a_log), DType::FP32,
-+                        {static_cast<std::int32_t>(config.heads)});
++                        {static_cast<std::int32_t>(config.kda_heads)});
 +            Tensor onw(const_cast<void*>(scalars.o_norm_w), DType::FP32,
-+                       {static_cast<std::int32_t>(config.head_dim)});
++                       {static_cast<std::int32_t>(config.kda_head_dim)});
 +            kda_block_decode(lw.kda, collapsed_t, dt, alog, onw,
 +                             state.kda_conv_q[kda_index], state.kda_conv_k[kda_index],
 +                             state.kda_conv_v[kda_index], state.kda_matrix[kda_index],
-+                             config.gate_lower_bound, config.heads, config.head_dim,
++                             config.gate_lower_bound, config.kda_heads, config.kda_head_dim,
 +                             config.rms_eps, block_out_t, cursor, stream);
 +            ++kda_index;
 +        }
@@ -6750,7 +6752,7 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_t, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, stream);
 +        }
 +        if (config.layer_mlp_dense[layer]) {
 +            dense_mlp_decode(lw.dense_mlp, collapsed_t, config.rms_eps, config.swiglu_limit,
@@ -6775,8 +6777,9 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +    // Final: head mean, output norm, lm_head.
 +    {
 +        Tensor residual_view(residual, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
++        Tensor head_mhc(head_mean, DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
++        ops::glm5_mhc_head(residual_view, head_mhc, stream);
 +        Tensor head_t(head_mean, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
-+        ops::glm5_mhc_head(residual_view, head_t, stream);
 +        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), DType::BF16,
 +                                   {hidden, 1});
 +        Tensor final_t(final_normed, DType::BF16, {hidden, 1});
@@ -6788,10 +6791,10 @@ index 0000000000000000000000000000000000000000..d36cb05aab4d3d83632f24bf2ee51b94
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.h b/src/models/glm5/execution/model.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..d88eb694522a2c63c341e9ebe6339698bd456335
+index 0000000000000000000000000000000000000000..8b7ebe3ac6ef6b7099a2d78d909e55eee9c7b7f3
 --- /dev/null
 +++ b/src/models/glm5/execution/model.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,88 @@
 +#pragma once
 +
 +// The GLM-5.3-Flash full-model decode step: one token through every block (mHC residual
@@ -6862,7 +6865,9 @@ index 0000000000000000000000000000000000000000..d88eb694522a2c63c341e9ebe6339698
 +// position (drives DSA visibility). The layer geometry comes from the model weights; the
 +// caller passes the layer_types ordering and dimensions in the config structure below.
 +struct Glm5StepConfig {
-+    std::uint32_t hidden, heads, head_dim;
++    std::uint32_t hidden;
++    std::uint32_t kda_heads, kda_head_dim;          // KDA mixer geometry
++    std::uint32_t heads, head_dim;                  // DSA MLA geometry (head_dim = qk_nope)
 +    std::uint32_t q_lora, kv_lora, v_head;
 +    std::uint32_t index_heads, index_dim, kpool, top_k;
 +    std::uint32_t ffn_dense, ffn_moe, experts, num_experts_per_tok;
@@ -32296,10 +32301,10 @@ index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173
 +}
 diff --git a/tests/models/glm5/test_decode_step.cpp b/tests/models/glm5/test_decode_step.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..479a00377f766ac5be6217050b04c3bfa67e5bbc
+index 0000000000000000000000000000000000000000..ce048c813d15a41eb7ecb5b40b205d6c36cb1080
 --- /dev/null
 +++ b/tests/models/glm5/test_decode_step.cpp
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,600 @@
 +// The GLM-5.3-Flash full decode step (mHC residual loop across a mixed layer stack)
 +// against a host oracle that chains the same per-block references. Two blocks at a small
 +// geometry: a KDA+MoE block then a DSA+dense block, covering both mixers and both MLPs.
@@ -32693,8 +32698,194 @@ index 0000000000000000000000000000000000000000..479a00377f766ac5be6217050b04c3bf
 +    // The full host oracle is verified in the per-block tests above; here we smoke the
 +    // device chain end to end. (The per-block oracles cover the math; this checks the
 +    // mHC residual wiring across layers.)
++    // ---- DEVICE SMOKE: upload weights, run the decode step, check logits ----
++    // The per-block math is verified on device in each block test; this smoke checks
++    // the CHAINING end to end: mHC residual wiring across layers, block dispatch,
++    // state indexing, and that the final logits are finite and non-degenerate.
++    {
++        auto d_emb = upload(round_trip(emb));
++        auto d_lm = upload(round_trip(lm_head_w));
++        auto d_onorm = upload(round_trip(out_norm));
++        auto d_token = upload(round_trip(token_h));
++        std::vector<test::GuardedDeviceBuffer> d_hcfn, d_hcbase, d_hcscale, d_anorm, d_fnorm;
++        for (std::uint32_t l = 0; l < 2 * LAYERS; ++l) {
++            d_hcfn.push_back(upload(round_trip(hc_fn[l])));
++            d_hcbase.push_back(upload(hc_base[l]));
++            d_hcscale.push_back(upload(hc_scale[l]));
++        }
++        for (std::uint32_t l = 0; l < LAYERS; ++l) {
++            d_anorm.push_back(upload(round_trip(attn_norm[l])));
++            d_fnorm.push_back(upload(round_trip(ffn_norm[l])));
++        }
++        auto d_wq = upload(round_trip(wq)); auto d_wk2 = upload(round_trip(wk));
++        auto d_wv2 = upload(round_trip(wv));
++        auto d_cq = upload(round_trip(conv_q)); auto d_ck = upload(round_trip(conv_k));
++        auto d_cv = upload(round_trip(conv_v));
++        auto d_fa = upload(round_trip(f_a)); auto d_fb2 = upload(round_trip(f_b));
++        auto d_bw = upload(round_trip(beta_w));
++        auto d_ga = upload(round_trip(g_a)); auto d_gb = upload(round_trip(g_b));
++        auto d_kwo = upload(round_trip(kda_wo));
++        auto d_dt = upload(round_trip(dt_bias)); auto d_alog = upload(a_log);
++        auto d_onw = upload(o_norm);
++        auto d_qa = upload(round_trip(q_a)); auto d_qan = upload(round_trip(q_a_n));
++        auto d_qb = upload(round_trip(q_b)); auto d_kva = upload(round_trip(kv_a));
++        auto d_kvan = upload(round_trip(kv_a_n));
++        auto d_wkb = upload(round_trip(wk_b)); auto d_wvb = upload(round_trip(wv_b));
++        auto d_dwo = upload(round_trip(dsa_wo));
++        auto d_iqb = upload(round_trip(idx_q_b)); auto d_ik = upload(round_trip(idx_k));
++        auto d_iknw = upload(round_trip(idx_k_nw)); auto d_iknb = upload(round_trip(idx_k_nb));
++        auto d_ig = upload(round_trip(idx_gate)); auto d_ip = upload(round_trip(idx_proj));
++        auto d_ape = upload(ape);
++        auto d_dgate = upload(round_trip(d_gate)); auto d_dup = upload(round_trip(d_up));
++        auto d_ddown = upload(round_trip(d_down));
++        auto d_mrouter = upload(round_trip(m_router)); auto d_mbias = upload(m_bias);
++        auto d_mgate = upload(round_trip(m_gate)); auto d_mup = upload(round_trip(m_up));
++        auto d_mdown = upload(round_trip(m_down));
++        auto d_mgsh = upload(round_trip(m_gsh)); auto d_mush = upload(round_trip(m_ush));
++        auto d_mdsh = upload(round_trip(m_dsh));
++
++        execution::Glm5ModelWeights mw{};
++        mw.token_embd = execution::bf16_weight(d_emb.data(), VOCAB, H);
++        mw.output_norm = execution::bf16_weight(d_onorm.data(), H, 1);
++        mw.lm_head = execution::bf16_weight(d_lm.data(), VOCAB, H);
++        mw.layers.resize(LAYERS);
++        mw.kda_scalars.resize(1);
++        mw.kda_scalars[0] = {d_dt.data(), d_alog.data(), d_onw.data()};
++        mw.dsa_ape.resize(1);
++        mw.dsa_ape[0] = d_ape.data();
++
++        auto& l0 = mw.layers[0];
++        l0.is_dsa = false; l0.mlp_is_dense = false;
++        l0.hc_attn_fn = execution::bf16_weight(d_hcfn[0].data(), 24, 4 * H);
++        l0.hc_attn_base = execution::bf16_weight(d_hcbase[0].data(), 24, 1);
++        l0.hc_attn_scale = execution::bf16_weight(d_hcscale[0].data(), 3, 1);
++        l0.hc_ffn_fn = execution::bf16_weight(d_hcfn[1].data(), 24, 4 * H);
++        l0.hc_ffn_base = execution::bf16_weight(d_hcbase[1].data(), 24, 1);
++        l0.hc_ffn_scale = execution::bf16_weight(d_hcscale[1].data(), 3, 1);
++        l0.attn_norm = execution::bf16_weight(d_anorm[0].data(), H, 1);
++        l0.ffn_norm = execution::bf16_weight(d_fnorm[0].data(), H, 1);
++        l0.kda.attn_norm = l0.attn_norm;
++        l0.kda.wq = execution::bf16_weight(d_wq.data(), DI, H);
++        l0.kda.wk = execution::bf16_weight(d_wk2.data(), DI, H);
++        l0.kda.wv = execution::bf16_weight(d_wv2.data(), DI, H);
++        l0.kda.conv_q = execution::bf16_weight(d_cq.data(), 4 * DI, 1);
++        l0.kda.conv_k = execution::bf16_weight(d_ck.data(), 4 * DI, 1);
++        l0.kda.conv_v = execution::bf16_weight(d_cv.data(), 4 * DI, 1);
++        l0.kda.f_a = execution::bf16_weight(d_fa.data(), HD, H);
++        l0.kda.f_b = execution::bf16_weight(d_fb2.data(), DI, HD);
++        l0.kda.beta = execution::bf16_weight(d_bw.data(), HK, H);
++        l0.kda.g_a = execution::bf16_weight(d_ga.data(), HD, H);
++        l0.kda.g_b = execution::bf16_weight(d_gb.data(), DI, HD);
++        l0.kda.wo = execution::bf16_weight(d_kwo.data(), H, DI);
++        l0.moe.ffn_norm = l0.ffn_norm;
++        l0.moe.router = execution::bf16_weight(d_mrouter.data(), EXP, H);
++        l0.moe.gate_exps = execution::bf16_weight(d_mgate.data(), EXP * FFN_M, H);
++        l0.moe.up_exps = execution::bf16_weight(d_mup.data(), EXP * FFN_M, H);
++        l0.moe.down_exps = execution::bf16_weight(d_mdown.data(), EXP * H, FFN_M);
++        l0.moe.gate_shexp = execution::bf16_weight(d_mgsh.data(), FFN_M, H);
++        l0.moe.up_shexp = execution::bf16_weight(d_mush.data(), FFN_M, H);
++        l0.moe.down_shexp = execution::bf16_weight(d_mdsh.data(), H, FFN_M);
++        l0.moe_router_bias = d_mbias.data();
++
++        auto& l1 = mw.layers[1];
++        l1.is_dsa = true; l1.mlp_is_dense = true;
++        l1.hc_attn_fn = execution::bf16_weight(d_hcfn[2].data(), 24, 4 * H);
++        l1.hc_attn_base = execution::bf16_weight(d_hcbase[2].data(), 24, 1);
++        l1.hc_attn_scale = execution::bf16_weight(d_hcscale[2].data(), 3, 1);
++        l1.hc_ffn_fn = execution::bf16_weight(d_hcfn[3].data(), 24, 4 * H);
++        l1.hc_ffn_base = execution::bf16_weight(d_hcbase[3].data(), 24, 1);
++        l1.hc_ffn_scale = execution::bf16_weight(d_hcscale[3].data(), 3, 1);
++        l1.attn_norm = execution::bf16_weight(d_anorm[1].data(), H, 1);
++        l1.ffn_norm = execution::bf16_weight(d_fnorm[1].data(), H, 1);
++        l1.dsa.attn_norm = l1.attn_norm;
++        l1.dsa.q_a = execution::bf16_weight(d_qa.data(), QL, H);
++        l1.dsa.q_a_norm = execution::bf16_weight(d_qan.data(), QL, 1);
++        l1.dsa.q_b = execution::bf16_weight(d_qb.data(), AH * AD, QL);
++        l1.dsa.kv_a = execution::bf16_weight(d_kva.data(), KL, H);
++        l1.dsa.kv_a_norm = execution::bf16_weight(d_kvan.data(), KL, 1);
++        l1.dsa.wk_b = execution::bf16_weight(d_wkb.data(), AD * KL * AH, 1);
++        l1.dsa.wv_b = execution::bf16_weight(d_wvb.data(), KL * VH * AH, 1);
++        l1.dsa.wo = execution::bf16_weight(d_dwo.data(), H, AH * VH);
++        l1.dsa.indexer_q_b = execution::bf16_weight(d_iqb.data(), IH * ID, QL);
++        l1.dsa.indexer_k = execution::bf16_weight(d_ik.data(), ID, H);
++        l1.dsa.indexer_k_norm_w = execution::bf16_weight(d_iknw.data(), ID, 1);
++        l1.dsa.indexer_k_norm_b = execution::bf16_weight(d_iknb.data(), ID, 1);
++        l1.dsa.indexer_gate = execution::bf16_weight(d_ig.data(), ID, H);
++        l1.dsa.indexer_proj = execution::bf16_weight(d_ip.data(), IH, H);
++        l1.dense_mlp.ffn_norm = l1.ffn_norm;
++        l1.dense_mlp.gate = execution::bf16_weight(d_dgate.data(), FFN_D, H);
++        l1.dense_mlp.up = execution::bf16_weight(d_dup.data(), FFN_D, H);
++        l1.dense_mlp.down = execution::bf16_weight(d_ddown.data(), H, FFN_D);
++
++        execution::Glm5DecodeState state{};
++        state.kda_conv_q.resize(1); state.kda_conv_k.resize(1);
++        state.kda_conv_v.resize(1); state.kda_matrix.resize(1);
++        state.dsa_latents.resize(1); state.dsa_ik_plane.resize(1);
++        state.dsa_ig_plane.resize(1); state.dsa_pooled.resize(1); state.dsa_cells.resize(1);
++        test::GuardedDeviceBuffer d_kda_cq(3 * DI * 4), d_kda_ck(3 * DI * 4),
++            d_kda_cv(3 * DI * 4), d_kda_mat(HK * HD * HD * 4);
++        test::GuardedDeviceBuffer d_dsa_lat(CACHE * KL * 2), d_dsa_ik(CACHE * ID * 2),
++            d_dsa_ig(CACHE * ID * 2), d_dsa_pooled(CACHE * ID), d_dsa_cells(TK + KP - 1);
++        d_kda_cq.fill(0); d_kda_ck.fill(0); d_kda_cv.fill(0); d_kda_mat.fill(0);
++        d_dsa_lat.fill(0); d_dsa_ik.fill(0); d_dsa_ig.fill(0);
++        state.kda_conv_q[0] = Tensor(d_kda_cq.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++        state.kda_conv_k[0] = Tensor(d_kda_ck.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++        state.kda_conv_v[0] = Tensor(d_kda_cv.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++        state.kda_matrix[0] = Tensor(d_kda_mat.data(), DType::FP32,
++                                      {static_cast<std::int32_t>(HD), static_cast<std::int32_t>(HD),
++                                       static_cast<std::int32_t>(HK)});
++        state.dsa_latents[0] = Tensor(d_dsa_lat.data(), DType::BF16,
++                                       {static_cast<std::int32_t>(CACHE), static_cast<std::int32_t>(KL)});
++        state.dsa_ik_plane[0] = Tensor(d_dsa_ik.data(), DType::BF16,
++                                        {static_cast<std::int32_t>(CACHE), static_cast<std::int32_t>(ID)});
++        state.dsa_ig_plane[0] = Tensor(d_dsa_ig.data(), DType::BF16,
++                                        {static_cast<std::int32_t>(CACHE), static_cast<std::int32_t>(ID)});
++        state.dsa_pooled[0] = Tensor(d_dsa_pooled.data(), DType::FP32,
++                                      {static_cast<std::int32_t>(CACHE / KP), static_cast<std::int32_t>(ID)});
++        state.dsa_cells[0] = Tensor(d_dsa_cells.data(), DType::I32,
++                                     {static_cast<std::int32_t>(TK + KP - 1)});
++
++        execution::Glm5StepConfig config{};
++        config.hidden = H; config.kda_heads = HK; config.kda_head_dim = HD;
++        config.heads = AH; config.head_dim = AD;
++        config.q_lora = QL; config.kv_lora = KL; config.v_head = VH;
++        config.index_heads = IH; config.index_dim = ID; config.kpool = KP; config.top_k = TK;
++        config.ffn_dense = FFN_D; config.ffn_moe = FFN_M;
++        config.experts = EXP; config.num_experts_per_tok = TOPK;
++        config.vocab_size = VOCAB;
++        config.rms_eps = 1e-5f; config.gate_lower_bound = -5.0f;
++        config.swiglu_limit = 10.0f; config.routed_scaling_factor = 2.5f;
++        config.layer_is_dsa = {false, true};
++        config.layer_mlp_dense = {false, true};
++
++        const std::size_t scratch_bytes = execution::glm5_decode_step_scratch_bytes(H, LAYERS);
++        test::GuardedDeviceBuffer d_scratch(scratch_bytes);
++        test::GuardedDeviceBuffer d_logits(VOCAB * 2);
++
++        {
++            Tensor token_t(const_cast<void*>(d_token.data()), DType::BF16,
++                           {static_cast<std::int32_t>(H), 1});
++            Tensor logits_t(const_cast<void*>(d_logits.data()), DType::BF16,
++                            {static_cast<std::int32_t>(VOCAB), 1});
++            execution::glm5_decode_step(mw, state, config, token_t, CACHE - 1, logits_t,
++                                        d_scratch.data(), nullptr);
++            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        }
++
++        const auto logits = represented(download<__nv_bfloat16>(d_logits));
++        std::uint32_t finite = 0;
++        float range = 0;
++        for (std::uint32_t i = 0; i < VOCAB; ++i) {
++            if (std::isfinite(logits[i])) { ++finite; range = std::max(range, std::abs(logits[i])); }
++        }
++        if (finite != VOCAB || range < 1e-6f) {
++            std::fprintf(stderr, "device smoke: %u/%u finite, range %.6g\n", finite, VOCAB, range);
++            ++failures;
++        }
++    }
++
 +    if (failures == 0) {
-+        std::puts("GLM5 decode step: host oracle chain (per-block) verified; device chain pending smoke");
++        std::puts("GLM5 decode step (mHC chain, KDA+DSA, MoE+dense) runs on device; logits finite");
 +        return 0;
 +    }
 +    std::fprintf(stderr, "done\n", failures);
