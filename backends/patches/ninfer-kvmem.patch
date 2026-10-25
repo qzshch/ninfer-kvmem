@@ -1834,10 +1834,10 @@ index 04fd6f91228536646cb58dcf784382e3c8a74960..6bddc8ff2fbd4b2920b611b0a24c683a
   */
 diff --git a/include/ninfer/ops/glm5_dsa.h b/include/ninfer/ops/glm5_dsa.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..59802c02fbb480ce757a6bfe1f3dc834b256d83f
+index 0000000000000000000000000000000000000000..a8c48c937a1df4f1487f46c8b5e7219df63d0789
 --- /dev/null
 +++ b/include/ninfer/ops/glm5_dsa.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,67 @@
 +#pragma once
 +
 +#include "core/tensor.h"
@@ -1891,6 +1891,18 @@ index 0000000000000000000000000000000000000000..59802c02fbb480ce757a6bfe1f3dc834
 +void glm5_dsa_attention(const Tensor& q_abs, const Tensor& latents, const Tensor& cells,
 +                        const Tensor& wv_b, Tensor& out, std::int32_t qk_nope,
 +                        cudaStream_t stream);
++
++/**
++ * Query absorption: q_abs[h, e] = sum_d q[h, d] * wk_b[d + nope*e + nope*lora*h] in FP32 from
++ * the represented BF16 inputs, for ONE token. `q` is BF16 [H, nope] (the q_b output),
++ * `wk_b` the GGUF layout BF16 {nope, lora, heads}, `q_abs` FP32 [H, lora]. Feeds
++ * glm5_dsa_attention's [H, lora] query plane (which reads it as BF16-representable values;
++ * the caller rounds when needed).
++ */
++void glm5_dsa_absorb(const Tensor& q, const Tensor& wk_b, Tensor& q_abs, cudaStream_t stream);
++
++/** Elementwise FP32 scaling: out = values * factor. Same-shape FP32 planes. */
++void glm5_dsa_scale(const Tensor& values, float factor, Tensor& out, cudaStream_t stream);
 +
 +} // namespace ninfer::ops
 diff --git a/include/ninfer/ops/glm5_kda.h b/include/ninfer/ops/glm5_kda.h
@@ -2025,6 +2037,48 @@ index 0000000000000000000000000000000000000000..0680d540410d2c4458b05616ad4b9e7b
 + * `streams` is BF16 [T,4*H]; `out` is BF16 [T,H] and may alias streams' first quarter.
 + */
 +void glm5_mhc_head(const Tensor& streams, Tensor& out, cudaStream_t stream);
++
++} // namespace ninfer::ops
+diff --git a/include/ninfer/ops/glm5_mlp.h b/include/ninfer/ops/glm5_mlp.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..297dc95ba8794fd9c4877dd3cbee9525083ba2ce
+--- /dev/null
++++ b/include/ninfer/ops/glm5_mlp.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include "core/tensor.h"
++
++#include <cuda_runtime.h> // cudaStream_t
++
++namespace ninfer::ops {
++
++/**
++ * GLM-5.3-Flash's clamped SwiGLU: out = silu(min(gate, limit)) * clamp(up, -limit, +limit),
++ * evaluated in FP32 from the represented BF16 inputs (gate has NO lower clamp; the limit is
++ * the audited swiglu_limit, e.g. 10). `gate`/`up` are BF16 [W, T], `out` BF16 [W, T].
++ */
++void glm5_swiglu(const Tensor& gate, const Tensor& up, float limit, Tensor& out,
++                 cudaStream_t stream);
++
++/**
++ * The GLM sigmoid router with noaux_tc correction: score = sigmoid(logits); selection ranks
++ * score + correction_bias (stable descending, ties by lower expert); the ORIGINAL scores of
++ * the selected experts are normalized (sum + 1e-20) and scaled by routed_scaling_factor.
++ * `logits` is BF16 [E] (one token), `correction_bias` FP32 [E], `weights` FP32 [top_k],
++ * `indices` Int32 [top_k].
++ */
++void glm5_moe_route(const Tensor& logits, const Tensor& correction_bias, std::int32_t top_k,
++                    float routed_scaling_factor, Tensor& weights, Tensor& indices,
++                    cudaStream_t stream);
++
++/**
++ * Weighted expert combination with the shared expert added unweighted:
++ * out = sum_i weights[i] * experts[i, :] + shared[:]. `experts` is BF16 [top_k, H],
++ * `weights` FP32 [top_k], `shared` BF16 [H], `out` BF16 [H].
++ */
++void glm5_moe_combine(const Tensor& experts, const Tensor& weights, const Tensor& shared,
++                      Tensor& out, cudaStream_t stream);
 +
 +} // namespace ninfer::ops
 diff --git a/include/ninfer/ops/sliding_window_attention.h b/include/ninfer/ops/sliding_window_attention.h
@@ -5867,14 +5921,268 @@ index 0000000000000000000000000000000000000000..c1905f9da44de09298e494520eeed7c8
 +[[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 +
 +} // namespace ninfer::models::glm5
+diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..efe24939be86ba92b7900597ab0007bfd9e36149
+--- /dev/null
++++ b/src/models/glm5/execution/block.cpp
+@@ -0,0 +1,174 @@
++#include "models/glm5/execution/block.h"
++
++#include "ninfer/ops/add_bias.h"
++#include "ninfer/ops/glm5_kda.h"
++#include "ninfer/ops/linear.h"
++#include "ninfer/ops/rmsnorm.h"
++#include "core/device.h"
++
++#include <stdexcept>
++
++namespace ninfer::models::glm5::execution {
++
++Weight bf16_weight(const void* payload, std::int32_t rows, std::int32_t columns) {
++    Weight weight{};
++    weight.qtype = QType::BF16;
++    weight.layout = QuantLayout::Contiguous;
++    weight.payload = payload;
++    weight.payload_bytes = static_cast<std::uint64_t>(rows) * columns * 2;
++    weight.qdata = payload;
++    weight.ndim = 2;
++    weight.shape[0] = rows;
++    weight.shape[1] = columns;
++    weight.padded_shape[0] = rows;
++    weight.padded_shape[1] = columns;
++    weight.n = rows;
++    weight.k = columns;
++    return weight;
++}
++
++std::size_t kda_block_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
++                                    std::uint32_t head_dim) {
++    const std::uint64_t d_inner = static_cast<std::uint64_t>(heads) * head_dim;
++    // Nine BF16 d_inner planes (three raw projections, three conv outputs, gate pre, g2,
++    // the prefill output), two BF16 head_dim stages, the normed hidden, the BF16 beta
++    // logits, then the FP32 gate and beta planes the gating op writes; every plane is
++    // 16-byte aligned in the scratch, so add per-plane padding.
++    const std::uint64_t bf16_planes = 9;
++    const std::uint64_t bytes =
++        d_inner * 2 * bf16_planes + static_cast<std::uint64_t>(head_dim) * 2 * 2 +
++        static_cast<std::uint64_t>(hidden) * 2 + static_cast<std::uint64_t>(heads) * 2 +
++        d_inner * 4 + static_cast<std::uint64_t>(heads) * 4 +
++        16 * (bf16_planes + 5);
++    return static_cast<std::size_t>(bytes + 256);
++}
++
++void kda_block_decode(const KdaBlockWeights& w, const Tensor& hidden_in, const Tensor& dt_bias,
++                      const Tensor& a_log, const Tensor& o_norm_w, Tensor& conv_q_state,
++                      Tensor& conv_k_state, Tensor& conv_v_state, Tensor& matrix_state,
++                      float gate_lower_bound, std::uint32_t heads, std::uint32_t head_dim,
++                      float rms_eps, Tensor& block_out, void* scratch, cudaStream_t stream,
++                      KdaBlockDebug* debug) {
++    const std::int32_t hidden = hidden_in.ne[0];
++    const std::int32_t d_inner =
++        static_cast<std::int32_t>(heads) * static_cast<std::int32_t>(head_dim);
++    if (hidden <= 0 || hidden_in.ne[1] != 1 || hidden_in.dtype != DType::BF16) {
++        throw std::invalid_argument("kda_block_decode: hidden_in must be BF16 [hidden, 1]");
++    }
++    if (dt_bias.ne[0] != d_inner || a_log.ne[0] != static_cast<std::int32_t>(heads) ||
++        o_norm_w.ne[0] != static_cast<std::int32_t>(head_dim)) {
++        throw std::invalid_argument("kda_block_decode: FP32 scalar plane mismatch");
++    }
++
++    auto* cursor = static_cast<std::uint8_t*>(scratch);
++    auto take = [&](std::size_t bytes) {
++        cursor = reinterpret_cast<std::uint8_t*>(
++            (reinterpret_cast<std::uintptr_t>(cursor) + 15) & ~std::uintptr_t{15});
++        void* result = cursor;
++        cursor += bytes;
++        return result;
++    };
++    void* normed = take(static_cast<std::size_t>(hidden) * 2);
++    const std::size_t inner_bf16 = static_cast<std::size_t>(d_inner) * 2;
++    void* q_raw = take(inner_bf16);
++    void* k_raw = take(inner_bf16);
++    void* v_raw = take(inner_bf16);
++    void* q_conv = take(inner_bf16);
++    void* k_conv = take(inner_bf16);
++    void* v_conv = take(inner_bf16);
++    void* stage = take(static_cast<std::size_t>(head_dim) * 2);
++    void* gate_pre = take(inner_bf16);
++    void* beta_logits = take(static_cast<std::size_t>(heads) * 2);
++    void* g2 = take(inner_bf16);
++    void* gate_log = take(static_cast<std::size_t>(d_inner) * 4);
++    void* beta_f32 = take(static_cast<std::size_t>(heads) * 4);
++    void* prefill_out = take(inner_bf16);
++
++    // norm(hidden), then the three projections and their causal convs. The ops take
++    // non-const output references, so every scratch plane gets a named Tensor.
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    Tensor normed_t(normed, DType::BF16, {hidden, 1});
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    if (debug && debug->normed) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->normed->data, normed, hidden * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++    Tensor q_raw_t(q_raw, DType::BF16, {d_inner, 1});
++    Tensor k_raw_t(k_raw, DType::BF16, {d_inner, 1});
++    Tensor v_raw_t(v_raw, DType::BF16, {d_inner, 1});
++    ops::linear(normed_t, w.wq, q_raw_t, stream);
++    ops::linear(normed_t, w.wk, k_raw_t, stream);
++    ops::linear(normed_t, w.wv, v_raw_t, stream);
++    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), DType::BF16, {4, d_inner});
++    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), DType::BF16, {4, d_inner});
++    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), DType::BF16, {4, d_inner});
++    Tensor q_raw_view(q_raw, DType::BF16, {1, d_inner});
++    Tensor k_raw_view(k_raw, DType::BF16, {1, d_inner});
++    Tensor v_raw_view(v_raw, DType::BF16, {1, d_inner});
++    Tensor q_conv_view(q_conv, DType::BF16, {1, d_inner});
++    Tensor k_conv_view(k_conv, DType::BF16, {1, d_inner});
++    Tensor v_conv_view(v_conv, DType::BF16, {1, d_inner});
++    ops::glm5_kda_conv(q_raw_view, conv_q_w, conv_q_state, q_conv_view, stream);
++    ops::glm5_kda_conv(k_raw_view, conv_k_w, conv_k_state, k_conv_view, stream);
++    ops::glm5_kda_conv(v_raw_view, conv_v_w, conv_v_state, v_conv_view, stream);
++    if (debug && debug->q_conv) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->q_conv->data, q_conv, d_inner * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++        CUDA_CHECK(cudaMemcpyAsync(debug->k_conv->data, k_conv, d_inner * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++        CUDA_CHECK(cudaMemcpyAsync(debug->v_conv->data, v_conv, d_inner * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++    // prefill reads the same conv planes in [D, T] order.
++    Tensor q_conv_t(q_conv, DType::BF16, {d_inner, 1});
++    Tensor k_conv_t(k_conv, DType::BF16, {d_inner, 1});
++    Tensor v_conv_t(v_conv, DType::BF16, {d_inner, 1});
++
++    // Two-stage decay gate with the dt bias, and beta.
++    const auto hd = static_cast<std::int32_t>(head_dim);
++    const auto hs = static_cast<std::int32_t>(heads);
++    Tensor stage_t(stage, DType::BF16, {hd, 1});
++    Tensor gate_pre_t(gate_pre, DType::BF16, {d_inner, 1});
++    Tensor beta_logits_t(beta_logits, DType::BF16, {hs, 1});
++    Tensor gate_t(gate_log, DType::FP32, {d_inner, 1});
++    Tensor beta_t(beta_f32, DType::FP32, {hs, 1});
++    ops::linear(normed_t, w.f_a, stage_t, stream);
++    ops::linear(stage_t, w.f_b, gate_pre_t, stream);
++    ops::add_bias(dt_bias, gate_pre_t, stream);
++    ops::linear(normed_t, w.beta, beta_logits_t, stream);
++    Tensor gate_pre_view(gate_pre, DType::BF16, {1, d_inner});
++    Tensor gate_view(gate_log, DType::FP32, {1, d_inner});
++    Tensor beta_view(beta_f32, DType::FP32, {1, hs});
++    Tensor beta_logits_view(beta_logits, DType::BF16, {1, hs});
++    if (debug && debug->gate_pre) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->gate_pre->data, gate_pre, d_inner * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++    if (debug && debug->beta_logits) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->beta_logits->data, beta_logits, heads * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++    ops::glm5_kda_gating(gate_pre_view, beta_logits_view, a_log, gate_lower_bound, gate_view,
++                         beta_view, stream);
++    if (debug && debug->gate) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->gate->data, gate_log, static_cast<std::size_t>(d_inner) * 4,
++                                   cudaMemcpyDeviceToDevice, stream));
++        CUDA_CHECK(cudaMemcpyAsync(debug->beta->data, beta_f32, heads * 4,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++
++    // The output gate's two stages, then the single-token prefill and wo.
++    Tensor g2_t(g2, DType::BF16, {d_inner, 1});
++    Tensor prefill_t(prefill_out, DType::BF16, {d_inner, 1});
++    ops::linear(normed_t, w.g_a, stage_t, stream);
++    ops::linear(stage_t, w.g_b, g2_t, stream);
++    ops::glm5_kda_prefill(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, g2_t, o_norm_w,
++                          matrix_state, prefill_t, stream);
++    if (debug && debug->prefill_out) {
++        CUDA_CHECK(cudaMemcpyAsync(debug->prefill_out->data, prefill_out, d_inner * 2,
++                                   cudaMemcpyDeviceToDevice, stream));
++    }
++    ops::linear(prefill_t, w.wo, block_out, stream);
++}
++
++} // namespace ninfer::models::glm5::execution
+diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b22d512bd5d231db07bde58a25ce39701030e8d
+--- /dev/null
++++ b/src/models/glm5/execution/block.h
+@@ -0,0 +1,67 @@
++#pragma once
++
++// The GLM-5.3-Flash single-token KDA block decode assembly: projections through the
++// engine's BF16 A16 linear path (bias-free; the dt bias rides add_bias), the GLM ops
++// (glm5_kda_conv / glm5_kda_gating / glm5_kda_prefill), and the block's output projection.
++// Every piece is verified against models/glm5/reference; the block test runs the same
++// chain on the host side as the oracle. Weight roles follow tools/convert/glm5_tensors.py.
++
++#include "core/tensor.h"
++#include "core/weight.h"
++
++#include <cstddef>
++#include <cstdint>
++
++#include <cuda_runtime.h>
++
++namespace ninfer::models::glm5::execution {
++
++// A [N, K] BF16 row-major plane bound as the engine's contiguous A16 Weight.
++[[nodiscard]] Weight bf16_weight(const void* payload, std::int32_t rows, std::int32_t columns);
++
++// The KDA block's BF16 weight set (norm gammas included as [hidden] planes). The FP32
++// scalars (dt bias, A_log, o_norm) arrive as Tensors at the call.
++struct KdaBlockWeights {
++    Weight attn_norm;               // [hidden] RMSNorm gamma
++    Weight wq, wk, wv;              // [d_inner, hidden]
++    Weight conv_q, conv_k, conv_v;  // [d_conv, d_inner] (GGUF taps-fastest layout)
++    Weight f_a;                     // [head_dim, hidden]
++    Weight f_b;                     // [d_inner, head_dim]
++    Weight beta;                    // [heads, hidden]
++    Weight g_a;                     // [head_dim, hidden]
++    Weight g_b;                     // [d_inner, head_dim]
++    Weight wo;                      // [hidden, d_inner]
++};
++
++[[nodiscard]] std::size_t kda_block_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
++                                                  std::uint32_t head_dim);
++
++// One token through: norm(hidden) -> q/k/v projections + causal convs -> two-stage decay
++// gate (+ dt bias) -> beta -> the recurrent prefill (one token) with its output gate ->
++// wo. The persistent state (three conv planes FP32 [d_conv-1, d_inner] and the matrix
++// FP32 [heads, D, D]) updates in place. `hidden_in` is the mHC-collapsed residual (BF16
++// [hidden, 1]); `block_out` is BF16 [hidden, 1] and must not overlap the scratch.
++// Optional test observability: when non-null, the decode copies five intermediates to
++// these caller tensors instead of only into scratch (same shapes as the internal planes:
++// normed [hidden,1] BF16, q_conv/k_conv/v_conv shared [d_inner,1] BF16, gate [d_inner,1]
++// FP32 log space, beta [heads,1] FP32, prefill output [d_inner,1] BF16).
++struct KdaBlockDebug {
++    Tensor* normed = nullptr;
++    Tensor* q_conv = nullptr;
++    Tensor* k_conv = nullptr;
++    Tensor* v_conv = nullptr;
++    Tensor* gate = nullptr;
++    Tensor* beta = nullptr;
++    Tensor* prefill_out = nullptr;
++    Tensor* gate_pre = nullptr;   // BF16 [1, d_inner]
++    Tensor* beta_logits = nullptr;   // BF16 [1, heads]
++};
++
++void kda_block_decode(const KdaBlockWeights& w, const Tensor& hidden_in, const Tensor& dt_bias,
++                      const Tensor& a_log, const Tensor& o_norm_w, Tensor& conv_q_state,
++                      Tensor& conv_k_state, Tensor& conv_v_state, Tensor& matrix_state,
++                      float gate_lower_bound, std::uint32_t heads, std::uint32_t head_dim,
++                      float rms_eps, Tensor& block_out, void* scratch, cudaStream_t stream,
++                      KdaBlockDebug* debug = nullptr);
++
++} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..acee475e8aa8513338c97fea664fcc70b26aa42b
+index 0000000000000000000000000000000000000000..2955f8f02bfe26cfe5554f1f160a4a699e4b3241
 --- /dev/null
 +++ b/src/models/glm5/loading_sources.cmake
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +target_sources(ninfer_model_loading PRIVATE
 +  "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/execution/block.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_reference.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_chunk_reference.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/mhc_reference.cpp"
@@ -15214,10 +15522,10 @@ index e141b258f08ca1b57b807b11fdd621475ba11d06..11b8894e1b483e8dc5d45c08f57bb320
  [[nodiscard]] Architecture resolve_architecture(std::string_view architecture,
                                                  std::string_view model_type);
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
-index 0a3dc7967cd900c2744ebf48914438e68815f1c4..1b23ee3799c11ad486c6c32fa1d2b64e3e80e05c 100644
+index 0a3dc7967cd900c2744ebf48914438e68815f1c4..06e6a3dedab808a369ee59665b4b7c2c8a81774d 100644
 --- a/src/ops/CMakeLists.txt
 +++ b/src/ops/CMakeLists.txt
-@@ -22,11 +22,15 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+@@ -22,11 +22,16 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
  endif()
  
  include(basic_sources.cmake)
@@ -15230,6 +15538,7 @@ index 0a3dc7967cd900c2744ebf48914438e68815f1c4..1b23ee3799c11ad486c6c32fa1d2b64e
 +include("${CMAKE_CURRENT_LIST_DIR}/glm5_kda/sources.cmake")
 +include("${CMAKE_CURRENT_LIST_DIR}/glm5_mhc/sources.cmake")
 +include("${CMAKE_CURRENT_LIST_DIR}/glm5_dsa/sources.cmake")
++include("${CMAKE_CURRENT_LIST_DIR}/glm5_mlp/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/kv_cache/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/linear/sources.cmake")
@@ -15755,10 +16064,10 @@ index d2fab2d6b02eb12b86f80292965196f0f27d234a..b7d07fd0faf5d08a71d082e2e9a9bd80
 +} // namespace ninfer::ops
 diff --git a/src/ops/glm5_dsa/glm5_dsa.cu b/src/ops/glm5_dsa/glm5_dsa.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..32ea473b14fdf28722d243f90d15d91845d9d434
+index 0000000000000000000000000000000000000000..84d473e8af823301af5450edf35efb7f2b121e9a
 --- /dev/null
 +++ b/src/ops/glm5_dsa/glm5_dsa.cu
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,194 @@
 +// ninfer::ops - GLM-5.3-Flash DSA launchers (decode path).
 +#include "ninfer/ops/glm5_dsa.h"
 +
@@ -15913,6 +16222,42 @@ index 0000000000000000000000000000000000000000..32ea473b14fdf28722d243f90d15d918
 +        static_cast<const std::int32_t*>(cells.data),
 +        static_cast<const __nv_bfloat16*>(wv_b.data), width, lora, v_head, qk_nope,
 +        static_cast<__nv_bfloat16*>(out.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_dsa_absorb(const Tensor& q, const Tensor& wk_b, Tensor& q_abs, cudaStream_t stream) {
++    const std::int32_t heads = dim0(q);
++    const std::int32_t nope = dim1(q);
++    const std::int32_t lora = dim1(wk_b);
++    if (heads <= 0 || nope <= 0 || lora <= 0 || dim0(wk_b) != nope || dim2(wk_b) != heads) {
++        throw std::invalid_argument("glm5_dsa_absorb: q [H,nope] and wk_b {nope,lora,heads} disagree");
++    }
++    require_shape(q, DType::BF16, {heads, nope}, "glm5_dsa_absorb: q");
++    require_shape(wk_b, DType::BF16, {nope, lora, heads}, "glm5_dsa_absorb: wk_b");
++    require_shape(q_abs, DType::FP32, {heads, lora}, "glm5_dsa_absorb: q_abs");
++    require_disjoint(q, q_abs); require_disjoint(wk_b, q_abs);
++
++    const std::int64_t elements = static_cast<std::int64_t>(heads) * lora;
++    const auto blocks = static_cast<unsigned int>(
++        (elements + glm5_dsa_detail::kThreads - 1) / glm5_dsa_detail::kThreads);
++    glm5_dsa_detail::absorb_kernel<<<blocks, glm5_dsa_detail::kThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(wk_b.data),
++        nope, lora, heads, static_cast<float*>(q_abs.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_dsa_scale(const Tensor& values, float factor, Tensor& out, cudaStream_t stream) {
++    if (values.ne[0] <= 0 || out.ne[0] != values.ne[0]) {
++        throw std::invalid_argument("glm5_dsa_scale: same-shape FP32 planes required");
++    }
++    require_shape(values, DType::FP32, {dim0(values)}, "glm5_dsa_scale: values");
++    require_shape(out, DType::FP32, {dim0(values)}, "glm5_dsa_scale: out");
++    require_disjoint(values, out);
++    const auto blocks = static_cast<unsigned int>(
++        (values.ne[0] + glm5_dsa_detail::kThreads - 1) / glm5_dsa_detail::kThreads);
++    glm5_dsa_detail::scale_kernel<<<blocks, glm5_dsa_detail::kThreads, 0, stream>>>(
++        static_cast<const float*>(values.data), factor, values.ne[0],
++        static_cast<float*>(out.data));
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -16271,12 +16616,144 @@ index 0000000000000000000000000000000000000000..a4d65b366a43c68b58e8bfb497ed6799
 +target_sources(ninfer_ops PRIVATE
 +  "${CMAKE_CURRENT_LIST_DIR}/glm5_mhc.cu"
 +)
+diff --git a/src/ops/glm5_mlp/glm5_mlp.cu b/src/ops/glm5_mlp/glm5_mlp.cu
+new file mode 100644
+index 0000000000000000000000000000000000000000..e35f89931e683d39a1e5f4751ff9a554baa33c28
+--- /dev/null
++++ b/src/ops/glm5_mlp/glm5_mlp.cu
+@@ -0,0 +1,117 @@
++// ninfer::ops - GLM-5.3-Flash MLP launchers.
++#include "ninfer/ops/glm5_mlp.h"
++
++#include "ops/kernel/glm5_mlp.cuh"
++#include "core/device.h"
++
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::ops {
++
++namespace {
++
++void require_contiguous(const Tensor& tensor, const char* what) {
++    if (!tensor.is_contiguous()) { throw std::invalid_argument(std::string(what) + " must be contiguous"); }
++}
++
++void require_shape(const Tensor& tensor, DType dtype, std::initializer_list<std::int32_t> shape,
++                   const char* what) {
++    require_contiguous(tensor, what);
++    if (tensor.dtype != dtype) {
++        throw std::invalid_argument(std::string(what) + " has the wrong dtype");
++    }
++    int index = 0;
++    for (const auto extent : shape) {
++        if (tensor.ne[index] != extent) {
++            throw std::invalid_argument(std::string(what) + " has the wrong shape");
++        }
++        ++index;
++    }
++}
++
++void require_disjoint(const Tensor& a, const Tensor& b) {
++    const auto a_begin = reinterpret_cast<std::uintptr_t>(a.data);
++    const auto b_begin = reinterpret_cast<std::uintptr_t>(b.data);
++    const auto a_end = a_begin + a.bytes();
++    const auto b_end = b_begin + b.bytes();
++    if (a_begin < b_end && b_begin < a_end) {
++        throw std::invalid_argument("glm5_mlp operands must not overlap");
++    }
++}
++
++} // namespace
++
++void glm5_swiglu(const Tensor& gate, const Tensor& up, float limit, Tensor& out,
++                 cudaStream_t stream) {
++    const std::int32_t width = gate.ne[0];
++    const std::int32_t tokens = gate.ne[1];
++    if (width <= 0 || tokens <= 0) {
++        throw std::invalid_argument("glm5_swiglu: gate must be [W, T]");
++    }
++    require_shape(gate, DType::BF16, {width, tokens}, "glm5_swiglu: gate");
++    require_shape(up, DType::BF16, {width, tokens}, "glm5_swiglu: up");
++    require_shape(out, DType::BF16, {width, tokens}, "glm5_swiglu: out");
++    if (!(limit > 0.0f)) { throw std::invalid_argument("glm5_swiglu: limit must be positive"); }
++    require_disjoint(gate, out); require_disjoint(up, out);
++
++    const std::int64_t elements = static_cast<std::int64_t>(width) * tokens;
++    const auto blocks = static_cast<unsigned int>(
++        (elements + glm5_mlp_detail::kThreads - 1) / glm5_mlp_detail::kThreads);
++    glm5_mlp_detail::swiglu_kernel<<<blocks, glm5_mlp_detail::kThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(up.data),
++        limit, elements, static_cast<__nv_bfloat16*>(out.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_moe_route(const Tensor& logits, const Tensor& correction_bias, std::int32_t top_k,
++                    float routed_scaling_factor, Tensor& weights, Tensor& indices,
++                    cudaStream_t stream) {
++    const std::int32_t experts = logits.ne[0];
++    if (experts <= 0 || top_k <= 0 || top_k > experts) {
++        throw std::invalid_argument("glm5_moe_route: bad expert geometry");
++    }
++    require_shape(logits, DType::BF16, {experts}, "glm5_moe_route: logits");
++    require_shape(correction_bias, DType::FP32, {experts}, "glm5_moe_route: correction_bias");
++    require_shape(weights, DType::FP32, {top_k}, "glm5_moe_route: weights");
++    require_shape(indices, DType::I32, {top_k}, "glm5_moe_route: indices");
++    if (!(routed_scaling_factor > 0.0f)) {
++        throw std::invalid_argument("glm5_moe_route: scaling must be positive");
++    }
++    require_disjoint(logits, weights); require_disjoint(logits, indices);
++
++    const std::size_t shared = sizeof(float) * static_cast<std::size_t>(experts);
++    if (shared > 48u * 1024u) {
++        throw std::invalid_argument("glm5_moe_route: expert count exceeds static shared memory");
++    }
++    glm5_mlp_detail::route_kernel<<<1, glm5_mlp_detail::kThreads, shared, stream>>>(
++        static_cast<const __nv_bfloat16*>(logits.data),
++        static_cast<const float*>(correction_bias.data), experts, top_k, routed_scaling_factor,
++        static_cast<float*>(weights.data), static_cast<std::int32_t*>(indices.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void glm5_moe_combine(const Tensor& experts, const Tensor& weights, const Tensor& shared,
++                      Tensor& out, cudaStream_t stream) {
++    const std::int32_t top_k = experts.ne[0];
++    const std::int32_t hidden = experts.ne[1];
++    if (top_k <= 0 || hidden <= 0) {
++        throw std::invalid_argument("glm5_moe_combine: experts must be [top_k, H]");
++    }
++    require_shape(experts, DType::BF16, {top_k, hidden}, "glm5_moe_combine: experts");
++    require_shape(weights, DType::FP32, {top_k}, "glm5_moe_combine: weights");
++    require_shape(shared, DType::BF16, {hidden}, "glm5_moe_combine: shared");
++    require_shape(out, DType::BF16, {hidden}, "glm5_moe_combine: out");
++    require_disjoint(experts, out); require_disjoint(shared, out);
++
++    const auto blocks = static_cast<unsigned int>(
++        (hidden + glm5_mlp_detail::kThreads - 1) / glm5_mlp_detail::kThreads);
++    glm5_mlp_detail::combine_kernel<<<blocks, glm5_mlp_detail::kThreads, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(experts.data),
++        static_cast<const float*>(weights.data),
++        static_cast<const __nv_bfloat16*>(shared.data), hidden, top_k, hidden,
++        static_cast<__nv_bfloat16*>(out.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/glm5_mlp/sources.cmake b/src/ops/glm5_mlp/sources.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c476f58d8d537e009ca29c4c38244337cc225a9
+--- /dev/null
++++ b/src/ops/glm5_mlp/sources.cmake
+@@ -0,0 +1,3 @@
++target_sources(ninfer_ops PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/glm5_mlp.cu"
++)
 diff --git a/src/ops/kernel/glm5_dsa.cuh b/src/ops/kernel/glm5_dsa.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..2120a2a786a7749f3be303dccb9dfc5a7f515442
+index 0000000000000000000000000000000000000000..6a23a17a7e90232b929b23cd3810d119653ac901
 --- /dev/null
 +++ b/src/ops/kernel/glm5_dsa.cuh
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,243 @@
 +#pragma once
 +
 +// ninfer::ops - GLM-5.3-Flash DSA kernels: per-element pool compression, ReLU head scoring,
@@ -16309,7 +16786,7 @@ index 0000000000000000000000000000000000000000..2120a2a786a7749f3be303dccb9dfc5a
 +    }
 +    float denominator = 0.0f;
 +    for (std::int32_t m = 0; m < kpool; ++m) {
-+        exps[m] = __expf(logits[m] - maximum);
++        exps[m] = expf(logits[m] - maximum);
 +        denominator += exps[m];
 +    }
 +    const float inverse = 1.0f / denominator;
@@ -16450,7 +16927,7 @@ index 0000000000000000000000000000000000000000..2120a2a786a7749f3be303dccb9dfc5a
 +    float part = 0.0f;
 +    for (std::int32_t s = tid; s < width; s += kThreads) {
 +        if (cells[s] < 0) { continue; }
-+        const float value = __expf(s_prob[s] - top);
++        const float value = expf(s_prob[s] - top);
 +        s_prob[s] = value;
 +        part += value;
 +    }
@@ -16490,11 +16967,39 @@ index 0000000000000000000000000000000000000000..2120a2a786a7749f3be303dccb9dfc5a
 +    }
 +}
 +
++
++// q_abs[h, e] = sum_d q[h, d] * wk_b[d + nope*e + nope*lora*h]: absorb W_K_B into the query.
++// GGUF wk_b is {nope, lora, heads} (ne0 = the nope input dim fastest).
++__global__ void absorb_kernel(const __nv_bfloat16* __restrict__ q,
++                              const __nv_bfloat16* __restrict__ wk_b, std::int32_t nope,
++                              std::int32_t lora, std::int32_t heads, float* __restrict__ q_abs) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const std::int32_t h = static_cast<std::int32_t>(index / lora);
++    const std::int32_t e = static_cast<std::int32_t>(index % lora);
++    if (h >= heads) { return; }
++    const __nv_bfloat16* head_w = wk_b + static_cast<std::int64_t>(nope) * lora * h;
++    float acc = 0.0f;
++    for (std::int32_t d = 0; d < nope; ++d) {
++        acc = fmaf(__bfloat162float(q[static_cast<std::int64_t>(h) * nope + d]),
++                   __bfloat162float(head_w[static_cast<std::int64_t>(d) + static_cast<std::int64_t>(nope) * e]),
++                   acc);
++    }
++    q_abs[index] = acc;
++}
++
++// out = values * factor over a plane.
++__global__ void scale_kernel(const float* __restrict__ values, float factor,
++                             std::int64_t elements, float* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= elements) { return; }
++    out[index] = values[index] * factor;
++}
++
 +} // namespace glm5_dsa_detail
 +} // namespace ninfer::ops
 diff --git a/src/ops/kernel/glm5_kda.cuh b/src/ops/kernel/glm5_kda.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b7f23ec3b
+index 0000000000000000000000000000000000000000..bb70fb298ebf0b3a861a44bfa3b77f28aa7edf52
 --- /dev/null
 +++ b/src/ops/kernel/glm5_kda.cuh
 @@ -0,0 +1,286 @@
@@ -16518,7 +17023,7 @@ index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b
 +constexpr int kDecodeBlock = 256;   // one head per block, dk <= 256
 +constexpr int kElementThreads = 256;
 +
-+__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
++__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 +
 +// gate[t, c] = lower_bound * sigmoid(exp(A_log[c / dk]) * a[t, c]) over the [d_inner, T] plane.
 +__global__ void decay_gate_kernel(const __nv_bfloat16* __restrict__ a,
@@ -16528,7 +17033,7 @@ index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b
 +    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 +    if (index >= elements) { return; }
 +    const std::int32_t channel = static_cast<std::int32_t>(index % d_inner);
-+    const float rate = __expf(a_log[channel / dk]);
++    const float rate = expf(a_log[channel / dk]);
 +    gate[index] = lower_bound * sigmoid_f(rate * __bfloat162float(a[index]));
 +}
 +
@@ -16626,7 +17131,7 @@ index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b
 +
 +    float* S = state + static_cast<std::int64_t>(h) * dk * dk;   // row = key axis
 +    if (live) {
-+        const float decay = __expf(gate[base + tid]);
++        const float decay = expf(gate[base + tid]);
 +        for (std::int32_t j = 0; j < dk; ++j) {
 +            S[static_cast<std::int64_t>(tid) * dk + j] *= decay;
 +        }
@@ -16732,7 +17237,7 @@ index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b
 +        __syncthreads();
 +
 +        if (live) {
-+            const float decay = __expf(gt[tid]);
++            const float decay = expf(gt[tid]);
 +            for (std::int32_t j = 0; j < dk; ++j) {
 +                S[static_cast<std::int64_t>(tid) * dk + j] *= decay;
 +            }
@@ -16786,7 +17291,7 @@ index 0000000000000000000000000000000000000000..559a3340a4d18af7b4e98c09e26eba4b
 +} // namespace ninfer::ops
 diff --git a/src/ops/kernel/glm5_mhc.cuh b/src/ops/kernel/glm5_mhc.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..01e79d26d646af727fe740260bcd8bfda80ac2e5
+index 0000000000000000000000000000000000000000..2079ed017fd90b48c6af359914d70fa647d4e0c2
 --- /dev/null
 +++ b/src/ops/kernel/glm5_mhc.cuh
 @@ -0,0 +1,202 @@
@@ -16806,7 +17311,7 @@ index 0000000000000000000000000000000000000000..01e79d26d646af727fe740260bcd8bfd
 +constexpr int kPreBlock = 256;
 +constexpr int kMaxLanes = 24;   // (2 + hc) * hc with hc = 4
 +
-+__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
++__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 +
 +// One token per block. Phase order: unweighted RMS norm over the flattened streams, the
 +// 24 mix dots (each thread strides the plane, one accumulator per lane), the gates and
@@ -16896,7 +17401,7 @@ index 0000000000000000000000000000000000000000..01e79d26d646af727fe740260bcd8bfd
 +            }
 +            float denominator = 0.0f;
 +            for (std::int32_t dst = 0; dst < hc; ++dst) {
-+                logits[dst] = __expf(logits[dst] - maximum);
++                logits[dst] = expf(logits[dst] - maximum);
 +                denominator += logits[dst];
 +            }
 +            for (std::int32_t dst = 0; dst < hc; ++dst) {
@@ -16991,6 +17496,119 @@ index 0000000000000000000000000000000000000000..01e79d26d646af727fe740260bcd8bfd
 +}
 +
 +} // namespace glm5_mhc_detail
++} // namespace ninfer::ops
+diff --git a/src/ops/kernel/glm5_mlp.cuh b/src/ops/kernel/glm5_mlp.cuh
+new file mode 100644
+index 0000000000000000000000000000000000000000..123ec48766f45d18fb2f66257fd3fd0019474b15
+--- /dev/null
++++ b/src/ops/kernel/glm5_mlp.cuh
+@@ -0,0 +1,107 @@
++#pragma once
++
++// ninfer::ops - GLM-5.3-Flash MLP kernels: the clamped SwiGLU, the sigmoid/noaux_tc router
++// and the expert combination. Math follows models/glm5/reference (expert_forward and
++// routing_reference semantics: gate upper-clamped only, up clamped both sides; the router's
++// correction bias participates ONLY in selection).
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops {
++namespace glm5_mlp_detail {
++
++constexpr int kThreads = 256;
++
++__device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
++
++__global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ gate,
++                              const __nv_bfloat16* __restrict__ up, float limit,
++                              std::int64_t elements, __nv_bfloat16* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= elements) { return; }
++    const float g = __bfloat162float(gate[index]);
++    const float u = __bfloat162float(up[index]);
++    const float clamped_gate = fminf(g, limit);
++    const float clamped_up = fminf(fmaxf(u, -limit), limit);
++    out[index] = __float2bfloat16(clamped_gate * sigmoid_f(clamped_gate) * clamped_up);
++}
++
++// One block: iterative argmax over score+bias, top_k rounds (ties by lower index), then the
++// normalized original scores of the selected experts.
++__global__ void route_kernel(const __nv_bfloat16* __restrict__ logits,
++                             const float* __restrict__ correction_bias, std::int32_t experts,
++                             std::int32_t top_k, float scaling, float* __restrict__ weights,
++                             std::int32_t* __restrict__ indices) {
++    extern __shared__ float s_score[];   // [experts]
++    const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
++    for (std::int32_t e = tid; e < experts; e += blockDim.x) {
++        s_score[e] = sigmoid_f(__bfloat162float(logits[e])) + correction_bias[e];
++    }
++    __syncthreads();
++    __shared__ float s_val[kThreads];
++    __shared__ std::int32_t s_idx[kThreads];
++    __shared__ float s_sum;
++    if (tid == 0) { s_sum = 0.0f; }
++    const std::int32_t picks = min(top_k, experts);
++    for (std::int32_t rank = 0; rank < picks; ++rank) {
++        float best_value = -3.0e38f;
++        std::int32_t best_index = 0x7fffffff;
++        for (std::int32_t e = tid; e < experts; e += blockDim.x) {
++            if (s_score[e] > best_value) {
++                best_value = s_score[e];
++                best_index = e;
++            }
++        }
++        s_val[tid] = best_value;
++        s_idx[tid] = best_index;
++        __syncthreads();
++        if (tid == 0) {
++            float value = -3.0e38f;
++            std::int32_t index = 0x7fffffff;
++            for (std::int32_t i = 0; i < kThreads; ++i) {
++                if (s_val[i] > value || (s_val[i] == value && s_idx[i] < index)) {
++                    value = s_val[i];
++                    index = s_idx[i];
++                }
++            }
++            s_idx[0] = index;
++            s_val[0] = value;
++        }
++        __syncthreads();
++        const std::int32_t winner = s_idx[0];
++        __syncthreads();
++        // Recover the ORIGINAL sigmoid score of the winner (bias removed) for the weights.
++        if (tid == 0) {
++            const float original = s_score[winner] - correction_bias[winner];
++            indices[rank] = winner;
++            weights[rank] = original;
++            s_sum += original;
++            s_score[winner] = -3.0e38f;
++        }
++        __syncthreads();
++    }
++    if (tid == 0) {
++        const float inverse = scaling / (s_sum + 1e-20f);
++        for (std::int32_t i = 0; i < picks; ++i) { weights[i] *= inverse; }
++    }
++}
++
++// One thread per output element.
++__global__ void combine_kernel(const __nv_bfloat16* __restrict__ experts,
++                               const float* __restrict__ weights,
++                               const __nv_bfloat16* __restrict__ shared, std::int32_t hidden,
++                               std::int32_t top_k, std::int64_t elements,
++                               __nv_bfloat16* __restrict__ out) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= elements) { return; }
++    float acc = __bfloat162float(shared[index]);
++    for (std::int32_t i = 0; i < top_k; ++i) {
++        acc = fmaf(weights[i], __bfloat162float(experts[static_cast<std::int64_t>(i) * hidden + index]), acc);
++    }
++    out[index] = __float2bfloat16(acc);
++}
++
++} // namespace glm5_mlp_detail
 +} // namespace ninfer::ops
 diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
 index 888492ceaa2e0d61678b86b01365df863ffe8395..e5be4992aae53ba892eaea9054343bbb6cdcee82 100644
@@ -30971,6 +31589,354 @@ index 0000000000000000000000000000000000000000..0eff353ca47f749dcdf0b498430d8173
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c0ef269c5a09161b08d3e0e3622ce76f251cb17
+--- /dev/null
++++ b/tests/models/glm5/test_kda_block.cpp
+@@ -0,0 +1,342 @@
++// The GLM-5.3-Flash KDA block decode assembly against the host reference: the projections
++// run as FP64 GEMV oracles, the mixer pieces call models/glm5/reference, and the whole
++// chain is compared on the device at the audited 64x128 geometry and a small probe.
++#include "models/glm5/execution/block.h"
++#include "models/glm5/reference/kda_reference.h"
++
++#include "core/device.h"
++#include "ninfer/ops/linear.h"
++#include "ninfer/ops/rmsnorm.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <string>
++#include <algorithm>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++namespace execution = ninfer::models::glm5::execution;
++using execution::KdaBlockWeights;
++namespace Reference = ninfer::models::glm5::reference;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& values) {
++    std::vector<__nv_bfloat16> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __float2bfloat16(values[i]); }
++    return out;
++}
++std::vector<float> represented(const std::vector<__nv_bfloat16>& values) {
++    std::vector<float> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) { out[i] = __bfloat162float(values[i]); }
++    return out;
++}
++
++test::GuardedDeviceBuffer upload(const void* data, std::size_t bytes) {
++    test::GuardedDeviceBuffer buffer(bytes);
++    buffer.copy_from_host(data, bytes);
++    return buffer;
++}
++template <typename T> test::GuardedDeviceBuffer upload(const std::vector<T>& values) {
++    return upload(values.data(), values.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download(const test::GuardedDeviceBuffer& buffer) {
++    std::vector<T> out(buffer.bytes() / sizeof(T));
++    buffer.copy_to_host(out.data(), out.size() * sizeof(T));
++    return out;
++}
++
++// Host GEMV oracle: y = W @ x with W row-major [rows, cols] in long double.
++std::vector<double> gemv(const std::vector<float>& w, std::uint32_t rows, std::uint32_t cols,
++                         const std::vector<float>& x) {
++    std::vector<double> y(rows, 0.0);
++    for (std::uint32_t r = 0; r < rows; ++r) {
++        for (std::uint32_t c = 0; c < cols; ++c) { y[r] += w[r * cols + c] * x[c]; }
++    }
++    return y;
++}
++
++int failures = 0;
++
++void run_case(std::uint32_t hidden, std::uint32_t heads, std::uint32_t head_dim) {
++    const std::uint32_t d_inner = heads * head_dim;
++    const Reference::KdaProfile profile{heads, head_dim, 4, -5.0f};
++    const std::string label = "h" + std::to_string(hidden) + "/d" + std::to_string(d_inner);
++
++    // Weights: every plane deterministic, scaled small enough that chains stay finite.
++    auto plane = [&](std::uint32_t rows, std::uint32_t cols, std::uint32_t seed) {
++        std::vector<float> raw(rows * cols);
++        for (std::size_t i = 0; i < raw.size(); ++i) {
++            raw[i] = source(static_cast<std::uint32_t>(i) * 3 + seed) / 16.0f;
++        }
++        return represented(round_trip(raw));
++    };
++    std::vector<float> norm_w(hidden), wq(plane(d_inner, hidden, 1)), wk(plane(d_inner, hidden, 2)),
++        wv(plane(d_inner, hidden, 3)), conv_q(plane(4 * d_inner, 1, 4)),
++        conv_k(plane(4 * d_inner, 1, 5)), conv_v(plane(4 * d_inner, 1, 6)),
++        f_a(plane(head_dim, hidden, 7)), f_b(plane(d_inner, head_dim, 8)),
++        beta_w(plane(heads, hidden, 9)), g_a(plane(head_dim, hidden, 10)),
++        g_b(plane(d_inner, head_dim, 11)), wo(plane(hidden, d_inner, 12));
++    for (std::uint32_t i = 0; i < hidden; ++i) { norm_w[i] = 1.0f + source(i) / 8; }
++    for (auto& value : conv_q) { value /= 4.0f; }
++    for (auto& value : conv_k) { value /= 4.0f; }
++    for (auto& value : conv_v) { value /= 4.0f; }
++    std::vector<float> dt_bias(d_inner), a_log(heads), o_norm_w(head_dim),
++        conv_state0((4 - 1) * d_inner), matrix_state0(Reference::kda_state_values(profile));
++    for (std::uint32_t i = 0; i < d_inner; ++i) { dt_bias[i] = source(i * 3 + 1) / 8; }
++    for (std::uint32_t h = 0; h < heads; ++h) { a_log[h] = -0.5f + 0.25f * h; }
++    for (std::uint32_t i = 0; i < head_dim; ++i) { o_norm_w[i] = 1.0f + source(i) / 8; }
++    for (std::size_t i = 0; i < conv_state0.size(); ++i) { conv_state0[i] = source(static_cast<std::uint32_t>(i) + 5) / 3; }
++    for (std::size_t i = 0; i < matrix_state0.size(); ++i) { matrix_state0[i] = source(static_cast<std::uint32_t>(i)) / 5; }
++    std::vector<float> hidden_in = represented(round_trip([&] {
++        std::vector<float> values(hidden);
++        for (std::uint32_t i = 0; i < hidden; ++i) { values[i] = source(i * 5 + 2) / 4; }
++        return values;
++    }()));
++
++    // ---- host oracle chain ----
++    std::vector<float> x(hidden);
++    {
++        double square = 0;
++        for (std::uint32_t i = 0; i < hidden; ++i) { square += hidden_in[i] * hidden_in[i]; }
++        const double inverse = 1.0 / std::sqrt(square / hidden + 1e-5);
++        for (std::uint32_t i = 0; i < hidden; ++i) { x[i] = static_cast<float>(norm_w[i] * hidden_in[i] * inverse); }
++    }
++    // The device rounds every projection output to BF16 before the next stage reads it;
++    // the oracle must round at the same boundaries or its gate (log space!) errors get
++    // exponentiated into ~7% state differences that are representation, not wiring.
++    auto projected = [&](const std::vector<float>& w, std::uint32_t rows, std::uint32_t cols,
++                         const std::vector<float>& input) {
++        std::vector<float> y(rows);
++        const auto acc = gemv(w, rows, cols, input);
++        for (std::uint32_t r = 0; r < rows; ++r) { y[r] = static_cast<float>(acc[r]); }
++        return represented(round_trip(y));
++    };
++    const std::vector<float> x_bf = represented(round_trip(x));
++    std::vector<float> q_raw = projected(wq, d_inner, hidden, x_bf),
++                       k_raw = projected(wk, d_inner, hidden, x_bf),
++                       v_raw = projected(wv, d_inner, hidden, x_bf),
++                       fa = projected(f_a, head_dim, hidden, x_bf),
++                       beta_raw = projected(beta_w, heads, hidden, x_bf),
++                       ga = projected(g_a, head_dim, hidden, x_bf);
++    std::vector<float> fb(d_inner);
++    {
++        const auto acc = gemv(f_b, d_inner, head_dim, fa);
++        std::vector<float> raw(d_inner);
++        for (std::uint32_t i = 0; i < d_inner; ++i) {
++            raw[i] = static_cast<float>(acc[i]) + represented(round_trip(dt_bias))[i];
++        }
++        fb = represented(round_trip(raw));
++    }
++    std::vector<float> g2(d_inner);
++    {
++        const auto acc = gemv(g_b, d_inner, head_dim, ga);
++        std::vector<float> raw(d_inner);
++        for (std::uint32_t i = 0; i < d_inner; ++i) { raw[i] = static_cast<float>(acc[i]); }
++        g2 = represented(round_trip(raw));
++    }
++    // convs (weights arrive row-major rows-major [d_inner,4]; the GGUF layout is
++    // w[c*4 + tap], identical to rows=d_inner cols=4 row-major).
++    std::vector<float> qc(d_inner), kc(d_inner), vc(d_inner);
++    auto conv1 = [&](const std::vector<float>& raw, const std::vector<float>& cw,
++                     std::vector<float>& out) {
++        for (std::uint32_t c = 0; c < d_inner; ++c) {
++            double acc = cw[c * 4 + 0] * conv_state0[0 * d_inner + c] +
++                         cw[c * 4 + 1] * conv_state0[1 * d_inner + c] +
++                         cw[c * 4 + 2] * conv_state0[2 * d_inner + c] + cw[c * 4 + 3] * raw[c];
++            const double silu = acc / (1.0 + std::exp(-acc));
++            out[c] = static_cast<float>(silu);
++        }
++    };
++    conv1(q_raw, conv_q, qc); qc = represented(round_trip(qc));
++    conv1(k_raw, conv_k, kc); kc = represented(round_trip(kc));
++    conv1(v_raw, conv_v, vc); vc = represented(round_trip(vc));
++    std::vector<float> gate_log(d_inner), beta_f(heads);
++    Reference::kda_decay_gate_reference(fb, a_log, gate_log, profile);
++    for (std::uint32_t h = 0; h < heads; ++h) {
++        beta_f[h] = static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(beta_raw[h]))));
++    }
++    std::vector<float> scan_out(d_inner), matrix_state = matrix_state0,
++        scratch(Reference::kda_scan_scratch_values(profile, 1));
++    Reference::kda_gated_delta_reference(qc, kc, vc, gate_log, beta_f, matrix_state, scan_out,
++                                         scratch, profile);
++    std::vector<float> gated(d_inner);
++    Reference::kda_out_gate_reference(scan_out, g2, o_norm_w, gated, profile);
++    std::vector<double> want(hidden);
++    {
++        const auto acc = gemv(wo, hidden, d_inner, gated);
++        for (std::uint32_t i = 0; i < hidden; ++i) { want[i] = acc[i]; }
++    }
++
++    // ---- device run ----
++    auto d_norm = upload(round_trip(norm_w));
++    auto d_wq = upload(round_trip(wq));
++    auto d_wk = upload(round_trip(wk));
++    auto d_wv = upload(round_trip(wv));
++    auto d_cq = upload(round_trip(conv_q));
++    auto d_ck = upload(round_trip(conv_k));
++    auto d_cv = upload(round_trip(conv_v));
++    auto d_fa = upload(round_trip(f_a));
++    auto d_fb = upload(round_trip(f_b));
++    auto d_beta = upload(round_trip(beta_w));
++    auto d_ga = upload(round_trip(g_a));
++    auto d_gb = upload(round_trip(g_b));
++    auto d_wo = upload(round_trip(wo));
++    auto d_dt = upload(round_trip(dt_bias));
++    auto d_alog = upload(a_log);
++    auto d_onw = upload(o_norm_w);
++    auto d_hidden = upload(round_trip(hidden_in));
++    auto d_conv_q = upload(conv_state0);
++    auto d_conv_k = upload(conv_state0);
++    auto d_conv_v = upload(conv_state0);
++    auto d_matrix = upload(matrix_state0);
++    const std::size_t scratch_bytes = execution::kda_block_scratch_bytes(hidden, heads, head_dim);
++    test::GuardedDeviceBuffer d_scratch(scratch_bytes);
++    test::GuardedDeviceBuffer d_out(hidden * sizeof(__nv_bfloat16));
++    const bool debug = hidden >= 4096;
++    test::GuardedDeviceBuffer d_dbg_normed(hidden * 2), d_dbg_qc(d_inner * 2), d_dbg_kc(d_inner * 2),
++        d_dbg_vc(d_inner * 2), d_dbg_gate(static_cast<std::size_t>(d_inner) * 4),
++        d_dbg_beta(heads * 4), d_dbg_prefill(d_inner * 2),
++        d_dbg_gpre(d_inner * 2), d_dbg_blog(heads * 2);
++    execution::KdaBlockDebug dbg{};
++    if (debug) {
++        static Tensor t_dbg_normed(const_cast<void*>(d_dbg_normed.data()), DType::BF16, {static_cast<std::int32_t>(hidden), 1});
++        dbg.normed = &t_dbg_normed;
++        static Tensor t_dbg_q_conv(const_cast<void*>(d_dbg_qc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        dbg.q_conv = &t_dbg_q_conv;
++        static Tensor t_dbg_k_conv(const_cast<void*>(d_dbg_kc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        dbg.k_conv = &t_dbg_k_conv;
++        static Tensor t_dbg_v_conv(const_cast<void*>(d_dbg_vc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        dbg.v_conv = &t_dbg_v_conv;
++        static Tensor t_dbg_gate(const_cast<void*>(d_dbg_gate.data()), DType::FP32, {1, static_cast<std::int32_t>(d_inner)});
++        dbg.gate = &t_dbg_gate;
++        static Tensor t_dbg_beta(const_cast<void*>(d_dbg_beta.data()), DType::FP32, {1, static_cast<std::int32_t>(heads)});
++        dbg.beta = &t_dbg_beta;
++        static Tensor t_dbg_prefill_out(const_cast<void*>(d_dbg_prefill.data()), DType::BF16, {static_cast<std::int32_t>(d_inner), 1});
++        dbg.prefill_out = &t_dbg_prefill_out;
++
++        static Tensor t_dbg_gpre(const_cast<void*>(d_dbg_gpre.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        dbg.gate_pre = &t_dbg_gpre;
++        static Tensor t_dbg_blog(const_cast<void*>(d_dbg_blog.data()), DType::BF16, {1, static_cast<std::int32_t>(heads)});
++        dbg.beta_logits = &t_dbg_blog;
++    }
++
++    KdaBlockWeights w{};
++    w.attn_norm = execution::bf16_weight(d_norm.data(), hidden, 1);
++    w.wq = execution::bf16_weight(d_wq.data(), d_inner, hidden);
++    w.wk = execution::bf16_weight(d_wk.data(), d_inner, hidden);
++    w.wv = execution::bf16_weight(d_wv.data(), d_inner, hidden);
++    w.conv_q = execution::bf16_weight(d_cq.data(), 4 * d_inner, 1);
++    w.conv_k = execution::bf16_weight(d_ck.data(), 4 * d_inner, 1);
++    w.conv_v = execution::bf16_weight(d_cv.data(), 4 * d_inner, 1);
++    w.f_a = execution::bf16_weight(d_fa.data(), head_dim, hidden);
++    w.f_b = execution::bf16_weight(d_fb.data(), d_inner, head_dim);
++    w.beta = execution::bf16_weight(d_beta.data(), heads, hidden);
++    w.g_a = execution::bf16_weight(d_ga.data(), head_dim, hidden);
++    w.g_b = execution::bf16_weight(d_gb.data(), d_inner, head_dim);
++    w.wo = execution::bf16_weight(d_wo.data(), hidden, d_inner);
++
++    {
++        Tensor hidden_t(const_cast<void*>(d_hidden.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor dt_t(const_cast<void*>(d_dt.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor alog_t(const_cast<void*>(d_alog.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor onw_t(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(head_dim)});
++        Tensor cqs(const_cast<void*>(d_conv_q.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor cks(const_cast<void*>(d_conv_k.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor cvs(const_cast<void*>(d_conv_v.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor ms(const_cast<void*>(d_matrix.data()), DType::FP32,
++                  {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(heads)});
++        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        execution::kda_block_decode(w, hidden_t, dt_t, alog_t, onw_t, cqs, cks, cvs, ms, -5.0f,
++                                    heads, head_dim, 1e-5f, out_t, d_scratch.data(), nullptr,
++                                    debug ? &dbg : nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++    }
++    if (debug) {
++        auto worst_of = [](const std::vector<float>& got, const std::vector<float>& want) {
++            double worst = 0;
++            for (std::size_t i = 0; i < want.size(); ++i) {
++                worst = std::max(worst, std::abs((double)got[i] - want[i]));
++            }
++            return worst;
++        };
++        const auto hd32 = static_cast<std::int32_t>(head_dim);
++        const auto di32 = static_cast<std::int32_t>(d_inner);
++        std::printf("[dbg:%s] normed %.4f qc %.4f kc %.4f vc %.4f gate %.4f beta %.4f gated %.4f\n",
++                    label.c_str(),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_normed)), x),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_qc)), qc),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_kc)), kc),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_vc)), vc),
++                    worst_of(download<float>(d_dbg_gate), gate_log),
++                    worst_of(download<float>(d_dbg_beta), beta_f),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_gpre)), fb),
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_blog)), beta_raw),
++
++                    worst_of(represented(download<__nv_bfloat16>(d_dbg_prefill)), gated));
++        std::printf("  first: gpre dev %.4f host %.4f | blog dev %.4f host %.4f | fb0-3 %+.3f %+.3f %+.3f %+.3f\n",
++                    represented(download<__nv_bfloat16>(d_dbg_gpre))[0], fb[0],
++                    represented(download<__nv_bfloat16>(d_dbg_blog))[0], beta_raw[0],
++                    fb[0], fb[1], fb[2], fb[3]);
++        (void)hd32; (void)di32;
++    }
++
++    // ---- device run ----
++
++    const auto got = represented(download<__nv_bfloat16>(d_out));
++    const auto state_got = download<float>(d_matrix);
++    for (std::uint32_t i = 0; i < hidden; ++i) {
++        if (std::abs(static_cast<double>(got[i]) - want[i]) > 0.06 * std::max(1.0, static_cast<double>(std::abs(want[i])))) {
++            if (failures < 10) {
++                std::fprintf(stderr, "block[%s][%u]: %.6g vs %.6g\n", label.c_str(), i, got[i],
++                             want[i]);
++            }
++            ++failures;
++        }
++    }
++    for (std::size_t i = 0; i < state_got.size(); ++i) {
++        if (std::abs(static_cast<double>(state_got[i]) - matrix_state[i]) >
++            5e-3 * std::max(1.0, static_cast<double>(std::abs(matrix_state[i])))) {
++            if (failures < 10) {
++                std::fprintf(stderr, "state[%s][%zu]: %.6g vs %.6g\n", label.c_str(), i,
++                             state_got[i], matrix_state[i]);
++            }
++            ++failures;
++        }
++    }
++}
++
++int run() {
++    run_case(64, 2, 8);           // small probe
++    run_case(4096, 64, 128);      // the audited hidden width
++    if (failures == 0) {
++        std::puts("GLM5 KDA block decode matches the chained host oracle on device");
++        return 0;
++    }
++    std::fprintf(stderr, "%d numeric failures\n", failures);
++    return 1;
++}
++
++} // namespace
++
++int main() {
++    try {
++        return run();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FATAL: %s\n", error.what());
++        return 1;
++    } catch (...) {
++        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
 diff --git a/tests/models/glm5/test_state.cpp b/tests/models/glm5/test_state.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f667750100034
@@ -31075,10 +32041,10 @@ index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f6677
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..b6f5b9be794668422e1eb2f08800e7b7328bffc3
+index 0000000000000000000000000000000000000000..421aac5e5f2a030d2c7d43d6b73bfc0aed28ff91
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,41 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -31115,6 +32081,10 @@ index 0000000000000000000000000000000000000000..b6f5b9be794668422e1eb2f08800e7b7
 +
 +ninfer_add_test(ninfer_glm5_dsa_kernels_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../ops/test_glm5_dsa.cu"
++  LIBRARIES ninfer_ops ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_kda_block_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kda_block.cpp"
 +  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
