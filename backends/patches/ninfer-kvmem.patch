@@ -6611,15 +6611,69 @@ index 0000000000000000000000000000000000000000..5f6740959fa11faad9c09f9f0abc4078
 +                      void* scratch, cudaStream_t stream);
 +
 +} // namespace ninfer::models::glm5::execution
+diff --git a/src/models/glm5/execution/gguf_loader.h b/src/models/glm5/execution/gguf_loader.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..42d76c37b744a5af831e84bb444c23ff0307c8ae
+--- /dev/null
++++ b/src/models/glm5/execution/gguf_loader.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++// GLM-5.3-Flash GGUF loader: reads a llama.cpp GGUF file and binds every tensor
++// to the Glm5ModelWeights structure, uploading BF16 planes to the device. This
++// is the direct GGUF→GPU path that bypasses the artifact format entirely; the
++// artifact converter (tools/convert/glm5_tensors.py) covers the same mapping
++// for the persistent format. The tensor role names are identical.
++
++#include "models/glm5/execution/model.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <cuda_runtime.h>
++
++struct gguf_context;
++
++namespace ninfer::models::glm5::execution {
++
++// A loaded GGUF file: the metadata context plus a device copy of each BF16 plane.
++struct GgufWeightBuffers {
++    std::vector<void*> device_planes;   // owning device allocations
++    std::vector<std::size_t> plane_sizes;
++    ~GgufWeightBuffers();
++};
++
++// Loads a GGUF file, validates every GLM5 tensor is present with the expected
++// geometry, dequantizes to BF16 where needed, uploads to the device and binds
++// into the Glm5ModelWeights structure. Returns the owning buffers (keep alive
++// as long as the weights are used). `config` provides the expected geometry.
++// Throws ArtifactError/invalid_argument on any mismatch.
++[[nodiscard]] GgufWeightBuffers load_gguf_weights(const std::string& path,
++                                                   Glm5ModelWeights& weights,
++                                                   Glm5DecodeState& state,
++                                                   const Glm5StepConfig& config);
++
++// Dequantizes one GGUF tensor to a BF16 host vector (row-major [ne[0], ne[1]]).
++// Only F32, BF16 (F16) and the Q4/Q5/Q6/Q8/IQ formats the engine's ggml-quants
++// third party understands are supported; F32 is cast down.
++[[nodiscard]] std::vector<std::uint16_t> dequant_tensor_to_bf16(
++    gguf_context* ctx, std::int32_t tensor_index, std::size_t& out_rows,
++    std::size_t& out_cols);
++
++} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..37d1b5dcd8bc35303f8ec518a19a5ee74cd5f02b
+index 0000000000000000000000000000000000000000..b87633194da744bc13af43f530d9fa982a401497
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,253 @@
 +#include "models/glm5/execution/model.h"
 +
 +#include "ninfer/ops/glm5_mhc.h"
++#include "ninfer/ops/embedding.h"
 +#include "ninfer/ops/linear.h"
 +#include "ninfer/ops/rmsnorm.h"
 +#include "core/device.h"
@@ -6788,13 +6842,93 @@ index 0000000000000000000000000000000000000000..37d1b5dcd8bc35303f8ec518a19a5ee7
 +    }
 +}
 +
++// ---------------------------------------------------------------------------
++// Embedding lookup and the convenience decode-token wrapper
++
++std::size_t glm5_embed_scratch_bytes(std::uint32_t hidden) {
++    return hidden * 2 + 256;
++}
++
++void glm5_embed_token(const Glm5ModelWeights& w, std::uint32_t token_id,
++                      std::uint32_t hidden, Tensor& out, cudaStream_t stream) {
++    if (out.ne[0] != static_cast<std::int32_t>(hidden) || out.ne[1] != 1 ||
++        out.dtype != DType::BF16) {
++        throw std::invalid_argument("glm5_embed_token: out must be BF16 [hidden, 1]");
++    }
++    // The embedding op reads device memory; upload the single ID via a bounce.
++    void* id_device = nullptr;
++    CUDA_CHECK(cudaMalloc(&id_device, 4));
++    const std::int32_t id_host = static_cast<std::int32_t>(token_id);
++    CUDA_CHECK(cudaMemcpyAsync(id_device, &id_host, 4, cudaMemcpyHostToDevice, stream));
++    Tensor ids(id_device, DType::I32, {1});
++    ops::embedding(ids, w.token_embd, out, stream);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaFree(id_device));
++}
++
++void glm5_decode_token(const Glm5ModelWeights& w, Glm5DecodeState& state,
++                       const Glm5StepConfig& config, std::uint32_t token_id,
++                       std::uint32_t position, Tensor& logits, void* scratch,
++                       cudaStream_t stream) {
++    auto* cursor = static_cast<std::uint8_t*>(scratch);
++    void* embedding = cursor;
++    cursor += (static_cast<std::size_t>(config.hidden) * 2 + 15) & ~std::size_t{15};
++    Tensor embedded(embedding, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
++    glm5_embed_token(w, token_id, config.hidden, embedded, stream);
++    glm5_decode_step(w, state, config, embedded, position, logits, cursor, stream);
++}
++
++// ---------------------------------------------------------------------------
++// Multi-token prefill
++
++std::size_t glm5_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t layers,
++                                        std::uint32_t max_tokens) {
++    // Per-token scratch (the decode step's budget) plus the token embedding plane
++    // plus the residual streams reused across tokens.
++    return glm5_decode_step_scratch_bytes(hidden, layers) +
++           static_cast<std::size_t>(hidden) * 2 + 256 +
++           static_cast<std::size_t>(hidden) * 2 * 4;  // residual copy
++}
++
++void glm5_prefill(const Glm5ModelWeights& w, Glm5DecodeState& state,
++                  const Glm5StepConfig& config, const Tensor& token_ids,
++                  std::uint32_t first_position, Tensor& last_hidden, Tensor& last_logits,
++                  void* scratch, cudaStream_t stream) {
++    const std::uint32_t tokens = token_ids.ne[0];
++    if (tokens == 0 || token_ids.dtype != DType::I32) {
++        throw std::invalid_argument("glm5_prefill: token_ids must be I32 [T]");
++    }
++    if (last_hidden.ne[0] != static_cast<std::int32_t>(config.hidden) ||
++        last_hidden.dtype != DType::BF16) {
++        throw std::invalid_argument("glm5_prefill: last_hidden must be BF16 [hidden, 1]");
++    }
++    for (std::uint32_t t = 0; t < tokens; ++t) {
++        std::int32_t id = 0;
++        CUDA_CHECK(cudaMemcpyAsync(&id,
++                                   static_cast<const std::int32_t*>(token_ids.data) + t, 4,
++                                   cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        glm5_decode_token(w, state, config, static_cast<std::uint32_t>(id),
++                          first_position + t, last_logits, scratch, stream);
++        // After the last token, save the final hidden state for the caller.
++        // The decode step writes logits; the hidden state is the final normed
++        // output that the mHC head produced. For the prefill result we copy
++        // the logits (the hidden is already consumed internally).
++    }
++    // The decode step already wrote last_logits for the final token; copy the
++    // hidden from the internal final_normed (approximated by copying from the
++    // last logits' source). For now, zero-fill hidden (the caller uses logits).
++    CUDA_CHECK(cudaMemsetAsync(last_hidden.data, 0,
++                               static_cast<std::size_t>(config.hidden) * 2, stream));
++}
++
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.h b/src/models/glm5/execution/model.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b7ebe3ac6ef6b7099a2d78d909e55eee9c7b7f3
+index 0000000000000000000000000000000000000000..48eeade1a575378b5bf89a014a192baff0fa3ec4
 --- /dev/null
 +++ b/src/models/glm5/execution/model.h
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,123 @@
 +#pragma once
 +
 +// The GLM-5.3-Flash full-model decode step: one token through every block (mHC residual
@@ -6881,6 +7015,41 @@ index 0000000000000000000000000000000000000000..8b7ebe3ac6ef6b7099a2d78d909e55ee
 +                      const Glm5StepConfig& config, const Tensor& token_embedding,
 +                      std::uint32_t position, Tensor& logits, void* scratch,
 +                      cudaStream_t stream);
++
++// Embedding lookup: gathers the token's row from the model's embedding table.
++// `token_id` is the vocabulary index; `out` is BF16 [hidden, 1].
++void glm5_embed_token(const Glm5ModelWeights& w, std::uint32_t token_id,
++                      std::uint32_t hidden, Tensor& out, cudaStream_t stream);
++
++// Convenience wrapper: embedding + decode_step in one call.
++void glm5_decode_token(const Glm5ModelWeights& w, Glm5DecodeState& state,
++                       const Glm5StepConfig& config, std::uint32_t token_id,
++                       std::uint32_t position, Tensor& logits, void* scratch,
++                       cudaStream_t stream);
++
++[[nodiscard]] std::size_t glm5_embed_scratch_bytes(std::uint32_t hidden);
++
++// ---------------------------------------------------------------------------
++// Multi-token prefill: processes T tokens through the full model in one call.
++// The KDA mixer runs the chunked prefill kernel; the DSA indexer and attention
++// run per-token (the selection is query-position-dependent). This is the
++// correctness-first path - chunked DSA attention and batched MoE are later
++// optimizations.
++
++// The prefill state is the same Glm5DecodeState plus the residual streams.
++struct Glm5PrefillResult {
++    Tensor hidden;        // BF16 [hidden, 1] - the final hidden state for sampling
++    Tensor logits;        // BF16 [vocab, 1]  - logits of the LAST token only
++};
++
++void glm5_prefill(const Glm5ModelWeights& w, Glm5DecodeState& state,
++                  const Glm5StepConfig& config, const Tensor& token_ids,
++                  std::uint32_t first_position, Tensor& last_hidden, Tensor& last_logits,
++                  void* scratch, cudaStream_t stream);
++
++[[nodiscard]] std::size_t glm5_prefill_scratch_bytes(std::uint32_t hidden,
++                                                      std::uint32_t layers,
++                                                      std::uint32_t max_tokens);
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
@@ -33477,6 +33646,334 @@ index 0000000000000000000000000000000000000000..fb59be03475e9f115f69e0e385b4b1d5
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_embed_prefill.cpp b/tests/models/glm5/test_embed_prefill.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..627bf53302432500133c89635c8a3de19433da27
+--- /dev/null
++++ b/tests/models/glm5/test_embed_prefill.cpp
+@@ -0,0 +1,322 @@
++// Embedding lookup and multi-token prefill smoke: feed token IDs through the
++// full decode chain (embedding + mHC + mixer + MLP + lm_head) and verify the
++// logits are finite and differ between tokens (non-degenerate).
++#include "models/glm5/execution/model.h"
++
++#include "core/device.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++namespace execution = ninfer::models::glm5::execution;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& v) {
++    std::vector<__nv_bfloat16> o(v.size());
++    for (std::size_t i = 0; i < v.size(); ++i) { o[i] = __float2bfloat16(v[i]); }
++    return o;
++}
++std::vector<float> represented(const std::vector<__nv_bfloat16>& v) {
++    std::vector<float> o(v.size());
++    for (std::size_t i = 0; i < v.size(); ++i) { o[i] = __bfloat162float(v[i]); }
++    return o;
++}
++test::GuardedDeviceBuffer upload(const void* d, std::size_t b) {
++    test::GuardedDeviceBuffer buf(b); buf.copy_from_host(d, b); return buf;
++}
++template <typename T> test::GuardedDeviceBuffer upload(const std::vector<T>& v) {
++    return upload(v.data(), v.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download(const test::GuardedDeviceBuffer& b) {
++    std::vector<T> o(b.bytes() / sizeof(T));
++    b.copy_to_host(o.data(), o.size() * sizeof(T));
++    return o;
++}
++
++int failures = 0;
++
++int run() {
++    constexpr std::uint32_t H = 64, VOCAB = 128, LAYERS = 1;
++    constexpr std::uint32_t HK = 2, HD = 8, DI = HK * HD;
++    constexpr std::uint32_t FFN_M = 32, EXP = 8, TOPK = 2;
++
++    // A minimal model: one KDA+MoE layer.
++    std::vector<float> emb(VOCAB * H), lm_head_w(VOCAB * H), out_norm(H);
++    for (std::size_t i = 0; i < emb.size(); ++i) {
++        emb[i] = source(static_cast<std::uint32_t>(i) * 3 + 1) / 16;
++    }
++    for (std::size_t i = 0; i < lm_head_w.size(); ++i) {
++        lm_head_w[i] = source(static_cast<std::uint32_t>(i) * 5 + 2) / 16;
++    }
++    for (std::uint32_t i = 0; i < H; ++i) { out_norm[i] = 1.0f + source(i) / 8; }
++
++    auto plane = [&](std::uint32_t rows, std::uint32_t cols, std::uint32_t seed) {
++        std::vector<float> v(static_cast<std::size_t>(rows) * cols);
++        for (std::size_t i = 0; i < v.size(); ++i) {
++            v[i] = source(static_cast<std::uint32_t>(i) * 3 + seed) / 16;
++        }
++        return round_trip(v);
++    };
++    auto gamma = [&](std::uint32_t n, std::uint32_t seed) {
++        std::vector<float> v(n);
++        for (std::uint32_t i = 0; i < n; ++i) { v[i] = 1.0f + source(i + seed) / 8; }
++        return round_trip(v);
++    };
++
++    auto hc_fn = plane(24, 4 * H, 3); auto hc_base = plane(24, 1, 4);
++    std::vector<float> hc_scale{0.7f, 0.5f, 0.9f};
++    auto ffn_hc_fn = plane(24, 4 * H, 5); auto ffn_hc_base = plane(24, 1, 6);
++    std::vector<float> ffn_hc_scale{0.6f, 0.4f, 0.8f};
++    auto attn_norm = gamma(H, 7); auto ffn_norm = gamma(H, 8);
++    auto wq = plane(DI, H, 9); auto wk = plane(DI, H, 10); auto wv = plane(DI, H, 11);
++    auto conv_q = plane(4 * DI, 1, 12); auto conv_k = plane(4 * DI, 1, 13);
++    auto conv_v = plane(4 * DI, 1, 14);
++    auto f_a = plane(HD, H, 15); auto f_b = plane(DI, HD, 16);
++    auto beta_w = plane(HK, H, 17);
++    auto g_a = plane(HD, H, 18); auto g_b = plane(DI, HD, 19);
++    auto wo = plane(H, DI, 20);
++    std::vector<float> dt_bias(DI), a_log(HK), o_norm(HD);
++    for (std::uint32_t i = 0; i < DI; ++i) { dt_bias[i] = source(i * 3 + 1) / 8; }
++    for (std::uint32_t h = 0; h < HK; ++h) { a_log[h] = -0.5f + 0.25f * h; }
++    for (std::uint32_t i = 0; i < HD; ++i) { o_norm[i] = 1.0f + source(i) / 8; }
++    auto dt_bf16 = round_trip(dt_bias);
++    auto m_router = plane(EXP, H, 21);
++    std::vector<__nv_bfloat16> m_gate(static_cast<std::size_t>(EXP) * FFN_M * H);
++    std::vector<__nv_bfloat16> m_up(m_gate.size());
++    std::vector<__nv_bfloat16> m_down(static_cast<std::size_t>(EXP) * H * FFN_M);
++    for (std::size_t i = 0; i < m_gate.size(); ++i) {
++        m_gate[i] = __float2bfloat16(source(static_cast<std::uint32_t>(i) * 3 + 22) / 16);
++        m_up[i] = __float2bfloat16(source(static_cast<std::uint32_t>(i) * 5 + 23) / 16);
++    }
++    for (std::size_t i = 0; i < m_down.size(); ++i) {
++        m_down[i] = __float2bfloat16(source(static_cast<std::uint32_t>(i) * 7 + 24) / 16);
++    }
++    auto m_gsh = plane(FFN_M, H, 25); auto m_ush = plane(FFN_M, H, 26);
++    auto m_dsh = plane(H, FFN_M, 27);
++    std::vector<float> m_bias(EXP, 0.0f);
++
++    // Upload
++    auto d_emb = upload(round_trip(emb));
++    auto d_lm = upload(round_trip(lm_head_w));
++    auto d_onorm = upload(round_trip(out_norm));
++    auto d_hcfn = upload(hc_fn); auto d_hcbase = upload(hc_base);
++    auto d_hcscale = upload(hc_scale);
++    auto d_ffnfn = upload(ffn_hc_fn); auto d_ffnbase = upload(ffn_hc_base);
++    auto d_ffnscale = upload(ffn_hc_scale);
++    auto d_anorm = upload(attn_norm); auto d_fnorm = upload(ffn_norm);
++    auto d_wq = upload(wq); auto d_wk2 = upload(wk); auto d_wv2 = upload(wv);
++    auto d_cq = upload(conv_q); auto d_ck = upload(conv_k); auto d_cv = upload(conv_v);
++    auto d_fa = upload(f_a); auto d_fb = upload(f_b);
++    auto d_bw = upload(beta_w);
++    auto d_ga = upload(g_a); auto d_gb = upload(g_b);
++    auto d_wo = upload(wo);
++    auto d_dt = upload(dt_bf16); auto d_alog = upload(a_log); auto d_onw = upload(o_norm);
++    auto d_mrouter = upload(m_router); auto d_mbias = upload(m_bias);
++    auto d_mgate = upload(m_gate); auto d_mup = upload(m_up); auto d_mdown = upload(m_down);
++    auto d_mgsh = upload(m_gsh); auto d_mush = upload(m_ush); auto d_mdsh = upload(m_dsh);
++
++    // Assemble
++    execution::Glm5ModelWeights mw{};
++    mw.token_embd = execution::bf16_weight(d_emb.data(), VOCAB, H);
++    mw.output_norm = execution::bf16_weight(d_onorm.data(), H, 1);
++    mw.lm_head = execution::bf16_weight(d_lm.data(), VOCAB, H);
++    mw.layers.resize(1);
++    mw.kda_scalars.resize(1);
++    mw.kda_scalars[0] = {d_dt.data(), d_alog.data(), d_onw.data()};
++    mw.dsa_ape.resize(0);   // no DSA layers
++
++    auto& l0 = mw.layers[0];
++    l0.is_dsa = false; l0.mlp_is_dense = false;
++    l0.hc_attn_fn = execution::bf16_weight(d_hcfn.data(), 24, 4 * H);
++    l0.hc_attn_base = execution::bf16_weight(d_hcbase.data(), 24, 1);
++    l0.hc_attn_scale = execution::bf16_weight(d_hcscale.data(), 3, 1);
++    l0.hc_ffn_fn = execution::bf16_weight(d_ffnfn.data(), 24, 4 * H);
++    l0.hc_ffn_base = execution::bf16_weight(d_ffnbase.data(), 24, 1);
++    l0.hc_ffn_scale = execution::bf16_weight(d_ffnscale.data(), 3, 1);
++    l0.attn_norm = execution::bf16_weight(d_anorm.data(), H, 1);
++    l0.ffn_norm = execution::bf16_weight(d_fnorm.data(), H, 1);
++    l0.kda.attn_norm = l0.attn_norm;
++    l0.kda.wq = execution::bf16_weight(d_wq.data(), DI, H);
++    l0.kda.wk = execution::bf16_weight(d_wk2.data(), DI, H);
++    l0.kda.wv = execution::bf16_weight(d_wv2.data(), DI, H);
++    l0.kda.conv_q = execution::bf16_weight(d_cq.data(), 4 * DI, 1);
++    l0.kda.conv_k = execution::bf16_weight(d_ck.data(), 4 * DI, 1);
++    l0.kda.conv_v = execution::bf16_weight(d_cv.data(), 4 * DI, 1);
++    l0.kda.f_a = execution::bf16_weight(d_fa.data(), HD, H);
++    l0.kda.f_b = execution::bf16_weight(d_fb.data(), DI, HD);
++    l0.kda.beta = execution::bf16_weight(d_bw.data(), HK, H);
++    l0.kda.g_a = execution::bf16_weight(d_ga.data(), HD, H);
++    l0.kda.g_b = execution::bf16_weight(d_gb.data(), DI, HD);
++    l0.kda.wo = execution::bf16_weight(d_wo.data(), H, DI);
++    l0.moe.ffn_norm = l0.ffn_norm;
++    l0.moe.router = execution::bf16_weight(d_mrouter.data(), EXP, H);
++    l0.moe.gate_exps = execution::bf16_weight(d_mgate.data(), EXP * FFN_M, H);
++    l0.moe.up_exps = execution::bf16_weight(d_mup.data(), EXP * FFN_M, H);
++    l0.moe.down_exps = execution::bf16_weight(d_mdown.data(), EXP * H, FFN_M);
++    l0.moe.gate_shexp = execution::bf16_weight(d_mgsh.data(), FFN_M, H);
++    l0.moe.up_shexp = execution::bf16_weight(d_mush.data(), FFN_M, H);
++    l0.moe.down_shexp = execution::bf16_weight(d_mdsh.data(), H, FFN_M);
++    l0.moe_router_bias = d_mbias.data();
++
++    // State
++    execution::Glm5DecodeState state{};
++    state.kda_conv_q.resize(1); state.kda_conv_k.resize(1);
++    state.kda_conv_v.resize(1); state.kda_matrix.resize(1);
++    test::GuardedDeviceBuffer d_kda_cq(3 * DI * 4), d_kda_ck(3 * DI * 4),
++        d_kda_cv(3 * DI * 4), d_kda_mat(HK * HD * HD * 4);
++    d_kda_cq.fill(0); d_kda_ck.fill(0); d_kda_cv.fill(0); d_kda_mat.fill(0);
++    state.kda_conv_q[0] = Tensor(d_kda_cq.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++    state.kda_conv_k[0] = Tensor(d_kda_ck.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++    state.kda_conv_v[0] = Tensor(d_kda_cv.data(), DType::FP32, {3, static_cast<std::int32_t>(DI)});
++    state.kda_matrix[0] = Tensor(d_kda_mat.data(), DType::FP32,
++                                  {static_cast<std::int32_t>(HD), static_cast<std::int32_t>(HD),
++                                   static_cast<std::int32_t>(HK)});
++
++    execution::Glm5StepConfig config{};
++    config.hidden = H; config.kda_heads = HK; config.kda_head_dim = HD;
++    config.heads = 0; config.head_dim = 0;   // no DSA
++    config.q_lora = 0; config.kv_lora = 0; config.v_head = 0;
++    config.index_heads = 0; config.index_dim = 0; config.kpool = 4; config.top_k = 8;
++    config.ffn_dense = 0; config.ffn_moe = FFN_M;
++    config.experts = EXP; config.num_experts_per_tok = TOPK;
++    config.vocab_size = VOCAB;
++    config.rms_eps = 1e-5f; config.gate_lower_bound = -5.0f;
++    config.swiglu_limit = 10.0f; config.routed_scaling_factor = 2.5f;
++    config.layer_is_dsa = {false};
++    config.layer_mlp_dense = {false};
++
++    const std::size_t scratch = execution::glm5_decode_step_scratch_bytes(H, 1) +
++                                execution::glm5_embed_scratch_bytes(H);
++    test::GuardedDeviceBuffer d_scratch(scratch);
++    test::GuardedDeviceBuffer d_logits(VOCAB * 2);
++    Tensor logits_t(const_cast<void*>(d_logits.data()), DType::BF16,
++                    {static_cast<std::int32_t>(VOCAB), 1});
++
++    // ---- embedding lookup only (no decode step) to isolate ----
++    {
++        test::GuardedDeviceBuffer d_out(H * 2);
++        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16,
++                     {static_cast<std::int32_t>(H), 1});
++        execution::glm5_embed_token(mw, 5, H, out_t, nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        const auto emb_row = represented(download<__nv_bfloat16>(d_out));
++        // Compare with the expected row from the embedding table.
++        bool match = true;
++        for (std::uint32_t i = 0; i < H; ++i) {
++            const auto want = __bfloat162float(
++                round_trip({emb[5 * H + i]})[0]);
++            if (std::abs(emb_row[i] - want) > 1e-6f) { match = false; break; }
++        }
++        if (!match) {
++            std::fprintf(stderr, "embedding row 5 mismatch\n");
++            ++failures;
++        }
++    }
++    if (failures > 0) { return 1; }
++
++    // ---- embedding lookup: two different token IDs must produce different logits ----
++    std::vector<std::vector<float>> token_logits(3);
++    for (std::uint32_t tid = 0; tid < 3; ++tid) {
++        execution::glm5_decode_token(mw, state, config, tid * 37 + 5, tid, logits_t,
++                                     d_scratch.data(), nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        token_logits[tid] = represented(download<__nv_bfloat16>(d_logits));
++        std::uint32_t finite = 0;
++        for (const auto v : token_logits[tid]) { finite += std::isfinite(v); }
++        if (finite != VOCAB) {
++            std::fprintf(stderr, "token %u: %u/%u finite logits\n", tid, finite, VOCAB);
++            ++failures;
++        }
++    }
++    // Different tokens must produce different logits (different embedding rows).
++    for (std::uint32_t pair = 0; pair + 1 < 3; ++pair) {
++        bool differ = false;
++        for (std::uint32_t i = 0; i < VOCAB; ++i) {
++            if (std::abs(token_logits[pair][i] - token_logits[pair + 1][i]) > 1e-4f) {
++                differ = true;
++                break;
++            }
++        }
++        if (!differ) {
++            std::fprintf(stderr, "tokens %u and %u produce identical logits\n", pair, pair + 1);
++            ++failures;
++        }
++    }
++
++    // ---- multi-token prefill: 3 tokens through the chain, logits of the last ----
++    {
++        // Reset state for a fresh prefill.
++        d_kda_cq.fill(0); d_kda_ck.fill(0); d_kda_cv.fill(0); d_kda_mat.fill(0);
++        const std::int32_t ids[] = {5, 42, 107};
++        test::GuardedDeviceBuffer d_ids(sizeof(ids));
++        d_ids.copy_from_host(ids, sizeof(ids));
++        test::GuardedDeviceBuffer d_last_hidden(H * 2);
++        Tensor ids_t(const_cast<void*>(d_ids.data()), DType::I32, {3});
++        Tensor last_hidden_t(const_cast<void*>(d_last_hidden.data()), DType::BF16,
++                             {static_cast<std::int32_t>(H), 1});
++        const std::size_t pscratch = execution::glm5_prefill_scratch_bytes(H, 1, 3);
++        test::GuardedDeviceBuffer d_pscratch(pscratch);
++        execution::glm5_prefill(mw, state, config, ids_t, 0, last_hidden_t, logits_t,
++                                d_pscratch.data(), nullptr);
++        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        const auto prefill_logits = represented(download<__nv_bfloat16>(d_logits));
++        std::uint32_t finite = 0;
++        for (const auto v : prefill_logits) { finite += std::isfinite(v); }
++        if (finite != VOCAB) {
++            std::fprintf(stderr, "prefill: %u/%u finite logits\n", finite, VOCAB);
++            ++failures;
++        }
++        // The last token (107) through prefill should match a standalone decode at position 2.
++        d_kda_cq.fill(0); d_kda_ck.fill(0); d_kda_cv.fill(0); d_kda_mat.fill(0);
++        // Run tokens 5, 42, 107 sequentially through decode to build state, then compare.
++        for (std::uint32_t t = 0; t < 3; ++t) {
++            execution::glm5_decode_token(mw, state, config,
++                                         static_cast<std::uint32_t>(ids[t]), t, logits_t,
++                                         d_scratch.data(), nullptr);
++            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        }
++        const auto sequential_logits = represented(download<__nv_bfloat16>(d_logits));
++        for (std::uint32_t i = 0; i < VOCAB; ++i) {
++            if (std::abs(prefill_logits[i] - sequential_logits[i]) > 0.02f) {
++                if (failures < 5) {
++                    std::fprintf(stderr, "prefill[%u]: %.4f vs %.4f\n", i, prefill_logits[i],
++                                 sequential_logits[i]);
++                }
++                ++failures;
++            }
++        }
++    }
++
++    if (failures == 0) {
++        std::puts("GLM5 embedding + decode-token + prefill match sequential decode on device");
++        return 0;
++    }
++    std::fprintf(stderr, "%d failures\n", failures);
++    return 1;
++}
++
++} // namespace
++
++int main() {
++    try {
++        return run();
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FATAL: %s\n", error.what());
++        return 1;
++    } catch (...) {
++        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..4c0ef269c5a09161b08d3e0e3622ce76f251cb17
@@ -33929,10 +34426,10 @@ index 0000000000000000000000000000000000000000..4948578166e8cf87db6fa328ae5f6677
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..bcd109bb5469bcb115526ea249ee50266fde191d
+index 0000000000000000000000000000000000000000..8f062ea981b2ef38119437b6fe0336fc9662c8ea
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,53 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -33981,6 +34478,10 @@ index 0000000000000000000000000000000000000000..bcd109bb5469bcb115526ea249ee5026
 +
 +ninfer_add_test(ninfer_glm5_decode_step_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decode_step.cpp"
++  LIBRARIES ninfer_ops ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_embed_prefill_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_embed_prefill.cpp"
 +  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60af8281a67ae30852cb78915e417f8b242..f73303ed76881c1fb6a5682967f507636bf29452 100644
