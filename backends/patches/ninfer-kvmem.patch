@@ -1907,10 +1907,10 @@ index 0000000..a8c48c9
 +} // namespace ninfer::ops
 diff --git a/include/ninfer/ops/glm5_kda.h b/include/ninfer/ops/glm5_kda.h
 new file mode 100644
-index 0000000..fde36e5
+index 0000000..b1c7587
 --- /dev/null
 +++ b/include/ninfer/ops/glm5_kda.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,93 @@
 +#pragma once
 +
 +#include "core/tensor.h"
@@ -1980,6 +1980,25 @@ index 0000000..fde36e5
 + * [H, T], `g2` BF16 [D_inner, T]; `state` FP32 [H, D, D] carries in and out; `out` is BF16
 + * [D_inner, T].
 + */
++/**
++ * The chunked prefill throughput path: the FLA naive chunk algorithm with the
++ * audited GLM-5.3 semantics (per-chunk rebased log-gate cumsum, the decayed
++ * key Gram from DIFFERENCES exp(gsum[i]-gsum[j]) only, exact forward
++ * substitution for (I+L)^-1, beta-of-earlier-token Gram rows, the state
++ * affine update per chunk). Tensor contracts match glm5_kda_prefill exactly;
++ * `tokens` must be a multiple of `chunk` (pad tails with zero rows, which
++ * contribute nothing). One head per block, chunks sequential inside (the
++ * state carries between chunks); the per-chunk work planes live in dynamic
++ * shared memory (production chunk=64 x head_dim=128 needs ~213KB, so the
++ * device must expose >= that much per-block dynamic smem; smaller test
++ * geometries run everywhere). The oracle is
++ * models/glm5/reference/kda_chunk_reference; reduction order is a private
++ * choice, so equality is tolerance-based.
++ */
++void glm5_kda_chunk(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
++                    const Tensor& beta, Tensor& state, Tensor& out, std::uint32_t chunk,
++                    cudaStream_t stream);
++
 +void glm5_kda_prefill(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
 +                      const Tensor& beta, const Tensor& g2, const Tensor& o_norm_w,
 +                      Tensor& state, Tensor& out, cudaStream_t stream);
@@ -2336,6 +2355,37 @@ index 6c48108..f206233 100644
      // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
      std::uint64_t computed_prefill_tokens = 0;
      // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
+diff --git a/scripts/run-wsl-glm5-chunk-test.sh b/scripts/run-wsl-glm5-chunk-test.sh
+new file mode 100644
+index 0000000..3a7165c
+--- /dev/null
++++ b/scripts/run-wsl-glm5-chunk-test.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++# Standalone build+run of the GLM KDA chunk kernel test against the WSL GPU
++# (the host Windows tree needs the vcpkg FFmpeg triplet for a full configure;
++# this path bypasses it for the one kernel). Sources are compiled directly,
++# so it doubles as a fast syntax check. Usage: bash run-wsl-glm5-chunk-test.sh
++set -eu
++NVCC=/usr/local/cuda/bin/nvcc
++SRC=/mnt/c/Users/druid/Documents/Codex/2026-10-24/gaudi2-recovery/ninfer-kvmem/backends/ninfer
++cd "$SRC"
++FLAGS="-std=c++20 -arch=sm_120 -Iinclude -Isrc -Itests"
++"$NVCC" $FLAGS -c tests/ops/test_glm5_kda_chunk.cu -o /tmp/ct_test.o
++"$NVCC" $FLAGS -c src/ops/glm5_kda/glm5_kda.cu -o /tmp/ct_kda.o
++"$NVCC" $FLAGS -c src/core/tensor.cpp -o /tmp/ct_tensor.o
++"$NVCC" $FLAGS -c src/core/device.cu -o /tmp/ct_device.o
++"$NVCC" $FLAGS -c src/core/arena.cu -o /tmp/ct_arena.o
++"$NVCC" $FLAGS -c src/core/dtype.cpp -o /tmp/ct_dtype.o
++"$NVCC" $FLAGS -c src/core/resident_memory.cpp -o /tmp/ct_res.o
++"$NVCC" $FLAGS -c src/core/resident_scan.cu -o /tmp/ct_scan.o
++g++ -std=c++20 -ffp-contract=off -Isrc -c src/models/glm5/reference/kda_reference.cpp -o /tmp/ct_ref.o
++g++ -std=c++20 -ffp-contract=off -Isrc -c src/models/glm5/reference/kda_chunk_reference.cpp -o /tmp/ct_chunk.o
++"$NVCC" /tmp/ct_test.o /tmp/ct_kda.o /tmp/ct_tensor.o /tmp/ct_device.o /tmp/ct_arena.o \
++    /tmp/ct_dtype.o /tmp/ct_res.o /tmp/ct_scan.o /tmp/ct_ref.o /tmp/ct_chunk.o \
++    -o /tmp/ct_run -lcudart
++/tmp/ct_run
++echo "RUN_EXIT=$?"
 diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
 index 291acf0..54529a3 100644
 --- a/src/artifact/binder.cpp
@@ -4178,10 +4228,10 @@ index 0000000..c5c686e
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.h b/src/core/gaudi2/runtime.h
 new file mode 100644
-index 0000000..717ac90
+index 0000000..8a35725
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.h
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,179 @@
 +#pragma once
 +
 +#include <synapse_api.h>
@@ -4208,6 +4258,8 @@ index 0000000..717ac90
 +class RmsNorm; class ClampSwiglu; class KdaGate; class KdaScan;
 +class MhcGates; class MhcCollapse; class MhcPost; class MhcHead;
 +class MoeRoute; class MoeCombine;
++class DsaPool; class DsaScore; class DsaSelect; class DsaAttention;
++class DsaAbsorb; class DsaScale;
 +}
 +
 +namespace detail { struct DeviceState; struct DeviceStorage; struct HostStorage;
@@ -4321,6 +4373,12 @@ index 0000000..717ac90
 +    friend class tpc::MhcHead;
 +    friend class tpc::MoeRoute;
 +    friend class tpc::MoeCombine;
++    friend class tpc::DsaPool;
++    friend class tpc::DsaScore;
++    friend class tpc::DsaSelect;
++    friend class tpc::DsaAttention;
++    friend class tpc::DsaAbsorb;
++    friend class tpc::DsaScale;
 +    // Only the closed Op may bind its validated static geometry. This is not an
 +    // unchecked public tensor/graph execution interface.
 +    [[nodiscard]] Compute launch(Recipe& recipe, std::span<const RecipeBinding> bindings);
@@ -5628,10 +5686,10 @@ index 0000000..d5a31d2
 +}
 diff --git a/src/core/gaudi2/tpc/glm5_tpc.cpp b/src/core/gaudi2/tpc/glm5_tpc.cpp
 new file mode 100644
-index 0000000..725ec7f
+index 0000000..ece5ca1
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glm5_tpc.cpp
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,1033 @@
 +// Host bridges for the GLM-5.3-Flash TPC kernels. Each class builds a
 +// SynapseAI graph with a custom kernel node, compiles it into a Recipe, and
 +// launches through the runtime adapter's Stream. The graph-building pattern
@@ -6331,13 +6389,346 @@ index 0000000..725ec7f
 +    return stream.launch(recipe_, bindings);
 +}
 +
++
++// ---------------------------------------------------------------------------
++// DSA pool
++
++DsaPool::DsaPool(const Device& device, DsaPoolShape shape,
++                 std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.dim || !shape.tokens || !shape.pool_k || shape.pool_k > 16 ||
++        shape.tokens % shape.pool_k) {
++        throw std::invalid_argument("DsaPool: dim/tokens positive, K in [1,16], K | tokens");
++    }
++    const auto pools = shape.tokens / shape.pool_k;
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor ik = create_bf16_tensor(graph, "ik", {shape.dim, shape.tokens}, sections);
++        synTensor ig = create_bf16_tensor(graph, "ig", {shape.dim, shape.tokens}, sections);
++        synTensor ape = create_f32_tensor(graph, "ape", {shape.dim, shape.pool_k}, sections);
++        synTensor pooled = create_f32_tensor(graph, "pooled", {shape.dim, pools}, sections);
++        created = {ik, ig, ape, pooled};
++        struct { std::int32_t pool_k; } params = {static_cast<std::int32_t>(shape.pool_k)};
++        const synTensor inputs[] = {ik, ig, ape};
++        const synTensor outputs[] = {pooled};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 3, 1, &params, sizeof(params),
++                                "glm5_dsa_pool_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaPool node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_pool", max_workspace_bytes);
++        const char* names[] = {"ik", "ig", "ape", "pooled"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaPool::launch(Stream& stream, DeviceBuffer& ik, DeviceBuffer& ig,
++                        DeviceBuffer& ape, DeviceBuffer& pooled) {
++    const auto pools = shape_.tokens / shape_.pool_k;
++    if (ik.size() != static_cast<std::uint64_t>(shape_.dim) * shape_.tokens * 2 ||
++        ig.size() != static_cast<std::uint64_t>(shape_.dim) * shape_.tokens * 2 ||
++        ape.size() != static_cast<std::uint64_t>(shape_.dim) * shape_.pool_k * 4 ||
++        pooled.size() != static_cast<std::uint64_t>(shape_.dim) * pools * 4) {
++        throw std::invalid_argument("DsaPool launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &ik, {shape_.dim, shape_.tokens}},
++        {tensor_ids_[1], &ig, {shape_.dim, shape_.tokens}},
++        {tensor_ids_[2], &ape, {shape_.dim, shape_.pool_k}},
++        {tensor_ids_[3], &pooled, {shape_.dim, pools}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// DSA score
++
++DsaScore::DsaScore(const Device& device, DsaScoreShape shape,
++                   std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.dim || !shape.heads || !shape.pools) {
++        throw std::invalid_argument("DsaScore: dim, heads and pools must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor iq = create_bf16_tensor(graph, "iq", {shape.dim, shape.heads}, sections);
++        synTensor pooled = create_f32_tensor(graph, "pooled", {shape.dim, shape.pools}, sections);
++        synTensor weights = create_f32_tensor(graph, "weights", {shape.heads}, sections);
++        synTensor score = create_f32_tensor(graph, "score", {shape.pools}, sections);
++        created = {iq, pooled, weights, score};
++        const synTensor inputs[] = {iq, pooled, weights};
++        const synTensor outputs[] = {score};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 3, 1, nullptr, 0,
++                                "glm5_dsa_score_f32", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaScore node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_score", max_workspace_bytes);
++        const char* names[] = {"iq", "pooled", "weights", "score"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaScore::launch(Stream& stream, DeviceBuffer& iq, DeviceBuffer& pooled,
++                         DeviceBuffer& weights, DeviceBuffer& score) {
++    if (iq.size() != static_cast<std::uint64_t>(shape_.dim) * shape_.heads * 2 ||
++        pooled.size() != static_cast<std::uint64_t>(shape_.dim) * shape_.pools * 4 ||
++        weights.size() != static_cast<std::uint64_t>(shape_.heads) * 4 ||
++        score.size() != static_cast<std::uint64_t>(shape_.pools) * 4) {
++        throw std::invalid_argument("DsaScore launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &iq, {shape_.dim, shape_.heads}},
++        {tensor_ids_[1], &pooled, {shape_.dim, shape_.pools}},
++        {tensor_ids_[2], &weights, {shape_.heads, 1}},
++        {tensor_ids_[3], &score, {shape_.pools, 1}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// DSA select
++
++DsaSelect::DsaSelect(const Device& device, DsaSelectShape shape, std::uint32_t position,
++                     bool select_tail, std::size_t max_workspace_bytes)
++    : shape_(shape), position_(position), select_tail_(select_tail ? 1 : 0) {
++    if (!shape.pools || !shape.pool_k || !shape.top_pools || !shape.slots ||
++        shape.pools > 512) {
++        throw std::invalid_argument("DsaSelect: positive shape, pools <= 512");
++    }
++    const auto visible = (position + 1) / shape.pool_k;
++    if (visible > shape.pools || shape.top_pools > visible) {
++        throw std::invalid_argument("DsaSelect: top_pools must fit the visible pools");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor score = create_f32_tensor(graph, "score", {shape.pools}, sections);
++        synTensor cells = create_i32_tensor(graph, "cells", {shape.slots}, sections);
++        created = {score, cells};
++        struct { std::int32_t position; std::int32_t pool_k;
++                 std::int32_t top_pools; std::int32_t select_tail; } params;
++        params.position = static_cast<std::int32_t>(position);
++        params.pool_k = static_cast<std::int32_t>(shape.pool_k);
++        params.top_pools = static_cast<std::int32_t>(shape.top_pools);
++        params.select_tail = select_tail_;
++        const synTensor inputs[] = {score};
++        const synTensor outputs[] = {cells};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 1, 1, &params, sizeof(params),
++                                "glm5_dsa_select_f32", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaSelect node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_select", max_workspace_bytes);
++        const char* names[] = {"score", "cells"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaSelect::launch(Stream& stream, DeviceBuffer& score, DeviceBuffer& cells) {
++    if (score.size() != static_cast<std::uint64_t>(shape_.pools) * 4 ||
++        cells.size() != static_cast<std::uint64_t>(shape_.slots) * 4) {
++        throw std::invalid_argument("DsaSelect launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &score, {shape_.pools, 1}},
++        {tensor_ids_[1], &cells, {shape_.slots, 1}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// DSA attention
++
++DsaAttention::DsaAttention(const Device& device, DsaAttentionShape shape, float qk_scale,
++                           std::size_t max_workspace_bytes)
++    : shape_(shape), qk_scale_(qk_scale) {
++    if (!shape.heads || !shape.lora || !shape.v_head || !shape.cache || !shape.slots) {
++        throw std::invalid_argument("DsaAttention: all dimensions must be positive");
++    }
++    if (shape.lora > 1024 || shape.lora % 128) {
++        throw std::invalid_argument("DsaAttention: lora in (0, 1024], multiple of 128");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor q_abs = create_bf16_tensor(graph, "q_abs", {shape.lora, shape.heads}, sections);
++        synTensor latents = create_bf16_tensor(graph, "latents",
++                                               {shape.lora, shape.cache}, sections);
++        synTensor cells = create_i32_tensor(graph, "cells", {shape.slots}, sections);
++        synTensor wv_b = create_bf16_tensor(graph, "wv_b",
++                                            {shape.lora * shape.v_head * shape.heads}, sections);
++        synTensor out = create_bf16_tensor(graph, "out",
++                                           {shape.heads * shape.v_head}, sections);
++        created = {q_abs, latents, cells, wv_b, out};
++        struct { float qk_scale; } params = {qk_scale};
++        const synTensor inputs[] = {q_abs, latents, cells, wv_b};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 4, 1, &params, sizeof(params),
++                                "glm5_dsa_attention_f32", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaAttention node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_attention", max_workspace_bytes);
++        const char* names[] = {"q_abs", "latents", "cells", "wv_b", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaAttention::launch(Stream& stream, DeviceBuffer& q_abs, DeviceBuffer& latents,
++                             DeviceBuffer& cells, DeviceBuffer& wv_b, DeviceBuffer& out) {
++    if (q_abs.size() != static_cast<std::uint64_t>(shape_.lora) * shape_.heads * 2 ||
++        latents.size() != static_cast<std::uint64_t>(shape_.lora) * shape_.cache * 2 ||
++        cells.size() != static_cast<std::uint64_t>(shape_.slots) * 4 ||
++        wv_b.size() != static_cast<std::uint64_t>(shape_.lora) * shape_.v_head * shape_.heads * 2 ||
++        out.size() != static_cast<std::uint64_t>(shape_.heads) * shape_.v_head * 2) {
++        throw std::invalid_argument("DsaAttention launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &q_abs, {shape_.lora, shape_.heads}},
++        {tensor_ids_[1], &latents, {shape_.lora, shape_.cache}},
++        {tensor_ids_[2], &cells, {shape_.slots, 1}},
++        {tensor_ids_[3], &wv_b, {shape_.lora * shape_.v_head * shape_.heads, 1}},
++        {tensor_ids_[4], &out, {shape_.heads * shape_.v_head, 1}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// DSA absorb
++
++DsaAbsorb::DsaAbsorb(const Device& device, DsaAbsorbShape shape,
++                     std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.heads || !shape.nope || !shape.lora) {
++        throw std::invalid_argument("DsaAbsorb: heads, nope and lora must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor q = create_bf16_tensor(graph, "q", {shape.nope, shape.heads}, sections);
++        synTensor wk_b = create_bf16_tensor(graph, "wk_b",
++                                            {shape.nope * shape.lora * shape.heads}, sections);
++        synTensor q_abs = create_f32_tensor(graph, "q_abs", {shape.lora, shape.heads}, sections);
++        created = {q, wk_b, q_abs};
++        const synTensor inputs[] = {q, wk_b};
++        const synTensor outputs[] = {q_abs};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 2, 1, nullptr, 0,
++                                "glm5_dsa_absorb_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaAbsorb node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_absorb", max_workspace_bytes);
++        const char* names[] = {"q", "wk_b", "q_abs"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaAbsorb::launch(Stream& stream, DeviceBuffer& q, DeviceBuffer& wk_b,
++                          DeviceBuffer& q_abs) {
++    if (q.size() != static_cast<std::uint64_t>(shape_.nope) * shape_.heads * 2 ||
++        wk_b.size() != static_cast<std::uint64_t>(shape_.nope) * shape_.lora * shape_.heads * 2 ||
++        q_abs.size() != static_cast<std::uint64_t>(shape_.lora) * shape_.heads * 4) {
++        throw std::invalid_argument("DsaAbsorb launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &q, {shape_.nope, shape_.heads}},
++        {tensor_ids_[1], &wk_b, {shape_.nope * shape_.lora * shape_.heads, 1}},
++        {tensor_ids_[2], &q_abs, {shape_.lora, shape_.heads}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// DSA scale
++
++DsaScale::DsaScale(const Device& device, std::uint32_t width, float factor,
++                   std::size_t max_workspace_bytes)
++    : width_(width), factor_(factor) {
++    if (!width) throw std::invalid_argument("DsaScale: width must be positive");
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor values = create_f32_tensor(graph, "values", {width}, sections);
++        synTensor out = create_f32_tensor(graph, "out", {width}, sections);
++        created = {values, out};
++        struct { float factor; } params = {factor};
++        const synTensor inputs[] = {values};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 1, 1, &params, sizeof(params),
++                                "glm5_dsa_scale_f32", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "DsaScale node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_dsa_scale", max_workspace_bytes);
++        const char* names[] = {"values", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute DsaScale::launch(Stream& stream, DeviceBuffer& values, DeviceBuffer& out) {
++    if (values.size() != static_cast<std::uint64_t>(width_) * 4 ||
++        out.size() != static_cast<std::uint64_t>(width_) * 4) {
++        throw std::invalid_argument("DsaScale launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &values, {width_, 1}},
++        {tensor_ids_[1], &out, {width_, 1}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
 +} // namespace ninfer::gaudi2::tpc
 diff --git a/src/core/gaudi2/tpc/include/glm5_tpc.h b/src/core/gaudi2/tpc/include/glm5_tpc.h
 new file mode 100644
-index 0000000..dd66118
+index 0000000..dbe0cb4
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/include/glm5_tpc.h
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,395 @@
 +#pragma once
 +// GLM-5.3-Flash TPC kernel wrappers: build SynapseAI graphs that compose TPC
 +// custom kernels with the closed Bf16Gemm MME recipe. Each wrapper compiles
@@ -6570,6 +6961,142 @@ index 0000000..dd66118
 +    float routed_scaling_factor_;
 +    Recipe recipe_;
 +    std::array<std::uint64_t, 4> tensor_ids_{};
++};
++
++// ---------------------------------------------------------------------------
++// DSA indexer pooling: pooled[p, e] = Σ_m softmax_m(ig[p*K+m, e] + ape[m, e])
++// * ik[p*K+m, e], the softmax running per key-dim element over the K pool
++// members. ik/ig: BF16 [D, T] (T a multiple of K); ape: FP32 [D, K];
++// pooled: FP32 [D, T/K].
++
++struct DsaPoolShape {
++    std::uint32_t dim;    // D (key-dim width)
++    std::uint32_t tokens; // T = pools * K
++    std::uint32_t pool_k; // K (<= 16)
++};
++
++class DsaPool {
++public:
++    DsaPool(const Device& device, DsaPoolShape shape, std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& ik, DeviceBuffer& ig,
++                                 DeviceBuffer& ape, DeviceBuffer& pooled);
++    [[nodiscard]] DsaPoolShape shape() const noexcept { return shape_; }
++private:
++    DsaPoolShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 4> tensor_ids_{};
++};
++
++// DSA indexer scoring: score[p] = Σ_h relu(iq[h, :] . pooled[p, :]) *
++// weights[h] (weights pre-scaled by 1/sqrt(D*H) by the caller).
++// iq: BF16 [D, H]; pooled: FP32 [D, P]; weights: FP32 [H, 1]; score: FP32 [P, 1].
++
++struct DsaScoreShape {
++    std::uint32_t dim;   // D
++    std::uint32_t heads; // H (index heads)
++    std::uint32_t pools; // P
++};
++
++class DsaScore {
++public:
++    DsaScore(const Device& device, DsaScoreShape shape, std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& iq, DeviceBuffer& pooled,
++                                 DeviceBuffer& weights, DeviceBuffer& score);
++    [[nodiscard]] DsaScoreShape shape() const noexcept { return shape_; }
++private:
++    DsaScoreShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 4> tensor_ids_{};
++};
++
++// DSA pool selection: ranks the visible pools stable-descending (ties by
++// lower index), writes the top_pools runs of K cells plus the optional
++// incomplete tail; unused slots of W = top_pools*K + (K-1) stay -1.
++// score: FP32 [P, 1] (P <= 512); cells: Int32 [W, 1].
++
++struct DsaSelectShape {
++    std::uint32_t pools;     // P
++    std::uint32_t pool_k;    // K
++    std::uint32_t top_pools; // ranked pools emitted as K-cell runs
++    std::uint32_t slots;     // W = top_pools*K + (K-1) fixed width
++};
++
++class DsaSelect {
++public:
++    DsaSelect(const Device& device, DsaSelectShape shape, std::uint32_t position,
++              bool select_tail, std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& score, DeviceBuffer& cells);
++    [[nodiscard]] DsaSelectShape shape() const noexcept { return shape_; }
++private:
++    DsaSelectShape shape_;
++    std::uint32_t position_;
++    std::int32_t select_tail_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 2> tensor_ids_{};
++};
++
++// DSA absorbed sparse attention over one token's selection row (decode).
++// q_abs: BF16 [lora, H]; latents: BF16 [lora, cache]; cells: Int32 [W, 1];
++// wv_b: BF16 [lora*v_head*H, 1] (GGUF {lora, v_head, H} layout);
++// out: BF16 [H*v_head, 1]; qk_scale precomputed (the 256^-0.5 constant).
++
++struct DsaAttentionShape {
++    std::uint32_t heads;   // H
++    std::uint32_t lora;    // kv_lora (<= 1024, 128-multiple register blocks)
++    std::uint32_t v_head;  // value width per head
++    std::uint32_t cache;   // latent cache rows
++    std::uint32_t slots;   // W (selection row width)
++};
++
++class DsaAttention {
++public:
++    DsaAttention(const Device& device, DsaAttentionShape shape, float qk_scale,
++                 std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& q_abs, DeviceBuffer& latents,
++                                 DeviceBuffer& cells, DeviceBuffer& wv_b, DeviceBuffer& out);
++    [[nodiscard]] DsaAttentionShape shape() const noexcept { return shape_; }
++private:
++    DsaAttentionShape shape_;
++    float qk_scale_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 5> tensor_ids_{};
++};
++
++// DSA query absorption: q_abs[h, e] = Σ_d q[h, d] * wk_b[d + nope*e +
++// nope*lora*h]. q: BF16 [nope, H]; wk_b: BF16 [nope*lora*H, 1];
++// q_abs: FP32 [lora, H].
++
++struct DsaAbsorbShape {
++    std::uint32_t heads; // H
++    std::uint32_t nope;  // qk_nope head dim
++    std::uint32_t lora;  // kv_lora rank
++};
++
++class DsaAbsorb {
++public:
++    DsaAbsorb(const Device& device, DsaAbsorbShape shape, std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& q, DeviceBuffer& wk_b,
++                                 DeviceBuffer& q_abs);
++    [[nodiscard】 DsaAbsorbShape shape() const noexcept { return shape_; }
++private:
++    DsaAbsorbShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 3> tensor_ids_{};
++};
++
++// Elementwise FP32 scaling: out = values * factor ([N, 1] planes).
++
++class DsaScale {
++public:
++    DsaScale(const Device& device, std::uint32_t width, float factor,
++             std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& values, DeviceBuffer& out);
++    [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
++private:
++    std::uint32_t width_;
++    float factor_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 2> tensor_ids_{};
 +};
 +
 +// MoE expert combination: out[t,:] = Σ_i weights[t,i] * experts[t,i,:]
@@ -7055,6 +7582,474 @@ index 0000000..43c6e3c
 +            } else {
 +                v_bf16_st_tnsr_partial((int5){i, token}, out, packed, count, 0);
 +            }
++        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c
+new file mode 100644
+index 0000000..34510db
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c
+@@ -0,0 +1,49 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA query absorption TPC-C kernel.
++//
++// q_abs[h, e] = Σ_d q[h, d] * wk_b[d + nope*e + nope*lora*h] in FP32 from
++// the represented BF16 inputs, for one token.
++//
++// Input  q     : BF16 [H, nope] (FCD = nope).
++// Input  wk_b  : BF16 [nope*lora*H, 1] in the GGUF {nope, lora, heads}
++//                layout — for fixed (h, e-block) the d axis is strided per
++//                lane group, so the kernel walks d scalar-wise and loads
++//                contiguous e blocks.
++// Output q_abs : FP32 [H, lora] (FCD = lora).
++//
++// Per (h, 128-lane e-block): the nope-axis loop reads one scalar q[h,d] and
++// one contiguous wk_b e-block per step, MAC-ing with the broadcast scalar —
++// the standard coefficient×lane pattern. Output exits in 64-lane partial
++// stores. Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor q, tensor wk_b, tensor q_abs)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int heads  = get_dim_size(q, 0);
++    const int nope   = get_dim_size(q, 1);
++    const int lora   = get_dim_size(q_abs, 1);
++
++    for (int h = 0; h < heads; ++h) {
++        for (int col = 0; col < lora; col += 128) {
++            const int count = (lora - col < 128) ? lora - col : 128;
++            float128 acc = {0};
++            for (int d = 0; d < nope; ++d) {
++                const float q_hd = s_bf16_ld_g(gen_addr((int5){d, h}, q));
++                const int row = nope * col + nope * lora * h + d;
++                float128 w;
++                if (count == 128) {
++                    w = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){row, 0}, wk_b));
++                } else {
++                    w = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){row, 0}, wk_b, count, 0));
++                }
++                acc.v1 = v_f32_mac_b(w.v1, q_hd, acc.v1);
++                acc.v2 = v_f32_mac_b(w.v2, q_hd, acc.v2);
++            }
++            v_f32_st_tnsr_partial((int5){col, h}, q_abs, acc.v1, count > 64 ? 64 : count, 0);
++            if (count > 64)
++                v_f32_st_tnsr_partial((int5){col + 64, h}, q_abs, acc.v2, count - 64, 0);
++        }
++    }
++    (void)begin; (void)end;
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c
+new file mode 100644
+index 0000000..78902b4
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c
+@@ -0,0 +1,128 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA absorbed sparse attention TPC-C
++// kernel (decode path, one token).
++//
++// score_s = (q_abs[h, :] . latents[cells[s], :]) * qk_scale  (the model's
++// 256^-0.5 constant arrives precomputed as `qk_scale`);
++// softmax EXCLUDES -1 slots; ctx = Σ_s w_s * latents[cells[s], :];
++// out[h, v] = Σ_c wv_b[c + kv_lora*v + kv_lora*v_head*h, :] . ctx.
++//
++// Input  q_abs   : BF16 [H, kv_lora] (FCD = kv_lora).
++// Input  latents : BF16 [cache, kv_lora].
++// Input  cells   : Int32 [W, 1] from the select kernel.
++// Input  wv_b    : BF16 [kv_lora*v_head*H, 1] in the GGUF {lora, v_head, H}
++//                  layout — for fixed (h, v) the c axis is contiguous.
++// Output out     : BF16 [H*v_head, 1].
++// Scalar: qk_scale.
++//
++// Per head: two streaming passes over the selection row (max/sum, then the
++// weighted ctx accumulation — the exp/softmax math stays in broadcast
++// float64; the type model forbids vector->scalar extraction, which this
++// structure never needs). The wv_b contraction is lane-parallel dot
++// products (c blocks in lanes) whose scalar results exit through 1-lane
++// BF16 partial stores.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor q_abs, tensor latents, tensor cells, tensor wv_b, tensor out,
++          float qk_scale)
++{
++    const int5 begin = get_index_space_offset();
++    const int heads  = get_dim_size(q_abs, 0);
++    const int lora   = get_dim_size(q_abs, 1);
++    const int v_head = get_dim_size(out, 0) / heads;
++    const int slots  = get_dim_size(cells, 0);
++
++    for (int h = 0; h < heads; ++h) {
++        // The head's query plane, kept as lora/128 float128 chunks.
++        float128 q[8];
++        for (int col = 0; col < lora; col += 128) {
++            const int count = (lora - col < 128) ? lora - col : 128;
++            if (count == 128) {
++                q[col / 128] = v_convert_bf16_to_f32_all_b(
++                    v_bf16_ld_tnsr_b((int5){col, h}, q_abs));
++            } else {
++                q[col / 128] = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                    (int5){col, h}, q_abs, count, 0));
++            }
++        }
++
++        // Pass 1: max over the valid slots.
++        float64 maximum = as_float64((int64)0xff800000);
++        for (int s = 0; s < slots; ++s) {
++            const int cell = s_i32_ld_g(gen_addr((int5){s, 0}, cells));
++            if (cell >= 0) {
++                float128 acc = {0};
++                for (int col = 0; col < lora; col += 128) {
++                    const float128 x = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_b((int5){col, cell}, latents));
++                    acc.v1 = v_f32_mac_b(x.v1, q[col / 128].v1, acc.v1);
++                    acc.v2 = v_f32_mac_b(x.v2, q[col / 128].v2, acc.v2);
++                }
++                maximum = v_f32_max_b(
++                    v_f32_reduce_add(acc.v1 + acc.v2) * qk_scale, maximum);
++            }
++        }
++
++        // Pass 2: exp-normalized ctx accumulation.
++        float128 ctx[8];
++        for (int c = 0; c < 8; ++c) { ctx[c].v1 = 0; ctx[c].v2 = 0; }
++        float64 denom = 0;
++        for (int s = 0; s < slots; ++s) {
++            const int cell = s_i32_ld_g(gen_addr((int5){s, 0}, cells));
++            if (cell >= 0) {
++                float128 acc = {0};
++                for (int col = 0; col < lora; col += 128) {
++                    const float128 x = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_b((int5){col, cell}, latents));
++                    acc.v1 = v_f32_mac_b(x.v1, q[col / 128].v1, acc.v1);
++                    acc.v2 = v_f32_mac_b(x.v2, q[col / 128].v2, acc.v2);
++                }
++                const float64 w = v_exp_cephes_f32(
++                    v_f32_reduce_add(acc.v1 + acc.v2) * qk_scale - maximum);
++                denom += w;
++                for (int col = 0; col < lora; col += 128) {
++                    const int count = (lora - col < 128) ? lora - col : 128;
++                    float128 x;
++                    if (count == 128) {
++                        x = v_convert_bf16_to_f32_all_b(
++                            v_bf16_ld_tnsr_b((int5){col, cell}, latents));
++                    } else {
++                        x = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                            (int5){col, cell}, latents, count, 0));
++                    }
++                    ctx[col / 128].v1 = v_f32_mac_b(x.v1, w, ctx[col / 128].v1);
++                    ctx[col / 128].v2 = v_f32_mac_b(x.v2, w, ctx[col / 128].v2);
++                }
++            }
++        }
++        const float64 inverse = v_reciprocal_f32(denom + 1.0e-20f);
++        for (int c = 0; c < 8; ++c) {
++            ctx[c].v1 = ctx[c].v1 * inverse;
++            ctx[c].v2 = ctx[c].v2 * inverse;
++        }
++
++        // wv_b contraction: per (h, v) a lane-parallel dot over c blocks.
++        for (int v = 0; v < v_head; ++v) {
++            const int wv_row = lora * v + lora * v_head * h;
++            float128 acc = {0};
++            for (int col = 0; col < lora; col += 128) {
++                const int count = (lora - col < 128) ? lora - col : 128;
++                float128 wv;
++                if (count == 128) {
++                    wv = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col + wv_row, 0}, wv_b));
++                } else {
++                    wv = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){col + wv_row, 0}, wv_b, count, 0));
++                }
++                acc.v1 = v_f32_mac_b(wv.v1, ctx[col / 128].v1, acc.v1);
++                acc.v2 = v_f32_mac_b(wv.v2, ctx[col / 128].v2, acc.v2);
++            }
++            const float64 total = v_f32_reduce_add(acc.v1 + acc.v2);
++            float128 packed;
++            packed.v1 = total;
++            packed.v2 = total;
++            v_bf16_st_tnsr_partial((int5){h * v_head + v, 0}, out,
++                                   v_convert_f32_to_bf16_all_b(packed), 1, 0);
++        }
++    }
++    (void)begin;
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c
+new file mode 100644
+index 0000000..f6979b0
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c
+@@ -0,0 +1,90 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA indexer pooling TPC-C kernel.
++//
++// pooled[p, e] = Σ_m softmax_m(ig[p*K+m, e] + ape[m, e]) * ik[p*K+m, e]
++// with the softmax running SEPARATELY PER KEY-DIM ELEMENT over the K pool
++// members (each output lane e carries its own K-way distribution).
++//
++// Input  ik, ig  : BF16 [T, D] (T a multiple of K; FCD = D).
++// Input  ape     : FP32 [K, D].
++// Output pooled  : FP32 [T/K, D].
++// Scalar: K (the pool size, <= DSA_MAX_POOL_K = 16).
++//
++// Per (pool, 128-lane D-block): logits live in K float64 vectors; pass 1
++// finds the per-lane max, pass 2 exponentiates, normalizes, and MACs the
++// weighted ik. FP32 tensors move in 64-lane halves; the tail block uses
++// partial loads/stores. Numerically stable softmax (max subtraction), FP32
++// accumulation throughout.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor ik, tensor ig, tensor ape, tensor pooled, int pool_k)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(ig, 0);   // D
++    const int pools  = get_dim_size(pooled, 0);
++
++    for (int pool = begin[0]; pool < end[0] && pool < pools; ++pool) {
++        for (int col = begin[1]; col < end[1] && col < width; col += 128) {
++            const int count = (width - col < 128) ? width - col : 128;
++
++            // Pass 1: per-lane max over the K logits (ig + ape). The logits
++            // are recomputed in pass 2 rather than cached in K register
++            // vectors — half the extra bandwidth buys a small register
++            // footprint; revisit if profiling shows the re-read dominating.
++            float64 maximum = as_float64((int64)0xff800000);
++            for (int m = 0; m < pool_k; ++m) {
++                float128 g = {0}, a = {0};
++                if (count == 128) {
++                    g = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, pool * pool_k + m}, ig));
++                    a.v1 = v_f32_ld_tnsr_b((int5){col, m}, ape);
++                    a.v2 = v_f32_ld_tnsr_b((int5){col + 64, m}, ape);
++                } else {
++                    g = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){col, pool * pool_k + m}, ig, count, 0));
++                    a.v1 = v_f32_ld_tnsr_partial_b((int5){col, m}, ape, count > 64 ? 64 : count, 0);
++                    if (count > 64)
++                        a.v2 = v_f32_ld_tnsr_partial_b((int5){col + 64, m}, ape, count - 64, 0);
++                }
++                maximum = v_f32_max_b(g.v1 + a.v1, maximum);
++                if (count > 64) maximum = v_f32_max_b(g.v2 + a.v2, maximum);
++            }
++
++            // Weighted ik over the K members, normalized per lane.
++            float128 wsum = {0};
++            float64 denom = 0;
++            for (int m = 0; m < pool_k; ++m) {
++                float128 g = {0}, a = {0};
++                if (count == 128) {
++                    g = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, pool * pool_k + m}, ig));
++                    a.v1 = v_f32_ld_tnsr_b((int5){col, m}, ape);
++                    a.v2 = v_f32_ld_tnsr_b((int5){col + 64, m}, ape);
++                } else {
++                    g = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){col, pool * pool_k + m}, ig, count, 0));
++                    a.v1 = v_f32_ld_tnsr_partial_b((int5){col, m}, ape, count > 64 ? 64 : count, 0);
++                    if (count > 64)
++                        a.v2 = v_f32_ld_tnsr_partial_b((int5){col + 64, m}, ape, count - 64, 0);
++                }
++                const float128 x = v_convert_bf16_to_f32_all_b(
++                    count == 128
++                        ? v_bf16_ld_tnsr_b((int5){col, pool * pool_k + m}, ik)
++                        : v_bf16_ld_tnsr_partial_b((int5){col, pool * pool_k + m}, ik, count, 0));
++
++                float128 w;
++                w.v1 = v_exp_cephes_f32((g.v1 + a.v1) - maximum);
++                w.v2 = v_exp_cephes_f32((g.v2 + a.v2) - maximum);
++                denom += w.v1;
++                if (count > 64) denom += w.v2;
++                wsum.v1 = v_f32_mac_b(x.v1, w.v1, wsum.v1);
++                wsum.v2 = v_f32_mac_b(x.v2, w.v2, wsum.v2);
++            }
++
++            const float64 inverse = v_reciprocal_f32(denom + 1.0e-20f);
++            const float64 o1 = wsum.v1 * inverse;
++            const float64 o2 = wsum.v2 * inverse;
++            v_f32_st_tnsr_partial((int5){col, pool}, pooled, o1, count > 64 ? 64 : count, 0);
++            if (count > 64)
++                v_f32_st_tnsr_partial((int5){col + 64, pool}, pooled, o2, count - 64, 0);
++        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c
+new file mode 100644
+index 0000000..98db800
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c
+@@ -0,0 +1,27 @@
++// ninfer::gaudi2::tpc — elementwise FP32 scaling, TPC-C for Gaudi2:
++// out = values * factor. FP32 tensors move in 64-lane halves with partial
++// tail handling. Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor values, tensor out, float factor)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(values, 0);
++
++    for (int col = begin[0]; col < end[0] && col < width; col += 128) {
++        const int count = (width - col < 128) ? width - col : 128;
++        const float64 v1 = count > 0
++            ? (count >= 64 ? v_f32_ld_tnsr_b((int5){col, 0}, values)
++                           : v_f32_ld_tnsr_partial_b((int5){col, 0}, values, count, 0))
++            : 0;
++        v_f32_st_tnsr_partial((int5){col, 0}, out, v1 * factor,
++                              count > 64 ? 64 : count, 0);
++        if (count > 64) {
++            const int count2 = count - 64;
++            const float64 v2 = count2 >= 64
++                ? v_f32_ld_tnsr_b((int5){col + 64, 0}, values)
++                : v_f32_ld_tnsr_partial_b((int5){col + 64, 0}, values, count2, 0);
++            v_f32_st_tnsr_partial((int5){col + 64, 0}, out, v2 * factor, count2, 0);
++        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c
+new file mode 100644
+index 0000000..617af23
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c
+@@ -0,0 +1,59 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA indexer scoring TPC-C kernel.
++//
++// score[p] = Σ_h relu(iq[h, :] . pooled[p, :]) * weights[h], where weights
++// are ALREADY scaled by 1/sqrt(D*H) by the caller.
++//
++// Input  iq      : BF16 [H, D] (FCD = D), H = index heads.
++// Input  pooled  : FP32 [P, D].
++// Input  weights : FP32 [H, 1].
++// Output score   : FP32 [P, 1].
++//
++// Per pool: H dot products (128-lane MAC + reduce, FP32 domain), relu, and
++// the weighted sum accumulates in a broadcast float64; the single output
++// element leaves through a 1-lane partial store (the type model has no
++// vector->scalar extraction, but every lane of the broadcast carries the
++// same value).
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor iq, tensor pooled, tensor weights, tensor score)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int heads  = get_dim_size(iq, 0);
++    const int width  = get_dim_size(iq, 1);  // D
++    const int pools  = get_dim_size(pooled, 0);
++
++    for (int pool = begin[0]; pool < end[0] && pool < pools; ++pool) {
++        float64 acc = 0;
++        for (int h = 0; h < heads; ++h) {
++            float128 dot = {0};
++            for (int col = 0; col < width; col += 128) {
++                const int count = (width - col < 128) ? width - col : 128;
++                float128 q;
++                if (count == 128) {
++                    q = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, h}, iq));
++                } else {
++                    q = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_partial_b((int5){col, h}, iq, count, 0));
++                }
++                const float64 p1 = count > 64
++                    ? v_f32_ld_tnsr_b((int5){col, pool}, pooled)
++                    : v_f32_ld_tnsr_partial_b((int5){col, pool}, pooled, count, 0);
++                const float64 p2 = count > 64
++                    ? v_f32_ld_tnsr_b((int5){col + 64, pool}, pooled)
++                    : 0;
++                const int count2 = count > 64 ? count - 64 : 0;
++                dot.v1 = v_f32_mac_b(q.v1, p1, dot.v1);
++                if (count2 > 0)
++                    dot.v2 = v_f32_mac_b(q.v2,
++                        v_f32_ld_tnsr_partial_b((int5){col + 64, pool}, pooled, count2, 0),
++                        dot.v2);
++            }
++            const float64 total = v_f32_reduce_add(dot.v1 + dot.v2);
++            const float64 clamped = v_f32_max_b(total, 0.0f);
++            const float w = s_f32_ld_g(gen_addr((int5){h, 0}, weights));
++            acc = v_f32_mac_b(clamped, w, acc);
++        }
++        v_f32_st_tnsr_partial((int5){pool, 0}, score, acc, 1, 0);
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
+new file mode 100644
+index 0000000..feb66a9
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
+@@ -0,0 +1,79 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA pool selection TPC-C kernel.
++//
++// The visible pools (p visible iff p*K + K-1 <= position, i.e. the first
++// n_vis = (position+1)/K pools) are ranked stable-descending with exact ties
++// broken by lower pool index; the pool at rank r occupies cells
++// [r*K, r*K+K); the incomplete tail (cells n_vis*K .. position, the query
++// included) fills [top_pools*K, ...) in position order when select_tail;
++// every unused slot of the fixed width W = top_pools*K + (K-1) is -1.
++//
++// Input  score  : FP32 [P, 1] (P <= 512).
++// Output cells  : Int32 [W, 1].
++// Scalars: position (the query's global position), pool_k, top_pools,
++//          select_tail (0/1).
++//
++// The top-pools ranking reuses the MoE router's repeated-max machinery:
++// chunks of 64 lanes, vector (key, id) selects, reduce-max winner,
++// reduce-min id on ties, predicated retirement. Cell runs write through
++// `winner*K + lane_id` so one partial store emits a pool's whole K-cell
++// span; the tail and the -1 fill use the same lane trick.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++#define DSA_SELECT_MAX_CHUNKS 8
++
++void main(tensor score, tensor cells, int position, int pool_k,
++          int top_pools, int select_tail)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int pools = get_dim_size(score, 0);
++    const int visible = (position + 1) / pool_k;
++    const int chunks = (visible + 63) / 64;
++    const int64 lanes = (int64)V_LANE_ID_32;
++    const int width = get_dim_size(cells, 0);  // W
++
++    // -1 fill for every cell (the selected runs overwrite theirs).
++    for (int c = begin[0]; c < end[0] && c < width; c += 64) {
++        const int count = (width - c < 64) ? width - c : 64;
++        v_i32_st_tnsr_partial((int5){c, 0}, cells, lanes * 0 - 1, count, 0);
++    }
++
++    // Load the visible scores into chunks and rank them.
++    float64 key[DSA_SELECT_MAX_CHUNKS];
++    bool64 eligible[DSA_SELECT_MAX_CHUNKS];
++    for (int c = 0; c < chunks; ++c) {
++        const int have = visible - c * 64;
++        key[c] = have >= 64
++            ? v_f32_ld_tnsr_b((int5){c * 64, 0}, score)
++            : v_f32_ld_tnsr_partial_b((int5){c * 64, 0}, score, have, 0);
++        eligible[c] = v_i32_cmp_less_b(lanes, (int64)have);
++    }
++
++    for (int rank = 0; rank < top_pools; ++rank) {
++        int64_float64_pair_t local;
++        local.v1 = 2147483647;
++        local.v2 = as_float64((int64)0xff800000);
++        for (int c = chunks - 1; c >= 0; --c) {
++            local = v_i32_sel2_geq_f32_vb(key[c], local.v2, lanes + c * 64, local.v1,
++                                          0, local, eligible[c], 0);
++        }
++        const float64 best = v_f32_reduce_max(local.v2);
++        int64 winner = v_i32_sel_eq_f32_b(local.v2, best, local.v1, 2147483647);
++        winner = v_i32_reduce_min(winner);
++        for (int c = 0; c < chunks; ++c)
++            eligible[c] = eligible[c] & v_i32_cmp_neq_b(lanes + c * 64, winner);
++
++        // The pool's whole K-cell span in one lane-indexed partial store.
++        v_i32_st_tnsr_partial((int5){rank * pool_k, 0}, cells,
++                              winner * pool_k + lanes, pool_k, 0);
++    }
++
++    // The incomplete tail: cells n_vis*K .. position in position order.
++    if (select_tail) {
++        const int tail_len = (position + 1) - visible * pool_k;
++        if (tail_len > 0) {
++            v_i32_st_tnsr_partial((int5){top_pools * pool_k, 0}, cells,
++                                  lanes + visible * pool_k, tail_len, 0);
 +        }
 +    }
 +}
@@ -8248,10 +9243,10 @@ index 0000000..20fab9e
 +}
 diff --git a/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
 new file mode 100644
-index 0000000..ab0049c
+index 0000000..058da1f
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,432 @@
 +// TPC kernel bridge lifecycle tests against the fake_synapse asynchronous test
 +// double. These validate graph construction (tensors, sections, custom kernel
 +// nodes), recipe compilation, launch resource management (DMA leases), and
@@ -8562,6 +9557,106 @@ index 0000000..ab0049c
 +    fake_synapse::assert_clean();
 +}
 +
++void dsa_lifecycle() {
++    constexpr std::uint32_t D = 32, K = 4, POOLS = 6, T = POOLS * K;
++    constexpr std::uint32_t IH = 4, LORA = 128, VH = 16, CACHE = 64, H = 4;
++    constexpr std::uint32_t TOP_POOLS = 3, W = TOP_POOLS * K + (K - 1);
++    constexpr std::uint32_t POSITION = T + 2;  // one tail pool visible
++    constexpr std::uint32_t VISIBLE = (POSITION + 1) / K;
++    {
++        Device device;
++        auto stream = device.create_stream();
++
++        DsaPool pool(device, {D, T, K}, 4096);
++        DsaScore score(device, {D, IH, VISIBLE}, 4096);
++        DsaSelect select(device, {VISIBLE, K, TOP_POOLS, W}, POSITION, true, 4096);
++        DsaAttention attend(device, {H, LORA, VH, CACHE, W}, 0.0625f, 4096);
++        DsaAbsorb absorb(device, {H, D, LORA}, 4096);
++        DsaScale scale(device, LORA, 1.5f, 4096);
++
++        PinnedBuffer h_ik = device.allocate_host(D * T * 2);
++        PinnedBuffer h_ig = device.allocate_host(D * T * 2);
++        PinnedBuffer h_ape = device.allocate_host(D * K * 4);
++        PinnedBuffer h_pooled = device.allocate_host(D * VISIBLE * 4);
++        PinnedBuffer h_iq = device.allocate_host(D * IH * 2);
++        PinnedBuffer h_weights = device.allocate_host(IH * 4);
++        PinnedBuffer h_score = device.allocate_host(VISIBLE * 4);
++        PinnedBuffer h_cells = device.allocate_host(W * 4);
++        PinnedBuffer h_q = device.allocate_host(D * H * 2);
++        PinnedBuffer h_wk = device.allocate_host(D * LORA * H * 2);
++        PinnedBuffer h_qabs = device.allocate_host(LORA * H * 4);
++        PinnedBuffer h_qabs_b = device.allocate_host(LORA * H * 2);
++        PinnedBuffer h_lat = device.allocate_host(LORA * CACHE * 2);
++        PinnedBuffer h_wv = device.allocate_host(LORA * VH * H * 2);
++        PinnedBuffer h_out = device.allocate_host(H * VH * 2);
++        PinnedBuffer h_scaled = device.allocate_host(LORA * 4);
++
++        DeviceBuffer d_ik = device.allocate_device(D * T * 2);
++        DeviceBuffer d_ig = device.allocate_device(D * T * 2);
++        DeviceBuffer d_ape = device.allocate_device(D * K * 4);
++        DeviceBuffer d_pooled = device.allocate_device(D * VISIBLE * 4);
++        DeviceBuffer d_iq = device.allocate_device(D * IH * 2);
++        DeviceBuffer d_weights = device.allocate_device(IH * 4);
++        DeviceBuffer d_score = device.allocate_device(VISIBLE * 4);
++        DeviceBuffer d_cells = device.allocate_device(W * 4);
++        DeviceBuffer d_q = device.allocate_device(D * H * 2);
++        DeviceBuffer d_wk = device.allocate_device(D * LORA * H * 2);
++        DeviceBuffer d_qabs = device.allocate_device(LORA * H * 4);
++        DeviceBuffer d_qabs_b = device.allocate_device(LORA * H * 2);
++        DeviceBuffer d_lat = device.allocate_device(LORA * CACHE * 2);
++        DeviceBuffer d_wv = device.allocate_device(LORA * VH * H * 2);
++        DeviceBuffer d_out = device.allocate_device(H * VH * 2);
++        DeviceBuffer d_scaled = device.allocate_device(LORA * 4);
++
++        auto up1 = stream.upload(d_ik, h_ik, h_ik.size()); up1.wait();
++        auto up2 = stream.upload(d_ig, h_ig, h_ig.size()); up2.wait();
++        auto up3 = stream.upload(d_ape, h_ape, h_ape.size()); up3.wait();
++        auto up4 = stream.upload(d_iq, h_iq, h_iq.size()); up4.wait();
++        auto up5 = stream.upload(d_weights, h_weights, h_weights.size()); up5.wait();
++        auto up6 = stream.upload(d_q, h_q, h_q.size()); up6.wait();
++        auto up7 = stream.upload(d_wk, h_wk, h_wk.size()); up7.wait();
++        auto up8 = stream.upload(d_lat, h_lat, h_lat.size()); up8.wait();
++        auto up9 = stream.upload(d_wv, h_wv, h_wv.size()); up9.wait();
++        auto up10 = stream.upload(d_qabs_b, h_qabs_b, h_qabs_b.size()); up10.wait();
++
++        auto c1 = pool.launch(stream, d_ik, d_ig, d_ape, d_pooled); c1.wait();
++        auto c2 = score.launch(stream, d_iq, d_pooled, d_weights, d_score); c2.wait();
++        auto c3 = select.launch(stream, d_score, d_cells); c3.wait();
++        auto c4 = absorb.launch(stream, d_q, d_wk, d_qabs); c4.wait();
++        auto c5 = scale.launch(stream, d_qabs, d_scaled); c5.wait();
++        auto c6 = attend.launch(stream, d_qabs_b, d_lat, d_cells, d_wv, d_out); c6.wait();
++
++        auto dn1 = stream.download(h_pooled, d_pooled, h_pooled.size()); dn1.wait();
++        auto dn2 = stream.download(h_cells, d_cells, h_cells.size()); dn2.wait();
++        auto dn3 = stream.download(h_qabs, d_qabs, h_qabs.size()); dn3.wait();
++        auto dn4 = stream.download(h_out, d_out, h_out.size()); dn4.wait();
++    }
++    fake_synapse::assert_clean();
++}
++
++void dsa_invalid_shapes_rejected() {
++    {
++        Device device;
++        try {
++            DsaPool p(device, {32, 10, 4}, 4096);  // 10 % 4 != 0
++            throw std::runtime_error("DsaPool non-multiple tokens accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            DsaPool p(device, {32, 8, 20}, 4096);  // K > 16
++            throw std::runtime_error("DsaPool oversized K accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            DsaSelect s(device, {8, 4, 20, 100}, 8, true, 4096);  // top > visible
++            throw std::runtime_error("DsaSelect top above visible accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            DsaAttention a(device, {4, 100, 16, 64, 16}, 0.0625f, 4096);  // lora % 128
++            throw std::runtime_error("DsaAttention non-128 lora accepted");
++        } catch (const std::invalid_argument&) {}
++    }
++    fake_synapse::assert_clean();
++}
++
 +} // namespace
 +
 +int main() {
@@ -8575,7 +9670,9 @@ index 0000000..ab0049c
 +        mhc_invalid_shapes_rejected();
 +        moe_lifecycle();
 +        moe_invalid_shapes_rejected();
-+        std::puts("GLM5 TPC kernel bridges (RMSNorm, clamp SwiGLU, KDA, mHC, MoE) pass lifecycle validation");
++        dsa_lifecycle();
++        dsa_invalid_shapes_rejected();
++        std::puts("GLM5 TPC kernel bridges (RMSNorm, clamp SwiGLU, KDA, mHC, MoE, DSA) pass lifecycle validation");
 +        return 0;
 +    } catch (const std::exception& e) {
 +        std::cerr << e.what() << '\n';
@@ -10377,12 +11474,569 @@ index 0000000..5f67409
 +                      void* scratch, cudaStream_t stream);
 +
 +} // namespace ninfer::models::glm5::execution
+diff --git a/src/models/glm5/execution/gguf_file.cpp b/src/models/glm5/execution/gguf_file.cpp
+new file mode 100644
+index 0000000..b47148c
+--- /dev/null
++++ b/src/models/glm5/execution/gguf_file.cpp
+@@ -0,0 +1,248 @@
++// Minimal standalone GGUF reader — implementation. See gguf_file.h.
++#include "models/glm5/execution/gguf_file.h"
++
++#include <array>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++#include <utility>
++
++namespace ninfer::models::glm5::execution {
++namespace {
++
++// ggml_type codes (ggml.h); only the element types travel through this
++// reader — block quants stay on the device dequant path.
++constexpr std::uint32_t kTypeF32 = 0, kTypeF16 = 1, kTypeI8 = 24, kTypeI16 = 25,
++                         kTypeI32 = 26, kTypeF64 = 28, kTypeBF16 = 30;
++// gguf_metadata_value_type codes.
++constexpr std::uint32_t kMetaU32 = 4, kMetaString = 8, kMetaArray = 9, kMetaU64 = 10;
++
++[[nodiscard]] std::uint64_t element_size(std::uint32_t ggml_type) {
++    switch (ggml_type) {
++    case kTypeF32: return 4;
++    case kTypeF16: return 2;
++    case kTypeI8: return 1;
++    case kTypeI16: return 2;
++    case kTypeI32: return 4;
++    case kTypeF64: return 8;
++    case kTypeBF16: return 2;
++    default:
++        throw std::runtime_error("gguf_file: block-quant tensor needs the device dequant path");
++    }
++}
++
++float decode_f16(std::uint16_t bits) {
++    const std::uint32_t sign = (bits >> 15) & 1u, exponent = (bits >> 10) & 0x1fu,
++                       mantissa = bits & 0x3ffu;
++    if (exponent == 0) return (sign ? -1.0f : 1.0f) * 6.103515625e-05f * (mantissa / 1024.0f);
++    if (exponent == 31) return mantissa ? std::numeric_limits<float>::quiet_NaN()
++                                        : (sign ? -std::numeric_limits<float>::infinity()
++                                                : std::numeric_limits<float>::infinity());
++    const std::uint32_t assembled = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
++    float value;
++    std::memcpy(&value, &assembled, 4);
++    return value;
++}
++
++} // namespace
++
++std::uint16_t round_bf16_bits(float value) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++GgufFile::GgufFile(const std::string& path) : file_(path, std::ios::binary) {
++    if (!file_) throw std::runtime_error("gguf_file: cannot open " + path);
++    parse_header();
++}
++
++void GgufFile::parse_header() {
++    std::array<char, 4> magic{};
++    file_.read(magic.data(), 4);
++    if (!file_ || std::memcmp(magic.data(), "GGUF", 4) != 0) {
++        throw std::runtime_error("gguf_file: bad magic");
++    }
++    std::uint32_t version = 0;
++    file_.read(reinterpret_cast<char*>(&version), 4);
++    if (!file_ || (version != 2 && version != 3)) {
++        throw std::runtime_error("gguf_file: unsupported version");
++    }
++    version_ = version;
++    std::uint64_t tensor_count = 0, kv_count = 0;
++    file_.read(reinterpret_cast<char*>(&tensor_count), 8);
++    file_.read(reinterpret_cast<char*>(&kv_count), 8);
++    if (!file_ || tensor_count > (1ull << 24) || kv_count > (1ull << 20)) {
++        throw std::runtime_error("gguf_file: implausible header counts");
++    }
++    for (std::uint64_t i = 0; i < kv_count; ++i) parse_metadata_entry();
++
++    infos_.resize(static_cast<std::size_t>(tensor_count));
++    for (auto& info : infos_) {
++        info.name = read_string();
++        file_.read(reinterpret_cast<char*>(&info.n_dims), 4);
++        if (!file_ || info.n_dims == 0 || info.n_dims > 4) {
++            throw std::runtime_error("gguf_file: bad dimension count for " + info.name);
++        }
++        for (std::uint32_t d = 0; d < info.n_dims; ++d)
++            file_.read(reinterpret_cast<char*>(&info.ne[d]), 8);
++        file_.read(reinterpret_cast<char*>(&info.ggml_type), 4);
++        file_.read(reinterpret_cast<char*>(&info.offset), 8);
++        if (!file_) throw std::runtime_error("gguf_file: truncated tensor info for " + info.name);
++        for (std::uint32_t d = 0; d < info.n_dims; ++d) {
++            if (info.ne[d] == 0) throw std::runtime_error("gguf_file: zero extent for " + info.name);
++        }
++    }
++    // The data section starts at the next alignment boundary after the directory.
++    const auto position = static_cast<std::uint64_t>(file_.tellg());
++    const std::uint64_t misalignment = position % alignment_;
++    data_start_ = misalignment ? position + (alignment_ - misalignment) : position;
++}
++
++void GgufFile::parse_metadata_entry() {
++    const std::string key = read_string();
++    std::uint32_t type = 0;
++    file_.read(reinterpret_cast<char*>(&type), 4);
++    if (!file_) throw std::runtime_error("gguf_file: truncated metadata entry");
++    const auto skip_scalar = [&](std::uint64_t bytes) { file_.ignore(static_cast<std::streamsize>(bytes)); };
++    switch (type) {
++    case 0: case 1: skip_scalar(1); break;               // u8 / i8
++    case 2: case 3: skip_scalar(2); break;               // u16 / i16
++    case 4: case 5: skip_scalar(4); break;               // u32 / i32
++    case 6: skip_scalar(4); break;                       // f32
++    case 7: skip_scalar(1); break;                       // bool
++    case 8: static_cast<void>(read_string()); break;     // string
++    case 10: case 11: skip_scalar(8); break;             // u64 / i64
++    case 12: skip_scalar(8); break;                      // f64
++    case kMetaArray: {
++        std::uint32_t element_type = 0;
++        std::uint64_t count = 0;
++        file_.read(reinterpret_cast<char*>(&element_type), 4);
++        file_.read(reinterpret_cast<char*>(&count), 8);
++        if (!file_ || count > (1ull << 28)) throw std::runtime_error("gguf_file: bad array size");
++        if (element_type == kMetaString) {
++            for (std::uint64_t i = 0; i < count; ++i) static_cast<void>(read_string());
++        } else if (element_type == kMetaArray) {
++            throw std::runtime_error("gguf_file: nested metadata arrays");
++        } else {
++            std::uint64_t width = 1;
++            if (element_type >= 2 && element_type <= 6) width = element_type == 2 || element_type == 3 ? 2 : 4;
++            else if (element_type >= 10) width = 8;
++            file_.ignore(static_cast<std::streamsize>(count * width));
++        }
++        break;
++    }
++    default:
++        throw std::runtime_error("gguf_file: unknown metadata value type");
++    }
++    if (!file_) throw std::runtime_error("gguf_file: truncated metadata value for " + key);
++    // The alignment key is the only metadata the reader itself needs.
++    if (key == "general.alignment" && type == kMetaU32) {
++        // Re-read: the scalar was skipped above; rewind over it.
++        file_.seekg(-4, std::ios::cur);
++        file_.read(reinterpret_cast<char*>(&alignment_), 4);
++        if (alignment_ == 0 || (alignment_ & (alignment_ - 1)) != 0) {
++            throw std::runtime_error("gguf_file: general.alignment must be a positive power of two");
++        }
++        // data_start_ is computed after the whole directory; the updated
++        // alignment applies from this file's data section onward.
++    }
++}
++
++std::string GgufFile::read_string() {
++    std::uint64_t length = 0;
++    file_.read(reinterpret_cast<char*>(&length), 8);
++    if (!file_ || length > (1ull << 22)) throw std::runtime_error("gguf_file: bad string length");
++    std::string value(static_cast<std::size_t>(length), '\0');
++    if (length) file_.read(value.data(), static_cast<std::streamsize>(length));
++    if (!file_) throw std::runtime_error("gguf_file: truncated string");
++    return value;
++}
++
++const GgufTensorInfo* GgufFile::find(const std::string& name) const {
++    for (const auto& info : infos_)
++        if (info.name == name) return &info;
++    return nullptr;
++}
++
++std::uint64_t GgufFile::tensor_bytes(const GgufTensorInfo& tensor) const {
++    std::uint64_t elements = 1;
++    for (std::uint32_t d = 0; d < tensor.n_dims; ++d) elements *= tensor.ne[d];
++    return elements * element_size(tensor.ggml_type);
++}
++
++void GgufFile::seek_tensor(const GgufTensorInfo& tensor, std::uint64_t bytes) {
++    file_.clear();
++    file_.seekg(static_cast<std::streamoff>(data_start_ + tensor.offset));
++    if (!file_) throw std::runtime_error("gguf_file: seek failed for " + tensor.name);
++    const auto usable = tensor_bytes(tensor);
++    if (bytes > usable) throw std::runtime_error("gguf_file: read past tensor end for " + tensor.name);
++}
++
++std::vector<std::uint16_t> GgufFile::read_bf16(const GgufTensorInfo& tensor) {
++    std::uint64_t elements = 1;
++    for (std::uint32_t d = 0; d < tensor.n_dims; ++d) elements *= tensor.ne[d];
++    std::vector<std::uint16_t> plane(static_cast<std::size_t>(elements));
++    seek_tensor(tensor, tensor_bytes(tensor));
++    switch (tensor.ggml_type) {
++    case kTypeBF16:
++        file_.read(reinterpret_cast<char*>(plane.data()),
++                   static_cast<std::streamsize>(elements * 2));
++        break;
++    case kTypeF32: {
++        std::vector<float> raw(static_cast<std::size_t>(elements));
++        file_.read(reinterpret_cast<char*>(raw.data()),
++                   static_cast<std::streamsize>(elements * 4));
++        for (std::size_t i = 0; i < raw.size(); ++i) plane[i] = round_bf16_bits(raw[i]);
++        break;
++    }
++    case kTypeF16: {
++        std::vector<std::uint16_t> raw(static_cast<std::size_t>(elements));
++        file_.read(reinterpret_cast<char*>(raw.data()),
++                   static_cast<std::streamsize>(elements * 2));
++        for (std::size_t i = 0; i < raw.size(); ++i) plane[i] = round_bf16_bits(decode_f16(raw[i]));
++        break;
++    }
++    case kTypeI8: {
++        std::vector<std::int8_t> raw(static_cast<std::size_t>(elements));
++        file_.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(elements));
++        for (std::size_t i = 0; i < raw.size(); ++i) plane[i] = round_bf16_bits(float(raw[i]));
++        break;
++    }
++    case kTypeI16: {
++        std::vector<std::int16_t> raw(static_cast<std::size_t>(elements));
++        file_.read(reinterpret_cast<char*>(raw.data()),
++                   static_cast<std::streamsize>(elements * 2));
++        for (std::size_t i = 0; i < raw.size(); ++i) plane[i] = round_bf16_bits(float(raw[i]));
++        break;
++    }
++    case kTypeI32: {
++        std::vector<std::int32_t> raw(static_cast<std::size_t>(elements));
++        file_.read(reinterpret_cast<char*>(raw.data()),
++                   static_cast<std::streamsize>(elements * 4));
++        for (std::size_t i = 0; i < raw.size(); ++i) plane[i] = round_bf16_bits(float(raw[i]));
++        break;
++    }
++    default:
++        throw std::runtime_error("gguf_file: unsupported source type for BF16 conversion");
++    }
++    if (!file_) throw std::runtime_error("gguf_file: truncated payload for " + tensor.name);
++    return plane;
++}
++
++std::vector<float> GgufFile::read_f32(const GgufTensorInfo& tensor) {
++    if (tensor.ggml_type != kTypeF32) {
++        throw std::runtime_error("gguf_file: read_f32 requires an F32 tensor");
++    }
++    std::uint64_t elements = 1;
++    for (std::uint32_t d = 0; d < tensor.n_dims; ++d) elements *= tensor.ne[d];
++    std::vector<float> plane(static_cast<std::size_t>(elements));
++    seek_tensor(tensor, elements * 4);
++    file_.read(reinterpret_cast<char*>(plane.data()),
++               static_cast<std::streamsize>(elements * 4));
++    if (!file_) throw std::runtime_error("gguf_file: truncated payload for " + tensor.name);
++    return plane;
++}
++
++} // namespace ninfer::models::glm5::execution
+diff --git a/src/models/glm5/execution/gguf_file.h b/src/models/glm5/execution/gguf_file.h
+new file mode 100644
+index 0000000..ad43ce9
+--- /dev/null
++++ b/src/models/glm5/execution/gguf_file.h
+@@ -0,0 +1,69 @@
++#pragma once
++
++// Minimal standalone GGUF file reader for the GLM-5.3-Flash direct GGUF path
++// (no ggml/llama.cpp dependency): header, metadata keys the loader needs,
++// the tensor directory, and payload reads that convert supported element
++// types to BF16 host planes or raw FP32. Pure host code — no CUDA, no
++// SynapseAI — so it builds and tests everywhere the engine's host tests do.
++//
++// Format reference: ggml's gguf.h (v2/v3). ne[0] is the row width (innermost
++// axis); a [rows, cols] engine plane maps to ne[0] == cols, ne[1] == rows.
++
++#include <cstddef>
++#include <cstdint>
++#include <fstream>
++#include <string>
++#include <vector>
++
++namespace ninfer::models::glm5::execution {
++
++struct GgufTensorInfo {
++    std::string name;
++    std::uint32_t n_dims = 0;
++    std::uint64_t ne[4] = {0, 1, 1, 1};  // GGUF order; ne[0] = row width
++    std::uint32_t ggml_type = 0;
++    std::uint64_t offset = 0;            // relative to the data section
++};
++
++class GgufFile {
++public:
++    // Parses the header, metadata, and tensor directory; validates magic,
++    // version (2|3), and the directory's self-consistency. Throws
++    // std::runtime_error on any structural problem.
++    explicit GgufFile(const std::string& path);
++
++    [[nodiscard]] const GgufTensorInfo* find(const std::string& name) const;
++    [[nodiscard]] const std::vector<GgufTensorInfo>& tensors() const noexcept { return infos_; }
++    [[nodiscard]] std::uint32_t alignment() const noexcept { return alignment_; }
++    [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
++
++    // Bytes one tensor occupies in the file (valid for the element types
++    // element_size supports; throws for block-quant types).
++    [[nodiscard]] std::uint64_t tensor_bytes(const GgufTensorInfo& tensor) const;
++
++    // Reads the tensor payload and converts to a BF16 host plane,
++    // row-major [rows(), cols()] (rows = ne[1], cols = ne[0]). Supported
++    // source types: F32, BF16, F16, I8, I16, I32; block-quant types throw
++    // (the CUDA dequant bridge covers those on the device path).
++    [[nodiscard]] std::vector<std::uint16_t> read_bf16(const GgufTensorInfo& tensor);
++
++    // Reads a raw FP32 plane (F32 tensors only).
++    [[nodiscard]] std::vector<float> read_f32(const GgufTensorInfo& tensor);
++
++private:
++    void parse_header();
++    void parse_metadata_entry();
++    [[nodiscard]] std::string read_string();
++    void seek_tensor(const GgufTensorInfo& tensor, std::uint64_t bytes);
++
++    std::ifstream file_;
++    std::uint64_t version_ = 0;
++    std::uint32_t alignment_ = 32;
++    std::uint64_t data_start_ = 0;
++    std::vector<GgufTensorInfo> infos_;
++};
++
++// Round-to-nearest-even FP32 -> BF16 (the engine's boundary convention).
++[[nodiscard]] std::uint16_t round_bf16_bits(float value);
++
++} // namespace ninfer::models::glm5::execution
+diff --git a/src/models/glm5/execution/gguf_loader.cpp b/src/models/glm5/execution/gguf_loader.cpp
+new file mode 100644
+index 0000000..6d11b70
+--- /dev/null
++++ b/src/models/glm5/execution/gguf_loader.cpp
+@@ -0,0 +1,222 @@
++// GLM-5.3-Flash GGUF loader — implementation. See gguf_loader.h.
++#include "models/glm5/execution/gguf_loader.h"
++
++#include <cuda_runtime.h>
++
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace ninfer::models::glm5::execution {
++namespace {
++
++void cuda_check(cudaError_t error, const char* what) {
++    if (error != cudaSuccess) {
++        throw std::runtime_error(std::string("gguf_loader: ") + what + ": " +
++                                 cudaGetErrorString(error));
++    }
++}
++
++[[nodiscard]] float bf16_to_f32(std::uint16_t bits) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
++    float value;
++    std::memcpy(&value, &wide, 4);
++    return value;
++}
++
++// Binds one GGUF tensor as a BF16 Weight with the expected [rows, cols]
++// geometry (GGUF ne[0] == cols, ne[1] == rows; a vector is [rows, 1] with
++// ne[0] == rows).
++struct Binder {
++    GgufFile& gguf;
++    GgufWeightBuffers& buffers;
++
++    [[nodiscard]] Weight bf16(const std::string& name, std::uint64_t rows, std::uint64_t cols) {
++        const GgufTensorInfo* tensor = gguf.find(name);
++        if (!tensor) throw std::runtime_error("gguf_loader: missing tensor " + name);
++        const bool vector_shape = rows == tensor->ne[0] && cols == 1 && tensor->ne[1] == 1;
++        if (!((tensor->ne[0] == cols && tensor->ne[1] == rows) || vector_shape)) {
++            throw std::runtime_error("gguf_loader: geometry mismatch for " + name);
++        }
++        std::vector<std::uint16_t> plane = gguf.read_bf16(*tensor);
++        void* device = nullptr;
++        cuda_check(cudaMalloc(&device, plane.size() * 2), "cudaMalloc");
++        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 2,
++                              cudaMemcpyHostToDevice), "cudaMemcpy");
++        buffers.device_planes.push_back(device);
++        Weight weight;
++        weight.payload = device;
++        weight.payload_bytes = plane.size() * 2;
++        weight.qtype = QType::BF16;
++        weight.ndim = 2;
++        weight.shape[0] = static_cast<std::int32_t>(rows);
++        weight.shape[1] = static_cast<std::int32_t>(vector_shape ? 1 : cols);
++        return weight;
++    }
++
++    // Binds by the tensor's own stored geometry (higher-rank planes like
++    // wk_b {nope, lora, heads} and the conv taps whose kernel width the
++    // step config does not carry).
++    [[nodiscard]] Weight bf16_raw(const std::string& name) {
++        const GgufTensorInfo* tensor = gguf.find(name);
++        if (!tensor) throw std::runtime_error("gguf_loader: missing tensor " + name);
++        std::vector<std::uint16_t> plane = gguf.read_bf16(*tensor);
++        void* device = nullptr;
++        cuda_check(cudaMalloc(&device, plane.size() * 2), "cudaMalloc");
++        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 2,
++                              cudaMemcpyHostToDevice), "cudaMemcpy");
++        buffers.device_planes.push_back(device);
++        Weight weight;
++        weight.payload = device;
++        weight.payload_bytes = plane.size() * 2;
++        weight.qtype = QType::BF16;
++        weight.ndim = tensor->n_dims;
++        for (std::uint32_t d = 0; d < tensor->n_dims && d < 4; ++d)
++            weight.shape[d] = static_cast<std::int32_t>(tensor->ne[d]);
++        return weight;
++    }
++
++    // FP32 scalar plane on the device (accepts F32 directly or a BF16 source
++    // widened losslessly).
++    [[nodiscard]] const void* f32(const std::string& name, std::uint64_t count) {
++        const GgufTensorInfo* tensor = gguf.find(name);
++        if (!tensor) throw std::runtime_error("gguf_loader: missing tensor " + name);
++        std::vector<float> plane;
++        if (tensor->ggml_type == 0 /*F32*/) {
++            plane = gguf.read_f32(*tensor);
++        } else if (tensor->ggml_type == 30 /*BF16*/) {
++            const auto raw = gguf.read_bf16(*tensor);
++            plane.reserve(raw.size());
++            for (const auto bits : raw) plane.push_back(bf16_to_f32(bits));
++        } else {
++            throw std::runtime_error("gguf_loader: scalar plane " + name + " is not F32/BF16");
++        }
++        if (plane.size() != count) {
++            throw std::runtime_error("gguf_loader: scalar count mismatch for " + name);
++        }
++        void* device = nullptr;
++        cuda_check(cudaMalloc(&device, plane.size() * 4), "cudaMalloc");
++        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 4,
++                              cudaMemcpyHostToDevice), "cudaMemcpy");
++        buffers.device_planes.push_back(device);
++        return device;
++    }
++};
++
++} // namespace
++
++GgufWeightBuffers::~GgufWeightBuffers() {
++    for (void* plane : device_planes) (void)cudaFree(plane);
++}
++
++GgufWeightBuffers load_gguf_weights(const std::string& path, Glm5ModelWeights& weights,
++                                    const Glm5StepConfig& config) {
++    GgufFile gguf(path);
++    GgufWeightBuffers buffers;
++    Binder binder{gguf, buffers};
++
++    const std::uint32_t layers = static_cast<std::uint32_t>(config.layer_is_dsa.size());
++    if (layers == 0 || config.layer_mlp_dense.size() != layers) {
++        throw std::runtime_error("gguf_loader: config layer kinds must be parallel and non-empty");
++    }
++    const std::uint32_t d_inner = config.kda_heads * config.kda_head_dim;
++    const std::uint32_t index_heads = config.index_heads, index_dim = config.index_dim;
++    const std::uint32_t heads = config.heads, nope = config.head_dim;
++    const std::uint32_t q_lora = config.q_lora, kv_lora = config.kv_lora, v_head = config.v_head;
++    const std::uint32_t hidden = config.hidden;
++
++    weights = Glm5ModelWeights{};
++    weights.token_embd = binder.bf16("token_embd.weight", config.vocab_size, hidden);
++    weights.output_norm = binder.bf16("output_norm.weight", hidden, 1);
++    weights.lm_head = binder.bf16("output.weight", config.vocab_size, hidden);
++
++    weights.layers.resize(layers);
++    weights.kda_scalars.reserve(layers);
++    weights.dsa_ape.reserve(layers);
++    for (std::uint32_t layer = 0; layer < layers; ++layer) {
++        const std::string prefix = "blk." + std::to_string(layer) + ".";
++        Glm5Layer& block = weights.layers[layer];
++        block.is_dsa = config.layer_is_dsa[layer];
++        block.mlp_is_dense = config.layer_mlp_dense[layer];
++
++        block.attn_norm = binder.bf16(prefix + "attn_norm.weight", hidden, 1);
++        block.ffn_norm = binder.bf16(prefix + "ffn_norm.weight", hidden, 1);
++        block.hc_attn_fn = binder.bf16(prefix + "hc_attn_fn.weight", 24, 4 * hidden);
++        block.hc_attn_base = binder.bf16(prefix + "hc_attn_base.weight", 24, 1);
++        block.hc_attn_scale = binder.bf16(prefix + "hc_attn_scale.weight", 3, 1);
++        block.hc_ffn_fn = binder.bf16(prefix + "hc_ffn_fn.weight", 24, 4 * hidden);
++        block.hc_ffn_base = binder.bf16(prefix + "hc_ffn_base.weight", 24, 1);
++        block.hc_ffn_scale = binder.bf16(prefix + "hc_ffn_scale.weight", 3, 1);
++
++        if (block.is_dsa) {
++            DsaBlockWeights& dsa = block.dsa;
++            dsa.attn_norm = block.attn_norm;
++            dsa.q_a = binder.bf16(prefix + "wq_a.weight", q_lora, hidden);
++            dsa.q_a_norm = binder.bf16(prefix + "wq_a_norm.weight", q_lora, 1);
++            dsa.q_b = binder.bf16(prefix + "wq_b.weight", heads * nope, q_lora);
++            dsa.kv_a = binder.bf16(prefix + "wkv_a_mqa.weight", kv_lora, hidden);
++            dsa.kv_a_norm = binder.bf16(prefix + "attn_kv_a_norm.weight", kv_lora, 1);
++            dsa.wk_b = binder.bf16_raw(prefix + "wk_b.weight");
++            dsa.wv_b = binder.bf16_raw(prefix + "wv_b.weight");
++            dsa.wo = binder.bf16(prefix + "wo.weight", hidden, heads * v_head);
++            dsa.indexer_q_b = binder.bf16(prefix + "indexer_attn_q_b.weight",
++                                          index_heads * index_dim, q_lora);
++            dsa.indexer_k = binder.bf16(prefix + "indexer_attn_k.weight", index_dim, hidden);
++            dsa.indexer_k_norm_w = binder.bf16(prefix + "indexer_k_norm.weight", index_dim, 1);
++            dsa.indexer_k_norm_b = binder.bf16(prefix + "indexer_k_norm_b.weight", index_dim, 1);
++            dsa.indexer_gate = binder.bf16(prefix + "indexer_kpool_gate.weight", index_dim, hidden);
++            // indexer_head_weights: [index_heads, index_dim] (the scorer's
++            // pre-scaled per-head vector stack).
++            dsa.indexer_proj = binder.bf16(prefix + "indexer_proj.weight", index_heads, index_dim);
++            weights.dsa_ape.push_back(
++                binder.f32(prefix + "indexer_kpool_ape.weight", config.kpool * index_dim));
++        } else {
++            KdaBlockWeights& kda = block.kda;
++            kda.attn_norm = block.attn_norm;
++            kda.wq = binder.bf16(prefix + "wq.weight", d_inner, hidden);
++            kda.wk = binder.bf16(prefix + "wk.weight", d_inner, hidden);
++            kda.wv = binder.bf16(prefix + "wv.weight", d_inner, hidden);
++            kda.conv_q = binder.bf16_raw(prefix + "ssm_conv1d_q.weight");
++            kda.conv_k = binder.bf16_raw(prefix + "ssm_conv1d_k.weight");
++            kda.conv_v = binder.bf16_raw(prefix + "ssm_conv1d_v.weight");
++            kda.f_a = binder.bf16(prefix + "ssm_f_a.weight", config.kda_head_dim, hidden);
++            kda.f_b = binder.bf16(prefix + "ssm_f_b.weight", d_inner, config.kda_head_dim);
++            kda.beta = binder.bf16(prefix + "ssm_beta.weight", d_inner, hidden);
++            kda.g_a = binder.bf16(prefix + "ssm_g_a.weight", config.kda_head_dim, hidden);
++            kda.g_b = binder.bf16(prefix + "ssm_g_b.weight", d_inner, config.kda_head_dim);
++            kda.wo = binder.bf16(prefix + "wo.weight", hidden, d_inner);
++            Glm5ModelWeights::KdaScalars scalars;
++            scalars.dt_bias = binder.f32(prefix + "ssm_dt.weight", d_inner);
++            scalars.a_log = binder.f32(prefix + "ssm_a_noscan.weight", config.kda_heads);
++            scalars.o_norm_w = binder.f32(prefix + "ssm_norm.weight", config.kda_head_dim);
++            weights.kda_scalars.push_back(scalars);
++        }
++
++        if (block.mlp_is_dense) {
++            DenseMlpWeights& dense = block.dense_mlp;
++            dense.ffn_norm = block.ffn_norm;
++            dense.gate = binder.bf16(prefix + "ffn_gate.weight", config.ffn_dense, hidden);
++            dense.up = binder.bf16(prefix + "ffn_up.weight", config.ffn_dense, hidden);
++            dense.down = binder.bf16(prefix + "ffn_down.weight", hidden, config.ffn_dense);
++        } else {
++            MoeBlockWeights& moe = block.moe;
++            moe.ffn_norm = block.ffn_norm;
++            moe.router = binder.bf16(prefix + "ffn_gate_inp.weight", config.experts, hidden);
++            moe.gate_exps = binder.bf16(prefix + "ffn_gate_exps.weight",
++                                        config.experts * config.ffn_moe, hidden);
++            moe.up_exps = binder.bf16(prefix + "ffn_up_exps.weight",
++                                      config.experts * config.ffn_moe, hidden);
++            moe.down_exps = binder.bf16(prefix + "ffn_down_exps.weight",
++                                        config.experts * hidden, config.ffn_moe);
++            moe.gate_shexp = binder.bf16(prefix + "ffn_gate_shexp.weight", config.ffn_moe, hidden);
++            moe.up_shexp = binder.bf16(prefix + "ffn_up_shexp.weight", config.ffn_moe, hidden);
++            moe.down_shexp = binder.bf16(prefix + "ffn_down_shexp.weight", hidden, config.ffn_moe);
++            block.moe_router_bias =
++                binder.f32(prefix + "ffn_exp_probs_b.weight", config.experts);
++        }
++    }
++    return buffers;
++}
++
++} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/gguf_loader.h b/src/models/glm5/execution/gguf_loader.h
 new file mode 100644
-index 0000000..42d76c3
+index 0000000..d8e989e
 --- /dev/null
 +++ b/src/models/glm5/execution/gguf_loader.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,43 @@
 +#pragma once
 +
 +// GLM-5.3-Flash GGUF loader: reads a llama.cpp GGUF file and binds every tensor
@@ -10390,44 +12044,40 @@ index 0000000..42d76c3
 +// is the direct GGUF→GPU path that bypasses the artifact format entirely; the
 +// artifact converter (tools/convert/glm5_tensors.py) covers the same mapping
 +// for the persistent format. The tensor role names are identical.
++//
++// The file reader itself is gguf_file.h (pure host, standalone-testable);
++// this header adds the CUDA upload and weight binding.
 +
++#include "models/glm5/execution/gguf_file.h"
 +#include "models/glm5/execution/model.h"
 +
 +#include <cstddef>
 +#include <cstdint>
 +#include <string>
-+#include <unordered_map>
 +#include <vector>
-+
-+#include <cuda_runtime.h>
-+
-+struct gguf_context;
 +
 +namespace ninfer::models::glm5::execution {
 +
-+// A loaded GGUF file: the metadata context plus a device copy of each BF16 plane.
++// The owning device allocations behind a loaded model (keep alive as long as
++// the weights are used).
 +struct GgufWeightBuffers {
-+    std::vector<void*> device_planes;   // owning device allocations
-+    std::vector<std::size_t> plane_sizes;
++    std::vector<void*> device_planes;
 +    ~GgufWeightBuffers();
++    GgufWeightBuffers() = default;
++    GgufWeightBuffers(const GgufWeightBuffers&) = delete;
++    GgufWeightBuffers& operator=(const GgufWeightBuffers&) = delete;
 +};
 +
 +// Loads a GGUF file, validates every GLM5 tensor is present with the expected
-+// geometry, dequantizes to BF16 where needed, uploads to the device and binds
-+// into the Glm5ModelWeights structure. Returns the owning buffers (keep alive
-+// as long as the weights are used). `config` provides the expected geometry.
-+// Throws ArtifactError/invalid_argument on any mismatch.
++// geometry ([rows, cols] with the GGUF row width ne[0] == cols), converts to
++// BF16 where needed, uploads to the device and binds into Glm5ModelWeights
++// (BF16 planes) plus the FP32 scalar planes (KDA dt_bias/a_log/o_norm, DSA
++// ape, MoE router bias). `config` provides the expected geometry and the
++// per-layer mixer/MLP kinds. Throws std::runtime_error on any mismatch; the
++// state itself stays caller-owned (capacity policy is not the loader's).
 +[[nodiscard]] GgufWeightBuffers load_gguf_weights(const std::string& path,
-+                                                   Glm5ModelWeights& weights,
-+                                                   Glm5DecodeState& state,
-+                                                   const Glm5StepConfig& config);
-+
-+// Dequantizes one GGUF tensor to a BF16 host vector (row-major [ne[0], ne[1]]).
-+// Only F32, BF16 (F16) and the Q4/Q5/Q6/Q8/IQ formats the engine's ggml-quants
-+// third party understands are supported; F32 is cast down.
-+[[nodiscard]] std::vector<std::uint16_t> dequant_tensor_to_bf16(
-+    gguf_context* ctx, std::int32_t tensor_index, std::size_t& out_rows,
-+    std::size_t& out_cols);
++                                                  Glm5ModelWeights& weights,
++                                                  const Glm5StepConfig& config);
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
@@ -10820,14 +12470,16 @@ index 0000000..48eeade
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
 new file mode 100644
-index 0000000..5cfe170
+index 0000000..38d8b60
 --- /dev/null
 +++ b/src/models/glm5/loading_sources.cmake
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,27 @@
 +target_sources(ninfer_model_loading PRIVATE
 +  "${CMAKE_CURRENT_LIST_DIR}/config.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/execution/block.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/execution/model.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/execution/gguf_file.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/execution/gguf_loader.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_reference.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/kda_chunk_reference.cpp"
 +  "${CMAKE_CURRENT_LIST_DIR}/reference/mhc_reference.cpp"
@@ -20918,10 +22570,10 @@ index 0000000..14b1159
 +)
 diff --git a/src/ops/glm5_kda/glm5_kda.cu b/src/ops/glm5_kda/glm5_kda.cu
 new file mode 100644
-index 0000000..762caae
+index 0000000..75044d8
 --- /dev/null
 +++ b/src/ops/glm5_kda/glm5_kda.cu
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,436 @@
 +// ninfer::ops - GLM-5.3-Flash KDA launchers (decode path).
 +#include "ninfer/ops/glm5_kda.h"
 +
@@ -21100,6 +22752,260 @@ index 0000000..762caae
 +        static_cast<const float*>(beta.data), static_cast<const __nv_bfloat16*>(g2.data),
 +        static_cast<const float*>(o_norm_w.data), static_cast<float*>(state.data),
 +        static_cast<__nv_bfloat16*>(out.data), dk, d_inner, heads, tokens);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++namespace {
++
++// The FLA naive chunk algorithm as a CUDA kernel: one head per block, the
++// chunk sequence serial inside the block (the recurrent state carries
++// between chunks). Work planes live in dynamic shared memory:
++//   gsum, q_normed, k_normed, egsum, w_rows (reused as ke), v_fixed  [c][dk]
++//   t_matrix (reused as the Aqk gram)                               [c][c]
++// The decayed grams keep the reference's DIFFERENCES-only exponentials —
++// expf(gsum[i]-gsum[j]) — never the factored e_i/e_j form, which overflows
++// for long chunks. Forward substitution is exact (no Neumann iteration).
++__global__ void glm5_kda_chunk_kernel(const __nv_bfloat16* __restrict__ q,
++                                      const __nv_bfloat16* __restrict__ k,
++                                      const __nv_bfloat16* __restrict__ v,
++                                      const float* __restrict__ gate,
++                                      const float* __restrict__ beta,
++                                      float* __restrict__ state,
++                                      __nv_bfloat16* __restrict__ out,
++                                      int dk, int d_inner, int heads, int tokens, int chunk) {
++    extern __shared__ float smem[];
++    const int head = blockIdx.x;
++    const int lane = threadIdx.x;               // one thread per value-axis d
++    const bool live = lane < dk;
++    const int d = lane;
++    const int base_d = head * dk;
++    const int chunks = tokens / chunk;
++    const float scale = 1.0f / sqrtf(static_cast<float>(dk));
++
++    float* gsum = smem;
++    float* q_normed = gsum + size_t(chunk) * dk;
++    float* k_normed = q_normed + size_t(chunk) * dk;
++    float* egsum = k_normed + size_t(chunk) * dk;
++    float* w_rows = egsum + size_t(chunk) * dk;
++    float* v_fixed = w_rows + size_t(chunk) * dk;
++    float* t_matrix = v_fixed + size_t(chunk) * dk;
++    float* staging = t_matrix + size_t(chunk) * chunk;   // [2]
++
++    for (int ci = 0; ci < chunks; ++ci) {
++        const int row0 = ci * chunk;
++        __syncthreads();
++
++        // Rebased log-gate cumsum (each lane owns one d column) and its
++        // elementwise exponential.
++        if (live) {
++            float running = 0.0f;
++            for (int r = 0; r < chunk; ++r) {
++                running += gate[size_t(row0 + r) * d_inner + base_d + d];
++                gsum[r * dk + d] = running;
++            }
++        }
++        __syncthreads();
++        for (int rd = lane; rd < chunk * dk; rd += blockDim.x)
++            egsum[rd] = expf(gsum[rd]);
++        __syncthreads();
++
++        // q/k L2 norms (eps 1e-6 inside the sqrt), q scaled by dk^-0.5.
++        for (int r = 0; r < chunk; ++r) {
++            float q_sq = 0.0f, k_sq = 0.0f;
++            if (lane == 0) { staging[0] = 0.0f; staging[1] = 0.0f; }
++            __syncthreads();
++            if (live) {
++                const float qv = __bfloat162float(q[size_t(row0 + r) * d_inner + base_d + d]);
++                const float kv = __bfloat162float(k[size_t(row0 + r) * d_inner + base_d + d]);
++                q_sq = qv * qv + 1e-6f;
++                k_sq = kv * kv + 1e-6f;
++            }
++            __syncthreads();
++            // Block reduction over the dk lanes (warp shuffle + smem cross).
++            for (int offset = 16; offset > 0; offset >>= 1) {
++                q_sq += __shfl_down_sync(0xffffffffu, q_sq, offset);
++                k_sq += __shfl_down_sync(0xffffffffu, k_sq, offset);
++            }
++            if (live && (lane % 32) == 0) {
++                atomicAdd(staging, q_sq);
++                atomicAdd(staging + 1, k_sq);
++            }
++            __syncthreads();
++            // Exact sqrt (not rsqrtf's approximation): the norm feeds every
++            // downstream product, and the zero-gate extreme (decay == 1)
++            // accumulates any norm error without attenuation.
++            const float q_inv = 1.0f / sqrtf(staging[0]);
++            const float k_inv = 1.0f / sqrtf(staging[1]);
++            if (live) {
++                const float qv = __bfloat162float(q[size_t(row0 + r) * d_inner + base_d + d]);
++                const float kv = __bfloat162float(k[size_t(row0 + r) * d_inner + base_d + d]);
++                q_normed[r * dk + d] = qv * q_inv * scale;
++                k_normed[r * dk + d] = kv * k_inv;
++            }
++            __syncthreads();  // staging must not be re-zeroed before every lane read it
++        }
++
++        // Decayed key Gram (strict lower; the LATER token's beta), then the
++        // exact forward substitution producing (I+L)^-1 - I.
++        for (int ij = lane; ij < chunk * chunk; ij += blockDim.x) {
++            const int i = ij / chunk, j = ij % chunk;
++            float acc = 0.0f;
++            if (j < i) {
++                const float beta_i = beta[size_t(row0 + i) * heads + head];
++                for (int dd = 0; dd < dk; ++dd)
++                    acc += k_normed[i * dk + dd] * expf(gsum[i * dk + dd] - gsum[j * dk + dd])
++                           * k_normed[j * dk + dd];
++                acc = -beta_i * acc;
++            }
++            t_matrix[ij] = acc;
++        }
++        __syncthreads();
++        for (int i = 1; i < chunk; ++i) {
++            // v_fixed doubles as the substitution scratch here; its real
++            // contents are produced only after this loop.
++            // The reference's exact forward substitution: the whole row of
++            // OLD values participates (m < i, double-buffered through the
++            // scratch), not the textbook m < j restricted form.
++            for (int j = lane; j < i; j += dk) {
++                float acc = 0.0f;
++                for (int m = 0; m < i; ++m)
++                    acc += t_matrix[i * chunk + m] * t_matrix[m * chunk + j];
++                v_fixed[j] = acc;
++            }
++            __syncthreads();
++            for (int j = lane; j < i; j += dk)
++                t_matrix[i * chunk + j] += v_fixed[j];
++            __syncthreads();
++        }
++
++        // w_rows and v_fixed hold (I+T) @ (beta_key . e^gsum k / v); then
++        // v_fixed -= w_rows @ S. The own token's beta is the diagonal.
++        for (int r = 0; r < chunk; ++r) {
++            if (!live) break;
++            const float b_own = beta[size_t(row0 + r) * heads + head];
++            float u_acc = b_own * __bfloat162float(v[size_t(row0 + r) * d_inner + base_d + d]);
++            float w_acc = b_own * k_normed[r * dk + d] * egsum[r * dk + d];
++            for (int col = 0; col < r; ++col) {
++                const float t = t_matrix[r * chunk + col] * beta[size_t(row0 + col) * heads + head];
++                u_acc += t * __bfloat162float(v[size_t(row0 + col) * d_inner + base_d + d]);
++                w_acc += t * k_normed[col * dk + d] * egsum[col * dk + d];
++            }
++            w_rows[r * dk + d] = w_acc;
++            v_fixed[r * dk + d] = u_acc;
++        }
++        __syncthreads();
++        for (int r = 0; r < chunk; ++r) {
++            if (!live) break;
++            float acc = 0.0f;
++            for (int kd = 0; kd < dk; ++kd)
++                acc += w_rows[r * dk + kd] * state[(size_t(head) * dk + kd) * dk + d];
++            v_fixed[r * dk + d] -= acc;
++        }
++        __syncthreads();
++
++        // Aqk (diagonal kept, differences only) into the consumed T plane;
++        // the output rows follow.
++        for (int ij = lane; ij < chunk * chunk; ij += blockDim.x) {
++            const int i = ij / chunk, j = ij % chunk;
++            float gram = 0.0f;
++            if (j <= i)
++                for (int dd = 0; dd < dk; ++dd)
++                    gram += q_normed[i * dk + dd] * expf(gsum[i * dk + dd] - gsum[j * dk + dd])
++                            * k_normed[j * dk + dd];
++            t_matrix[ij] = gram;
++        }
++        __syncthreads();
++        if (live) {
++            for (int r = 0; r < chunk; ++r) {
++                float acc = 0.0f;
++                for (int kd = 0; kd < dk; ++kd)
++                    acc += q_normed[r * dk + kd] * egsum[r * dk + kd]
++                           * state[(size_t(head) * dk + kd) * dk + d];
++                for (int col = 0; col <= r; ++col)
++                    acc += t_matrix[r * chunk + col] * v_fixed[col * dk + d];
++                out[size_t(row0 + r) * d_inner + base_d + d] = __float2bfloat16(acc);
++            }
++        }
++        __syncthreads();
++
++        // State: decay by the chunk's last cumsum, then the rank-chunk
++        // update with decay-shifted keys. w_rows (consumed) becomes ke.
++        if (live) {
++            for (int r = 0; r < chunk; ++r)
++                w_rows[r * dk + d] = k_normed[r * dk + d]
++                    * expf(gsum[(chunk - 1) * dk + d] - gsum[r * dk + d]);
++        }
++        __syncthreads();
++        if (live) {
++            for (int kd = 0; kd < dk; ++kd) {
++                const float decay = egsum[(chunk - 1) * dk + kd];
++                float* s_entry = state + (size_t(head) * dk + kd) * dk + d;
++                float acc = (*s_entry) * decay;
++                for (int r = 0; r < chunk; ++r)
++                    acc += w_rows[r * dk + kd] * v_fixed[r * dk + d];
++                *s_entry = acc;
++            }
++        }
++        __syncthreads();
++    }
++}
++
++} // namespace
++
++void glm5_kda_chunk(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& gate,
++                    const Tensor& beta, Tensor& state, Tensor& out, std::uint32_t chunk,
++                    cudaStream_t stream) {
++    const std::int32_t tokens = dim1(q);
++    const std::int32_t d_inner = dim0(q);
++    const std::int32_t heads = dim0(beta);
++    if (d_inner <= 0 || heads <= 0 || tokens <= 0 || d_inner % heads != 0 ||
++        chunk == 0 || tokens % chunk != 0) {
++        throw std::invalid_argument("glm5_kda_chunk: bad geometry (tokens must be a multiple of chunk)");
++    }
++    const std::int32_t dk = d_inner / heads;
++    if (dk <= 0 || dk > glm5_kda_detail::kDecodeBlock) {
++        throw std::invalid_argument("glm5_kda_chunk: head dim must be <= 256");
++    }
++    if (chunk > 256) {
++        throw std::invalid_argument("glm5_kda_chunk: chunk must be <= 256");
++    }
++    require_shape(q, DType::BF16, {d_inner, tokens}, "glm5_kda_chunk: q");
++    require_shape(k, DType::BF16, {d_inner, tokens}, "glm5_kda_chunk: k");
++    require_shape(v, DType::BF16, {d_inner, tokens}, "glm5_kda_chunk: v");
++    require_shape(gate, DType::FP32, {d_inner, tokens}, "glm5_kda_chunk: gate");
++    require_shape(beta, DType::FP32, {heads, tokens}, "glm5_kda_chunk: beta");
++    require_shape(state, DType::FP32, {dk, dk, heads}, "glm5_kda_chunk: state");
++    require_shape(out, DType::BF16, {d_inner, tokens}, "glm5_kda_chunk: out");
++    require_disjoint(q, out); require_disjoint(k, out); require_disjoint(v, out);
++
++    const size_t smem_floats = size_t(chunk) * (6 * size_t(dk) + chunk) + 2;
++    const size_t smem_bytes = smem_floats * 4;
++    int device = 0;
++    CUDA_CHECK(cudaGetDevice(&device));
++    int max_smem = 0;
++    CUDA_CHECK(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
++    if (smem_bytes > static_cast<size_t>(max_smem)) {
++        throw std::invalid_argument("glm5_kda_chunk: geometry needs "
++                                    + std::to_string(smem_bytes) + " bytes of shared memory, device offers "
++                                    + std::to_string(max_smem));
++    }
++    static size_t configured_bytes = 0;
++    static int configured_device = -1;
++    if (smem_bytes > configured_bytes || device != configured_device) {
++        CUDA_CHECK(cudaFuncSetAttribute(glm5_kda_chunk_kernel,
++                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                        static_cast<int>(smem_bytes)));
++        if (smem_bytes > configured_bytes) configured_bytes = smem_bytes;
++        configured_device = device;
++    }
++    glm5_kda_chunk_kernel<<<static_cast<unsigned int>(heads),
++                            glm5_kda_detail::kDecodeBlock,
++                            smem_bytes, stream>>>(
++        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
++        static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(gate.data),
++        static_cast<const float*>(beta.data), static_cast<float*>(state.data),
++        static_cast<__nv_bfloat16*>(out.data), dk, d_inner, heads, tokens,
++        static_cast<int>(chunk));
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -37740,6 +39646,218 @@ index 0000000..627bf53
 +        return 1;
 +    }
 +}
+diff --git a/tests/models/glm5/test_gguf_file.cpp b/tests/models/glm5/test_gguf_file.cpp
+new file mode 100644
+index 0000000..f6ac8b7
+--- /dev/null
++++ b/tests/models/glm5/test_gguf_file.cpp
+@@ -0,0 +1,206 @@
++// GGUF file reader tests: a tiny in-test writer produces a spec-shaped file
++// (metadata incl. general.alignment, BF16/F32/F16/I8 tensors), then every
++// reader path is checked against the written payload — directory lookup,
++// BF16 conversion from each supported source type (round-to-nearest-even at
++// the FP32->BF16 boundary), raw FP32 planes, alignment math, and the
++// rejection paths (bad magic, unknown tensor, block quants).
++#include "models/glm5/execution/gguf_file.h"
++
++#include <bit>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++using namespace ninfer::models::glm5::execution;
++
++namespace {
++
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++
++void put_u32(std::vector<char>& out, std::uint32_t v) {
++    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
++}
++void put_u64(std::vector<char>& out, std::uint64_t v) {
++    for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
++}
++void put_string(std::vector<char>& out, const std::string& s) {
++    put_u64(out, s.size());
++    out.insert(out.end(), s.begin(), s.end());
++}
++template <typename T>
++void put_raw(std::vector<char>& out, const std::vector<T>& data) {
++    const char* bytes = reinterpret_cast<const char*>(data.data());
++    out.insert(out.end(), bytes, bytes + data.size() * sizeof(T));
++}
++
++std::uint16_t bf16_of(float value) {
++    std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++struct WrittenTensor {
++    std::string name;
++    std::vector<char> payload;
++    std::uint32_t ggml_type;
++    std::uint64_t ne0, ne1;
++};
++
++// One deterministic pass: header + metadata, the directory with computed
++// offsets, then each payload at a 64-byte-aligned data-section offset.
++std::vector<char> build_file(const std::vector<WrittenTensor>& tensors) {
++    std::vector<char> out;
++    out.insert(out.end(), {'G', 'G', 'U', 'F'});
++    put_u32(out, 3);
++    put_u64(out, tensors.size());
++    put_u64(out, 2);                                    // metadata entries
++    put_string(out, "general.alignment"); put_u32(out, 4); put_u32(out, 64);
++    put_string(out, "general.description"); put_u32(out, 8); put_string(out, "sample");
++
++    // Directory first (so the data-section start is known before payloads).
++    std::uint64_t cursor = 0;                           // data-section relative
++    std::vector<std::uint64_t> offsets;
++    for (const auto& tensor : tensors) {
++        const std::uint64_t misaligned = cursor % 64;
++        if (misaligned) cursor += 64 - misaligned;
++        offsets.push_back(cursor);
++        cursor += tensor.payload.size();
++    }
++    for (std::size_t i = 0; i < tensors.size(); ++i) {
++        put_string(out, tensors[i].name);
++        put_u32(out, 2);
++        put_u64(out, tensors[i].ne0);
++        put_u64(out, tensors[i].ne1);
++        put_u32(out, tensors[i].ggml_type);
++        put_u64(out, offsets[i]);
++    }
++    while (out.size() % 64) out.push_back('\0');        // data section start
++    const std::size_t data_start = out.size();
++    for (std::size_t i = 0; i < tensors.size(); ++i) {
++        while (out.size() - data_start < offsets[i]) out.push_back('\0');
++        out.insert(out.end(), tensors[i].payload.begin(), tensors[i].payload.end());
++    }
++    return out;
++}
++
++std::filesystem::path write_temp(const std::vector<char>& bytes, const std::string& name) {
++    const auto path = std::filesystem::temp_directory_path() / name;
++    std::ofstream file(path, std::ios::binary);
++    file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
++    return path;
++}
++
++void roundtrip_test() {
++    const std::vector<float> f32_plane = {1.0f, -2.5f, 0.25f, 3.0f, -0.5f, 7.125f, 100.0f, -100.0f};
++    const std::vector<std::uint16_t> bf16_plane = {0x3f80, 0xc040, 0x3a00, 0x4040,
++                                                   0xbf00, 0x40e4, 0x42c8, 0xc2c8};
++    const std::vector<std::uint16_t> f16_plane = {0x3c00, 0xc000, 0x3800, 0x4800};  // 1, -2, .5, 8
++    const std::vector<std::int8_t> i8_plane = {-1, 0, 3, 127};
++
++    std::vector<WrittenTensor> tensors = {
++        {"token_embd.weight", {}, 0 /*F32*/, 4, 2},   // 8 elements, 32 bytes
++        {"output_norm.weight", {}, 30 /*BF16*/, 4, 2},
++        {"latents.weight", {}, 1 /*F16*/, 4, 1},
++        {"ids.weight", {}, 24 /*I8*/, 4, 1},
++    };
++    {
++        std::vector<char> payload;
++        put_raw(payload, f32_plane);
++        tensors[0].payload = std::move(payload);
++    }
++    {
++        std::vector<char> payload;
++        put_raw(payload, bf16_plane);
++        tensors[1].payload = std::move(payload);
++    }
++    {
++        std::vector<char> payload;
++        put_raw(payload, f16_plane);
++        tensors[2].payload = std::move(payload);
++    }
++    {
++        std::vector<char> payload;
++        put_raw(payload, i8_plane);
++        tensors[3].payload = std::move(payload);
++    }
++
++    const auto path = write_temp(build_file(tensors), "ninfer_gguf_roundtrip.gguf");
++    GgufFile gguf(path.string());
++
++    require(gguf.version() == 3 && gguf.alignment() == 64, "header parsed");
++    require(gguf.tensors().size() == 4, "directory size");
++    const GgufTensorInfo* embd = gguf.find("token_embd.weight");
++    require(embd && embd->ne[0] == 4 && embd->ne[1] == 2 && embd->ggml_type == 0,
++            "tensor directory fields");
++    require(gguf.find("missing.weight") == nullptr, "unknown tensor lookup");
++
++    const auto f32_out = gguf.read_f32(*embd);
++    require(f32_out.size() == 8 && f32_out == f32_plane, "F32 plane roundtrip");
++
++    const auto f32_bf16 = gguf.read_bf16(*embd);
++    require(f32_bf16.size() == 8, "F32->BF16 size");
++    for (std::size_t i = 0; i < f32_plane.size(); ++i)
++        require(f32_bf16[i] == bf16_of(f32_plane[i]), "F32->BF16 round-nearest-even");
++
++    const auto bf16_out = gguf.read_bf16(*gguf.find("output_norm.weight"));
++    require(bf16_out == bf16_plane, "BF16 passthrough");
++
++    const auto f16_bf16 = gguf.read_bf16(*gguf.find("latents.weight"));
++    require(f16_bf16.size() == 4 && f16_bf16[0] == bf16_of(1.0f) &&
++            f16_bf16[1] == bf16_of(-2.0f) && f16_bf16[2] == bf16_of(0.5f) &&
++            f16_bf16[3] == bf16_of(8.0f), "F16->BF16 conversion");
++
++    const auto i8_bf16 = gguf.read_bf16(*gguf.find("ids.weight"));
++    require(i8_bf16.size() == 4 && i8_bf16[0] == bf16_of(-1.0f) &&
++            i8_bf16[1] == bf16_of(0.0f) && i8_bf16[3] == bf16_of(127.0f), "I8->BF16 conversion");
++
++    // The offsets proved correct by construction: every read above landed on
++    // its own payload (mixed sizes would have failed any single comparison).
++    std::filesystem::remove(path);
++}
++
++void rejection_test() {
++    std::vector<char> bad = {'G', 'G', 'U', 'X', 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++    const auto path = write_temp(bad, "ninfer_gguf_bad.gguf");
++    try {
++        GgufFile gguf(path.string());
++        throw std::runtime_error("bad magic accepted");
++    } catch (const std::runtime_error& e) {
++        require(std::strstr(e.what(), "magic") != nullptr, "bad magic message");
++    }
++    std::filesystem::remove(path);
++
++    // A block-quant tensor must route to the device dequant path, not throw
++    // arbitrary garbage here.
++    std::vector<WrittenTensor> quant = {{"q.weight", {}, 2 /*Q4_0*/, 32, 1}};
++    quant[0].payload.assign(18, '\x55');
++    const auto qpath = write_temp(build_file(quant), "ninfer_gguf_quant.gguf");
++    GgufFile gguf(qpath.string());
++    const GgufTensorInfo* q = gguf.find("q.weight");
++    require(q != nullptr, "quant tensor in directory");
++    try {
++        static_cast<void>(gguf.read_bf16(*q));
++        throw std::runtime_error("block quant accepted by host reader");
++    } catch (const std::runtime_error& e) {
++        require(std::strstr(e.what(), "unsupported source type") != nullptr, "quant rejection");
++    }
++    std::filesystem::remove(qpath);
++}
++
++} // namespace
++
++int main() {
++    try {
++        roundtrip_test();
++        rejection_test();
++        std::puts("glm5 gguf_file reader passes roundtrip and rejection validation");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what());
++        return 1;
++    }
++}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
 index 0000000..4c0ef26
@@ -38192,10 +40310,10 @@ index 0000000..4948578
 +}
 diff --git a/tests/models/glm5/tests.cmake b/tests/models/glm5/tests.cmake
 new file mode 100644
-index 0000000..8f062ea
+index 0000000..e29da7d
 --- /dev/null
 +++ b/tests/models/glm5/tests.cmake
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,61 @@
 +ninfer_add_test(ninfer_glm5_config_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
 +  NEEDS_SOURCE_DIR
@@ -38248,6 +40366,14 @@ index 0000000..8f062ea
 +
 +ninfer_add_test(ninfer_glm5_embed_prefill_test
 +  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_embed_prefill.cpp"
++  LIBRARIES ninfer_ops ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_gguf_file_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_file.cpp"
++  LIBRARIES ninfer_model_loading)
++
++ninfer_add_test(ninfer_glm5_kda_chunk_kernel_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../ops/test_glm5_kda_chunk.cu"
 +  LIBRARIES ninfer_ops ninfer_model_loading)
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
 index d439f60..f73303e 100644
@@ -40093,6 +42219,180 @@ index 0000000..04c022e
 +        return 1;
 +    } catch (...) {
 +        std::fprintf(stderr, "FATAL: unknown exception\n");
++        return 1;
++    }
++}
+diff --git a/tests/ops/test_glm5_kda_chunk.cu b/tests/ops/test_glm5_kda_chunk.cu
+new file mode 100644
+index 0000000..7fc0af7
+--- /dev/null
++++ b/tests/ops/test_glm5_kda_chunk.cu
+@@ -0,0 +1,168 @@
++// GLM-5.3-Flash KDA chunked prefill kernel against the host chunk reference
++// (models/glm5/reference/kda_chunk_reference), on the real device. Two
++// geometries: a small one pinning the algorithm shape and a wider one with
++// multiple chunks to exercise the serial state carry between chunks. The
++// reference chain (chunk reference == token-recurrent reference) was verified
++// separately; this test pins kernel == chunk reference.
++#include "ninfer/ops/glm5_kda.h"
++#include "models/glm5/reference/kda_chunk_reference.h"
++
++#include "core/device.h"
++#include "ops/op_tester.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <exception>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++namespace {
++
++using namespace ninfer;
++using namespace ninfer::ops;
++namespace Reference = ninfer::models::glm5::reference;
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 19u) - 9) / 8.0f;
++}
++
++std::vector<__nv_bfloat16> round_trip(const std::vector<float>& values) {
++    std::vector<__nv_bfloat16> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) out[i] = __float2bfloat16(values[i]);
++    return out;
++}
++
++std::vector<float> represented(const std::vector<__nv_bfloat16>& values) {
++    std::vector<float> out(values.size());
++    for (std::size_t i = 0; i < values.size(); ++i) out[i] = __bfloat162float(values[i]);
++    return out;
++}
++
++int failures = 0;
++
++// Upload/download helpers over the guarded buffer's byte-level API.
++test::GuardedDeviceBuffer upload_bytes(const void* data, std::size_t bytes) {
++    test::GuardedDeviceBuffer buffer(bytes);
++    buffer.copy_from_host(data, bytes);
++    return buffer;
++}
++template <typename T> test::GuardedDeviceBuffer upload_bytes(const std::vector<T>& values) {
++    return upload_bytes(values.data(), values.size() * sizeof(T));
++}
++template <typename T> std::vector<T> download_bytes(const test::GuardedDeviceBuffer& buffer) {
++    std::vector<T> out(buffer.bytes() / sizeof(T));
++    buffer.copy_to_host(out.data(), out.size() * sizeof(T));
++    return out;
++}
++std::vector<float> download_bf16(const test::GuardedDeviceBuffer& buffer) {
++    return represented(download_bytes<__nv_bfloat16>(buffer));
++}
++
++void check_close(const std::string& what, const std::vector<float>& got,
++                 const std::vector<float>& want, float tolerance) {
++    if (got.size() != want.size()) {
++        std::printf("FAIL %s: size %zu vs %zu\n", what.c_str(), got.size(), want.size());
++        ++failures;
++        return;
++    }
++    double worst = 0.0;
++    for (std::size_t i = 0; i < want.size(); ++i) {
++        const double error = std::abs(static_cast<double>(got[i]) - want[i]);
++        const double bound = tolerance * std::max(1.0, std::abs(static_cast<double>(want[i])));
++        if (error > worst) worst = error / std::max(1.0, std::abs(static_cast<double>(want[i])));
++        if (error > bound) {
++            std::printf("FAIL %s [%zu]: got %.6f want %.6f\n", what.c_str(), i, got[i], want[i]);
++            ++failures;
++            return;
++        }
++    }
++    std::printf("ok %s (worst relative %.2e)\n", what.c_str(), worst);
++}
++
++void chunk_case(const std::string& label, std::uint32_t heads, std::uint32_t dk,
++                std::uint32_t chunk, std::uint32_t tokens, bool zero_gate = false) {
++    const std::uint32_t d_inner = heads * dk;
++    const Reference::KdaProfile profile{heads, dk, 4, -5.0f};
++
++    std::vector<float> q(d_inner * tokens), k(d_inner * tokens), v(d_inner * tokens),
++        gate(d_inner * tokens), beta(heads * tokens);
++    for (std::uint32_t i = 0; i < d_inner * tokens; ++i) {
++        q[i] = source(i * 7 + 1);
++        k[i] = source(i * 5 + 3);
++        v[i] = source(i * 3 + 7);
++        // The zero-gate extreme (decay == 1, no attenuation) is the case
++        // where any substitution/norm error accumulates unbounded.
++        gate[i] = zero_gate ? 0.0f
++            : -1.0f - 6.0f * ((i * 2654435761u) % 1000u) / 1000.0f;  // log space
++    }
++    for (std::uint32_t i = 0; i < heads * tokens; ++i)
++        beta[i] = 0.25f + 0.5f * ((i * 40503u) % 1000u) / 1000.0f;
++
++    std::vector<float> state(Reference::kda_state_values(profile));
++    for (std::size_t i = 0; i < state.size(); ++i) state[i] = source(static_cast<std::uint32_t>(i));
++
++    // Host reference on the represented BF16 values (the kernel's inputs).
++    const auto q_bf = round_trip(q), k_bf = round_trip(k), v_bf = round_trip(v);
++    const auto q_rep = represented(q_bf), k_rep = represented(k_bf), v_rep = represented(v_bf);
++    const std::vector<float> state_initial = state;
++    std::vector<float> out_want(q_rep.size());
++    std::vector<float> scratch(Reference::kda_chunk_scratch_values(profile, tokens, chunk));
++    Reference::kda_chunk_reference(q_rep, k_rep, v_rep, gate, beta, state, out_want,
++                                   scratch, profile, chunk);
++
++    // Device run.
++    const auto q_dev = round_trip(q_rep), k_dev = round_trip(k_rep), v_dev = round_trip(v_rep);
++    test::GuardedDeviceBuffer d_q = upload_bytes(q_dev), d_k = upload_bytes(k_dev),
++        d_v = upload_bytes(v_dev), d_gate = upload_bytes(gate), d_beta = upload_bytes(beta),
++        d_state = upload_bytes(state_initial);
++    test::GuardedDeviceBuffer d_out(q_dev.size() * sizeof(__nv_bfloat16));
++
++    const Tensor tq{d_q.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++                                            static_cast<std::int32_t>(tokens)}};
++    const Tensor tk{d_k.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++                                            static_cast<std::int32_t>(tokens)}};
++    const Tensor tv{d_v.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++                                            static_cast<std::int32_t>(tokens)}};
++    const Tensor tgate{d_gate.data(), DType::FP32, {static_cast<std::int32_t>(d_inner),
++                                                  static_cast<std::int32_t>(tokens)}};
++    const Tensor tbeta{d_beta.data(), DType::FP32, {static_cast<std::int32_t>(heads),
++                                                  static_cast<std::int32_t>(tokens)}};
++    Tensor tstate{d_state.data(), DType::FP32, {static_cast<std::int32_t>(dk),
++                                              static_cast<std::int32_t>(dk),
++                                              static_cast<std::int32_t>(heads)}};
++    Tensor tout{d_out.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++                                          static_cast<std::int32_t>(tokens)}};
++
++    {   // Upload self-check: what comes back from d_q before the kernel?
++        const auto echoed = download_bytes<__nv_bfloat16>(d_q);
++    }
++    glm5_kda_chunk(tq, tk, tv, tgate, tbeta, tstate, tout, chunk, 0);
++    CUDA_CHECK(cudaStreamSynchronize(0));
++
++    check_close(label + ".out", download_bf16(d_out), out_want, 5e-3f);
++    check_close(label + ".state", download_bytes<float>(d_state), state, 5e-3f);
++}
++
++} // namespace
++
++int main() {
++    try {
++        chunk_case("zerogate 2x16 c8 t24", 2, 16, 8, 24, true);
++        chunk_case("small 2x16 c8 t24", 2, 16, 8, 24);
++        chunk_case("wide 4x64 c32 t96", 4, 64, 32, 96);
++        if (failures == 0) {
++            std::puts("glm5 kda chunk kernel matches the host chunk reference");
++            return 0;
++        }
++        std::printf("%d failures\n", failures);
++        return 1;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what());
 +        return 1;
 +    }
 +}
