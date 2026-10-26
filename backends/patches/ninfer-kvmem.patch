@@ -4178,10 +4178,10 @@ index 0000000..c5c686e
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.h b/src/core/gaudi2/runtime.h
 new file mode 100644
-index 0000000..5d16d41
+index 0000000..717ac90
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.h
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,171 @@
 +#pragma once
 +
 +#include <synapse_api.h>
@@ -4206,6 +4206,8 @@ index 0000000..5d16d41
 +
 +namespace tpc {
 +class RmsNorm; class ClampSwiglu; class KdaGate; class KdaScan;
++class MhcGates; class MhcCollapse; class MhcPost; class MhcHead;
++class MoeRoute; class MoeCombine;
 +}
 +
 +namespace detail { struct DeviceState; struct DeviceStorage; struct HostStorage;
@@ -4313,6 +4315,12 @@ index 0000000..5d16d41
 +    friend class tpc::ClampSwiglu;
 +    friend class tpc::KdaGate;
 +    friend class tpc::KdaScan;
++    friend class tpc::MhcGates;
++    friend class tpc::MhcCollapse;
++    friend class tpc::MhcPost;
++    friend class tpc::MhcHead;
++    friend class tpc::MoeRoute;
++    friend class tpc::MoeCombine;
 +    // Only the closed Op may bind its validated static geometry. This is not an
 +    // unchecked public tensor/graph execution interface.
 +    [[nodiscard]] Compute launch(Recipe& recipe, std::span<const RecipeBinding> bindings);
