@@ -2357,7 +2357,7 @@ index 6c48108..f206233 100644
      // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
 diff --git a/scripts/run-wsl-glm5-chunk-test.sh b/scripts/run-wsl-glm5-chunk-test.sh
 new file mode 100644
-index 0000000..3a7165c
+index 0000000..6fb7382
 --- /dev/null
 +++ b/scripts/run-wsl-glm5-chunk-test.sh
 @@ -0,0 +1,25 @@
@@ -2368,7 +2368,7 @@ index 0000000..3a7165c
 +# so it doubles as a fast syntax check. Usage: bash run-wsl-glm5-chunk-test.sh
 +set -eu
 +NVCC=/usr/local/cuda/bin/nvcc
-+SRC=/mnt/c/Users/druid/Documents/Codex/2026-10-24/gaudi2-recovery/ninfer-kvmem/backends/ninfer
++SRC="$(cd "$(dirname "$0")/.." && pwd)"
 +cd "$SRC"
 +FLAGS="-std=c++20 -arch=sm_120 -Iinclude -Isrc -Itests"
 +"$NVCC" $FLAGS -c tests/ops/test_glm5_kda_chunk.cu -o /tmp/ct_test.o
