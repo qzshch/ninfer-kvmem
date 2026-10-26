@@ -6725,7 +6725,7 @@ index 0000000..ece5ca1
 +} // namespace ninfer::gaudi2::tpc
 diff --git a/src/core/gaudi2/tpc/include/glm5_tpc.h b/src/core/gaudi2/tpc/include/glm5_tpc.h
 new file mode 100644
-index 0000000..dbe0cb4
+index 0000000..4890ea2
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/include/glm5_tpc.h
 @@ -0,0 +1,395 @@
@@ -7077,7 +7077,7 @@ index 0000000..dbe0cb4
 +    DsaAbsorb(const Device& device, DsaAbsorbShape shape, std::size_t max_workspace_bytes);
 +    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& q, DeviceBuffer& wk_b,
 +                                 DeviceBuffer& q_abs);
-+    [[nodiscard】 DsaAbsorbShape shape() const noexcept { return shape_; }
++    [[nodiscard]] DsaAbsorbShape shape() const noexcept { return shape_; }
 +private:
 +    DsaAbsorbShape shape_;
 +    Recipe recipe_;
