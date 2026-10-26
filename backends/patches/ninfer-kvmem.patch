@@ -4853,10 +4853,10 @@ index 0000000..7950143
 +}
 diff --git a/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp b/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp
 new file mode 100644
-index 0000000..2a0a048
+index 0000000..5fbef1b
 --- /dev/null
 +++ b/src/core/gaudi2/tests/fake_synapse/fake_gemm.cpp
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,277 @@
 +// Private offline graph/queue simulator. Never compiled into the native runtime.
 +#include "synapse_api.h"
 +#include "control.h"
@@ -4912,8 +4912,8 @@ index 0000000..2a0a048
 +    bits += 0x7fffu + ((bits >> 16) & 1u); return static_cast<std::uint16_t>(bits >> 16);
 +}
 +std::uint32_t element_bytes(synDataType type) {
-+    demand(type == syn_type_bf16 || type == syn_type_float);
-+    return type == syn_type_float ? 4 : 2;
++    demand(type == syn_type_bf16 || type == syn_type_float || type == syn_type_int32);
++    return type == syn_type_float ? 4 : type == syn_type_int32 ? 4 : 2;
 +}
 +}
 +namespace fake_synapse {
@@ -4946,7 +4946,8 @@ index 0000000..2a0a048
 +}
 +synStatus synTensorSetDeviceDataType(synTensor tensor, synDataType type) {
 +    if (fail("synTensorSetDeviceDataType")) return synFail;
-+    demand(tensors.contains(tensor) && (type == syn_type_bf16 || type == syn_type_float));
++    demand(tensors.contains(tensor) &&
++           (type == syn_type_bf16 || type == syn_type_float || type == syn_type_int32));
 +    tensor->dtype = type; tensor->typed = true; return synSuccess;
 +}
 +synStatus synTensorSetAllowPermutation(synTensor tensor, bool allow) {
@@ -5283,7 +5284,7 @@ index 0000000..37c2498
 +}
 diff --git a/src/core/gaudi2/tests/fake_synapse/synapse_api.h b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
 new file mode 100644
-index 0000000..dd8acf5
+index 0000000..6d444a4
 --- /dev/null
 +++ b/src/core/gaudi2/tests/fake_synapse/synapse_api.h
 @@ -0,0 +1,79 @@
@@ -5313,7 +5314,7 @@ index 0000000..dd8acf5
 +enum synTensorType { DATA_TENSOR = 0 };
 +// Values mirror the verified SDK's synapse_common_types.h so the double can
 +// track element sizes by dtype; only the members the runtime actually uses.
-+enum synDataType { syn_type_bf16 = 2, syn_type_float = 4 };
++enum synDataType { syn_type_bf16 = 2, syn_type_float = 4, syn_type_int32 = 16 };
 +enum synGeometryType { synGeometrySizes = 1 };
 +enum synRoundingMode { synRoundToNearest = 1 };
 +struct synTensorGeometry { std::uint64_t sizes[25]; std::uint32_t dims; };
@@ -5619,10 +5620,10 @@ index 0000000..d5a31d2
 +}
 diff --git a/src/core/gaudi2/tpc/glm5_tpc.cpp b/src/core/gaudi2/tpc/glm5_tpc.cpp
 new file mode 100644
-index 0000000..19e17d6
+index 0000000..725ec7f
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glm5_tpc.cpp
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,700 @@
 +// Host bridges for the GLM-5.3-Flash TPC kernels. Each class builds a
 +// SynapseAI graph with a custom kernel node, compiles it into a Recipe, and
 +// launches through the runtime adapter's Stream. The graph-building pattern
@@ -5669,6 +5670,34 @@ index 0000000..19e17d6
 +        synSectionSetPersistent(section, true) != synSuccess ||
 +        synTensorAssignToSection(tensor, section, 0) != synSuccess) {
 +        throw SynapseError(synFail, "TPC section assignment failed");
++    }
++    sections.push_back(section);
++    return tensor;
++}
++
++// Creates one external Int32 tensor (for expert indices); the section handle
++// is appended to `sections` for later destruction.
++synTensor create_i32_tensor(synGraphHandle graph, const char* name,
++                              std::initializer_list<std::uint32_t> sizes,
++                              std::vector<synSectionHandle>& sections) {
++    synTensor tensor = nullptr;
++    // Always 2-D (FCD first), padding {n} to {n, 1}: the runtime's
++    // RecipeBinding sizes are a fixed 2-entry array.
++    synTensorGeometry geo{};
++    geo.dims = 2;
++    geo.sizes[0] = *sizes.begin();
++    geo.sizes[1] = sizes.size() > 1 ? *(sizes.begin() + 1) : 1;
++    if (synTensorHandleCreate(&tensor, graph, DATA_TENSOR, name) != synSuccess ||
++        synTensorSetGeometry(tensor, &geo, synGeometrySizes) != synSuccess ||
++        synTensorSetDeviceDataType(tensor, syn_type_int32) != synSuccess ||
++        synTensorSetAllowPermutation(tensor, false) != synSuccess) {
++        throw SynapseError(synFail, "TPC I32 tensor creation failed");
++    }
++    synSectionHandle section = nullptr;
++    if (synSectionCreate(&section, 0, graph) != synSuccess ||
++        synSectionSetPersistent(section, true) != synSuccess ||
++        synTensorAssignToSection(tensor, section, 0) != synSuccess) {
++        throw SynapseError(synFail, "TPC I32 section assignment failed");
 +    }
 +    sections.push_back(section);
 +    return tensor;
@@ -5939,13 +5968,368 @@ index 0000000..19e17d6
 +    return stream.launch(recipe_, bindings);
 +}
 +
++
++// ---------------------------------------------------------------------------
++// mHC gates
++
++MhcGates::MhcGates(const Device& device, MhcGatesShape shape, float rms_eps,
++                   float hc_eps, std::uint32_t sinkhorn_iters,
++                   std::size_t max_workspace_bytes)
++    : shape_(shape), rms_eps_(rms_eps), hc_eps_(hc_eps),
++      sinkhorn_iters_(sinkhorn_iters) {
++    if (!shape.hidden || !shape.tokens) {
++        throw std::invalid_argument("MhcGates: hidden and tokens must be positive");
++    }
++    if (!(rms_eps > 0) || !(hc_eps > 0)) {
++        throw std::invalid_argument("MhcGates: epsilons must be positive");
++    }
++    if (!sinkhorn_iters) {
++        throw std::invalid_argument("MhcGates: sinkhorn_iters must be >= 1");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor streams = create_bf16_tensor(graph, "streams",
++                                               {shape.hidden * 4, shape.tokens}, sections);
++        synTensor mixes = create_bf16_tensor(graph, "mixes", {24, shape.tokens}, sections);
++        synTensor base = create_f32_tensor(graph, "base", {24}, sections);
++        synTensor scale = create_f32_tensor(graph, "scale", {3}, sections);
++        synTensor gates = create_f32_tensor(graph, "gates", {24, shape.tokens}, sections);
++        created = {streams, mixes, base, scale, gates};
++        struct { float rms_eps; float hc_eps; std::int32_t sinkhorn_iters; } params;
++        params.rms_eps = rms_eps;
++        params.hc_eps = hc_eps;
++        params.sinkhorn_iters = static_cast<std::int32_t>(sinkhorn_iters);
++        const synTensor inputs[] = {streams, mixes, base, scale};
++        const synTensor outputs[] = {gates};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 4, 1, &params, sizeof(params),
++                                "glm5_mhc_gates_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MhcGates node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_mhc_gates", max_workspace_bytes);
++        const char* names[] = {"streams", "mixes", "base", "scale", "gates"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MhcGates::launch(Stream& stream, DeviceBuffer& streams, DeviceBuffer& mixes,
++                         DeviceBuffer& base, DeviceBuffer& scale, DeviceBuffer& gates) {
++    if (streams.size() != static_cast<std::uint64_t>(shape_.hidden) * 4 * shape_.tokens * 2 ||
++        mixes.size() != 24ull * shape_.tokens * 2 ||
++        base.size() != 24 * 4 || scale.size() != 3 * 4 ||
++        gates.size() != 24ull * shape_.tokens * 4) {
++        throw std::invalid_argument("MhcGates launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &streams, {shape_.hidden * 4, shape_.tokens}},
++        {tensor_ids_[1], &mixes, {24, shape_.tokens}},
++        {tensor_ids_[2], &base, {24, 1}},
++        {tensor_ids_[3], &scale, {3, 1}},
++        {tensor_ids_[4], &gates, {24, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// mHC collapse
++
++MhcCollapse::MhcCollapse(const Device& device, MhcGatesShape shape,
++                         std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.hidden || !shape.tokens) {
++        throw std::invalid_argument("MhcCollapse: hidden and tokens must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor streams = create_bf16_tensor(graph, "streams",
++                                               {shape.hidden * 4, shape.tokens}, sections);
++        synTensor pre = create_f32_tensor(graph, "pre", {4, shape.tokens}, sections);
++        synTensor out = create_bf16_tensor(graph, "out", {shape.hidden, shape.tokens}, sections);
++        created = {streams, pre, out};
++        const synTensor inputs[] = {streams, pre};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 2, 1, nullptr, 0,
++                                "glm5_mhc_collapse_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MhcCollapse node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_mhc_collapse", max_workspace_bytes);
++        const char* names[] = {"streams", "pre", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MhcCollapse::launch(Stream& stream, DeviceBuffer& streams,
++                            DeviceBuffer& pre, DeviceBuffer& out) {
++    if (streams.size() != static_cast<std::uint64_t>(shape_.hidden) * 4 * shape_.tokens * 2 ||
++        pre.size() != 4ull * shape_.tokens * 4 ||
++        out.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.tokens * 2) {
++        throw std::invalid_argument("MhcCollapse launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &streams, {shape_.hidden * 4, shape_.tokens}},
++        {tensor_ids_[1], &pre, {4, shape_.tokens}},
++        {tensor_ids_[2], &out, {shape_.hidden, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// mHC post-block stream update
++
++MhcPost::MhcPost(const Device& device, MhcGatesShape shape,
++                 std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.hidden || !shape.tokens) {
++        throw std::invalid_argument("MhcPost: hidden and tokens must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor block = create_bf16_tensor(graph, "block", {shape.hidden, shape.tokens}, sections);
++        synTensor residual = create_bf16_tensor(graph, "residual",
++                                                {shape.hidden * 4, shape.tokens}, sections);
++        synTensor post = create_f32_tensor(graph, "post", {4, shape.tokens}, sections);
++        synTensor comb = create_f32_tensor(graph, "comb", {16, shape.tokens}, sections);
++        synTensor out = create_bf16_tensor(graph, "out", {shape.hidden * 4, shape.tokens}, sections);
++        created = {block, residual, post, comb, out};
++        const synTensor inputs[] = {block, residual, post, comb};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 4, 1, nullptr, 0,
++                                "glm5_mhc_post_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MhcPost node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_mhc_post", max_workspace_bytes);
++        const char* names[] = {"block", "residual", "post", "comb", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MhcPost::launch(Stream& stream, DeviceBuffer& block, DeviceBuffer& residual,
++                        DeviceBuffer& post, DeviceBuffer& comb, DeviceBuffer& out) {
++    if (block.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.tokens * 2 ||
++        residual.size() != static_cast<std::uint64_t>(shape_.hidden) * 4 * shape_.tokens * 2 ||
++        post.size() != 4ull * shape_.tokens * 4 ||
++        comb.size() != 16ull * shape_.tokens * 4 ||
++        out.size() != static_cast<std::uint64_t>(shape_.hidden) * 4 * shape_.tokens * 2) {
++        throw std::invalid_argument("MhcPost launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &block, {shape_.hidden, shape_.tokens}},
++        {tensor_ids_[1], &residual, {shape_.hidden * 4, shape_.tokens}},
++        {tensor_ids_[2], &post, {4, shape_.tokens}},
++        {tensor_ids_[3], &comb, {16, shape_.tokens}},
++        {tensor_ids_[4], &out, {shape_.hidden * 4, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// mHC head
++
++MhcHead::MhcHead(const Device& device, MhcGatesShape shape,
++                 std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.hidden || !shape.tokens) {
++        throw std::invalid_argument("MhcHead: hidden and tokens must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor streams = create_bf16_tensor(graph, "streams",
++                                               {shape.hidden * 4, shape.tokens}, sections);
++        synTensor out = create_bf16_tensor(graph, "out", {shape.hidden, shape.tokens}, sections);
++        created = {streams, out};
++        const synTensor inputs[] = {streams};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 1, 1, nullptr, 0,
++                                "glm5_mhc_head_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MhcHead node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_mhc_head", max_workspace_bytes);
++        const char* names[] = {"streams", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MhcHead::launch(Stream& stream, DeviceBuffer& streams, DeviceBuffer& out) {
++    if (streams.size() != static_cast<std::uint64_t>(shape_.hidden) * 4 * shape_.tokens * 2 ||
++        out.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.tokens * 2) {
++        throw std::invalid_argument("MhcHead launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &streams, {shape_.hidden * 4, shape_.tokens}},
++        {tensor_ids_[1], &out, {shape_.hidden, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++
++// ---------------------------------------------------------------------------
++// MoE router
++
++MoeRoute::MoeRoute(const Device& device, MoeRouteShape shape,
++                   float routed_scaling_factor, std::size_t max_workspace_bytes)
++    : shape_(shape), routed_scaling_factor_(routed_scaling_factor) {
++    if (!shape.experts || !shape.top_k || !shape.tokens) {
++        throw std::invalid_argument("MoeRoute: experts, top_k and tokens must be positive");
++    }
++    if (shape.experts > 512) {
++        throw std::invalid_argument("MoeRoute: experts must be <= 512");
++    }
++    if (shape.top_k > shape.experts) {
++        throw std::invalid_argument("MoeRoute: top_k must be <= experts");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor logits = create_bf16_tensor(graph, "logits",
++                                              {shape.experts, shape.tokens}, sections);
++        synTensor correction_bias = create_f32_tensor(graph, "correction_bias",
++                                                      {shape.experts}, sections);
++        synTensor weights = create_f32_tensor(graph, "weights",
++                                              {shape.top_k, shape.tokens}, sections);
++        synTensor indices = create_i32_tensor(graph, "indices",
++                                              {shape.top_k, shape.tokens}, sections);
++        created = {logits, correction_bias, weights, indices};
++        struct { std::int32_t top_k; float routed_scaling_factor; } params;
++        params.top_k = static_cast<std::int32_t>(shape.top_k);
++        params.routed_scaling_factor = routed_scaling_factor;
++        const synTensor inputs[] = {logits, correction_bias};
++        const synTensor outputs[] = {weights, indices};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 2, 2, &params, sizeof(params),
++                                "glm5_moe_route_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MoeRoute node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_moe_route", max_workspace_bytes);
++        const char* names[] = {"logits", "correction_bias", "weights", "indices"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MoeRoute::launch(Stream& stream, DeviceBuffer& logits,
++                         DeviceBuffer& correction_bias, DeviceBuffer& weights,
++                         DeviceBuffer& indices) {
++    if (logits.size() != static_cast<std::uint64_t>(shape_.experts) * shape_.tokens * 2 ||
++        correction_bias.size() != static_cast<std::uint64_t>(shape_.experts) * 4 ||
++        weights.size() != static_cast<std::uint64_t>(shape_.top_k) * shape_.tokens * 4 ||
++        indices.size() != static_cast<std::uint64_t>(shape_.top_k) * shape_.tokens * 4) {
++        throw std::invalid_argument("MoeRoute launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &logits, {shape_.experts, shape_.tokens}},
++        {tensor_ids_[1], &correction_bias, {shape_.experts, 1}},
++        {tensor_ids_[2], &weights, {shape_.top_k, shape_.tokens}},
++        {tensor_ids_[3], &indices, {shape_.top_k, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
++// ---------------------------------------------------------------------------
++// MoE expert combination
++
++MoeCombine::MoeCombine(const Device& device, MoeCombineShape shape,
++                       std::size_t max_workspace_bytes)
++    : shape_(shape) {
++    if (!shape.hidden || !shape.top_k || !shape.tokens) {
++        throw std::invalid_argument("MoeCombine: hidden, top_k and tokens must be positive");
++    }
++
++    synGraphHandle graph = create_graph();
++    std::vector<synTensor> created;
++    std::vector<synSectionHandle> sections;
++    try {
++        synTensor experts = create_bf16_tensor(graph, "experts",
++                                               {shape.hidden * shape.top_k, shape.tokens}, sections);
++        synTensor weights = create_f32_tensor(graph, "weights",
++                                              {shape.top_k, shape.tokens}, sections);
++        synTensor shared = create_bf16_tensor(graph, "shared",
++                                              {shape.hidden, shape.tokens}, sections);
++        synTensor out = create_bf16_tensor(graph, "out", {shape.hidden, shape.tokens}, sections);
++        created = {experts, weights, shared, out};
++        struct { std::int32_t top_k; } params = {static_cast<std::int32_t>(shape.top_k)};
++        const synTensor inputs[] = {experts, weights, shared};
++        const synTensor outputs[] = {out};
++        synNodeId node = 0;
++        if (synNodeCreateWithId(graph, inputs, outputs, 3, 1, &params, sizeof(params),
++                                "glm5_moe_combine_bf16", nullptr, &node, nullptr, nullptr) != synSuccess) {
++            throw SynapseError(synFail, "MoeCombine node creation");
++        }
++        (void)synNodeSetRoundingMode(graph, node, synRoundToNearest);
++        recipe_ = device.compile(graph, "glm5_moe_combine", max_workspace_bytes);
++        const char* names[] = {"experts", "weights", "shared", "out"};
++        recipe_.tensor_ids(names, tensor_ids_);
++    } catch (...) {
++        destroy_graph_safe(graph, created, sections);
++        throw;
++    }
++    destroy_graph_safe(graph, created, sections);
++}
++
++Compute MoeCombine::launch(Stream& stream, DeviceBuffer& experts, DeviceBuffer& weights,
++                           DeviceBuffer& shared, DeviceBuffer& out) {
++    if (experts.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.top_k * shape_.tokens * 2 ||
++        weights.size() != static_cast<std::uint64_t>(shape_.top_k) * shape_.tokens * 4 ||
++        shared.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.tokens * 2 ||
++        out.size() != static_cast<std::uint64_t>(shape_.hidden) * shape_.tokens * 2) {
++        throw std::invalid_argument("MoeCombine launch: buffer size mismatch");
++    }
++    RecipeBinding bindings[] = {
++        {tensor_ids_[0], &experts, {shape_.hidden * shape_.top_k, shape_.tokens}},
++        {tensor_ids_[1], &weights, {shape_.top_k, shape_.tokens}},
++        {tensor_ids_[2], &shared, {shape_.hidden, shape_.tokens}},
++        {tensor_ids_[3], &out, {shape_.hidden, shape_.tokens}},
++    };
++    return stream.launch(recipe_, bindings);
++}
++
 +} // namespace ninfer::gaudi2::tpc
 diff --git a/src/core/gaudi2/tpc/include/glm5_tpc.h b/src/core/gaudi2/tpc/include/glm5_tpc.h
 new file mode 100644
-index 0000000..265dc72
+index 0000000..dd66118
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/include/glm5_tpc.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,259 @@
 +#pragma once
 +// GLM-5.3-Flash TPC kernel wrappers: build SynapseAI graphs that compose TPC
 +// custom kernels with the closed Bf16Gemm MME recipe. Each wrapper compiles
@@ -6070,7 +6454,217 @@ index 0000000..265dc72
 +    std::array<std::uint64_t, 7> tensor_ids_{};
 +};
 +
++// ---------------------------------------------------------------------------
++// mHC gates: the 24-lane weight generation for one mHC site. The raw fn
++// projections arrive as BF16 [24, T] (MME GEMM output); the kernel scans the
++// four streams for the RMS, applies the sigmoid/scale/base gates, and runs
++// the 4x4 Sinkhorn. gates out: FP32 [24, T] = pre[0:4] | post[4:8] |
++// comb[8:24] with comb entry (src, dst) at 8 + 4*src + dst.
++
++struct MhcGatesShape {
++    std::uint32_t hidden;  // H (one stream's width; streams are [4H, T])
++    std::uint32_t tokens;
++};
++
++class MhcGates {
++public:
++    MhcGates(const Device& device, MhcGatesShape shape, float rms_eps,
++             float hc_eps, std::uint32_t sinkhorn_iters,
++             std::size_t max_workspace_bytes);
++    // streams: BF16 [4H, T], mixes: BF16 [24, T], base: FP32 [24, 1],
++    // scale: FP32 [3, 1], gates: FP32 [24, T].
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& streams,
++                                 DeviceBuffer& mixes, DeviceBuffer& base,
++                                 DeviceBuffer& scale, DeviceBuffer& gates);
++    [[nodiscard]] MhcGatesShape shape() const noexcept { return shape_; }
++private:
++    MhcGatesShape shape_;
++    float rms_eps_, hc_eps_;
++    std::uint32_t sinkhorn_iters_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 5> tensor_ids_{};
++};
++
++// mHC collapse: collapsed[t, :] = Σ_n pre[t,n] * streams[t, n*H + :].
++// pre: FP32 [4, T]; streams: BF16 [4H, T]; out: BF16 [H, T].
++
++class MhcCollapse {
++public:
++    MhcCollapse(const Device& device, MhcGatesShape shape,
++                std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& streams,
++                                 DeviceBuffer& pre, DeviceBuffer& out);
++    [[nodiscard]] MhcGatesShape shape() const noexcept { return shape_; }
++private:
++    MhcGatesShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 3> tensor_ids_{};
++};
++
++// mHC post-block stream update: out[t,dst,:] = post[t,dst]*block[t,:] +
++// Σ_src comb[t,src,dst]*residual[t,src,:]. block: BF16 [H, T];
++// residual: BF16 [4H, T]; post: FP32 [4, T]; comb: FP32 [16, T] (row
++// 4*src+dst); out: BF16 [4H, T].
++
++class MhcPost {
++public:
++    MhcPost(const Device& device, MhcGatesShape shape,
++            std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& block,
++                                 DeviceBuffer& residual, DeviceBuffer& post,
++                                 DeviceBuffer& comb, DeviceBuffer& out);
++    [[nodiscard]] MhcGatesShape shape() const noexcept { return shape_; }
++private:
++    MhcGatesShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 5> tensor_ids_{};
++};
++
++// mHC head: out[t, :] = (1/4) Σ_n streams[t, n*H + :].
++// streams: BF16 [4H, T]; out: BF16 [H, T].
++
++class MhcHead {
++public:
++    MhcHead(const Device& device, MhcGatesShape shape,
++            std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& streams,
++                                 DeviceBuffer& out);
++    [[nodiscard]] MhcGatesShape shape() const noexcept { return shape_; }
++private:
++    MhcGatesShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 2> tensor_ids_{};
++};
++
++// ---------------------------------------------------------------------------
++// MoE sigmoid router with noaux_tc: score = sigmoid(logits); top_k ranked by
++// score + correction_bias (stable descending, ties by lower expert); weights
++// are the ORIGINAL scores normalized (sum + 1e-20) and scaled by
++// routed_scaling_factor. logits: BF16 [E, T]; correction_bias: FP32 [E, 1];
++// weights: FP32 [top_k, T]; indices: Int32 [top_k, T].
++
++struct MoeRouteShape {
++    std::uint32_t experts;  // E (<= 512)
++    std::uint32_t top_k;
++    std::uint32_t tokens;
++};
++
++class MoeRoute {
++public:
++    MoeRoute(const Device& device, MoeRouteShape shape, float routed_scaling_factor,
++             std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& logits,
++                                 DeviceBuffer& correction_bias, DeviceBuffer& weights,
++                                 DeviceBuffer& indices);
++    [[nodiscard]] MoeRouteShape shape() const noexcept { return shape_; }
++private:
++    MoeRouteShape shape_;
++    float routed_scaling_factor_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 4> tensor_ids_{};
++};
++
++// MoE expert combination: out[t,:] = Σ_i weights[t,i] * experts[t,i,:]
++// + shared[t,:]. experts: BF16 [top_k*H, T]; weights: FP32 [top_k, T];
++// shared: BF16 [H, T]; out: BF16 [H, T].
++
++struct MoeCombineShape {
++    std::uint32_t hidden;  // H
++    std::uint32_t top_k;
++    std::uint32_t tokens;
++};
++
++class MoeCombine {
++public:
++    MoeCombine(const Device& device, MoeCombineShape shape,
++               std::size_t max_workspace_bytes);
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& experts,
++                                 DeviceBuffer& weights, DeviceBuffer& shared,
++                                 DeviceBuffer& out);
++    [[nodiscard]] MoeCombineShape shape() const noexcept { return shape_; }
++private:
++    MoeCombineShape shape_;
++    Recipe recipe_;
++    std::array<std::uint64_t, 4> tensor_ids_{};
++};
++
 +} // namespace ninfer::gaudi2::tpc
+diff --git a/src/core/gaudi2/tpc/kernels/README.md b/src/core/gaudi2/tpc/kernels/README.md
+new file mode 100644
+index 0000000..05bab96
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/README.md
+@@ -0,0 +1,70 @@
++# GLM-5.3-Flash TPC-C kernels (Gaudi2)
++
++Ten device kernels, all compile-validated against the real TPC compiler
++(`tpc-clang 2.7.33` from SynapseAI `1.24.1-482`) with `-march=gaudi2`.
++Host bridges live in `../glm5_tpc.cpp` + `../include/glm5_tpc.h`; their
++graph/launch/cleanup lifecycle is covered by `../tests/glm5_tpc_test.cpp`
++against the fake_synapse double. Kernel **math** is verified by the CUDA
++executor tests on the 5090 host against the same reference implementations
++(`src/models/glm5/reference/`) — the TPC sources are the Gaudi2 port of that
++math, not an independent derivation.
++
++## Kernels
++
++| GUID | File | Contract |
++|---|---|---|
++| `glm5_rmsnorm_bf16` | `glm5_rmsnorm_bf16_gaudi2.c` | RMSNorm, BF16 [D,T], FP32 two-pass |
++| `glm5_clamp_swiglu_bf16` | `glm5_clamp_swiglu_bf16_gaudi2.c` | clamped SwiGLU, BF16 [2I,T] → [I,T] |
++| `glm5_kda_gate_bf16` | `glm5_kda_gate_bf16_gaudi2.c` | KDA decay gate (needs head_dim == 128) |
++| `glm5_kda_scan_f32` | `glm5_kda_scan_f32_gaudi2.c` | KDA delta recurrence, two HBM streaming passes (needs head_dim == 128) |
++| `glm5_mhc_gates_bf16` | `glm5_mhc_gates_bf16_gaudi2.c` | mHC pre/post/comb gates + 4x4 Sinkhorn |
++| `glm5_mhc_collapse_bf16` | `glm5_mhc_collapse_bf16_gaudi2.c` | pre-block stream collapse |
++| `glm5_mhc_post_bf16` | `glm5_mhc_post_bf16_gaudi2.c` | post-block stream update |
++| `glm5_mhc_head_bf16` | `glm5_mhc_head_bf16_gaudi2.c` | final 4-stream mean |
++| `glm5_moe_route_bf16` | `glm5_moe_route_bf16_gaudi2.c` | sigmoid router, noaux_tc, top-k <= 512 experts |
++| `glm5_moe_combine_bf16` | `glm5_moe_combine_bf16_gaudi2.c` | weighted expert sum + shared |
++
++Adapted lineage: Sinkhorn lane machinery and the top-k selection reduction
++from the 1Cat flashinfer-gaudi kernels (Apache-2.0); clamp-SwiGLU shape from
++abotsis/vllm-gaudi (Apache-2.0). GLM semantics (sigmoid+eps pre, 2x sigmoid
++post, comb layout src-major, original-score weight normalization) follow the
++CUDA contracts in `include/ninfer/ops/glm5_*.h`.
++
++## Toolchain (offline, in WSL)
++
++`tpc-clang` ships inside the SynapseAI `habanalabs-graph` deb — no full SDK
++install needed for syntax/type/intrinsic validation:
++
++```
++# one-time (proxy on the host side for the download):
++curl -O <vault>/habanalabs-graph_1.24.1-482_amd64.deb   # sha256 66b7f816...
++wsl -d Ubuntu-24.04 -- bash -c 'mkdir -p ~/tpc-sdk/extract && \
++    dpkg-deb -x /mnt/c/<path>/habanalabs-graph.deb ~/tpc-sdk/extract'
++
++# per-change validation (this directory):
++bash compile_kernels.sh
++```
++
++The script compiles every `glm5_*_gaudi2.c` with
++`tpc-clang -march=gaudi2 -c`; 10/10 must pass. On a real Gaudi2 host the
++same sources feed the GC packaging flow (recipe registration via the
++HabanaTools loader) — that integration is still pending hardware.
++
++## Type-model notes (tpc-clang 2.7.33 quirks the kernels respect)
++
++- `float128` is `struct {float64 v1, v2;}` — no implicit conversion to or
++  from `float64`; whole-vector math goes member-wise, MAC via `v_f32_mac_b`.
++- `float64` is 64 lanes: scalar↔float64 broadcast is implicit, but there is
++  **no vector→scalar extraction**. Per-element scalar values come from
++  scalar memory reads (`s_f32_ld_g` / `s_bf16_ld_g` with `gen_addr`).
++- `v_f32_ld_tnsr_b` returns `float64` (64 lanes); BF16 loads return
++  `bfloat128` (128 lanes). FP32 stores go through
++  `v_f32_st_tnsr_partial(coord, t, float64, count, 0)`.
++- Low-N lane groups ride in the first lanes of a float64 via
++  `*_ld_tnsr_partial_b` (zero-filled tail) and leave via
++  `*_st_tnsr_partial` — the whole mHC gate row moves in 4/4/16-lane blocks.
++- Comparisons return masks via named builtins (`v_i32_cmp_less_b`), not C
++  operators on vector types.
++- `no_saturation_sigmoid_f32` does **not** exist here; the no-LUT path is
++  `v_reciprocal_f32(1.0f + v_exp_cephes_f32(-x))` (the LUT `v_sigmoid_f32`
++  saturates to exact 0/1 at |x| >= 9).
 diff --git a/src/core/gaudi2/tpc/kernels/attn_recurrence_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/attn_recurrence_f32_gaudi2.c
 new file mode 100644
 index 0000000..d3bd17b
@@ -6340,12 +6934,47 @@ index 0000000..a7b665d
 +{
 +    m.def("registered", []() { return true; });
 +}
+diff --git a/src/core/gaudi2/tpc/kernels/compile_kernels.sh b/src/core/gaudi2/tpc/kernels/compile_kernels.sh
+new file mode 100644
+index 0000000..70db1dd
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/compile_kernels.sh
+@@ -0,0 +1,29 @@
++#!/bin/bash
++# Compile every GLM-5.3-Flash TPC-C kernel with the SynapseAI tpc-clang
++# (extracted once into ~/tpc-sdk/extract — see README.md). 10/10 must pass
++# before any kernel-source change is committed.
++#
++# Requires: WSL Ubuntu with the habanalabs-graph 1.24.1-482 deb extracted
++# (tpc-clang 2.7.33, no installation beyond dpkg-deb -x).
++set -u
++HERE="$(cd "$(dirname "$0")" && pwd)"
++OUT="${1:-/tmp/tpc-out}"
++GC="$HOME/tpc-sdk/extract/opt/habanalabs/bin/tpc-clang"
++GC_FLAGS="-march=gaudi2"
++if [ ! -x "$GC" ]; then
++    echo "tpc-clang not found at $GC — extract the SDK first (README.md)" >&2
++    exit 2
++fi
++mkdir -p "$OUT"
++pass=0; fail=0
++for src in "$HERE"/glm5_*_gaudi2.c; do
++    name=$(basename "$src" .c)
++    if "$GC" $GC_FLAGS -c "$src" -o "$OUT/$name.o" 2> "$OUT/$name.err"; then
++        echo "PASS $name"; pass=$((pass+1))
++    else
++        echo "FAIL $name"; fail=$((fail+1))
++        sed -n '1,12p' "$OUT/$name.err"
++    fi
++done
++echo "== $pass passed, $fail failed =="
++[ "$fail" -eq 0 ]
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c
 new file mode 100644
-index 0000000..0982809
+index 0000000..43c6e3c
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,75 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash clamped SwiGLU TPC-C kernel for Gaudi2.
 +// Adapted from abotsis/vllm-gaudi's tpc_clamp_swiglu (Apache-2.0), simplified
 +// for the ninfer runtime adapter's tensor contracts and made tail-safe.
@@ -6359,14 +6988,21 @@ index 0000000..0982809
 +//   g = min(h_g, limit);  u = clamp(h_u, -limit, limit);
 +//   out = silu(g) * u,  silu(g) = g * sigmoid(g).
 +//
-+// Uses no_saturation_sigmoid_f32 (the polynomial path, not the LUT tanh path
-+// which saturates to exact 0/1 at |x| >= 9 — the deep-negative gate region
-+// that silu must resolve). The multiply order is (sigmoid(g) * g) * u; folding
++// The multiply order is (sigmoid(g) * g) * u; folding
 +// to sigmoid(g) * (g * u) overflows FP32 for large-magnitude gates because
 +// g*u can reach inf and 0 * inf = NaN. Keeping silu(g) first bounds every
 +// intermediate by limit^2.
 +//
 +// The tail chunk (I % 128) uses partial load/store with count clamping.
++//
++// Sigmoid is the no-LUT Cephe path (v_exp_cephes_f32 + v_reciprocal_f32);
++// the LUT tanh path (v_sigmoid_f32) saturates to exact 0/1 at |x| >= 9 —
++// the deep-negative gate region that silu must resolve.
++
++static inline float64 sigmoid_nolut_f32(float64 v)
++{
++    return v_reciprocal_f32(1.0f + v_exp_cephes_f32(-v));
++}
 +
 +void main(tensor h, tensor out, float limit)
 +{
@@ -6398,10 +7034,10 @@ index 0000000..0982809
 +            uc.v1 = v_f32_max_b(v_f32_min_b(u.v1, limit), nlim);
 +            uc.v2 = v_f32_max_b(v_f32_min_b(u.v2, limit), nlim);
 +
-+            // silu(g) * u, with the no-saturation sigmoid polynomial.
++            // silu(g) * u, with the no-LUT Cephe sigmoid.
 +            float128 result;
-+            const float64 s1 = no_saturation_sigmoid_f32(gc.v1);
-+            const float64 s2 = no_saturation_sigmoid_f32(gc.v2);
++            const float64 s1 = sigmoid_nolut_f32(gc.v1);
++            const float64 s2 = sigmoid_nolut_f32(gc.v2);
 +            result.v1 = s1 * gc.v1 * uc.v1;  // sigmoid first: bounds by limit^2.
 +            result.v2 = s2 * gc.v2 * uc.v2;
 +
@@ -6416,10 +7052,10 @@ index 0000000..0982809
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
 new file mode 100644
-index 0000000..d5a8307
+index 0000000..314c092
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,57 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash KDA decay gate TPC-C kernel for Gaudi2.
 +//
 +// Input  a     : BF16 [d_inner, T], dim0 = d_inner (FCD), dim1 = T.
@@ -6429,24 +7065,23 @@ index 0000000..d5a8307
 +// Scalars: lower_bound (negative finite FP32), head_dim.
 +//
 +// Math: gate[i, t] = lower_bound * sigmoid(exp(A_log[i / head_dim]) * a[i, t]).
-+// The head index comes from integer division of the d_inner index by
-+// head_dim. The result is the log-space decay factor the KDA recurrence
-+// kernel exponentiates. The output stays FP32 (not BF16) because exp()
-+// amplifies any BF16 rounding in the log domain by the gate magnitude.
++// The result is the log-space decay factor the KDA recurrence kernel
++// exponentiates. The output stays FP32 (not BF16) because exp() amplifies
++// any BF16 rounding in the log domain by the gate magnitude.
 +//
-+// Scalar path (decode is d_inner-wide only; the vectorized variant pays off
-+// at prefill time, deferred until chunked prefill lands). The BF16 scalar
-+// read composes verified intrinsics: a count=1 partial load (remaining lanes
-+// zero-filled per the *_partial_b contract) widened to FP32 and reduced —
-+// summing the zero lanes returns lane 0 exactly. GC bring-up must confirm
-+// the zero-fill behavior on hardware.
++// Vectorized contract: head_dim == 128 (the production KDA head), so every
++// 128-lane chunk of `a` spans exactly one head and the per-head rate is a
++// single scalar broadcast. FP32 tensors load/store in 64-lane halves
++// (v_f32_ld/st semantics on this target), hence the split stores.
++//
++// Sigmoid is the no-LUT Cephe path (v_exp_cephes_f32 + v_reciprocal_f32):
++// the LUT tanh path (v_sigmoid_f32) saturates to exact 0/1 at |x| >= 9, and
++// the deep-negative product region maps to the whole decay range.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
 +
-+// Lane 0 of a BF16 tensor at `coord`, as an FP32 scalar.
-+static float scalar_bf16(const int5 coord, tensor t)
++static inline float64 sigmoid_nolut_f32(float64 v)
 +{
-+    const bfloat128 raw = v_bf16_ld_tnsr_partial_b(coord, t, 1, 0);
-+    const float128 wide = v_convert_bf16_to_f32_all_b(raw);
-+    return v_f32_reduce_add(wide.v1 + wide.v2);
++    return v_reciprocal_f32(1.0f + v_exp_cephes_f32(-v));
 +}
 +
 +void main(tensor a, tensor a_log, tensor gate, float lower_bound, int head_dim)
@@ -6455,158 +7090,635 @@ index 0000000..d5a8307
 +    const int5 end   = begin + get_index_space_size();
 +
 +    for (int token = begin[1]; token < end[1]; ++token) {
-+        for (int i = begin[0]; i < end[0]; ++i) {
++        for (int i = begin[0]; i < end[0]; i += 128) {
 +            const int head = i / head_dim;
-+            const float a_val = scalar_bf16((int5){i, token}, a);
 +            const float rate = s_f32_ld_g(gen_addr((int5){head, 0}, a_log));
-+            const float decay_input = exp_f32(rate) * a_val;
++            const float64 decay_scale = exp_f32(rate);
 +
-+            // Explicit scalar sigmoid: 1 / (1 + exp(-x)). The LUT tanh path
-+            // saturates to exact 0/1 at |x| >= 9; the deep-negative region of
-+            // this product feeds the whole decay range, so use the scalar
-+            // exponential directly.
-+            const float sig = 1.0f / (1.0f + exp_f32(-decay_input));
-+            const float result = lower_bound * sig;
++            float128 av;
++            const int count = (end[0] - i < 128) ? end[0] - i : 128;
++            if (count == 128) {
++                av = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){i, token}, a));
++            } else {
++                av = v_convert_bf16_to_f32_all_b(
++                    v_bf16_ld_tnsr_partial_b((int5){i, token}, a, count, 0));
++            }
 +
-+            s_f32_st_g(gen_addr((int5){i, token}, gate), result);
++            float128 out;
++            out.v1 = lower_bound * sigmoid_nolut_f32(av.v1 * decay_scale);
++            out.v2 = lower_bound * sigmoid_nolut_f32(av.v2 * decay_scale);
++
++            v_f32_st_tnsr_partial((int5){i, token}, gate, out.v1, 0, 0);
++            v_f32_st_tnsr_partial((int5){i + 64, token}, gate, out.v2, 0, 0);
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c
 new file mode 100644
-index 0000000..adfbdc7
+index 0000000..984dd74
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,97 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash KDA delta-rule recurrence TPC-C kernel.
 +//
-+// Single token, all heads. One TPC thread block per head; the sequential
-+// dependency never leaves the TPC's local memory.
++// Single token, all heads. One index-space x-slot per head.
 +//
 +// Input  q     : BF16 [d_inner, 1] (post-conv, pre-norm).
 +// Input  k     : BF16 [d_inner, 1].
 +// Input  v     : BF16 [d_inner, 1].
 +// Input  gate  : FP32 [d_inner, 1] (log space, from the KDA gate kernel).
 +// Input  beta  : FP32 [heads, 1] (already sigmoided).
-+// In/Out state : FP32 [heads*head_dim*head_dim, 1] (row = key axis i over
-+//                value axis j at offset head*dk*dk + i*dk + j; in-place).
++// In/Out state : FP32 [heads*dk*dk, 1], row = key axis i, lane = value axis j
++//                at offset head*dk*dk + i*dk + j; updated in place.
 +// Output out   : BF16 [d_inner, 1] (pre-output-gate).
-+// Scalar: head_dim.
++// Scalar: head_dim (must equal 128 — the production KDA head).
 +//
-+// Math per head h:
-+//   1. L2-normalize q and k (eps 1e-6 inside sqrt); scale q by dk^-0.5.
-+//   2. Decay: S[i][:] *= exp(gate[i]).
-+//   3. u[j] = Σ_i S[i][j] * k[i].
-+//   4. delta[j] = beta * (v[j] - u[j]).
-+//   5. S[i][j] += k[i] * delta[j].
-+//   6. out[j] = Σ_i S[i][j] * q[i].
++// Math per head h (k-hat/q-hat are L2-normalized, q scaled by dk^-0.5,
++// eps 1e-6 inside both sqrts):
++//   c[i]    = exp(gate[i]) * k_hat[i]
++//   u[j]    = Σ_i c[i] * S[i][j]                (pass A over state)
++//   delta[j]= beta * (v[j] - u[j])
++//   S'[i][j]= c[i] * S[i][j] + k_hat[i] * delta[j]
++//   out[j]  = Σ_i q_hat[i] * S'[i][j]           (pass B, fused with update)
 +//
-+// All arithmetic FP32. The state stays in TPC local memory (SRAM) during the
-+// scan; only the final state write-back and the out vector go to HBM.
-+// The dk=128 head fits: 128*128*4B = 64KB state + 3*128*4B vectors ≈ 65.5KB,
-+// within a single TPC's 128KB local memory on Gaudi2.
++// Two streaming passes over the HBM-resident state rows; the state never
++// needs to fit in TPC local memory (the 64KB-per-head local-array variant
++// exists as a later optimization target). u/delta/out stay lane-aligned
++// float128 vectors: lane j of the row load IS value-axis j, so the
++// recurrence's column indexing is free. Per-row scalar coefficients come
++// from scalar memory reads (s_bf16_ld_g/s_f32_ld_g) and broadcast into
++// float64 lane math — the TPC type model has no vector->scalar extraction.
++// FP32 state rows load/store in 64-lane halves (v_f32_ld_tnsr_b returns
++// float64 on this target).
 +//
-+// BF16 scalar reads use the count=1 partial-load reduce idiom (zero-filled
-+// tail lanes sum away); the BF16 scalar store converts a broadcast scalar
-+// and writes one lane. GC bring-up must confirm both on hardware, then the
-+// state row loops (16K scalar accesses per head) are the first
-+// vectorization target: each row of S is 128 contiguous FP32 lanes.
-+
-+// Lane 0 of a BF16 tensor at `coord`, as an FP32 scalar.
-+static float scalar_bf16(const int5 coord, tensor t)
-+{
-+    const bfloat128 raw = v_bf16_ld_tnsr_partial_b(coord, t, 1, 0);
-+    const float128 wide = v_convert_bf16_to_f32_all_b(raw);
-+    return v_f32_reduce_add(wide.v1 + wide.v2);
-+}
-+
-+// One BF16 lane store: broadcast the scalar and write element 0 only.
-+static void scalar_bf16_store(const int5 coord, tensor t, float value)
-+{
-+    const float64 broadcast = value;
-+    const bfloat128 packed = v_convert_f32_to_bf16_all_b(broadcast);
-+    v_bf16_st_tnsr_partial(coord, t, packed, 1, 0);
-+}
++// exp is the Cephe no-LUT path via exp_f32 on the broadcast coefficient.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
 +
 +void main(tensor q, tensor k, tensor v, tensor gate, tensor beta,
 +          tensor state, tensor out, int head_dim)
 +{
 +    const int5 begin = get_index_space_offset();
-+    const int state_base = begin[0] * head_dim * head_dim;  // this head's slice
-+    const int base = begin[0] * head_dim;                   // within d_inner
++    const int head = begin[0];
++    const int dk = head_dim;
++    const int base = head * dk;
++    const int state_base = head * dk * dk;
 +
-+    // ---- Phase 1: L2 norms for q and k, scale q. ----
-+    float q_norm = 1e-6f;
-+    float k_norm = 1e-6f;
-+    for (int i = 0; i < head_dim; ++i) {
-+        const float qv = scalar_bf16((int5){base + i, 0}, q);
-+        const float kv = scalar_bf16((int5){base + i, 0}, k);
-+        q_norm += qv * qv;
-+        k_norm += kv * kv;
++    // ---- Load q, k, v as one 128-lane vector each; L2-normalize. ----
++    const float128 qv = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){base, 0}, q));
++    const float128 kv = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){base, 0}, k));
++    const float128 vv = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){base, 0}, v));
++
++    const float64 q_ss = v_f32_reduce_add(qv.v1 * qv.v1 + qv.v2 * qv.v2) + 1e-6f;
++    const float64 k_ss = v_f32_reduce_add(kv.v1 * kv.v1 + kv.v2 * kv.v2) + 1e-6f;
++    const float64 q_scale = rsqrt_f32(q_ss) * (1.0f / sqrt_f32((float64)dk));
++    const float64 k_inv = rsqrt_f32(k_ss);
++
++    float128 qh, kh;
++    qh.v1 = qv.v1 * q_scale;  qh.v2 = qv.v2 * q_scale;
++    kh.v1 = kv.v1 * k_inv;    kh.v2 = kv.v2 * k_inv;
++
++    const float64 beta_lane = s_f32_ld_g(gen_addr((int5){head, 0}, beta));
++
++    // ---- Pass A: u[j] = Σ_i c[i] * S[i][j], lane-aligned accumulation. ----
++    float128 u = {0};
++    for (int i = 0; i < dk; ++i) {
++        const float gi = s_f32_ld_g(gen_addr((int5){base + i, 0}, gate));
++        const float64 ki = s_bf16_ld_g(gen_addr((int5){base + i, 0}, k)) * k_inv;
++        const float64 c = exp_f32(gi) * ki;
++        const int row = state_base + i * dk;
++        u.v1 = v_f32_mac_b(v_f32_ld_tnsr_b((int5){row, 0}, state), c, u.v1);
++        u.v2 = v_f32_mac_b(v_f32_ld_tnsr_b((int5){row + 64, 0}, state), c, u.v2);
 +    }
-+    q_norm = sqrt_f32(q_norm);
-+    k_norm = sqrt_f32(k_norm);
-+    const float q_scale = 1.0f / sqrt_f32((float)head_dim);
-+    const float q_inv = 1.0f / q_norm;
-+    const float k_inv = 1.0f / k_norm;
 +
-+    // Normalized q, k in local arrays.
-+    float qh[128], kh[128];
-+    for (int i = 0; i < head_dim; ++i) {
-+        qh[i] = scalar_bf16((int5){base + i, 0}, q) * q_inv * q_scale;
-+        kh[i] = scalar_bf16((int5){base + i, 0}, k) * k_inv;
++    // ---- delta[j] = beta * (v[j] - u[j]). ----
++    float128 delta;
++    delta.v1 = beta_lane * (vv.v1 - u.v1);
++    delta.v2 = beta_lane * (vv.v2 - u.v2);
++
++    // ---- Pass B: update rows, accumulate out[j] = Σ_i q_hat[i] * S'[i][j]. ----
++    float128 out_acc = {0};
++    for (int i = 0; i < dk; ++i) {
++        const float gi = s_f32_ld_g(gen_addr((int5){base + i, 0}, gate));
++        const float64 ki = s_bf16_ld_g(gen_addr((int5){base + i, 0}, k)) * k_inv;
++        const float64 c = exp_f32(gi) * ki;
++        const float64 qi = s_bf16_ld_g(gen_addr((int5){base + i, 0}, q)) * q_scale;
++        const int row = state_base + i * dk;
++
++        const float64 r1 = v_f32_ld_tnsr_b((int5){row, 0}, state);
++        const float64 r2 = v_f32_ld_tnsr_b((int5){row + 64, 0}, state);
++        const float64 n1 = v_f32_mac_b(delta.v1, ki, r1 * c);
++        const float64 n2 = v_f32_mac_b(delta.v2, ki, r2 * c);
++        v_f32_st_tnsr_partial((int5){row, 0}, state, n1, 0, 0);
++        v_f32_st_tnsr_partial((int5){row + 64, 0}, state, n2, 0, 0);
++        out_acc.v1 = v_f32_mac_b(n1, qi, out_acc.v1);
++        out_acc.v2 = v_f32_mac_b(n2, qi, out_acc.v2);
 +    }
 +
-+    // ---- Phase 2: decay S rows by exp(gate). ----
-+    // State layout: state_base + i*head_dim + j for [i][j].
-+    float S[128][128];  // 64KB local memory — the TPC's main SRAM.
-+    for (int i = 0; i < head_dim; ++i) {
-+        const float decay =
-+            exp_f32(s_f32_ld_g(gen_addr((int5){base + i, 0}, gate)));
-+        for (int j = 0; j < head_dim; ++j) {
-+            S[i][j] = s_f32_ld_g(gen_addr(
-+                (int5){state_base + i * head_dim + j, 0}, state)) * decay;
++    v_bf16_st_tnsr((int5){base, 0}, out, v_convert_f32_to_bf16_all_b(out_acc));
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c
+new file mode 100644
+index 0000000..4d39dd5
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c
+@@ -0,0 +1,49 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash mHC pre-block stream collapse TPC-C
++// kernel: collapsed[t, :] = Σ_n pre[t, n] * streams[t, n*H + :].
++//
++// Input  streams : BF16 [4H, T], FCD = 4H, stream n at rows [n*H, (n+1)*H).
++// Input  pre     : FP32 [4, T] — the sigmoid+eps pre gates.
++// Output out     : BF16 [H, T] — the block's input residual.
++//
++// Per-token four scalar gate reads broadcast into float64 lane coefficients;
++// the H-axis runs in 128-lane chunks with FP32 MAC accumulation and a single
++// BF16 round at the store. Validated against tpc-clang 2.7.33 (SynapseAI
++// 1.24.1).
++
++void main(tensor streams, tensor pre, tensor out)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(out, 0);  // H
++
++    for (int token = begin[1]; token < end[1]; ++token) {
++        const float pre0 = s_f32_ld_g(gen_addr((int5){0, token}, pre));
++        const float pre1 = s_f32_ld_g(gen_addr((int5){1, token}, pre));
++        const float pre2 = s_f32_ld_g(gen_addr((int5){2, token}, pre));
++        const float pre3 = s_f32_ld_g(gen_addr((int5){3, token}, pre));
++
++        for (int col = begin[0]; col < end[0]; col += 128) {
++            const int count = (end[0] - col < 128) ? end[0] - col : 128;
++            float128 acc = {0};
++            for (int n = 0; n < 4; ++n) {
++                const float gate = n == 0 ? pre0 : n == 1 ? pre1 : n == 2 ? pre2 : pre3;
++                float128 x;
++                if (count == 128) {
++                    x = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_b((int5){n * width + col, token}, streams));
++                } else {
++                    x = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){n * width + col, token}, streams, count, 0));
++                }
++                acc.v1 = v_f32_mac_b(x.v1, gate, acc.v1);
++                acc.v2 = v_f32_mac_b(x.v2, gate, acc.v2);
++            }
++            if (count == 128) {
++                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
++            } else {
++                v_bf16_st_tnsr_partial((int5){col, token}, out,
++                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++            }
 +        }
 +    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c
+new file mode 100644
+index 0000000..62bb2c6
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c
+@@ -0,0 +1,138 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash mHC gate generation TPC-C kernel.
++// Sinkhorn lane machinery adapted from the 1Cat flashinfer-gaudi mHC kernel
++// (Apache-2.0): the 4x4 comb matrix rides in the low 16 lanes of a float64;
++// row/column sums go through byte shuffles (matrix_direction maps entry k to
++// lane k), and the low-16 partial loads/stores move the whole group at once.
++//
++// Input  streams : BF16 [4H, T] — the four residual streams, FCD = 4H.
++// Input  mixes   : BF16 [24, T] — raw fn projections (MME GEMM output,
++//                  un-normalized; the gate math applies the RMS scale here,
++//                  so the BF16 rounding sits at the mix magnitude).
++// Input  base    : FP32 [24, 1] — pre[0:4] | post[4:8] | comb[8:24], comb
++//                  entry (s,d) at 8 + 4*s + d (src-major rows).
++// Input  scale   : FP32 [3, 1]  — {pre, post, comb} scales.
++// Output gates   : FP32 [24, T] — pre | post | comb in the same lane order.
++// Scalars: rms_eps, hc_eps, sinkhorn_iters (>= 1).
++//
++// Math per token:
++//   inv_rms   = 1 / sqrt(mean(streams^2) + rms_eps)      [FP32 scan of 4H]
++//   pre[n]    = sigmoid(mixes[n]*inv_rms*scale[0] + base[n]) + hc_eps
++//   post[n]   = 2 * sigmoid(mixes[4+n]*inv_rms*scale[1] + base[4+n])
++//   comb[s,d] = sinkhorn(softmax over d of mixes[8+4*s+d]*inv_rms*scale[2]
++//                        + base[8+4*s+d]):
++//               row-softmax, one column normalization (sum over src + hc_eps),
++//               then iters-1 rounds of {row over dst, column over src}.
++//
++// Sigmoid is the no-LUT Cephe path (v_sigmoid_f32's LUT saturates at |x|>=9).
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
 +
-+    // ---- Phase 3: u[j] = Σ_i S[i][j] * k[i]. ----
-+    float u[128];
-+    for (int j = 0; j < head_dim; ++j) {
-+        float acc = 0.0f;
-+        for (int i = 0; i < head_dim; ++i) {
-+            acc += S[i][j] * kh[i];
-+        }
-+        u[j] = acc;
-+    }
++static inline float64 sigmoid_nolut_f32(float64 v)
++{
++    return v_reciprocal_f32(1.0f + v_exp_cephes_f32(-v));
++}
 +
-+    // ---- Phase 4: delta[j] = beta * (v[j] - u[j]). ----
-+    const float b = s_f32_ld_g(gen_addr((int5){begin[0], 0}, beta));
-+    float delta[128];
-+    for (int j = 0; j < head_dim; ++j) {
-+        const float vj = scalar_bf16((int5){base + j, 0}, v);
-+        delta[j] = b * (vj - u[j]);
-+    }
++// Byte-shuffle selector that picks matrix entry k (lane k) into every lane.
++static inline uchar256 matrix_direction(uint64 index)
++{
++    const uint64 selected = (index & 7) | ((index & 8) << 2) | 0x80;
++    uint256 packed;
++    packed.v1 = selected;
++    packed.v2 = selected;
++    packed.v3 = selected;
++    packed.v4 = selected;
++    return v_convert_u32_to_u8_all_b(packed);
++}
 +
-+    // ---- Phase 5: S[i][j] += k[i] * delta[j]. ----
-+    for (int i = 0; i < head_dim; ++i) {
-+        for (int j = 0; j < head_dim; ++j) {
-+            S[i][j] += kh[i] * delta[j];
-+        }
-+    }
++void main(tensor streams, tensor mixes, tensor base, tensor scale, tensor gates,
++          float rms_eps, float hc_eps, int sinkhorn_iters)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(streams, 0);  // 4H
++    const uint64 lane = read_lane_id_4b_b();
++    const uchar256 r0 = matrix_direction(lane & 0xfffffffc);
++    const uchar256 r1 = matrix_direction((lane & 0xfffffffc) | 1);
++    const uchar256 r2 = matrix_direction((lane & 0xfffffffc) | 2);
++    const uchar256 r3 = matrix_direction((lane & 0xfffffffc) | 3);
++    const uchar256 c0 = matrix_direction(lane & 3);
++    const uchar256 c1 = matrix_direction((lane & 3) | 4);
++    const uchar256 c2 = matrix_direction((lane & 3) | 8);
++    const uchar256 c3 = matrix_direction((lane & 3) | 12);
 +
-+    // ---- Phase 6: out[j] = Σ_i S[i][j] * q[i]; write state back. ----
-+    for (int j = 0; j < head_dim; ++j) {
-+        float acc = 0.0f;
-+        for (int i = 0; i < head_dim; ++i) {
-+            acc += S[i][j] * qh[i];
++    for (int token = begin[1]; token < end[1]; ++token) {
++        // In-kernel RMS of the four streams (FP32 accumulation over BF16).
++        float128 squares = {0};
++        for (int col = 0; col < width; col += 128) {
++            const int count = (width - col < 128) ? width - col : 128;
++            float128 x;
++            if (count == 128) {
++                x = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, token}, streams));
++            } else {
++                x = v_convert_bf16_to_f32_all_b(
++                    v_bf16_ld_tnsr_partial_b((int5){col, token}, streams, count, 0));
++            }
++            squares.v1 = v_f32_mac_b(x.v1, x.v1, squares.v1);
++            squares.v2 = v_f32_mac_b(x.v2, x.v2, squares.v2);
 +        }
-+        scalar_bf16_store((int5){base + j, 0}, out, acc);
++        const float64 inv_rms = 1.0 /
++            sqrt_f32(v_f32_reduce_add(squares.v1 + squares.v2) *
++                        (1.0f / (float)width) + rms_eps);
++
++        const float64 pre_scale  = s_f32_ld_g(gen_addr((int5){0, 0}, scale));
++        const float64 post_scale = s_f32_ld_g(gen_addr((int5){1, 0}, scale));
++        const float64 comb_scale = s_f32_ld_g(gen_addr((int5){2, 0}, scale));
++
++        // pre[n] = sigmoid(mixes[n] * inv_rms * pre_scale + base[n]) + hc_eps.
++        const float64 pre_raw = v_convert_bf16_to_f32_all_b(
++            v_bf16_ld_tnsr_partial_b((int5){0, token}, mixes, 4, 0)).v1;
++        const float64 pre_base = v_f32_ld_tnsr_partial_b((int5){0, 0}, base, 4, 0);
++        const float64 pre_gates = sigmoid_nolut_f32(
++            pre_raw * (inv_rms * pre_scale) + pre_base) + hc_eps;
++        v_f32_st_tnsr_partial((int5){0, token}, gates, pre_gates, 4, 0);
++
++        // post[n] = 2 * sigmoid(mixes[4+n] * inv_rms * post_scale + base[4+n]).
++        const float64 post_raw = v_convert_bf16_to_f32_all_b(
++            v_bf16_ld_tnsr_partial_b((int5){4, token}, mixes, 4, 0)).v1;
++        const float64 post_base = v_f32_ld_tnsr_partial_b((int5){4, 0}, base, 4, 0);
++        const float64 post_gates = sigmoid_nolut_f32(
++            post_raw * (inv_rms * post_scale) + post_base) * 2.0f;
++        v_f32_st_tnsr_partial((int5){4, token}, gates, post_gates, 4, 0);
++
++        // comb: 16 raw lanes, stable softmax over dst (row-major src rows),
++        // then the Sinkhorn alternation.
++        const float64 comb_raw = v_convert_bf16_to_f32_all_b(
++            v_bf16_ld_tnsr_partial_b((int5){8, token}, mixes, 16, 0)).v1;
++        const float64 comb_base = v_f32_ld_tnsr_partial_b((int5){8, 0}, base, 16, 0);
++        float64 values = comb_raw * (inv_rms * comb_scale) + comb_base;
++
++        float64 maximum = -3.402823466e+38f;
++        maximum = v_f32_max_b(v_f32_shuffle_b(values, r0, 0, 0.0f), maximum);
++        maximum = v_f32_max_b(v_f32_shuffle_b(values, r1, 0, 0.0f), maximum);
++        maximum = v_f32_max_b(v_f32_shuffle_b(values, r2, 0, 0.0f), maximum);
++        maximum = v_f32_max_b(v_f32_shuffle_b(values, r3, 0, 0.0f), maximum);
++        values = v_exp_cephes_f32(values - maximum);
++        float64 sum = 0.0f;
++        sum += v_f32_shuffle_b(values, r0, 0, 0.0f);
++        sum += v_f32_shuffle_b(values, r1, 0, 0.0f);
++        sum += v_f32_shuffle_b(values, r2, 0, 0.0f);
++        sum += v_f32_shuffle_b(values, r3, 0, 0.0f);
++        values = values / (sum + hc_eps);
++
++        for (int iteration = 0; iteration < sinkhorn_iters; ++iteration) {
++            if (iteration != 0) {
++                const float64 a = v_f32_shuffle_b(values, r0, 0, 0.0f)
++                                + v_f32_shuffle_b(values, r1, 0, 0.0f);
++                const float64 b = v_f32_shuffle_b(values, r2, 0, 0.0f)
++                                + v_f32_shuffle_b(values, r3, 0, 0.0f);
++                values = values / ((a + b) + hc_eps);
++            }
++            float64 column_sum = 0.0f;
++            column_sum += v_f32_shuffle_b(values, c0, 0, 0.0f);
++            column_sum += v_f32_shuffle_b(values, c1, 0, 0.0f);
++            column_sum += v_f32_shuffle_b(values, c2, 0, 0.0f);
++            column_sum += v_f32_shuffle_b(values, c3, 0, 0.0f);
++            values = values / (column_sum + hc_eps);
++        }
++        v_f32_st_tnsr_partial((int5){8, token}, gates, values, 16, 0);
 +    }
-+    for (int i = 0; i < head_dim; ++i) {
-+        for (int j = 0; j < head_dim; ++j) {
-+            s_f32_st_g(gen_addr(
-+                (int5){state_base + i * head_dim + j, 0}, state), S[i][j]);
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c
+new file mode 100644
+index 0000000..acf6426
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c
+@@ -0,0 +1,42 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash mHC head TPC-C kernel: the final
++// unweighted mean over the four streams, out[t, :] = (1/4) Σ_n streams[t, n*H + :].
++//
++// Input  streams : BF16 [4H, T], stream n at rows [n*H, (n+1)*H).
++// Output out     : BF16 [H, T].
++//
++// FP32 accumulation across the four 128-lane chunks, ×0.25, one BF16 round.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor streams, tensor out)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(out, 0);  // H
++
++    for (int token = begin[1]; token < end[1]; ++token) {
++        for (int col = begin[0]; col < end[0]; col += 128) {
++            const int count = (end[0] - col < 128) ? end[0] - col : 128;
++            float128 acc = {0};
++            for (int n = 0; n < 4; ++n) {
++                float128 x;
++                if (count == 128) {
++                    x = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_b((int5){n * width + col, token}, streams));
++                } else {
++                    x = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){n * width + col, token}, streams, count, 0));
++                }
++                acc.v1 += x.v1;
++                acc.v2 += x.v2;
++            }
++            acc.v1 = acc.v1 * 0.25f;
++            acc.v2 = acc.v2 * 0.25f;
++            if (count == 128) {
++                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
++            } else {
++                v_bf16_st_tnsr_partial((int5){col, token}, out,
++                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++            }
 +        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c
+new file mode 100644
+index 0000000..8921694
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c
+@@ -0,0 +1,75 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash mHC post-block stream update TPC-C
++// kernel: out[t, dst, :] = post[t,dst] * block[t, :] + Σ_src comb[t,src,dst]
++//                                   * residual[t, src, :].
++//
++// Input  block    : BF16 [H, T] — the block output.
++// Input  residual : BF16 [4H, T] — the pre-block streams, stream src at rows
++//                   [src*H, (src+1)*H).
++// Input  post     : FP32 [4, T].
++// Input  comb     : FP32 [16, T] — entry (src, dst) at row 4*src + dst.
++// Output out      : BF16 [4H, T] — the updated streams, may alias residual.
++//
++// Four dst streams each re-scan their H-axis in 128-lane chunks; the five
++// scalar coefficients (one post, four comb) broadcast into float64 lane
++// math. FP32 accumulation, one BF16 round at the store.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor block, tensor residual, tensor post, tensor comb, tensor out)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(block, 0);  // H
++
++    for (int token = begin[1]; token < end[1]; ++token) {
++        const float post0 = s_f32_ld_g(gen_addr((int5){0, token}, post));
++        const float post1 = s_f32_ld_g(gen_addr((int5){1, token}, post));
++        const float post2 = s_f32_ld_g(gen_addr((int5){2, token}, post));
++        const float post3 = s_f32_ld_g(gen_addr((int5){3, token}, post));
++
++        for (int dst = 0; dst < 4; ++dst) {
++            const float dst_post = dst == 0 ? post0 : dst == 1 ? post1
++                                 : dst == 2 ? post2 : post3;
++            float64 c0 = s_f32_ld_g(gen_addr((int5){0 * 4 + dst, token}, comb));
++            float64 c1 = s_f32_ld_g(gen_addr((int5){1 * 4 + dst, token}, comb));
++            float64 c2 = s_f32_ld_g(gen_addr((int5){2 * 4 + dst, token}, comb));
++            float64 c3 = s_f32_ld_g(gen_addr((int5){3 * 4 + dst, token}, comb));
++
++            for (int col = begin[0]; col < end[0]; col += 128) {
++                const int count = (end[0] - col < 128) ? end[0] - col : 128;
++                float128 b, r0, r1, r2, r3;
++                if (count == 128) {
++                    b  = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, token}, block));
++                    r0 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){0 * width + col, token}, residual));
++                    r1 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){1 * width + col, token}, residual));
++                    r2 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){2 * width + col, token}, residual));
++                    r3 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){3 * width + col, token}, residual));
++                } else {
++                    b  = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b((int5){col, token}, block, count, 0));
++                    r0 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b((int5){0 * width + col, token}, residual, count, 0));
++                    r1 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b((int5){1 * width + col, token}, residual, count, 0));
++                    r2 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b((int5){2 * width + col, token}, residual, count, 0));
++                    r3 = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b((int5){3 * width + col, token}, residual, count, 0));
++                }
++                float128 acc;
++                acc.v1 = b.v1 * dst_post;
++                acc.v2 = b.v2 * dst_post;
++                acc.v1 = v_f32_mac_b(r0.v1, c0, acc.v1);
++                acc.v2 = v_f32_mac_b(r0.v2, c0, acc.v2);
++                acc.v1 = v_f32_mac_b(r1.v1, c1, acc.v1);
++                acc.v2 = v_f32_mac_b(r1.v2, c1, acc.v2);
++                acc.v1 = v_f32_mac_b(r2.v1, c2, acc.v1);
++                acc.v2 = v_f32_mac_b(r2.v2, c2, acc.v2);
++                acc.v1 = v_f32_mac_b(r3.v1, c3, acc.v1);
++                acc.v2 = v_f32_mac_b(r3.v2, c3, acc.v2);
++
++                const bfloat128 packed = v_convert_f32_to_bf16_all_b(acc);
++                if (count == 128) {
++                    v_bf16_st_tnsr((int5){dst * width + col, token}, out, packed);
++                } else {
++                    v_bf16_st_tnsr_partial((int5){dst * width + col, token}, out,
++                                           packed, count, 0);
++                }
++            }
++        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c
+new file mode 100644
+index 0000000..164f142
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c
+@@ -0,0 +1,50 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash MoE expert combination TPC-C kernel:
++// out[t, :] = Σ_i weights[t, i] * experts[t, i, :] + shared[t, :].
++//
++// Input  experts  : BF16 [top_k*H, T] — expert i at rows [i*H, (i+1)*H).
++// Input  weights  : FP32 [top_k, T].
++// Input  shared   : BF16 [H, T] — the shared expert, added unweighted.
++// Output out      : BF16 [H, T].
++//
++// top_k is a runtime scalar (register-bounded by the loop; the production
++// GLM-5.3-Flash route is 8). FP32 accumulation, one BF16 round at the store.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++void main(tensor experts, tensor weights, tensor shared, tensor out, int top_k)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(out, 0);  // H
++
++    for (int token = begin[1]; token < end[1]; ++token) {
++        for (int col = begin[0]; col < end[0]; col += 128) {
++            const int count = (end[0] - col < 128) ? end[0] - col : 128;
++            float128 acc;
++            if (count == 128) {
++                acc = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){col, token}, shared));
++            } else {
++                acc = v_convert_bf16_to_f32_all_b(
++                    v_bf16_ld_tnsr_partial_b((int5){col, token}, shared, count, 0));
++            }
++            for (int i = 0; i < top_k; ++i) {
++                const float w = s_f32_ld_g(gen_addr((int5){i, token}, weights));
++                float128 x;
++                if (count == 128) {
++                    x = v_convert_bf16_to_f32_all_b(
++                        v_bf16_ld_tnsr_b((int5){i * width + col, token}, experts));
++                } else {
++                    x = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                        (int5){i * width + col, token}, experts, count, 0));
++                }
++                acc.v1 = v_f32_mac_b(x.v1, w, acc.v1);
++                acc.v2 = v_f32_mac_b(x.v2, w, acc.v2);
++            }
++            if (count == 128) {
++                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
++            } else {
++                v_bf16_st_tnsr_partial((int5){col, token}, out,
++                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++            }
++        }
++    }
++}
+diff --git a/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c
+new file mode 100644
+index 0000000..573a569
+--- /dev/null
++++ b/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c
+@@ -0,0 +1,115 @@
++// ninfer::gaudi2::tpc — GLM-5.3-Flash MoE sigmoid router with noaux_tc
++// correction, TPC-C for Gaudi2. The repeated-max selection mechanism is
++// adapted from the 1Cat flashinfer-gaudi DeepSeek top-k router (Apache-2.0):
++// every 64-lane chunk carries one expert per lane; a vector select reduces
++// (score, expert-id) pairs, reduce-max picks the winner, ties resolve to the
++// smaller id via the reduce-min id pass, and predication retires winners.
++//
++// Input  logits          : BF16 [E, T] — the router projection, FCD = E.
++// Input  correction_bias : FP32 [E, 1] — the noaux_tc bias.
++// Output weights         : FP32 [top_k, T] — normalized ORIGINAL scores,
++//                          scaled by routed_scaling_factor.
++// Output indices         : Int32 [top_k, T] — expert ids, descending by
++//                          score + bias, ties by lower id.
++// Scalars: top_k (>= 1), routed_scaling_factor.
++//
++// Math per token:
++//   score[e]  = sigmoid(logits[e])                    [no-LUT Cephe sigmoid]
++//   rank key  = score[e] + correction_bias[e]
++//   select top_k by key (stable descending, ties -> lower id)
++//   weights[i] = score[sel_i] * routed_scaling / (Σ_j score[sel_j] + 1e-20)
++//
++// The expert axis rides in ceil(E/64) 64-lane chunks (register arrays sized
++// for 8 chunks = 512 experts; one BF16 load fills two chunks). Tail chunks
++// load partially and their idle lanes are excluded from selection.
++// Validated against tpc-clang 2.7.33 (SynapseAI 1.24.1).
++
++#define MOE_MAX_CHUNKS 8
++
++static inline float64 sigmoid_nolut_f32(float64 v)
++{
++    return v_reciprocal_f32(1.0f + v_exp_cephes_f32(-v));
++}
++
++void main(tensor logits, tensor correction_bias, tensor weights, tensor indices,
++          int top_k, float routed_scaling_factor)
++{
++    const int5 begin = get_index_space_offset();
++    const int5 end   = begin + get_index_space_size();
++    const int experts = get_dim_size(logits, 0);
++    const int chunks = (experts + 63) / 64;
++    const int64 lanes = (int64)V_LANE_ID_32;
++
++    for (int token = begin[1]; token < end[1]; ++token) {
++        float64 score[MOE_MAX_CHUNKS];
++        float64 key[MOE_MAX_CHUNKS];
++        bool64 eligible[MOE_MAX_CHUNKS];
++        for (int c = 0; c < chunks; ++c) {
++            score[c] = 0;
++            key[c] = as_float64((int64)0xff800000);  // -inf: idle until loaded
++            eligible[c] = v_i32_cmp_less_b(lanes, (int64)(experts - c * 64));
++        }
++
++        // One BF16 load covers two 64-lane chunks of logits.
++        for (int c = 0; c < chunks; c += 2) {
++            const int base = c * 64;
++            const int have = experts - base;
++            float128 raw;
++            if (have >= 128) {
++                raw = v_convert_bf16_to_f32_all_b(
++                    v_bf16_ld_tnsr_b((int5){base, token}, logits));
++            } else {
++                raw = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_partial_b(
++                    (int5){base, token}, logits, have, 0));
++            }
++            score[c] = sigmoid_nolut_f32(raw.v1);
++            if (c + 1 < chunks) score[c + 1] = sigmoid_nolut_f32(raw.v2);
++        }
++        for (int c = 0; c < chunks; ++c) {
++            const int base = c * 64;
++            const int have = experts - base;
++            const float64 bias = have >= 64
++                ? v_f32_ld_tnsr_b((int5){base, 0}, correction_bias)
++                : v_f32_ld_tnsr_partial_b((int5){base, 0}, correction_bias, have, 0);
++            key[c] = score[c] + bias;
++        }
++
++        float64 sum = 0;
++        float64 packed_weights = 0;
++        int64 packed_ids = 0;
++        for (int rank = 0; rank < top_k; ++rank) {
++            // Reduce (key, score, id) across all chunks; descending chunk
++            // order plus >= gives the smaller id on ties, and predication
++            // excludes already-selected experts and idle tail lanes.
++            int64_float64_pair_t local;
++            local.v1 = 2147483647;
++            local.v2 = as_float64((int64)0xff800000);
++            float64 local_score = 0;
++            for (int c = chunks - 1; c >= 0; --c) {
++                local_score = v_f32_sel_geq_f32_vb(key[c], local.v2, score[c], local_score,
++                                                   0, local_score, eligible[c], 0);
++                local = v_i32_sel2_geq_f32_vb(key[c], local.v2, lanes + c * 64, local.v1,
++                                              0, local, eligible[c], 0);
++            }
++            const float64 best = v_f32_reduce_max(local.v2);
++            int64 winner = v_i32_sel_eq_f32_b(local.v2, best, local.v1, 2147483647);
++            winner = v_i32_reduce_min(winner);
++            const bool64 selected_lane = v_i32_cmp_eq_b(local.v1, winner);
++            for (int c = 0; c < chunks; ++c)
++                eligible[c] = eligible[c] & v_i32_cmp_neq_b(lanes + c * 64, winner);
++            const float64 selected_weight = v_f32_reduce_add(
++                v_f32_mov_vb(local_score, 0, 0, selected_lane, 0));
++            const bool64 output_lane = v_i32_cmp_eq_b(lanes, rank);
++            packed_weights = v_f32_mov_vb(selected_weight, 0, packed_weights, output_lane, 0);
++            packed_ids = v_i32_mov_vb(winner, 0, packed_ids, output_lane, 0);
++            sum += selected_weight;
++        }
++
++        const float64 denominator = sum + 1.0e-20f;
++        float64 inverse = v_reciprocal_f32(denominator);
++        inverse = inverse * (2.0f - denominator * inverse);
++        v_i32_st_tnsr_partial((int5){0, token}, indices, packed_ids, top_k, 0);
++        v_f32_st_tnsr_partial((int5){0, token}, weights,
++                              packed_weights * (inverse * routed_scaling_factor), top_k, 0);
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_rmsnorm_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_rmsnorm_bf16_gaudi2.c
@@ -7128,10 +8240,10 @@ index 0000000..20fab9e
 +}
 diff --git a/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
 new file mode 100644
-index 0000000..30035f7
+index 0000000..ab0049c
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,330 @@
 +// TPC kernel bridge lifecycle tests against the fake_synapse asynchronous test
 +// double. These validate graph construction (tensors, sections, custom kernel
 +// nodes), recipe compilation, launch resource management (DMA leases), and
@@ -7300,6 +8412,148 @@ index 0000000..30035f7
 +    fake_synapse::assert_clean();
 +}
 +
++void mhc_lifecycle() {
++    constexpr std::uint32_t H = 32, T = 1, W4 = H * 4;
++    {
++        Device device;
++        auto stream = device.create_stream();
++        MhcGatesShape shape{H, T};
++
++        MhcGates gates(device, shape, 1e-6f, 1e-6f, 4, 4096);
++        MhcCollapse collapse(device, shape, 4096);
++        MhcPost post(device, shape, 4096);
++        MhcHead head(device, shape, 4096);
++        require(gates.shape().hidden == H && collapse.shape().tokens == T, "mHC shapes");
++
++        PinnedBuffer h_streams = device.allocate_host(W4 * T * 2);
++        PinnedBuffer h_mixes = device.allocate_host(24 * T * 2);
++        PinnedBuffer h_base = device.allocate_host(24 * 4);
++        PinnedBuffer h_scale = device.allocate_host(3 * 4);
++        PinnedBuffer h_gates = device.allocate_host(24 * T * 4);
++        PinnedBuffer h_pre = device.allocate_host(4 * T * 4);
++        PinnedBuffer h_block = device.allocate_host(H * T * 2);
++        PinnedBuffer h_comb = device.allocate_host(16 * T * 4);
++        PinnedBuffer h_postg = device.allocate_host(4 * T * 4);
++        PinnedBuffer h_collapsed = device.allocate_host(H * T * 2);
++        PinnedBuffer h_updated = device.allocate_host(W4 * T * 2);
++        PinnedBuffer h_head = device.allocate_host(H * T * 2);
++        DeviceBuffer d_streams = device.allocate_device(W4 * T * 2);
++        DeviceBuffer d_mixes = device.allocate_device(24 * T * 2);
++        DeviceBuffer d_base = device.allocate_device(24 * 4);
++        DeviceBuffer d_scale = device.allocate_device(3 * 4);
++        DeviceBuffer d_gates = device.allocate_device(24 * T * 4);
++        DeviceBuffer d_pre = device.allocate_device(4 * T * 4);
++        DeviceBuffer d_block = device.allocate_device(H * T * 2);
++        DeviceBuffer d_comb = device.allocate_device(16 * T * 4);
++        DeviceBuffer d_postg = device.allocate_device(4 * T * 4);
++        DeviceBuffer d_collapsed = device.allocate_device(H * T * 2);
++        DeviceBuffer d_residual = device.allocate_device(W4 * T * 2);
++        DeviceBuffer d_updated = device.allocate_device(W4 * T * 2);
++        DeviceBuffer d_head = device.allocate_device(H * T * 2);
++
++        auto up1 = stream.upload(d_streams, h_streams, h_streams.size()); up1.wait();
++        auto up2 = stream.upload(d_mixes, h_mixes, h_mixes.size()); up2.wait();
++        auto up3 = stream.upload(d_base, h_base, h_base.size()); up3.wait();
++        auto up4 = stream.upload(d_scale, h_scale, h_scale.size()); up4.wait();
++        auto up5 = stream.upload(d_block, h_block, h_block.size()); up5.wait();
++        auto up6 = stream.upload(d_residual, h_streams, h_streams.size()); up6.wait();
++
++        auto c1 = gates.launch(stream, d_streams, d_mixes, d_base, d_scale, d_gates); c1.wait();
++        auto c2 = collapse.launch(stream, d_streams, d_pre, d_collapsed); c2.wait();
++        auto c3 = post.launch(stream, d_block, d_residual, d_postg, d_comb, d_updated); c3.wait();
++        auto c4 = head.launch(stream, d_streams, d_head); c4.wait();
++
++        auto dn1 = stream.download(h_gates, d_gates, h_gates.size()); dn1.wait();
++        auto dn2 = stream.download(h_collapsed, d_collapsed, h_collapsed.size()); dn2.wait();
++        auto dn3 = stream.download(h_updated, d_updated, h_updated.size()); dn3.wait();
++        auto dn4 = stream.download(h_head, d_head, h_head.size()); dn4.wait();
++    }
++    fake_synapse::assert_clean();
++}
++
++void mhc_invalid_shapes_rejected() {
++    {
++        Device device;
++        try {
++            MhcGates g(device, {0, 1}, 1e-6f, 1e-6f, 4, 4096);
++            throw std::runtime_error("MhcGates zero hidden accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            MhcGates g(device, {32, 1}, 1e-6f, 1e-6f, 0, 4096);
++            throw std::runtime_error("MhcGates zero sinkhorn iters accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            MhcCollapse c(device, {32, 0}, 4096);
++            throw std::runtime_error("MhcCollapse zero tokens accepted");
++        } catch (const std::invalid_argument&) {}
++    }
++    fake_synapse::assert_clean();
++}
++
++void moe_lifecycle() {
++    constexpr std::uint32_t E = 96, K = 8, H = 32, T = 1;
++    {
++        Device device;
++        auto stream = device.create_stream();
++        MoeRouteShape route_shape{E, K, T};
++        MoeCombineShape combine_shape{H, K, T};
++        MoeRoute router(device, route_shape, 2.5f, 4096);
++        MoeCombine combine(device, combine_shape, 4096);
++        require(router.shape().experts == E && combine.shape().top_k == K, "MoE shapes");
++
++        PinnedBuffer h_logits = device.allocate_host(E * T * 2);
++        PinnedBuffer h_bias = device.allocate_host(E * 4);
++        PinnedBuffer h_weights = device.allocate_host(K * T * 4);
++        PinnedBuffer h_indices = device.allocate_host(K * T * 4);
++        PinnedBuffer h_experts = device.allocate_host(K * H * T * 2);
++        PinnedBuffer h_shared = device.allocate_host(H * T * 2);
++        PinnedBuffer h_out = device.allocate_host(H * T * 2);
++        DeviceBuffer d_logits = device.allocate_device(E * T * 2);
++        DeviceBuffer d_bias = device.allocate_device(E * 4);
++        DeviceBuffer d_weights = device.allocate_device(K * T * 4);
++        DeviceBuffer d_indices = device.allocate_device(K * T * 4);
++        DeviceBuffer d_experts = device.allocate_device(K * H * T * 2);
++        DeviceBuffer d_shared = device.allocate_device(H * T * 2);
++        DeviceBuffer d_out = device.allocate_device(H * T * 2);
++
++        auto up1 = stream.upload(d_logits, h_logits, h_logits.size()); up1.wait();
++        auto up2 = stream.upload(d_bias, h_bias, h_bias.size()); up2.wait();
++        auto up3 = stream.upload(d_experts, h_experts, h_experts.size()); up3.wait();
++        auto up4 = stream.upload(d_shared, h_shared, h_shared.size()); up4.wait();
++
++        auto c1 = router.launch(stream, d_logits, d_bias, d_weights, d_indices); c1.wait();
++        auto c2 = combine.launch(stream, d_experts, d_weights, d_shared, d_out); c2.wait();
++
++        auto dn1 = stream.download(h_weights, d_weights, h_weights.size()); dn1.wait();
++        auto dn2 = stream.download(h_indices, d_indices, h_indices.size()); dn2.wait();
++        auto dn3 = stream.download(h_out, d_out, h_out.size()); dn3.wait();
++    }
++    fake_synapse::assert_clean();
++}
++
++void moe_invalid_shapes_rejected() {
++    {
++        Device device;
++        try {
++            MoeRoute r(device, {0, 1, 1}, 2.5f, 4096);
++            throw std::runtime_error("MoeRoute zero experts accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            MoeRoute r(device, {96, 600, 1}, 2.5f, 4096);  // experts > 512
++            throw std::runtime_error("MoeRoute oversized experts accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            MoeRoute r(device, {96, 100, 1}, 2.5f, 4096);  // top_k > experts
++            throw std::runtime_error("MoeRoute top_k above experts accepted");
++        } catch (const std::invalid_argument&) {}
++        try {
++            MoeCombine c(device, {32, 0, 1}, 4096);
++            throw std::runtime_error("MoeCombine zero top_k accepted");
++        } catch (const std::invalid_argument&) {}
++    }
++    fake_synapse::assert_clean();
++}
++
 +} // namespace
 +
 +int main() {
@@ -7309,7 +8563,11 @@ index 0000000..30035f7
 +        kda_gate_lifecycle();
 +        kda_scan_lifecycle();
 +        invalid_shapes_rejected();
-+        std::puts("GLM5 TPC kernel bridges (RMSNorm, clamp SwiGLU, KDA gate, KDA scan) pass lifecycle validation");
++        mhc_lifecycle();
++        mhc_invalid_shapes_rejected();
++        moe_lifecycle();
++        moe_invalid_shapes_rejected();
++        std::puts("GLM5 TPC kernel bridges (RMSNorm, clamp SwiGLU, KDA, mHC, MoE) pass lifecycle validation");
 +        return 0;
 +    } catch (const std::exception& e) {
 +        std::cerr << e.what() << '\n';
