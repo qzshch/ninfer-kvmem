@@ -9243,7 +9243,7 @@ index 0000000..20fab9e
 +}
 diff --git a/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
 new file mode 100644
-index 0000000..058da1f
+index 0000000..ed5c9c9
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/tests/glm5_tpc_test.cpp
 @@ -0,0 +1,432 @@
@@ -9572,7 +9572,7 @@ index 0000000..058da1f
 +        DsaSelect select(device, {VISIBLE, K, TOP_POOLS, W}, POSITION, true, 4096);
 +        DsaAttention attend(device, {H, LORA, VH, CACHE, W}, 0.0625f, 4096);
 +        DsaAbsorb absorb(device, {H, D, LORA}, 4096);
-+        DsaScale scale(device, LORA, 1.5f, 4096);
++        DsaScale scale(device, LORA * H, 1.5f, 4096);
 +
 +        PinnedBuffer h_ik = device.allocate_host(D * T * 2);
 +        PinnedBuffer h_ig = device.allocate_host(D * T * 2);
@@ -9589,7 +9589,7 @@ index 0000000..058da1f
 +        PinnedBuffer h_lat = device.allocate_host(LORA * CACHE * 2);
 +        PinnedBuffer h_wv = device.allocate_host(LORA * VH * H * 2);
 +        PinnedBuffer h_out = device.allocate_host(H * VH * 2);
-+        PinnedBuffer h_scaled = device.allocate_host(LORA * 4);
++        PinnedBuffer h_scaled = device.allocate_host(LORA * H * 4);
 +
 +        DeviceBuffer d_ik = device.allocate_device(D * T * 2);
 +        DeviceBuffer d_ig = device.allocate_device(D * T * 2);
@@ -9606,7 +9606,7 @@ index 0000000..058da1f
 +        DeviceBuffer d_lat = device.allocate_device(LORA * CACHE * 2);
 +        DeviceBuffer d_wv = device.allocate_device(LORA * VH * H * 2);
 +        DeviceBuffer d_out = device.allocate_device(H * VH * 2);
-+        DeviceBuffer d_scaled = device.allocate_device(LORA * 4);
++        DeviceBuffer d_scaled = device.allocate_device(LORA * H * 4);
 +
 +        auto up1 = stream.upload(d_ik, h_ik, h_ik.size()); up1.wait();
 +        auto up2 = stream.upload(d_ig, h_ig, h_ig.size()); up2.wait();
