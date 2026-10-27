@@ -3478,10 +3478,10 @@ index 0000000..adb77ed
 +}
 diff --git a/src/core/gaudi2/glm5_hpu_block.cpp b/src/core/gaudi2/glm5_hpu_block.cpp
 new file mode 100644
-index 0000000..3db28a2
+index 0000000..e7339d6
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_block.cpp
-@@ -0,0 +1,462 @@
+@@ -0,0 +1,466 @@
 +#include "core/gaudi2/glm5_hpu_block.h"
 +#include "ops/gaudi2/bf16_gemm.h"
 +
@@ -3584,6 +3584,10 @@ index 0000000..3db28a2
 +    // upload channel works on both the fake and the real runtime.
 +    auto zero_fill = [&device](DeviceBuffer& buffer, std::size_t bytes) {
 +        PinnedBuffer zeros = device.allocate_host(bytes);
++        // Explicitly clear the staging plane: the real host allocator does
++        // not zero its buffers, and the fake one happening to must not mask
++        // an uninitialized upload.
++        std::memset(zeros.bytes().data(), 0, bytes);
 +        auto stream = device.create_stream();
 +        auto transfer = stream.upload(buffer, zeros, bytes);
 +        transfer.wait();
@@ -7230,10 +7234,10 @@ index 0000000..4890ea2
 +} // namespace ninfer::gaudi2::tpc
 diff --git a/src/core/gaudi2/tpc/kernels/README.md b/src/core/gaudi2/tpc/kernels/README.md
 new file mode 100644
-index 0000000..05bab96
+index 0000000..d02f7da
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/README.md
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,76 @@
 +# GLM-5.3-Flash TPC-C kernels (Gaudi2)
 +
 +Ten device kernels, all compile-validated against the real TPC compiler
@@ -7299,6 +7303,12 @@ index 0000000..05bab96
 +- Low-N lane groups ride in the first lanes of a float64 via
 +  `*_ld_tnsr_partial_b` (zero-filled tail) and leave via
 +  `*_st_tnsr_partial` — the whole mHC gate row moves in 4/4/16-lane blocks.
++- `*_st_tnsr_partial`'s count argument is the LAST VALID LANE INDEX
++  (element count minus one; 64 elements pass 63) per the interface
++  definition. The partial LOAD's argument is kept as an element count:
++  under either reading that stays safe — one extra lane reads padding that
++  the store's narrower range discards, while under-reading would corrupt
++  the tail.
 +- Comparisons return masks via named builtins (`v_i32_cmp_less_b`), not C
 +  operators on vector types.
 +- `no_saturation_sigmoid_f32` does **not** exist here; the no-LUT path is
@@ -7610,7 +7620,7 @@ index 0000000..70db1dd
 +[ "$fail" -eq 0 ]
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c
 new file mode 100644
-index 0000000..43c6e3c
+index 0000000..c656d9a
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_clamp_swiglu_bf16_gaudi2.c
 @@ -0,0 +1,75 @@
@@ -7684,7 +7694,7 @@ index 0000000..43c6e3c
 +            if (count == 128) {
 +                v_bf16_st_tnsr((int5){i, token}, out, packed);
 +            } else {
-+                v_bf16_st_tnsr_partial((int5){i, token}, out, packed, count, 0);
++                v_bf16_st_tnsr_partial((int5){i, token}, out, packed, count - 1, 0);
 +            }
 +        }
 +    }
@@ -7901,7 +7911,7 @@ index 0000000..1c05429
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c
 new file mode 100644
-index 0000000..21066f1
+index 0000000..223c9d6
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_pool_bf16_gaudi2.c
 @@ -0,0 +1,87 @@
@@ -7985,16 +7995,16 @@ index 0000000..21066f1
 +
 +            v_f32_st_tnsr_partial((int5){col, pool}, pooled,
 +                                  wsum1 * v_reciprocal_f32(sum1),
-+                                  count > 64 ? 64 : count, 0);
++                                  (count > 64 ? 64 : count) - 1, 0);
 +            if (count > 64)
 +                v_f32_st_tnsr_partial((int5){col + 64, pool}, pooled,
-+                                      wsum2 * v_reciprocal_f32(sum2), count - 64, 0);
++                                      wsum2 * v_reciprocal_f32(sum2), count - 64 - 1, 0);
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c
 new file mode 100644
-index 0000000..98db800
+index 0000000..d7d8608
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_scale_f32_gaudi2.c
 @@ -0,0 +1,27 @@
@@ -8015,13 +8025,13 @@ index 0000000..98db800
 +                           : v_f32_ld_tnsr_partial_b((int5){col, 0}, values, count, 0))
 +            : 0;
 +        v_f32_st_tnsr_partial((int5){col, 0}, out, v1 * factor,
-+                              count > 64 ? 64 : count, 0);
++                              (count > 64 ? 64 : count) - 1, 0);
 +        if (count > 64) {
 +            const int count2 = count - 64;
 +            const float64 v2 = count2 >= 64
 +                ? v_f32_ld_tnsr_b((int5){col + 64, 0}, values)
 +                : v_f32_ld_tnsr_partial_b((int5){col + 64, 0}, values, count2, 0);
-+            v_f32_st_tnsr_partial((int5){col + 64, 0}, out, v2 * factor, count2, 0);
++            v_f32_st_tnsr_partial((int5){col + 64, 0}, out, v2 * factor, count2 - 1, 0);
 +        }
 +    }
 +}
@@ -8094,7 +8104,7 @@ index 0000000..4093420
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
 new file mode 100644
-index 0000000..feb66a9
+index 0000000..9e15c32
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
 @@ -0,0 +1,79 @@
@@ -8135,7 +8145,7 @@ index 0000000..feb66a9
 +    // -1 fill for every cell (the selected runs overwrite theirs).
 +    for (int c = begin[0]; c < end[0] && c < width; c += 64) {
 +        const int count = (width - c < 64) ? width - c : 64;
-+        v_i32_st_tnsr_partial((int5){c, 0}, cells, lanes * 0 - 1, count, 0);
++        v_i32_st_tnsr_partial((int5){c, 0}, cells, lanes * 0 - 1, count - 1, 0);
 +    }
 +
 +    // Load the visible scores into chunks and rank them.
@@ -8165,7 +8175,7 @@ index 0000000..feb66a9
 +
 +        // The pool's whole K-cell span in one lane-indexed partial store.
 +        v_i32_st_tnsr_partial((int5){rank * pool_k, 0}, cells,
-+                              winner * pool_k + lanes, pool_k, 0);
++                              winner * pool_k + lanes, pool_k - 1, 0);
 +    }
 +
 +    // The incomplete tail: cells n_vis*K .. position in position order.
@@ -8173,16 +8183,16 @@ index 0000000..feb66a9
 +        const int tail_len = (position + 1) - visible * pool_k;
 +        if (tail_len > 0) {
 +            v_i32_st_tnsr_partial((int5){top_pools * pool_k, 0}, cells,
-+                                  lanes + visible * pool_k, tail_len, 0);
++                                  lanes + visible * pool_k, tail_len - 1, 0);
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
 new file mode 100644
-index 0000000..314c092
+index 0000000..5864d69
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,59 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash KDA decay gate TPC-C kernel for Gaudi2.
 +//
 +// Input  a     : BF16 [d_inner, T], dim0 = d_inner (FCD), dim1 = T.
@@ -8235,17 +8245,19 @@ index 0000000..314c092
 +            out.v1 = lower_bound * sigmoid_nolut_f32(av.v1 * decay_scale);
 +            out.v2 = lower_bound * sigmoid_nolut_f32(av.v2 * decay_scale);
 +
-+            v_f32_st_tnsr_partial((int5){i, token}, gate, out.v1, 0, 0);
-+            v_f32_st_tnsr_partial((int5){i + 64, token}, gate, out.v2, 0, 0);
++            // 64-lane halves; the partial-store argument is the last
++            // valid lane index, so a full half passes 63.
++            v_f32_st_tnsr_partial((int5){i, token}, gate, out.v1, 63, 0);
++            v_f32_st_tnsr_partial((int5){i + 64, token}, gate, out.v2, 63, 0);
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c
 new file mode 100644
-index 0000000..1d105b7
+index 0000000..9ae373e
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_kda_scan_f32_gaudi2.c
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,102 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash KDA delta-rule recurrence TPC-C kernel.
 +//
 +// Single token, all heads. One index-space x-slot per head.
@@ -8338,9 +8350,10 @@ index 0000000..1d105b7
 +        const float64 r2 = v_f32_ld_tnsr_b((int5){row + 64, 0}, state);
 +        const float64 n1 = v_f32_mac_b(delta.v1, ki, r1 * decay);
 +        const float64 n2 = v_f32_mac_b(delta.v2, ki, r2 * decay);
-+        // FP32 tensor rows are 64 lanes; count 0 does not cover the row.
-+        v_f32_st_tnsr_partial((int5){row, 0}, state, n1, 64, 0);
-+        v_f32_st_tnsr_partial((int5){row + 64, 0}, state, n2, 64, 0);
++        // FP32 tensor rows are 64 lanes; the partial-store argument is
++        // the last valid lane INDEX, so a full half passes 63.
++        v_f32_st_tnsr_partial((int5){row, 0}, state, n1, 63, 0);
++        v_f32_st_tnsr_partial((int5){row + 64, 0}, state, n2, 63, 0);
 +        out_acc.v1 = v_f32_mac_b(n1, qi, out_acc.v1);
 +        out_acc.v2 = v_f32_mac_b(n2, qi, out_acc.v2);
 +    }
@@ -8349,7 +8362,7 @@ index 0000000..1d105b7
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c
 new file mode 100644
-index 0000000..4d39dd5
+index 0000000..d67e976
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_collapse_bf16_gaudi2.c
 @@ -0,0 +1,49 @@
@@ -8397,14 +8410,14 @@ index 0000000..4d39dd5
 +                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
 +            } else {
 +                v_bf16_st_tnsr_partial((int5){col, token}, out,
-+                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++                                       v_convert_f32_to_bf16_all_b(acc), count - 1, 0);
 +            }
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c
 new file mode 100644
-index 0000000..62bb2c6
+index 0000000..c341ff7
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_gates_bf16_gaudi2.c
 @@ -0,0 +1,138 @@
@@ -8498,7 +8511,7 @@ index 0000000..62bb2c6
 +        const float64 pre_base = v_f32_ld_tnsr_partial_b((int5){0, 0}, base, 4, 0);
 +        const float64 pre_gates = sigmoid_nolut_f32(
 +            pre_raw * (inv_rms * pre_scale) + pre_base) + hc_eps;
-+        v_f32_st_tnsr_partial((int5){0, token}, gates, pre_gates, 4, 0);
++        v_f32_st_tnsr_partial((int5){0, token}, gates, pre_gates, 3, 0);
 +
 +        // post[n] = 2 * sigmoid(mixes[4+n] * inv_rms * post_scale + base[4+n]).
 +        const float64 post_raw = v_convert_bf16_to_f32_all_b(
@@ -8506,7 +8519,7 @@ index 0000000..62bb2c6
 +        const float64 post_base = v_f32_ld_tnsr_partial_b((int5){4, 0}, base, 4, 0);
 +        const float64 post_gates = sigmoid_nolut_f32(
 +            post_raw * (inv_rms * post_scale) + post_base) * 2.0f;
-+        v_f32_st_tnsr_partial((int5){4, token}, gates, post_gates, 4, 0);
++        v_f32_st_tnsr_partial((int5){4, token}, gates, post_gates, 3, 0);
 +
 +        // comb: 16 raw lanes, stable softmax over dst (row-major src rows),
 +        // then the Sinkhorn alternation.
@@ -8543,12 +8556,12 @@ index 0000000..62bb2c6
 +            column_sum += v_f32_shuffle_b(values, c3, 0, 0.0f);
 +            values = values / (column_sum + hc_eps);
 +        }
-+        v_f32_st_tnsr_partial((int5){8, token}, gates, values, 16, 0);
++        v_f32_st_tnsr_partial((int5){8, token}, gates, values, 15, 0);
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c
 new file mode 100644
-index 0000000..acf6426
+index 0000000..16818fc
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_head_bf16_gaudi2.c
 @@ -0,0 +1,42 @@
@@ -8589,14 +8602,14 @@ index 0000000..acf6426
 +                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
 +            } else {
 +                v_bf16_st_tnsr_partial((int5){col, token}, out,
-+                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++                                       v_convert_f32_to_bf16_all_b(acc), count - 1, 0);
 +            }
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c
 new file mode 100644
-index 0000000..8921694
+index 0000000..9f07e6e
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_mhc_post_bf16_gaudi2.c
 @@ -0,0 +1,75 @@
@@ -8669,7 +8682,7 @@ index 0000000..8921694
 +                    v_bf16_st_tnsr((int5){dst * width + col, token}, out, packed);
 +                } else {
 +                    v_bf16_st_tnsr_partial((int5){dst * width + col, token}, out,
-+                                           packed, count, 0);
++                                           packed, count - 1, 0);
 +                }
 +            }
 +        }
@@ -8677,7 +8690,7 @@ index 0000000..8921694
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c
 new file mode 100644
-index 0000000..164f142
+index 0000000..dcb552e
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_moe_combine_bf16_gaudi2.c
 @@ -0,0 +1,50 @@
@@ -8726,14 +8739,14 @@ index 0000000..164f142
 +                v_bf16_st_tnsr((int5){col, token}, out, v_convert_f32_to_bf16_all_b(acc));
 +            } else {
 +                v_bf16_st_tnsr_partial((int5){col, token}, out,
-+                                       v_convert_f32_to_bf16_all_b(acc), count, 0);
++                                       v_convert_f32_to_bf16_all_b(acc), count - 1, 0);
 +            }
 +        }
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c
 new file mode 100644
-index 0000000..573a569
+index 0000000..d62f36f
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_moe_route_bf16_gaudi2.c
 @@ -0,0 +1,115 @@
@@ -8847,14 +8860,14 @@ index 0000000..573a569
 +        const float64 denominator = sum + 1.0e-20f;
 +        float64 inverse = v_reciprocal_f32(denominator);
 +        inverse = inverse * (2.0f - denominator * inverse);
-+        v_i32_st_tnsr_partial((int5){0, token}, indices, packed_ids, top_k, 0);
++        v_i32_st_tnsr_partial((int5){0, token}, indices, packed_ids, top_k - 1, 0);
 +        v_f32_st_tnsr_partial((int5){0, token}, weights,
-+                              packed_weights * (inverse * routed_scaling_factor), top_k, 0);
++                              packed_weights * (inverse * routed_scaling_factor), top_k - 1, 0);
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_rmsnorm_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_rmsnorm_bf16_gaudi2.c
 new file mode 100644
-index 0000000..3bfcb3a
+index 0000000..e521b59
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_rmsnorm_bf16_gaudi2.c
 @@ -0,0 +1,72 @@
@@ -8925,7 +8938,7 @@ index 0000000..3bfcb3a
 +                v_bf16_st_tnsr((int5){i, token}, out, v_convert_f32_to_bf16_all_b(r));
 +            } else {
 +                v_bf16_st_tnsr_partial((int5){i, token}, out,
-+                                       v_convert_f32_to_bf16_all_b(r), count, 0);
++                                       v_convert_f32_to_bf16_all_b(r), count - 1, 0);
 +            }
 +        }
 +    }
@@ -12663,10 +12676,10 @@ index 0000000..9e30ba7
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000..cfbf2d0
+index 0000000..e40d99b
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,556 @@
 +#include "models/glm5/execution/model.h"
 +
 +#include "ninfer/ops/glm5_mhc.h"
@@ -12681,19 +12694,55 @@ index 0000000..cfbf2d0
 +
 +namespace ninfer::models::glm5::execution {
 +
-+std::size_t glm5_decode_step_scratch_bytes(std::uint32_t hidden, std::uint32_t layers) {
-+    // Residual streams (4*H) + the collapsed and block output planes per step + the mHC
-+    // weight planes + the final hidden/logits staging + per-block internal scratch is
-+    // the caller's separate allocation (each block call gets its own slice from this).
-+    return static_cast<std::size_t>(hidden) * 2 * 4 * 2  // 4 residual streams + post copy
-+           + static_cast<std::size_t>(hidden) * 2 * 2  // collapsed + block_out
-+           + static_cast<std::size_t>(hidden) * 2      // head mean output
-+           + 4 * 4 + 16 * 4                            // pre/post/comb planes
-+           + static_cast<std::size_t>(hidden) * 2     // final normed
-+           // generous per-block internal scratch (one block at a time reuses this)
-+           + static_cast<std::size_t>(hidden) * 2 * 16
-+           + static_cast<std::size_t>(hidden) * 4 * 4
-+           + 1024 * static_cast<std::size_t>(layers);
++std::size_t glm5_decode_step_scratch_bytes(const Glm5StepConfig& config,
++                                           std::uint32_t worst_position) {
++    // Residual streams (4*H), the collapsed and block output planes, the mHC
++    // weight planes, the final hidden/logits staging, and the per-block
++    // internal scratch as the PEAK over one block of each kind (the blocks
++    // reuse one slice). The DSA slice scales with the visible-pool count at
++    // worst_position: the re-pooling scratch and the score column both
++    // grow with the history length.
++    const std::uint64_t hidden = config.hidden;
++    const std::uint64_t d_inner =
++        static_cast<std::uint64_t>(config.kda_heads) * config.kda_head_dim;
++    const std::uint64_t kda =
++        hidden * 2 + 15 + 9 * (d_inner * 2 + 15) + d_inner * 4 + 15 +
++        static_cast<std::uint64_t>(config.kda_head_dim) * 2 + 15 +
++        static_cast<std::uint64_t>(config.kda_heads) * 2 + 15 +
++        static_cast<std::uint64_t>(config.kda_heads) * 4 + 15 + 4096;
++    const std::uint64_t completed =
++        (static_cast<std::uint64_t>(worst_position) + 1) / config.kpool;
++    const std::uint64_t dsa =
++        hidden * 2 + 15 +
++        static_cast<std::uint64_t>(config.q_lora) * 2 + 15 +
++        static_cast<std::uint64_t>(config.heads) * config.head_dim * 2 + 15 +
++        static_cast<std::uint64_t>(config.kv_lora) * 2 + 15 +
++        static_cast<std::uint64_t>(config.index_heads) * config.index_dim * 2 + 15 +
++        config.index_dim * 6 + 15 +
++        static_cast<std::uint64_t>(config.index_heads) * 2 + 15 +
++        static_cast<std::uint64_t>(config.index_heads) * 4 + 15 +
++        static_cast<std::uint64_t>(config.heads) * config.kv_lora * 4 + 15 +
++        static_cast<std::uint64_t>(config.heads) * config.kv_lora * 2 + 15 +
++        static_cast<std::uint64_t>(config.heads) * config.v_head * 2 + 15 +
++        // history-scaled planes: the re-pool scratch [completed, index_dim]
++        // and the score column [completed]
++        (completed ? completed : 1) * config.index_dim * 4 + 15 +
++        (completed ? completed : 1) * 4 + 15 + 4096;
++    const std::uint64_t dense =
++        hidden * 2 + 15 + (static_cast<std::uint64_t>(config.ffn_dense) * 2 + 15) * 3 + 512;
++    const std::uint64_t moe =
++        hidden * 2 + static_cast<std::uint64_t>(config.ffn_moe) * 8 +
++        static_cast<std::uint64_t>(config.num_experts_per_tok) * hidden * 2 +
++        static_cast<std::uint64_t>(config.num_experts_per_tok) * 8 +
++        static_cast<std::uint64_t>(config.experts) * 2 + 1024;
++    const std::uint64_t block_peak = std::max(std::max(kda, dsa), std::max(dense, moe));
++    return static_cast<std::size_t>(
++        hidden * 2 * 4 * 2        // 4 residual streams + the post copy
++        + hidden * 2 * 2          // collapsed + block_out
++        + hidden * 2              // head mean output
++        + 4 * 4 + 16 * 4          // pre/post/comb planes
++        + hidden * 2              // final normed
++        + block_peak);
 +}
 +
 +void glm5_decode_step(const Glm5ModelWeights& w, Glm5DecodeState& state,
@@ -12879,19 +12928,19 @@ index 0000000..cfbf2d0
 +    cursor += (static_cast<std::size_t>(config.hidden) * 2 + 15) & ~std::size_t{15};
 +    Tensor embedded(embedding, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
 +    glm5_embed_token(w, token_id, config.hidden, embedded, stream);
-+    glm5_decode_step(w, state, config, embedded, position, logits, cursor, stream);
++    glm5_decode_step(w, state, config, embedded, position, logits, cursor, stream, hidden_out);
 +}
 +
 +// ---------------------------------------------------------------------------
 +// Multi-token prefill
 +
-+std::size_t glm5_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t layers,
++std::size_t glm5_prefill_scratch_bytes(const Glm5StepConfig& config,
 +                                        std::uint32_t max_tokens) {
-+    // Per-token scratch (the decode step's budget) plus the token embedding plane
-+    // plus the residual streams reused across tokens.
-+    return glm5_decode_step_scratch_bytes(hidden, layers) +
-+           static_cast<std::size_t>(hidden) * 2 + 256 +
-+           static_cast<std::size_t>(hidden) * 2 * 4;  // residual copy
++    // Per-token scratch (the decode step's budget at the WORST position the
++    // prefill reaches) plus the token embedding plane plus the residual copy.
++    return glm5_decode_step_scratch_bytes(config, max_tokens - 1) +
++           static_cast<std::size_t>(config.hidden) * 2 + 256 +
++           static_cast<std::size_t>(config.hidden) * 2 * 4;
 +}
 +
 +void glm5_prefill(const Glm5ModelWeights& w, Glm5DecodeState& state,
@@ -12930,7 +12979,8 @@ index 0000000..cfbf2d0
 +// Chunked prefill: the batched throughput path
 +
 +std::size_t glm5_prefill_chunked_scratch_bytes(const Glm5StepConfig& config,
-+                                               std::uint32_t max_tokens) {
++                                               std::uint32_t max_tokens,
++                                               std::uint32_t first_position) {
 +    const std::uint64_t h = config.hidden;
 +    const std::uint64_t hc = h * 4;
 +    const std::uint64_t t = max_tokens;
@@ -12973,7 +13023,10 @@ index 0000000..cfbf2d0
 +               static_cast<std::uint64_t>(config.heads) * kl * t * 2 + 15 +
 +               ih * t * 2 + 15 + ih * t * 4 + 15 +
 +               static_cast<std::uint64_t>(config.heads) * vh * t * 2 + 15;
-+        const std::uint64_t dsa_completed = t / config.kpool + 1;
++        // The score column scales with the VISIBLE pools - the full history
++        // before this chunk plus the chunk's own completed pools.
++        const std::uint64_t dsa_completed =
++            (static_cast<std::uint64_t>(first_position) + t) / config.kpool + 1;
 +        dsa += dsa_completed * 4 + 15 + 4096;
 +        block_scratch = std::max(block_scratch, dsa);
 +    }
@@ -13185,10 +13238,10 @@ index 0000000..cfbf2d0
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.h b/src/models/glm5/execution/model.h
 new file mode 100644
-index 0000000..2fd52ac
+index 0000000..5144be2
 --- /dev/null
 +++ b/src/models/glm5/execution/model.h
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,144 @@
 +#pragma once
 +
 +// The GLM-5.3-Flash full-model decode step: one token through every block (mHC residual
@@ -13249,8 +13302,12 @@ index 0000000..2fd52ac
 +    std::vector<Tensor> dsa_latents, dsa_ik_plane, dsa_ig_plane, dsa_pooled, dsa_cells;
 +};
 +
-+[[nodiscard]] std::size_t glm5_decode_step_scratch_bytes(std::uint32_t hidden,
-+                                                         std::uint32_t layers);
++struct Glm5StepConfig;  // defined below; the scratch budgets need its geometry
++
++// The per-block slice is the peak over one block of each kind; the DSA slice
++// scales with the visible-pool count at `worst_position` (history length).
++[[nodiscard]] std::size_t glm5_decode_step_scratch_bytes(const Glm5StepConfig& config,
++                                                         std::uint32_t worst_position);
 +
 +// One full decode step: token_embedding [hidden,1] BF16 -> the four-stream mHC residual
 +// (initialized to four copies of the embedding), every block (mHC pre -> norm -> mixer ->
@@ -13309,8 +13366,7 @@ index 0000000..2fd52ac
 +                  std::uint32_t first_position, Tensor& last_hidden, Tensor& last_logits,
 +                  void* scratch, cudaStream_t stream);
 +
-+[[nodiscard]] std::size_t glm5_prefill_scratch_bytes(std::uint32_t hidden,
-+                                                      std::uint32_t layers,
++[[nodiscard]] std::size_t glm5_prefill_scratch_bytes(const Glm5StepConfig& config,
 +                                                      std::uint32_t max_tokens);
 +
 +// The chunked-prefill throughput path: T tokens (a multiple of `chunk`) in
@@ -13326,8 +13382,8 @@ index 0000000..2fd52ac
 +                          Tensor& last_hidden, Tensor& last_logits, void* scratch,
 +                          cudaStream_t stream);
 +
-+[[nodiscard]] std::size_t glm5_prefill_chunked_scratch_bytes(const Glm5StepConfig& config,
-+                                                             std::uint32_t max_tokens);
++[[nodiscard]] std::size_t glm5_prefill_chunked_scratch_bytes(
++    const Glm5StepConfig& config, std::uint32_t max_tokens, std::uint32_t first_position);
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/loading_sources.cmake b/src/models/glm5/loading_sources.cmake
@@ -39219,7 +39275,7 @@ index 0000000..0eff353
 +}
 diff --git a/tests/models/glm5/test_decode_step.cpp b/tests/models/glm5/test_decode_step.cpp
 new file mode 100644
-index 0000000..ce048c8
+index 0000000..b66127b
 --- /dev/null
 +++ b/tests/models/glm5/test_decode_step.cpp
 @@ -0,0 +1,600 @@
@@ -39776,7 +39832,7 @@ index 0000000..ce048c8
 +        config.layer_is_dsa = {false, true};
 +        config.layer_mlp_dense = {false, true};
 +
-+        const std::size_t scratch_bytes = execution::glm5_decode_step_scratch_bytes(H, LAYERS);
++        const std::size_t scratch_bytes = execution::glm5_decode_step_scratch_bytes(config, 7);
 +        test::GuardedDeviceBuffer d_scratch(scratch_bytes);
 +        test::GuardedDeviceBuffer d_logits(VOCAB * 2);
 +
@@ -40488,7 +40544,7 @@ index 0000000..667eb49
 +}
 diff --git a/tests/models/glm5/test_embed_prefill.cpp b/tests/models/glm5/test_embed_prefill.cpp
 new file mode 100644
-index 0000000..627bf53
+index 0000000..295fc9a
 --- /dev/null
 +++ b/tests/models/glm5/test_embed_prefill.cpp
 @@ -0,0 +1,322 @@
@@ -40691,7 +40747,7 @@ index 0000000..627bf53
 +    config.layer_is_dsa = {false};
 +    config.layer_mlp_dense = {false};
 +
-+    const std::size_t scratch = execution::glm5_decode_step_scratch_bytes(H, 1) +
++    const std::size_t scratch = execution::glm5_decode_step_scratch_bytes(config, 7) +
 +                                execution::glm5_embed_scratch_bytes(H);
 +    test::GuardedDeviceBuffer d_scratch(scratch);
 +    test::GuardedDeviceBuffer d_logits(VOCAB * 2);
@@ -40760,7 +40816,7 @@ index 0000000..627bf53
 +        Tensor ids_t(const_cast<void*>(d_ids.data()), DType::I32, {3});
 +        Tensor last_hidden_t(const_cast<void*>(d_last_hidden.data()), DType::BF16,
 +                             {static_cast<std::int32_t>(H), 1});
-+        const std::size_t pscratch = execution::glm5_prefill_scratch_bytes(H, 1, 3);
++        const std::size_t pscratch = execution::glm5_prefill_scratch_bytes(config, 3);
 +        test::GuardedDeviceBuffer d_pscratch(pscratch);
 +        execution::glm5_prefill(mw, state, config, ids_t, 0, last_hidden_t, logits_t,
 +                                d_pscratch.data(), nullptr);
@@ -41484,10 +41540,10 @@ index 0000000..f45b39d
 +}
 diff --git a/tests/models/glm5/test_prefill_chunked.cpp b/tests/models/glm5/test_prefill_chunked.cpp
 new file mode 100644
-index 0000000..f52c354
+index 0000000..336b213
 --- /dev/null
 +++ b/tests/models/glm5/test_prefill_chunked.cpp
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,403 @@
 +// GLM-5.3-Flash chunked prefill vs the per-token decode path, end to end on
 +// the device: the same weights and token sequence run twice — T sequential
 +// glm5_decode_token calls against one glm5_prefill_chunked call (chunk < T,
@@ -41822,7 +41878,7 @@ index 0000000..f52c354
 +    Tensor logits_a(d_logits_a.data(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
 +    Tensor hidden_a(d_hidden_a.data(), DType::BF16, {static_cast<std::int32_t>(H)});
 +    const std::size_t scratch_decode =
-+        execution::glm5_decode_step_scratch_bytes(H, LAYERS) + execution::glm5_embed_scratch_bytes(H) + 256;
++        execution::glm5_decode_step_scratch_bytes(config, T - 1) + execution::glm5_embed_scratch_bytes(H) + 256;
 +    std::vector<std::uint8_t> scratch_a(scratch_decode);
 +    void* d_scratch_a = nullptr;
 +    CUDA_CHECK(cudaMalloc(&d_scratch_a, scratch_decode));
@@ -41841,7 +41897,8 @@ index 0000000..f52c354
 +    test::GuardedDeviceBuffer d_hidden_b(H * 2);
 +    Tensor logits_b(d_logits_b.data(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
 +    Tensor hidden_b(d_hidden_b.data(), DType::BF16, {static_cast<std::int32_t>(H)});
-+    const std::size_t scratch_chunked = execution::glm5_prefill_chunked_scratch_bytes(config, T);
++    const std::size_t scratch_chunked =
++        execution::glm5_prefill_chunked_scratch_bytes(config, T, 0);
 +    void* d_scratch_b = nullptr;
 +    CUDA_CHECK(cudaMalloc(&d_scratch_b, scratch_chunked));
 +    execution::glm5_prefill_chunked(mw, state_b, config, ids_t, 0, CHUNK, hidden_b, logits_b,
