@@ -7701,7 +7701,7 @@ index 0000000..c656d9a
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c
 new file mode 100644
-index 0000000..484bfd3
+index 0000000..3ec9fea
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_absorb_bf16_gaudi2.c
 @@ -0,0 +1,68 @@
@@ -7767,15 +7767,15 @@ index 0000000..484bfd3
 +            // single lane (there is no vector->scalar conversion).
 +            const float64 total = v_f32_reduce_add(acc.v1 + acc.v2);
 +            // The store takes a float64 operand directly (a broadcast
-+            // vector); one lane is written.
-+            v_f32_st_tnsr_partial((int5){e, h}, q_abs, total, 1, 0);
++            // vector); last valid lane 0 writes exactly one element.
++            v_f32_st_tnsr_partial((int5){e, h}, q_abs, total, 0, 0);
 +        }
 +    }
 +    (void)begin; (void)end;
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c
 new file mode 100644
-index 0000000..1c05429
+index 0000000..de130b9
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_attention_f32_gaudi2.c
 @@ -0,0 +1,130 @@
@@ -7904,7 +7904,7 @@ index 0000000..1c05429
 +            packed.v1 = total;
 +            packed.v2 = total;
 +            v_bf16_st_tnsr_partial((int5){h * v_head + v, 0}, out,
-+                                   v_convert_f32_to_bf16_all_b(packed), 1, 0);
++                                   v_convert_f32_to_bf16_all_b(packed), 0, 0);
 +        }
 +    }
 +    (void)begin;
@@ -8037,10 +8037,10 @@ index 0000000..d7d8608
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c
 new file mode 100644
-index 0000000..4093420
+index 0000000..fc5a413
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_score_f32_gaudi2.c
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA indexer scoring TPC-C kernel.
 +//
 +// score[p] = Σ_h relu(iq[h, :] . pooled[p, :]) * weights[h], where weights
@@ -8099,7 +8099,9 @@ index 0000000..4093420
 +            const float w = s_f32_ld_g(gen_addr((int5){h, 0}, weights));
 +            acc = v_f32_mac_b(clamped, w, acc);
 +        }
-+        v_f32_st_tnsr_partial((int5){pool, 0}, score, acc, 1, 0);
++        // Last valid lane INDEX: one element passes 0 - a 1 here writes
++        // two lanes and a neighbouring partition overwrites its peer.
++        v_f32_st_tnsr_partial((int5){pool, 0}, score, acc, 0, 0);
 +    }
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
@@ -10927,10 +10929,10 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..c98ae4e
+index 0000000..fef3286
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
-@@ -0,0 +1,923 @@
+@@ -0,0 +1,930 @@
 +#include "models/glm5/execution/block.h"
 +
 +#include "ninfer/ops/add_bias.h"
@@ -11120,7 +11122,12 @@ index 0000000..c98ae4e
 +                                    std::uint32_t head_dim, std::uint32_t q_lora,
 +                                    std::uint32_t kv_lora, std::uint32_t v_head,
 +                                    std::uint32_t index_heads, std::uint32_t index_dim,
-+                                    std::uint32_t selection_width) {
++                                    std::uint32_t kpool, std::uint32_t position) {
++    // History-scaled planes: the re-pool scratch [completed, index_dim] and
++    // the score column [completed] both grow with the visible-pool count at
++    // `position` (no more flat 4MB blanket).
++    const std::uint64_t completed =
++        (static_cast<std::uint64_t>(position) + 1) / kpool;
 +    const std::uint64_t bytes =
 +        static_cast<std::uint64_t>(hidden) * 2 + static_cast<std::uint64_t>(q_lora) * 2 +
 +        static_cast<std::uint64_t>(heads) * head_dim * 2 + static_cast<std::uint64_t>(kv_lora) * 2 +
@@ -11128,9 +11135,9 @@ index 0000000..c98ae4e
 +        static_cast<std::uint64_t>(index_heads) * 4 * 2 +
 +        static_cast<std::uint64_t>(heads) * kv_lora * 4 +
 +        static_cast<std::uint64_t>(heads) * kv_lora * 2 +
-+        static_cast<std::uint64_t>(selection_width) * 4 +
 +        static_cast<std::uint64_t>(heads) * v_head * 2 +
-+        static_cast<std::uint64_t>(1 << 20) * 4 +   // completed-pool scores bound
++        (completed ? completed : 1) * index_dim * 4 + 15 +   // re-pool scratch
++        (completed ? completed : 1) * 4 + 15 +               // score column
 +        16 * 16 + 1024;
 +    return static_cast<std::size_t>(bytes);
 +}
@@ -11165,7 +11172,9 @@ index 0000000..c98ae4e
 +    void* ik_raw = take(index_dim * 2);
 +    void* ik_normed = take(index_dim * 2);
 +    void* ig = take(index_dim * 2);
-+    void* weights_bf = take(static_cast<std::size_t>(index_heads) * tokens * 2);
++    // One column: the decode path computes a single token's head weights
++    // (the [IH, T] sizing here was a leftover of the batched rework).
++    void* weights_bf = take(index_heads * 2);
 +    void* weights_f32 = take(index_heads * 4);
 +    void* q_abs = take(static_cast<std::size_t>(heads) * kv_lora * 4);
 +    void* scores = take(static_cast<std::size_t>(completed ? completed : 1) * 4);
@@ -11856,7 +11865,7 @@ index 0000000..c98ae4e
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
 new file mode 100644
-index 0000000..f2e2852
+index 0000000..cce4297
 --- /dev/null
 +++ b/src/models/glm5/execution/block.h
 @@ -0,0 +1,193 @@
@@ -11946,7 +11955,7 @@ index 0000000..f2e2852
 +                                                  std::uint32_t kv_lora, std::uint32_t v_head,
 +                                                  std::uint32_t index_heads,
 +                                                  std::uint32_t index_dim,
-+                                                  std::uint32_t selection_width);
++                                                  std::uint32_t kpool, std::uint32_t position);
 +
 +// One token: norm -> q_a/norm/q_b/absorb; kv_a/norm latent written to `latents` row
 +// `position`; the indexer's LayerNorm'd key and pool gate appended to the [position+1,
@@ -39881,7 +39890,7 @@ index 0000000..b66127b
 +}
 diff --git a/tests/models/glm5/test_dsa_mlp_blocks.cpp b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 new file mode 100644
-index 0000000..667eb49
+index 0000000..8254c26
 --- /dev/null
 +++ b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 @@ -0,0 +1,657 @@
@@ -40174,7 +40183,7 @@ index 0000000..667eb49
 +    test::GuardedDeviceBuffer d_cells(width * 4);
 +    test::GuardedDeviceBuffer d_out(hidden * 2);
 +    const std::size_t scratch_bytes = execution::dsa_block_scratch_bytes(
-+        hidden, heads, head_dim, q_lora, kv_lora, v_head, index_heads, index_dim, width);
++        hidden, heads, head_dim, q_lora, kv_lora, v_head, index_heads, index_dim, kpool, position);
 +    test::GuardedDeviceBuffer d_scratch(scratch_bytes);
 +
 +    execution::DsaBlockWeights w{};
