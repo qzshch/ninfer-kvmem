@@ -2977,10 +2977,10 @@ index e684873..86281fc 100644
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000..6763992
+index 0000000..8c07d5f
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,153 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -3042,7 +3042,7 @@ index 0000000..6763992
 +add_test(NAME ninfer-gaudi2-glm5-hpu-block COMMAND ninfer-gaudi2-glm5-hpu-block-test)
 +
 +add_executable(ninfer-gaudi2-glm5-hpu-model-test runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp
-+  glm5_hpu_block.cpp glm5_hpu_model.cpp
++  glm5_hpu_block.cpp glm5_hpu_dsa.cpp glm5_hpu_mlp.cpp glm5_hpu_model.cpp
 +  tests/glm5_hpu_model_test.cpp
 +  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
 +target_compile_features(ninfer-gaudi2-glm5-hpu-model-test PRIVATE cxx_std_20)
@@ -3050,6 +3050,26 @@ index 0000000..6763992
 +target_include_directories(ninfer-gaudi2-glm5-hpu-model-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 +  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
 +add_test(NAME ninfer-gaudi2-glm5-hpu-model COMMAND ninfer-gaudi2-glm5-hpu-model-test)
++
++add_executable(ninfer-gaudi2-glm5-hpu-dsa-test runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp
++  glm5_hpu_dsa.cpp
++  tests/glm5_hpu_dsa_test.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
++target_compile_features(ninfer-gaudi2-glm5-hpu-dsa-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-glm5-hpu-dsa-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-glm5-hpu-dsa-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-glm5-hpu-dsa COMMAND ninfer-gaudi2-glm5-hpu-dsa-test)
++
++add_executable(ninfer-gaudi2-glm5-hpu-mlp-test runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp
++  glm5_hpu_mlp.cpp
++  tests/glm5_hpu_mlp_test.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
++target_compile_features(ninfer-gaudi2-glm5-hpu-mlp-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-glm5-hpu-mlp-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-glm5-hpu-mlp-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-glm5-hpu-mlp COMMAND ninfer-gaudi2-glm5-hpu-mlp-test)
 +
 +# The HPU GGUF loader path shares the tensor walk with the CUDA TU (the
 +# walk lives in gguf_loader.cpp via the header's std::function interface).
@@ -4099,15 +4119,848 @@ index 0000000..97e46a1
 +    const Glm5KdaHpuConfig& config);
 +
 +} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/glm5_hpu_dsa.cpp b/src/core/gaudi2/glm5_hpu_dsa.cpp
+new file mode 100644
+index 0000000..0991837
+--- /dev/null
++++ b/src/core/gaudi2/glm5_hpu_dsa.cpp
+@@ -0,0 +1,425 @@
++// GLM-5.3-Flash DSA block on the Gaudi2 runtime adapter. The math mirrors the
++// CUDA dsa_block_decode (block.cpp) with the same BF16 rounding boundaries;
++// the eight matrix projections run on the MME, everything else on the host.
++#include "core/gaudi2/glm5_hpu_dsa.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::gaudi2 {
++namespace {
++
++float bf16_word_to_float(std::uint16_t word) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(word) << 16;
++    float value;
++    std::memcpy(&value, &wide, 4);
++    return value;
++}
++
++std::uint16_t float_to_bf16_word(float value) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++constexpr float kNegInf = -3.0e38f;
++
++std::vector<float> widen_bf16_payload(const void* payload, std::size_t elements) {
++    const auto* words = reinterpret_cast<const std::uint16_t*>(payload);
++    std::vector<float> out(elements);
++    for (std::size_t i = 0; i < elements; ++i) out[i] = bf16_word_to_float(words[i]);
++    return out;
++}
++
++} // namespace
++
++Glm5DsaHpuProjections::Glm5DsaHpuProjections(const Device& device,
++                                             const Glm5DsaHpuConfig& config,
++                                             std::size_t max_workspace_bytes)
++    : q_a{device, Bf16GemmShape{1, config.q_lora, config.hidden}, max_workspace_bytes},
++      q_b{device, Bf16GemmShape{1, config.heads * config.head_dim, config.q_lora},
++          max_workspace_bytes},
++      kv_a{device, Bf16GemmShape{1, config.kv_lora, config.hidden}, max_workspace_bytes},
++      iq_b{device,
++           Bf16GemmShape{1, config.index_heads * config.index_dim, config.q_lora},
++           max_workspace_bytes},
++      ik{device, Bf16GemmShape{1, config.index_dim, config.hidden}, max_workspace_bytes},
++      ig{device, Bf16GemmShape{1, config.index_dim, config.hidden}, max_workspace_bytes},
++      iproj{device, Bf16GemmShape{1, config.index_heads, config.hidden}, max_workspace_bytes},
++      wo{device, Bf16GemmShape{1, config.hidden, config.heads * config.v_head},
++         max_workspace_bytes} {}
++
++Glm5DsaHpuState glm5_dsa_hpu_init_state(const Device& device,
++                                        const Glm5DsaHpuConfig& config) {
++    Glm5DsaHpuState state;
++    // The history planes only ever expose rows [0, position]; every row is
++    // written before any read, so no zero-fill is needed (unlike the KDA
++    // recurrence whose carried state IS read before its first write).
++    state.latents = device.allocate_device(
++        static_cast<std::size_t>(config.max_positions) * config.kv_lora * 2);
++    state.ik_plane = device.allocate_device(
++        static_cast<std::size_t>(config.max_positions) * config.index_dim * 2);
++    state.ig_plane = device.allocate_device(
++        static_cast<std::size_t>(config.max_positions) * config.index_dim * 2);
++    return state;
++}
++
++std::size_t glm5_dsa_hpu_scratch_bytes(const Glm5DsaHpuConfig& config,
++                                       std::uint32_t position) {
++    const std::uint64_t hidden = config.hidden;
++    const std::uint64_t tokens = static_cast<std::uint64_t>(position) + 1;
++    const std::uint64_t completed = tokens / config.kpool;
++    const std::uint64_t width =
++        static_cast<std::uint64_t>(config.top_k / config.kpool) * config.kpool +
++        (config.kpool - 1);
++    return static_cast<std::size_t>(
++        hidden * 2 +                                        // normed input staging
++        static_cast<std::uint64_t>(config.heads) * config.head_dim * 2 +
++        static_cast<std::uint64_t>(config.heads) * config.kv_lora * 2 +
++        tokens * config.kv_lora * 2 +                       // latent history download
++        tokens * config.index_dim * 2 * 2 +                 // ik/ig history download
++        completed * config.index_dim * 4 +                  // pooled plane
++        completed * 4 +                                     // scores
++        width * 4 +                                         // cells
++        static_cast<std::uint64_t>(config.heads) * config.v_head * 2 +
++        4096);
++}
++
++std::vector<std::uint16_t> glm5_dsa_hpu_decode_step(
++    const Device& device, Stream& stream, Glm5DsaHpuProjections& projections,
++    const Glm5DsaHpuWeights& w, Glm5DsaHpuState& state, const Glm5DsaHpuConfig& config,
++    std::span<const std::uint16_t> hidden_in, std::uint32_t position) {
++    const std::uint32_t hidden = config.hidden;
++    const std::uint32_t heads = config.heads;
++    const std::uint32_t nope = config.head_dim;
++    const std::uint32_t lora = config.kv_lora;
++    const std::uint32_t v_head = config.v_head;
++    const std::uint32_t ih = config.index_heads;
++    const std::uint32_t id = config.index_dim;
++    const std::uint32_t kpool = config.kpool;
++    if (hidden_in.size() != hidden) {
++        throw std::invalid_argument("glm5_dsa_hpu_decode_step: hidden_in size mismatch");
++    }
++    if (position >= config.max_positions) {
++        throw std::invalid_argument("glm5_dsa_hpu_decode_step: position exceeds plane capacity");
++    }
++
++    auto device_project = [&](Bf16Gemm& gemm, const DeviceBuffer& weight,
++                              const std::vector<float>& input,
++                              std::uint32_t in_cols) {
++        const std::uint32_t out_rows = static_cast<std::uint32_t>(gemm.shape().n);
++        PinnedBuffer host_in = device.allocate_host(in_cols * 2);
++        for (std::uint32_t i = 0; i < in_cols; ++i) {
++            const auto word = float_to_bf16_word(input[i]);
++            std::memcpy(host_in.bytes().data() + i * 2, &word, 2);
++        }
++        PinnedBuffer host_out = device.allocate_host(out_rows * 2);
++        DeviceBuffer dev_in = device.allocate_device(in_cols * 2);
++        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
++        auto up = stream.upload(dev_in, host_in, in_cols * 2);
++        up.wait();
++        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight), dev_out);
++        compute.wait();
++        auto down = stream.download(host_out, dev_out, out_rows * 2);
++        down.wait();
++        std::vector<float> result(out_rows);
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_out.bytes().data());
++        for (std::uint32_t r = 0; r < out_rows; ++r) {
++            result[r] = bf16_word_to_float(words[r]);
++        }
++        return result;
++    };
++    auto append_row = [&](DeviceBuffer& plane, const std::vector<float>& row,
++                          std::uint32_t row_elements) {
++        PinnedBuffer host = device.allocate_host(row_elements * 2);
++        for (std::uint32_t i = 0; i < row_elements; ++i) {
++            const auto word = float_to_bf16_word(row[i]);
++            std::memcpy(host.bytes().data() + i * 2, &word, 2);
++        }
++        const std::size_t offset = static_cast<std::size_t>(position) * row_elements * 2;
++        auto up = stream.upload(plane, host, row_elements * 2, offset);
++        up.wait();
++    };
++    auto download_rows = [&](const DeviceBuffer& plane, std::uint32_t rows,
++                             std::uint32_t row_elements) {
++        PinnedBuffer host = device.allocate_host(static_cast<std::size_t>(rows) * row_elements * 2);
++        auto down = stream.download(host, const_cast<DeviceBuffer&>(plane),
++                                    static_cast<std::size_t>(rows) * row_elements * 2);
++        down.wait();
++        return host;
++    };
++
++    // ---- Stage 1: RMSNorm on host ----
++    std::vector<float> x(hidden);
++    {
++        PinnedBuffer host_w = device.allocate_host(hidden * 2);
++        auto dl = stream.download(host_w, const_cast<DeviceBuffer&>(w.attn_norm), hidden * 2);
++        dl.wait();
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_w.bytes().data());
++        float square = 0;
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            const float v = bf16_word_to_float(hidden_in[i]);
++            square += v * v;
++        }
++        const float inverse =
++            1.0f / std::sqrt(square / hidden + config.rms_eps);
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            x[i] = bf16_word_to_float(hidden_in[i]) * inverse * bf16_word_to_float(words[i]);
++        }
++    }
++
++    // ---- Stage 2: q side projections (MME) + lora norms (host) ----
++    const std::vector<float> q_latent = device_project(projections.q_a, w.q_a, x, hidden);
++    std::vector<float> qn(config.q_lora);
++    {
++        float square = 0;
++        for (std::uint32_t i = 0; i < config.q_lora; ++i) square += q_latent[i] * q_latent[i];
++        const float inverse =
++            1.0f / std::sqrt(square / config.q_lora + config.rms_eps);
++        for (std::uint32_t i = 0; i < config.q_lora; ++i) {
++            // The CUDA path rounds the normed latent to BF16 before q_b; keep
++            // the FP32 value in flight and round at the MME input instead
++            // (device_project rounds) - same represented values.
++            qn[i] = q_latent[i] * inverse * w.q_a_norm[i];
++        }
++    }
++    const std::vector<float> q_heads =
++        device_project(projections.q_b, w.q_b, qn, config.q_lora);
++
++    // ---- Stage 3: kv side projection + latent row append ----
++    const std::vector<float> latent_raw = device_project(projections.kv_a, w.kv_a, x, hidden);
++    std::vector<float> latent(lora);
++    {
++        float square = 0;
++        for (std::uint32_t i = 0; i < lora; ++i) square += latent_raw[i] * latent_raw[i];
++        const float inverse = 1.0f / std::sqrt(square / lora + config.rms_eps);
++        for (std::uint32_t i = 0; i < lora; ++i) {
++            latent[i] = latent_raw[i] * inverse * w.kv_a_norm[i];
++        }
++    }
++    append_row(state.latents, latent, lora);
++
++    // ---- Stage 4: indexer projections (MME) + LayerNorm (host) + appends ----
++    const std::vector<float> iq = device_project(projections.iq_b, w.iq_b, qn, config.q_lora);
++    const std::vector<float> ik_raw = device_project(projections.ik, w.ik, x, hidden);
++    std::vector<float> ik_normed(id);
++    {
++        // LayerNorm over the key dim (eps 1e-6, the audited indexer constant).
++        double mean = 0;
++        for (std::uint32_t e = 0; e < id; ++e) mean += ik_raw[e];
++        mean /= id;
++        double variance = 0;
++        for (std::uint32_t e = 0; e < id; ++e) {
++            const double d = ik_raw[e] - mean;
++            variance += d * d;
++        }
++        variance /= id;
++        const float denom = static_cast<float>(1.0 / std::sqrt(variance + 1e-6));
++        const float mu = static_cast<float>(mean);
++        for (std::uint32_t e = 0; e < id; ++e) {
++            ik_normed[e] = (ik_raw[e] - mu) * denom * w.ik_ln_w[e] + w.ik_ln_b[e];
++        }
++    }
++    const std::vector<float> ig = device_project(projections.ig, w.ig, x, hidden);
++    append_row(state.ik_plane, ik_normed, id);
++    append_row(state.ig_plane, ig, id);
++
++    // ---- Stage 5: re-pool every completed pool over the device planes ----
++    const std::uint32_t tokens = position + 1;
++    const std::uint32_t completed = tokens / kpool;
++    std::vector<float> pooled;
++    if (completed > 0) {
++        auto ik_host = download_rows(state.ik_plane, completed * kpool, id);
++        auto ig_host = download_rows(state.ig_plane, completed * kpool, id);
++        const auto* ik_words =
++            reinterpret_cast<const std::uint16_t*>(ik_host.bytes().data());
++        const auto* ig_words =
++            reinterpret_cast<const std::uint16_t*>(ig_host.bytes().data());
++        pooled.assign(static_cast<std::size_t>(completed) * id, 0.0f);
++        for (std::uint32_t p = 0; p < completed; ++p) {
++            for (std::uint32_t e = 0; e < id; ++e) {
++                float logits[8];
++                float maximum = kNegInf;
++                for (std::uint32_t m = 0; m < kpool; ++m) {
++                    logits[m] =
++                        bf16_word_to_float(
++                            ig_words[static_cast<std::size_t>(p * kpool + m) * id + e]) +
++                        w.ape[m * id + e];
++                    if (m == 0 || logits[m] > maximum) maximum = logits[m];
++                }
++                float denominator = 0;
++                for (std::uint32_t m = 0; m < kpool; ++m) {
++                    logits[m] = std::exp(logits[m] - maximum);
++                    denominator += logits[m];
++                }
++                const float inverse = 1.0f / denominator;
++                float acc = 0;
++                for (std::uint32_t m = 0; m < kpool; ++m) {
++                    acc += logits[m] * inverse *
++                           bf16_word_to_float(
++                               ik_words[static_cast<std::size_t>(p * kpool + m) * id + e]);
++                }
++                pooled[p * id + e] = acc;
++            }
++        }
++    }
++
++    // ---- Stage 6: head weights (MME) + the 1/sqrt(dim*heads) scale ----
++    const std::vector<float> weights_raw =
++        device_project(projections.iproj, w.iproj, x, hidden);
++    std::vector<float> weights(ih);
++    {
++        const float scale =
++            std::sqrt(1.0f / (static_cast<float>(id) * ih));
++        for (std::uint32_t h = 0; h < ih; ++h) weights[h] = weights_raw[h] * scale;
++    }
++
++    // ---- Stage 7: score + select on host ----
++    const std::uint32_t top_pools = config.top_k / kpool;
++    const std::uint32_t width = top_pools * kpool + (kpool - 1);
++    std::vector<std::int32_t> cells(width, -1);
++    const std::uint32_t n_vis = completed;  // (position+1)/kpool == completed
++    if (completed > 0) {
++        std::vector<float> score(completed, 0.0f);
++        for (std::uint32_t p = 0; p < completed; ++p) {
++            float acc = 0;
++            for (std::uint32_t h = 0; h < ih; ++h) {
++                float dot = 0;
++                for (std::uint32_t e = 0; e < id; ++e) {
++                    dot += iq[h * id + e] * pooled[p * id + e];
++                }
++                acc += std::max(dot, 0.0f) * weights[h];
++            }
++            score[p] = acc;
++        }
++        // Stable descending selection: ties resolve to the lower pool index
++        // (the CUDA block argmax keeps the first strict maximum).
++        const std::uint32_t picks = std::min(top_pools, n_vis);
++        std::vector<bool> taken(completed, false);
++        for (std::uint32_t rank = 0; rank < picks; ++rank) {
++            std::uint32_t winner = 0;
++            float best = kNegInf;
++            for (std::uint32_t p = 0; p < completed; ++p) {
++                if (taken[p]) continue;
++                if (score[p] > best) {
++                    best = score[p];
++                    winner = p;
++                }
++            }
++            taken[winner] = true;
++            for (std::uint32_t m = 0; m < kpool; ++m) {
++                cells[rank * kpool + m] =
++                    static_cast<std::int32_t>(winner * kpool + m);
++            }
++        }
++        // The incomplete tail (cells n_vis*kpool .. position) fills after the
++        // selected pools; the query's own row is included (it sees itself).
++        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
++            const std::int32_t cell =
++                static_cast<std::int32_t>(n_vis * kpool + m);
++            cells[top_pools * kpool + m] =
++                cell <= static_cast<std::int32_t>(position) ? cell : -1;
++        }
++    } else {
++        // No completed pool: the selection row is tail-only.
++        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
++            const std::int32_t cell = static_cast<std::int32_t>(m);
++            cells[top_pools * kpool + m] =
++                cell <= static_cast<std::int32_t>(position) ? cell : -1;
++        }
++    }
++
++    // ---- Stage 8: absorb + attention on host ----
++    // q_abs[h, e] = sum_d q[h, d] * wk_b[d + nope*e + nope*lora*h] in FP32,
++    // rounded to BF16 before the attention (the CUDA host bridge contract).
++    std::vector<float> q_abs(static_cast<std::size_t>(heads) * lora);
++    for (std::uint32_t h = 0; h < heads; ++h) {
++        for (std::uint32_t e = 0; e < lora; ++e) {
++            float acc = 0;
++            for (std::uint32_t d = 0; d < nope; ++d) {
++                acc += q_heads[h * nope + d] *
++                       w.wk_b[static_cast<std::size_t>(d) + nope * e +
++                              static_cast<std::size_t>(nope) * lora * h];
++            }
++            q_abs[h * lora + e] = acc;
++        }
++    }
++    std::vector<float> q_abs_bf(static_cast<std::size_t>(heads) * lora);
++    for (std::size_t i = 0; i < q_abs.size(); ++i) {
++        q_abs_bf[i] = bf16_word_to_float(float_to_bf16_word(q_abs[i]));
++    }
++
++    auto latents_host = download_rows(state.latents, tokens, lora);
++    const auto* latent_words =
++        reinterpret_cast<const std::uint16_t*>(latents_host.bytes().data());
++    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(nope));
++    std::vector<float> attn_out(static_cast<std::size_t>(heads) * v_head);
++    for (std::uint32_t h = 0; h < heads; ++h) {
++        // Scores over the selection row; softmax excludes -1 slots.
++        std::vector<float> logits(width, kNegInf);
++        bool any = false;
++        float maximum = 0.0f;
++        for (std::uint32_t s = 0; s < width; ++s) {
++            if (cells[s] < 0) continue;
++            const auto* row =
++                latent_words + static_cast<std::size_t>(cells[s]) * lora;
++            float dot = 0;
++            for (std::uint32_t e = 0; e < lora; ++e) {
++                dot += q_abs_bf[h * lora + e] * bf16_word_to_float(row[e]);
++            }
++            const float value = dot * attn_scale;
++            logits[s] = value;
++            if (!any || value > maximum) {
++                maximum = value;
++                any = true;
++            }
++        }
++        std::vector<float> prob(width, 0.0f);
++        float denominator = 0;
++        if (any) {
++            for (std::uint32_t s = 0; s < width; ++s) {
++                if (cells[s] < 0) continue;
++                prob[s] = std::exp(logits[s] - maximum);
++                denominator += prob[s];
++            }
++        } else {
++            denominator = 1.0f;  // the CUDA kernel guards sum>0 the same way
++        }
++        const float inverse = 1.0f / denominator;
++        // ctx[e] over valid slots, then out[h, v] = sum_c wv_b[c + lora*v +
++        // lora*v_head*h] * ctx[c].
++        std::vector<float> ctx(lora, 0.0f);
++        for (std::uint32_t s = 0; s < width; ++s) {
++            if (cells[s] < 0) continue;
++            const auto* row =
++                latent_words + static_cast<std::size_t>(cells[s]) * lora;
++            for (std::uint32_t e = 0; e < lora; ++e) {
++                ctx[e] += prob[s] * inverse * bf16_word_to_float(row[e]);
++            }
++        }
++        for (std::uint32_t v = 0; v < v_head; ++v) {
++            float acc = 0;
++            for (std::uint32_t c = 0; c < lora; ++c) {
++                acc += w.wv_b[static_cast<std::size_t>(c) + lora * v +
++                              static_cast<std::size_t>(lora) * v_head * h] *
++                       ctx[c];
++            }
++            attn_out[h * v_head + v] = acc;
++        }
++    }
++
++    // ---- Stage 9: wo projection on the MME ----
++    const std::vector<float> block_out =
++        device_project(projections.wo, w.wo, attn_out, heads * v_head);
++    std::vector<std::uint16_t> result(hidden);
++    for (std::uint32_t i = 0; i < hidden; ++i) {
++        result[i] = float_to_bf16_word(block_out[i]);
++    }
++    return result;
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/glm5_hpu_dsa.h b/src/core/gaudi2/glm5_hpu_dsa.h
+new file mode 100644
+index 0000000..54b22d7
+--- /dev/null
++++ b/src/core/gaudi2/glm5_hpu_dsa.h
+@@ -0,0 +1,95 @@
++#pragma once
++// GLM-5.3-Flash DSA mixer block (NoPE MLA + k-pool indexer) on the Gaudi2
++// SynapseAI runtime adapter. Same contract as glm5_hpu_block.h: every matrix
++// projection rides the MME through closed Bf16Gemm recipes, the selection
++// chain and the absorbed attention run on the host between launches, and all
++// the elementwise math mirrors the CUDA executor (src/models/glm5/execution/
++// block.cpp) including its BF16 rounding boundaries.
++//
++// Persistent state (latents / indexer planes) lives in HBM; each decode step
++// appends the token's row and re-pools every completed pool over the device
++// plane, exactly like the CUDA decode path.
++
++#include "core/gaudi2/runtime.h"
++#include "ops/gaudi2/bf16_gemm.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++struct Glm5DsaHpuConfig {
++    std::uint32_t hidden;
++    std::uint32_t heads, head_dim;            // head_dim = qk_nope
++    std::uint32_t q_lora, kv_lora, v_head;
++    std::uint32_t index_heads, index_dim, kpool, top_k;
++    std::uint32_t max_positions;              // capacity of the history planes
++    float rms_eps;
++};
++
++// HBM-resident history: this token's latent row and indexer rows are appended
++// each step; the selection chain reads them back.
++struct Glm5DsaHpuState {
++    DeviceBuffer latents;   // BF16 [max_positions * kv_lora]
++    DeviceBuffer ik_plane;  // BF16 [max_positions * index_dim]
++    DeviceBuffer ig_plane;  // BF16 [max_positions * index_dim]
++};
++
++// Device-resident projection planes plus the host-side operands of the host
++// math (absorb weights, LayerNorm parameters, ape, norm gammas).
++struct Glm5DsaHpuWeights {
++    DeviceBuffer attn_norm;   // BF16 [hidden]
++    DeviceBuffer q_a;         // BF16 [q_lora, hidden]
++    DeviceBuffer q_b;         // BF16 [heads*head_dim, q_lora]
++    DeviceBuffer kv_a;        // BF16 [kv_lora, hidden]
++    DeviceBuffer iq_b;        // BF16 [index_heads*index_dim, q_lora]
++    DeviceBuffer ik;          // BF16 [index_dim, hidden]
++    DeviceBuffer ig;          // BF16 [index_dim, hidden]
++    DeviceBuffer iproj;       // BF16 [index_heads, hidden]
++    DeviceBuffer wo;          // BF16 [hidden, heads*v_head]
++    // Host-resident planes (small; host math between GEMMs).
++    std::vector<float> q_a_norm;   // BF16-represented gamma [q_lora]
++    std::vector<float> kv_a_norm;  // BF16-represented gamma [kv_lora]
++    std::vector<float> wk_b;       // GGUF {head_dim, kv_lora, heads}, BF16 values
++    std::vector<float> wv_b;       // GGUF {kv_lora, v_head, heads}, BF16 values
++    std::vector<float> ik_ln_w;    // LayerNorm gamma [index_dim], BF16 values
++    std::vector<float> ik_ln_b;    // LayerNorm beta [index_dim], BF16 values
++    std::vector<float> ape;        // FP32 [kpool * index_dim]
++};
++
++// One static Bf16Gemm recipe per projection shape; the expert-free DSA chain
++// needs nine distinct GEMMs (q_a, q_b, kv_a, iq_b, ik, ig, iproj, wo).
++struct Glm5DsaHpuProjections {
++    Bf16Gemm q_a;    // [1, q_lora, hidden]
++    Bf16Gemm q_b;    // [1, heads*head_dim, q_lora]
++    Bf16Gemm kv_a;   // [1, kv_lora, hidden]
++    Bf16Gemm iq_b;   // [1, index_heads*index_dim, q_lora]
++    Bf16Gemm ik;     // [1, index_dim, hidden]
++    Bf16Gemm ig;     // [1, index_dim, hidden]
++    Bf16Gemm iproj;  // [1, index_heads, hidden]
++    Bf16Gemm wo;     // [1, hidden, heads*v_head]
++
++    Glm5DsaHpuProjections(const Device& device, const Glm5DsaHpuConfig& config,
++                          std::size_t max_workspace_bytes = 4096);
++};
++
++[[nodiscard]] Glm5DsaHpuState glm5_dsa_hpu_init_state(const Device& device,
++                                                      const Glm5DsaHpuConfig& config);
++
++// One token through the DSA block: RMSNorm (host) -> q_a/norm/q_b (MME) ->
++// absorb (host) -> kv_a/norm + latent row append -> indexer projections
++// (MME) + LayerNorm (host) + row appends -> re-pool (host over the device
++// plane) -> head weights (MME + host scale) -> score/select/attend (host) ->
++// wo (MME). Returns the block output [hidden] BF16 words.
++[[nodiscard]] std::vector<std::uint16_t> glm5_dsa_hpu_decode_step(
++    const Device& device, Stream& stream, Glm5DsaHpuProjections& projections,
++    const Glm5DsaHpuWeights& w, Glm5DsaHpuState& state, const Glm5DsaHpuConfig& config,
++    std::span<const std::uint16_t> hidden_in, std::uint32_t position);
++
++// Scratch (pinned host) needed for one decode step at `position`.
++[[nodiscard]] std::size_t glm5_dsa_hpu_scratch_bytes(const Glm5DsaHpuConfig& config,
++                                                     std::uint32_t position);
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/glm5_hpu_mlp.cpp b/src/core/gaudi2/glm5_hpu_mlp.cpp
+new file mode 100644
+index 0000000..297a535
+--- /dev/null
++++ b/src/core/gaudi2/glm5_hpu_mlp.cpp
+@@ -0,0 +1,214 @@
++// GLM-5.3-Flash FFN half on the Gaudi2 runtime adapter. The math mirrors the
++// CUDA dense_mlp_decode / moe_block_decode: projections on the MME, the
++// clamped SwiGLU / noaux_tc router / combine on the host between launches.
++#include "core/gaudi2/glm5_hpu_mlp.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::gaudi2 {
++namespace {
++
++float bf16_word_to_float(std::uint16_t word) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(word) << 16;
++    float value;
++    std::memcpy(&value, &wide, 4);
++    return value;
++}
++
++std::uint16_t float_to_bf16_word(float value) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
++
++// The audited clamped SwiGLU: gate upper-clamped only, up clamped both sides,
++// evaluated FP32 with a BF16 output boundary (the CUDA kernel contract).
++float swiglu(float gate, float up, float limit) {
++    const float g = std::min(gate, limit);
++    const float u = std::max(-limit, std::min(up, limit));
++    return g * sigmoid(g) * u;
++}
++
++} // namespace
++
++Glm5MlpHpuProjections::Glm5MlpHpuProjections(const Device& device,
++                                             const Glm5MlpHpuConfig& config,
++                                             std::size_t max_workspace_bytes)
++    : gate{device, Bf16GemmShape{1, config.ffn, config.hidden}, max_workspace_bytes},
++      up{device, Bf16GemmShape{1, config.ffn, config.hidden}, max_workspace_bytes},
++      down{device, Bf16GemmShape{1, config.hidden, config.ffn}, max_workspace_bytes},
++      router{device, Bf16GemmShape{1, std::max(config.experts, 1u), config.hidden},
++             max_workspace_bytes},
++      shared_gate{device, Bf16GemmShape{1, config.ffn, config.hidden}, max_workspace_bytes},
++      shared_up{device, Bf16GemmShape{1, config.ffn, config.hidden}, max_workspace_bytes},
++      shared_down{device, Bf16GemmShape{1, config.hidden, config.ffn},
++                  max_workspace_bytes} {}
++
++std::size_t glm5_mlp_hpu_scratch_bytes(const Glm5MlpHpuConfig& config) {
++    const std::uint64_t h = config.hidden;
++    const std::uint64_t f = config.ffn;
++    std::uint64_t bytes = h * 2 + h * 2 + f * 2 * 3 + 16 * 1024;
++    if (config.is_moe()) {
++        bytes += static_cast<std::uint64_t>(config.experts) * 2 +
++                 static_cast<std::uint64_t>(config.top_k) * (h * 2 + 4 + 4) +
++                 static_cast<std::uint64_t>(config.top_k) * 4;
++    }
++    return static_cast<std::size_t>(bytes);
++}
++
++std::vector<std::uint16_t> glm5_mlp_hpu_decode_step(
++    const Device& device, Stream& stream, Glm5MlpHpuProjections& projections,
++    const Glm5MlpHpuWeights& w, const Glm5MlpHpuConfig& config,
++    std::span<const std::uint16_t> hidden_in) {
++    const std::uint32_t hidden = config.hidden;
++    const std::uint32_t ffn = config.ffn;
++    if (hidden_in.size() != hidden) {
++        throw std::invalid_argument("glm5_mlp_hpu_decode_step: hidden_in size mismatch");
++    }
++
++    auto device_project = [&](Bf16Gemm& gemm, const DeviceBuffer& weight,
++                              const std::vector<float>& input,
++                              std::uint32_t in_cols) {
++        const std::uint32_t out_rows = static_cast<std::uint32_t>(gemm.shape().n);
++        PinnedBuffer host_in = device.allocate_host(in_cols * 2);
++        for (std::uint32_t i = 0; i < in_cols; ++i) {
++            const auto word = float_to_bf16_word(input[i]);
++            std::memcpy(host_in.bytes().data() + i * 2, &word, 2);
++        }
++        PinnedBuffer host_out = device.allocate_host(out_rows * 2);
++        DeviceBuffer dev_in = device.allocate_device(in_cols * 2);
++        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
++        auto up = stream.upload(dev_in, host_in, in_cols * 2);
++        up.wait();
++        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight), dev_out);
++        compute.wait();
++        auto down = stream.download(host_out, dev_out, out_rows * 2);
++        down.wait();
++        std::vector<float> result(out_rows);
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_out.bytes().data());
++        for (std::uint32_t r = 0; r < out_rows; ++r) {
++            result[r] = bf16_word_to_float(words[r]);
++        }
++        return result;
++    };
++    // The dense SwiGLU chain: gate/up on the MME, activation on the host, down
++    // on the MME. Every expert (routed or shared) reuses the same recipes
++    // against its own weight buffers.
++    auto swiglu_expert = [&](Bf16Gemm& gate_gemm, Bf16Gemm& up_gemm, Bf16Gemm& down_gemm,
++                             const DeviceBuffer& gate_w, const DeviceBuffer& up_w,
++                             const DeviceBuffer& down_w,
++                             const std::vector<float>& normed) {
++        const std::vector<float> g = device_project(gate_gemm, gate_w, normed, hidden);
++        const std::vector<float> u = device_project(up_gemm, up_w, normed, hidden);
++        std::vector<float> activated(ffn);
++        for (std::uint32_t i = 0; i < ffn; ++i) {
++            activated[i] = bf16_word_to_float(
++                float_to_bf16_word(swiglu(g[i], u[i], config.swiglu_limit)));
++        }
++        return device_project(down_gemm, down_w, activated, ffn);
++    };
++
++    // ---- Stage 1: RMSNorm on host ----
++    std::vector<float> normed(hidden);
++    {
++        PinnedBuffer host_w = device.allocate_host(hidden * 2);
++        auto dl = stream.download(host_w, const_cast<DeviceBuffer&>(w.ffn_norm), hidden * 2);
++        dl.wait();
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_w.bytes().data());
++        float square = 0;
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            const float v = bf16_word_to_float(hidden_in[i]);
++            square += v * v;
++        }
++        const float inverse = 1.0f / std::sqrt(square / hidden + config.rms_eps);
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            normed[i] = bf16_word_to_float(hidden_in[i]) * inverse *
++                        bf16_word_to_float(words[i]);
++        }
++    }
++
++    if (!config.is_moe()) {
++        // ---- Dense path ----
++        const std::vector<float> block_out =
++            swiglu_expert(projections.gate, projections.up, projections.down,
++                          w.gate, w.up, w.down, normed);
++        std::vector<std::uint16_t> result(hidden);
++        for (std::uint32_t i = 0; i < hidden; ++i) {
++            result[i] = float_to_bf16_word(block_out[i]);
++        }
++        return result;
++    }
++
++    // ---- MoE path ----
++    const std::uint32_t experts = config.experts;
++    const std::uint32_t top_k = config.top_k;
++
++    // Router on the MME (BF16 logits), the noaux_tc selection on the host:
++    // score = sigmoid(logit); ranks by score + bias with ties to the lower
++    // expert; the ORIGINAL scores are normalized and scaled.
++    const std::vector<float> logits = device_project(
++        projections.router, w.router, normed, hidden);
++    std::vector<float> score(experts);
++    for (std::uint32_t e = 0; e < experts; ++e) score[e] = sigmoid(logits[e]);
++    std::vector<float> weights(top_k, 0.0f);
++    std::vector<std::uint32_t> selected(top_k, 0x7fffffffu);
++    {
++        std::vector<float> ranking(experts);
++        for (std::uint32_t e = 0; e < experts; ++e) ranking[e] = score[e] + w.router_bias[e];
++        std::vector<bool> taken(experts, false);
++        for (std::uint32_t rank = 0; rank < top_k; ++rank) {
++            std::uint32_t winner = 0;
++            float best = -3.0e38f;
++            for (std::uint32_t e = 0; e < experts; ++e) {
++                if (taken[e]) continue;
++                if (ranking[e] > best) {
++                    best = ranking[e];
++                    winner = e;
++                }
++            }
++            taken[winner] = true;
++            selected[rank] = winner;
++            weights[rank] = score[winner];
++        }
++        float sum = 0;
++        for (std::uint32_t i = 0; i < top_k; ++i) sum += weights[i];
++        const float inverse = config.routed_scaling_factor / (sum + 1e-20f);
++        for (std::uint32_t i = 0; i < top_k; ++i) weights[i] *= inverse;
++    }
++
++    // Selected experts sequentially through the shared recipes.
++    std::vector<std::vector<float>> stacked(top_k);
++    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++        const std::uint32_t expert = selected[slot];
++        if (expert >= experts) {
++            stacked[slot].assign(hidden, 0.0f);
++            continue;
++        }
++        stacked[slot] = swiglu_expert(projections.gate, projections.up, projections.down,
++                                      w.expert_gate[expert], w.expert_up[expert],
++                                      w.expert_down[expert], normed);
++    }
++
++    // Shared expert (unweighted) plus the weighted routed combine.
++    const std::vector<float> shared = swiglu_expert(
++        projections.shared_gate, projections.shared_up, projections.shared_down,
++        w.gate, w.up, w.down, normed);
++    std::vector<std::uint16_t> result(hidden);
++    for (std::uint32_t i = 0; i < hidden; ++i) {
++        float acc = shared[i];
++        for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++            acc += weights[slot] * stacked[slot][i];
++        }
++        result[i] = float_to_bf16_word(acc);
++    }
++    return result;
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/glm5_hpu_mlp.h b/src/core/gaudi2/glm5_hpu_mlp.h
+new file mode 100644
+index 0000000..534ddf5
+--- /dev/null
++++ b/src/core/gaudi2/glm5_hpu_mlp.h
+@@ -0,0 +1,72 @@
++#pragma once
++// GLM-5.3-Flash FFN half (dense MLP and MoE blocks) on the Gaudi2 SynapseAI
++// runtime adapter. Same contract as the other HPU block executors: matrix
++// projections on the MME through closed Bf16Gemm recipes, the clamped
++// SwiGLU / router / combine math on the host between launches, mirroring the
++// CUDA executors (src/models/glm5/execution/block.cpp) with the same BF16
++// rounding boundaries.
++//
++// MoE weight residency: every expert's gate/up/down row block is uploaded as
++// its own DeviceBuffer at bind time (the same total bytes as the stacked
++// plane, but bindable per expert - Bf16Gemm binds whole buffers, and slicing
++// the plane would need per-launch staging copies of every selected expert).
++
++#include "core/gaudi2/runtime.h"
++#include "ops/gaudi2/bf16_gemm.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++struct Glm5MlpHpuConfig {
++    std::uint32_t hidden;
++    std::uint32_t ffn;              // per-expert / dense intermediate width
++    std::uint32_t experts = 0;      // 0 => dense block
++    std::uint32_t top_k = 0;
++    float rms_eps;
++    float swiglu_limit;
++    float routed_scaling_factor = 1.0f;
++
++    [[nodiscard]] bool is_moe() const noexcept { return experts > 0; }
++};
++
++struct Glm5MlpHpuWeights {
++    DeviceBuffer ffn_norm;          // BF16 [hidden]
++    // Dense (and the MoE router / shared expert) planes.
++    DeviceBuffer gate, up, down;    // dense: [ffn, hidden] / [ffn, hidden] / [hidden, ffn]
++    DeviceBuffer router;            // MoE: BF16 [experts, hidden]
++    // Per-expert row blocks (MoE only), each dense-shaped.
++    std::vector<DeviceBuffer> expert_gate;   // [experts] each BF16 [ffn, hidden]
++    std::vector<DeviceBuffer> expert_up;     // [experts] each BF16 [ffn, hidden]
++    std::vector<DeviceBuffer> expert_down;   // [experts] each BF16 [hidden, ffn]
++    // Host-resident router correction bias, FP32 [experts] (noaux_tc).
++    std::vector<float> router_bias;
++};
++
++// Dense and MoE share the recipe set: the routed experts reuse the dense
++// shapes (every expert row block is [ffn, hidden] / [hidden, ffn]).
++struct Glm5MlpHpuProjections {
++    Bf16Gemm gate, up;      // [1, ffn, hidden]
++    Bf16Gemm down;          // [1, hidden, ffn]
++    Bf16Gemm router;        // [1, experts, hidden] (unused when dense)
++    Bf16Gemm shared_gate, shared_up;   // [1, ffn, hidden] (MoE shared expert)
++    Bf16Gemm shared_down;              // [1, hidden, ffn]
++
++    Glm5MlpHpuProjections(const Device& device, const Glm5MlpHpuConfig& config,
++                          std::size_t max_workspace_bytes = 4096);
++};
++
++// One token through the FFN half: RMSNorm (host) -> the dense or routed
++// SwiGLU chain -> the block output [hidden] BF16 words.
++[[nodiscard]] std::vector<std::uint16_t> glm5_mlp_hpu_decode_step(
++    const Device& device, Stream& stream, Glm5MlpHpuProjections& projections,
++    const Glm5MlpHpuWeights& w, const Glm5MlpHpuConfig& config,
++    std::span<const std::uint16_t> hidden_in);
++
++// Scratch (pinned host) needed for one decode step.
++[[nodiscard]] std::size_t glm5_mlp_hpu_scratch_bytes(const Glm5MlpHpuConfig& config);
++
++} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_model.cpp b/src/core/gaudi2/glm5_hpu_model.cpp
 new file mode 100644
-index 0000000..18becb6
+index 0000000..0260b6f
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_model.cpp
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,566 @@
 +// GLM-5.3-Flash full-model HPU executor. The math mirrors the CUDA
-+// decode_step; projections run on the MME via per-shape Bf16Gemm sets,
-+// and the elementwise chains use the same audited host formulas.
++// decode_step; projections run on the MME via per-shape Bf16Gemm sets, and
++// the elementwise chains use the same audited host formulas. Both mixer kinds
++// (KDA, DSA) and both FFN kinds (dense, MoE) dispatch to their block
++// executors; every layer runs its attention half then its FFN half through
++// the mHC residual, exactly like the CUDA assembly.
 +#include "core/gaudi2/glm5_hpu_model.h"
 +
 +#include <cmath>
@@ -4236,18 +5089,19 @@ index 0000000..18becb6
 +
 +Glm5HpuModel::Glm5HpuModel(const Device& device,
 +                           const models::glm5::execution::Glm5StepConfig& config,
-+                           std::size_t max_workspace_bytes)
++                           std::size_t max_workspace_bytes, std::uint32_t positions)
 +    : lm_head(device, Bf16GemmShape{1, config.vocab_size, config.hidden},
 +              max_workspace_bytes),
 +      hidden(config.hidden), layers(static_cast<std::uint32_t>(config.layer_is_dsa.size())),
-+      kda_heads(config.kda_heads), kda_head_dim(config.kda_head_dim) {
++      kda_heads(config.kda_heads), kda_head_dim(config.kda_head_dim),
++      max_positions(positions) {
 +    const std::uint32_t d_inner = config.kda_heads * config.kda_head_dim;
 +
 +    for (std::uint32_t layer = 0; layer < layers; ++layer) {
 +        if (!config.layer_is_dsa[layer]) {
 +            Glm5KdaHpuConfig block_config{config.hidden, config.kda_heads,
 +                                          config.kda_head_dim, 4,
-+                                          config.gate_lower_bound, config.rms_eps};
++                                          config.rms_eps, config.gate_lower_bound};
 +            kda_projections.push_back(
 +                Glm5KdaHpuProjections(device, block_config, max_workspace_bytes));
 +            kda_layer_indices.push_back(layer);
@@ -4267,7 +5121,40 @@ index 0000000..18becb6
 +            state.matrix = zero(static_cast<std::size_t>(config.kda_heads) *
 +                                config.kda_head_dim * config.kda_head_dim * 4);
 +            kda_state.push_back(std::move(state));
++        } else {
++            Glm5DsaHpuConfig block_config{};
++            block_config.hidden = config.hidden;
++            block_config.heads = config.heads;
++            block_config.head_dim = config.head_dim;
++            block_config.q_lora = config.q_lora;
++            block_config.kv_lora = config.kv_lora;
++            block_config.v_head = config.v_head;
++            block_config.index_heads = config.index_heads;
++            block_config.index_dim = config.index_dim;
++            block_config.kpool = config.kpool;
++            block_config.top_k = config.top_k;
++            block_config.max_positions = max_positions;
++            block_config.rms_eps = config.rms_eps;
++            dsa_projections.push_back(
++                Glm5DsaHpuProjections(device, block_config, max_workspace_bytes));
++            dsa_layer_indices.push_back(layer);
++            dsa_state.push_back(glm5_dsa_hpu_init_state(device, block_config));
 +        }
++
++        Glm5MlpHpuConfig mlp_config{};
++        mlp_config.hidden = config.hidden;
++        mlp_config.rms_eps = config.rms_eps;
++        mlp_config.swiglu_limit = config.swiglu_limit;
++        if (config.layer_mlp_dense[layer]) {
++            mlp_config.ffn = config.ffn_dense;
++        } else {
++            mlp_config.ffn = config.ffn_moe;
++            mlp_config.experts = config.experts;
++            mlp_config.top_k = config.num_experts_per_tok;
++            mlp_config.routed_scaling_factor = config.routed_scaling_factor;
++        }
++        mlp_projections.push_back(
++            Glm5MlpHpuProjections(device, mlp_config, max_workspace_bytes));
 +    }
 +}
 +
@@ -4344,6 +5231,127 @@ index 0000000..18becb6
 +    }
 +}
 +
++void Glm5HpuModel::upload_dsa_weights(
++    const Device& device, Stream& stream,
++    const models::glm5::execution::Glm5ModelWeights& weights,
++    const models::glm5::execution::Glm5StepConfig& config) {
++    const std::uint32_t heads = config.heads;
++    const std::uint32_t nope = config.head_dim;
++    const std::uint32_t lora = config.kv_lora;
++    const std::uint32_t v_head = config.v_head;
++    const std::uint32_t ih = config.index_heads;
++    const std::uint32_t id = config.index_dim;
++    const std::uint32_t kpool = config.kpool;
++    std::size_t dsa_idx = 0;
++    for (std::uint32_t layer = 0; layer < layers; ++layer) {
++        if (!config.layer_is_dsa[layer]) continue;
++        const auto& dw = weights.layers[layer].dsa;
++
++        auto upload_plane = [&](const void* payload, std::size_t bytes) {
++            PinnedBuffer host = device.allocate_host(bytes);
++            std::memcpy(host.bytes().data(), payload, bytes);
++            DeviceBuffer dev = device.allocate_device(bytes);
++            auto t = stream.upload(dev, host, bytes);
++            t.wait();
++            weight_residency.push_back(std::move(dev));
++            return weight_residency.size() - 1;
++        };
++        auto widen = [&](const void* payload, std::size_t elements) {
++            const auto* src = reinterpret_cast<const std::uint16_t*>(payload);
++            std::vector<float> out(elements);
++            for (std::size_t i = 0; i < elements; ++i) {
++                out[i] = bf16_word_to_float(src[i]);
++            }
++            return out;
++        };
++
++        Glm5DsaHpuWeights hw;
++        hw.attn_norm = weight_residency[upload_plane(dw.attn_norm.payload, dw.attn_norm.payload_bytes)];
++        hw.q_a = weight_residency[upload_plane(dw.q_a.payload, dw.q_a.payload_bytes)];
++        hw.q_b = weight_residency[upload_plane(dw.q_b.payload, dw.q_b.payload_bytes)];
++        hw.kv_a = weight_residency[upload_plane(dw.kv_a.payload, dw.kv_a.payload_bytes)];
++        hw.iq_b = weight_residency[upload_plane(dw.indexer_q_b.payload, dw.indexer_q_b.payload_bytes)];
++        hw.ik = weight_residency[upload_plane(dw.indexer_k.payload, dw.indexer_k.payload_bytes)];
++        hw.ig = weight_residency[upload_plane(dw.indexer_gate.payload, dw.indexer_gate.payload_bytes)];
++        hw.iproj = weight_residency[upload_plane(dw.indexer_proj.payload, dw.indexer_proj.payload_bytes)];
++        hw.wo = weight_residency[upload_plane(dw.wo.payload, dw.wo.payload_bytes)];
++
++        hw.q_a_norm = widen(dw.q_a_norm.payload, config.q_lora);
++        hw.kv_a_norm = widen(dw.kv_a_norm.payload, lora);
++        hw.wk_b = widen(dw.wk_b.payload,
++                        static_cast<std::size_t>(nope) * lora * heads);
++        hw.wv_b = widen(dw.wv_b.payload,
++                        static_cast<std::size_t>(lora) * v_head * heads);
++        hw.ik_ln_w = widen(dw.indexer_k_norm_w.payload, id);
++        hw.ik_ln_b = widen(dw.indexer_k_norm_b.payload, id);
++        // The ape plane is FP32 in the GGUF payload.
++        hw.ape.resize(static_cast<std::size_t>(kpool) * id);
++        std::memcpy(hw.ape.data(), weights.dsa_ape[dsa_idx],
++                    static_cast<std::size_t>(kpool) * id * 4);
++
++        dsa_weights.push_back(std::move(hw));
++        ++dsa_idx;
++    }
++}
++
++void Glm5HpuModel::upload_mlp_weights(
++    const Device& device, Stream& stream,
++    const models::glm5::execution::Glm5ModelWeights& weights,
++    const models::glm5::execution::Glm5StepConfig& config) {
++    for (std::uint32_t layer = 0; layer < layers; ++layer) {
++        auto upload_plane = [&](const void* payload, std::size_t bytes) {
++            PinnedBuffer host = device.allocate_host(bytes);
++            std::memcpy(host.bytes().data(), payload, bytes);
++            DeviceBuffer dev = device.allocate_device(bytes);
++            auto t = stream.upload(dev, host, bytes);
++            t.wait();
++            weight_residency.push_back(std::move(dev));
++            return weight_residency.size() - 1;
++        };
++
++        Glm5MlpHpuWeights hw;
++        if (config.layer_mlp_dense[layer]) {
++            const auto& mw = weights.layers[layer].dense_mlp;
++            hw.ffn_norm = weight_residency[upload_plane(mw.ffn_norm.payload, mw.ffn_norm.payload_bytes)];
++            hw.gate = weight_residency[upload_plane(mw.gate.payload, mw.gate.payload_bytes)];
++            hw.up = weight_residency[upload_plane(mw.up.payload, mw.up.payload_bytes)];
++            hw.down = weight_residency[upload_plane(mw.down.payload, mw.down.payload_bytes)];
++        } else {
++            const auto& mw = weights.layers[layer].moe;
++            const std::uint32_t ffn = config.ffn_moe;
++            const std::uint32_t experts = config.experts;
++            const std::size_t gate_block = static_cast<std::size_t>(ffn) * config.hidden * 2;
++            const std::size_t down_block = static_cast<std::size_t>(config.hidden) * ffn * 2;
++            hw.ffn_norm = weight_residency[upload_plane(mw.ffn_norm.payload, mw.ffn_norm.payload_bytes)];
++            hw.router = weight_residency[upload_plane(mw.router.payload, mw.router.payload_bytes)];
++            // Shared expert planes ride the dense slots of the weights struct.
++            hw.gate = weight_residency[upload_plane(mw.gate_shexp.payload, mw.gate_shexp.payload_bytes)];
++            hw.up = weight_residency[upload_plane(mw.up_shexp.payload, mw.up_shexp.payload_bytes)];
++            hw.down = weight_residency[upload_plane(mw.down_shexp.payload, mw.down_shexp.payload_bytes)];
++            // Per-expert row blocks as their own buffers (same total bytes as
++            // the stacked plane; Bf16Gemm binds whole buffers per launch).
++            hw.expert_gate.resize(experts);
++            hw.expert_up.resize(experts);
++            hw.expert_down.resize(experts);
++            for (std::uint32_t e = 0; e < experts; ++e) {
++                hw.expert_gate[e] = weight_residency[upload_plane(
++                    static_cast<const std::uint8_t*>(mw.gate_exps.payload) + e * gate_block,
++                    gate_block)];
++                hw.expert_up[e] = weight_residency[upload_plane(
++                    static_cast<const std::uint8_t*>(mw.up_exps.payload) + e * gate_block,
++                    gate_block)];
++                hw.expert_down[e] = weight_residency[upload_plane(
++                    static_cast<const std::uint8_t*>(mw.down_exps.payload) + e * down_block,
++                    down_block)];
++            }
++            hw.router_bias.resize(experts);
++            std::memcpy(hw.router_bias.data(), weights.layers[layer].moe_router_bias,
++                        static_cast<std::size_t>(experts) * 4);
++        }
++        mlp_weights.push_back(std::move(hw));
++    }
++}
++
 +std::size_t glm5_hpu_model_scratch_bytes(
 +    const models::glm5::execution::Glm5StepConfig& config) {
 +    const std::uint64_t h = config.hidden;
@@ -4357,7 +5365,6 @@ index 0000000..18becb6
 +    const models::glm5::execution::Glm5ModelWeights& weights,
 +    const models::glm5::execution::Glm5StepConfig& config,
 +    std::uint32_t token_id, std::uint32_t position) {
-+    (void)position;
 +    const std::uint32_t h = config.hidden;
 +    constexpr std::uint32_t hc = 4;
 +
@@ -4374,44 +5381,91 @@ index 0000000..18becb6
 +        }
 +    }
 +
-+    // ---- Layer loop ----
-+    std::size_t kda_index = 0;
++    // ---- Layer loop: attention half + FFN half per layer ----
++    std::size_t kda_index = 0, dsa_index = 0;
 +    for (std::uint32_t layer = 0; layer < model.layers; ++layer) {
 +        const auto& lw = weights.layers[layer];
-+        std::vector<float> block_out(h, 0.0f);
 +
 +        {
 +            const MhcSite site = mhc_site(residual, lw.hc_attn_fn.payload,
 +                                          lw.hc_attn_base.payload,
 +                                          lw.hc_attn_scale.payload, h,
 +                                          config.rms_eps);
++            std::vector<std::uint16_t> hidden_bf(h);
++            for (std::uint32_t i = 0; i < h; ++i) {
++                hidden_bf[i] = float_to_bf16_word(site.collapsed[i]);
++            }
 +
++            std::vector<std::uint16_t> block_out_bf;
 +            if (!config.layer_is_dsa[layer]) {
 +                Glm5KdaHpuConfig block_config{config.hidden, config.kda_heads,
 +                                              config.kda_head_dim, 4,
-+                                              config.gate_lower_bound, config.rms_eps};
-+                Glm5KdaHpuWeights& block_weights = model.kda_weights[kda_index];
-+
-+                std::vector<std::uint16_t> hidden_bf(h);
-+                for (std::uint32_t i = 0; i < h; ++i) {
-+                    hidden_bf[i] = float_to_bf16_word(site.collapsed[i]);
-+                }
-+                const auto result_bf = glm5_kda_hpu_decode_step(
++                                              config.rms_eps, config.gate_lower_bound};
++                block_out_bf = glm5_kda_hpu_decode_step(
 +                    device, stream, model.kda_projections[kda_index],
-+                    block_weights, model.kda_state[kda_index],
++                    model.kda_weights[kda_index], model.kda_state[kda_index],
 +                    block_config, hidden_bf);
-+                for (std::uint32_t i = 0; i < h; ++i) {
-+                    block_out[i] = bf16_word_to_float(result_bf[i]);
-+                }
 +                ++kda_index;
++            } else {
++                Glm5DsaHpuConfig block_config{};
++                block_config.hidden = config.hidden;
++                block_config.heads = config.heads;
++                block_config.head_dim = config.head_dim;
++                block_config.q_lora = config.q_lora;
++                block_config.kv_lora = config.kv_lora;
++                block_config.v_head = config.v_head;
++                block_config.index_heads = config.index_heads;
++                block_config.index_dim = config.index_dim;
++                block_config.kpool = config.kpool;
++                block_config.top_k = config.top_k;
++                block_config.max_positions = model.max_positions;
++                block_config.rms_eps = config.rms_eps;
++                block_out_bf = glm5_dsa_hpu_decode_step(
++                    device, stream, model.dsa_projections[dsa_index],
++                    model.dsa_weights[dsa_index], model.dsa_state[dsa_index],
++                    block_config, hidden_bf, position);
++                ++dsa_index;
 +            }
-+            // DSA: the block output stays zero (the selection chain
-+            // arrives with the DSA projection set).
 +
++            std::vector<float> block_out(h);
++            for (std::uint32_t i = 0; i < h; ++i) {
++                block_out[i] = bf16_word_to_float(block_out_bf[i]);
++            }
 +            mhc_post(site, block_out, residual, h);
 +        }
-+        // FFN half: the MLP executor is the follow-up (the residual flows
-+        // through the attention half's comb mix unchanged).
++
++        {
++            const MhcSite site = mhc_site(residual, lw.hc_ffn_fn.payload,
++                                          lw.hc_ffn_base.payload,
++                                          lw.hc_ffn_scale.payload, h,
++                                          config.rms_eps);
++            std::vector<std::uint16_t> hidden_bf(h);
++            for (std::uint32_t i = 0; i < h; ++i) {
++                hidden_bf[i] = float_to_bf16_word(site.collapsed[i]);
++            }
++
++            Glm5MlpHpuConfig mlp_config{};
++            mlp_config.hidden = config.hidden;
++            mlp_config.rms_eps = config.rms_eps;
++            mlp_config.swiglu_limit = config.swiglu_limit;
++            if (config.layer_mlp_dense[layer]) {
++                mlp_config.ffn = config.ffn_dense;
++            } else {
++                mlp_config.ffn = config.ffn_moe;
++                mlp_config.experts = config.experts;
++                mlp_config.top_k = config.num_experts_per_tok;
++                mlp_config.routed_scaling_factor = config.routed_scaling_factor;
++            }
++            const std::vector<std::uint16_t> mlp_out_bf = glm5_mlp_hpu_decode_step(
++                device, stream, model.mlp_projections[layer], model.mlp_weights[layer],
++                mlp_config, hidden_bf);
++
++            std::vector<float> mlp_out(h);
++            for (std::uint32_t i = 0; i < h; ++i) {
++                mlp_out[i] = bf16_word_to_float(mlp_out_bf[i]);
++            }
++            mhc_post(site, mlp_out, residual, h);
++        }
 +    }
 +
 +    // ---- Head mean → output norm → lm_head on the MME ----
@@ -4469,26 +5523,28 @@ index 0000000..18becb6
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_model.h b/src/core/gaudi2/glm5_hpu_model.h
 new file mode 100644
-index 0000000..93795f5
+index 0000000..5d97347
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_model.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,94 @@
 +#pragma once
 +// GLM-5.3-Flash full-model HPU executor: the mHC residual chain + per-block
-+// dispatch (KDA via the existing block executor with MME projections) +
-+// the final head/norm/lm_head. This is the correctness-first HPU path:
-+// every GEMM is on the MME, the elementwise chains use the same audited
-+// host math as the CUDA reference, and the TPC bridges take over as the
++// dispatch (KDA and DSA mixers, dense/MoE MLPs, every projection on the MME)
++// + the final head/norm/lm_head. This is the correctness-first HPU path:
++// every GEMM is on the MME, the elementwise chains use the same audited host
++// math as the CUDA reference, and the TPC bridges take over as the
 +// kernel-lib runtime loading (gap 1's libglm5_tpc.so) comes online.
 +//
-+// State ownership: the model owns its HBM-resident KDA state (the
-+// DeviceBuffer-based Glm5KdaHpuState per layer). The Glm5DecodeState the
-+// CUDA path uses carries Tensor-typed planes; unifying the two types is
-+// gap 4's next step - until then the HPU model manages its own state,
-+// initialized to zero at construction and carried across decode steps.
++// State ownership: the model owns its HBM-resident per-layer state (the KDA
++// recurrence planes and the DSA history planes). The Glm5DecodeState the
++// CUDA path uses carries Tensor-typed planes; unifying the two types is gap
++// 4's next step - until then the HPU model manages its own state, initialized
++// at construction and carried across decode steps.
 +
 +#include "core/gaudi2/runtime.h"
 +#include "core/gaudi2/glm5_hpu_block.h"
++#include "core/gaudi2/glm5_hpu_dsa.h"
++#include "core/gaudi2/glm5_hpu_mlp.h"
 +#include "models/glm5/execution/model.h"
 +
 +#include <cstddef>
@@ -4512,6 +5568,18 @@ index 0000000..93795f5
 +    // reads DeviceBuffers).
 +    std::vector<Glm5KdaHpuWeights> kda_weights;
 +
++    // Per-DSA-layer projection sets, state and weight planes (the history
++    // planes hold max_positions rows; positions beyond that are rejected).
++    std::vector<Glm5DsaHpuProjections> dsa_projections;
++    std::vector<std::uint32_t> dsa_layer_indices;
++    std::vector<Glm5DsaHpuState> dsa_state;
++    std::vector<Glm5DsaHpuWeights> dsa_weights;
++    std::uint32_t max_positions;
++
++    // Per-layer FFN half (dense or MoE; both share the projection kinds).
++    std::vector<Glm5MlpHpuProjections> mlp_projections;
++    std::vector<Glm5MlpHpuWeights> mlp_weights;
++
 +    // Keeps every weight DeviceBuffer alive for the model's lifetime.
 +    std::vector<DeviceBuffer> weight_residency;
 +
@@ -4522,19 +5590,26 @@ index 0000000..93795f5
 +    std::uint32_t hidden, layers, kda_heads, kda_head_dim;
 +
 +    Glm5HpuModel(const Device& device, const models::glm5::execution::Glm5StepConfig& config,
-+                 std::size_t max_workspace_bytes = 4096);
++                 std::size_t max_workspace_bytes = 4096,
++                 std::uint32_t max_positions = 4096);
 +
-+    // Uploads the per-KDA-layer weight planes from the model's Weight
-+    // payloads into HBM DeviceBuffers (the block executor reads
-+    // DeviceBuffers). Call once after the Weight payloads are resident.
++    // Uploads the per-layer weight planes from the model's Weight payloads
++    // into HBM DeviceBuffers (the block executors read DeviceBuffers). Call
++    // once after the Weight payloads are resident.
 +    void upload_kda_weights(const Device& device, Stream& stream,
++                            const models::glm5::execution::Glm5ModelWeights& weights,
++                            const models::glm5::execution::Glm5StepConfig& config);
++    void upload_dsa_weights(const Device& device, Stream& stream,
++                            const models::glm5::execution::Glm5ModelWeights& weights,
++                            const models::glm5::execution::Glm5StepConfig& config);
++    void upload_mlp_weights(const Device& device, Stream& stream,
 +                            const models::glm5::execution::Glm5ModelWeights& weights,
 +                            const models::glm5::execution::Glm5StepConfig& config);
 +};
 +
-+// One full decode step: token_id → embedding → the mHC residual chain
-+// across every block → the head mean → the output norm → the lm_head →
-+// logits [vocab, 1] BF16. Returns the logits as host BF16 words.
++// One full decode step: token_id → embedding → the mHC residual chain across
++// every block (mixer + FFN halves) → the head mean → the output norm → the
++// lm_head → logits [vocab, 1] BF16. Returns the logits as host BF16 words.
 +[[nodiscard]] std::vector<std::uint16_t> glm5_hpu_decode_step(
 +    const Device& device, Stream& stream, Glm5HpuModel& model,
 +    const models::glm5::execution::Glm5ModelWeights& weights,
@@ -6306,18 +7381,327 @@ index 0000000..8d0854b
 +        return 1;
 +    }
 +}
+diff --git a/src/core/gaudi2/tests/glm5_hpu_dsa_test.cpp b/src/core/gaudi2/tests/glm5_hpu_dsa_test.cpp
+new file mode 100644
+index 0000000..84d63e8
+--- /dev/null
++++ b/src/core/gaudi2/tests/glm5_hpu_dsa_test.cpp
+@@ -0,0 +1,138 @@
++// GLM-5.3-Flash DSA block on the Gaudi2 runtime adapter, against the
++// fake_synapse test double. Eight decode positions run the full chain
++// (projections on the MME, the selection chain on the host) so the k-pool
++// crossing at position kpool-1 exercises the pool/score/select path with
++// real history; the resource lifecycle is what this validates (the math is
++// anchored by the CUDA executor suite).
++#include "core/gaudi2/glm5_hpu_dsa.h"
++#include "control.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++using namespace ninfer::gaudi2;
++
++namespace {
++
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::uint16_t round_bf16(float v) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &v, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++float bf16_val(std::uint16_t w) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(w) << 16;
++    float v;
++    std::memcpy(&v, &wide, 4);
++    return v;
++}
++
++std::vector<std::uint16_t> bf16_plane(std::uint32_t rows, std::uint32_t cols,
++                                      std::uint32_t seed) {
++    std::vector<std::uint16_t> o(static_cast<std::size_t>(rows) * cols);
++    for (std::size_t i = 0; i < o.size(); ++i) {
++        o[i] = round_bf16(source(static_cast<std::uint32_t>(i) * 3 + seed) / 16.0f);
++    }
++    return o;
++}
++
++} // namespace
++
++int main() {
++    try {
++        constexpr std::uint32_t H = 64, HEADS = 4, NOPE = 16;
++        constexpr std::uint32_t QL = 32, KVL = 24, VH = 8;
++        constexpr std::uint32_t IH = 2, ID = 12, KPOOL = 4, TOPK = 8;
++        constexpr std::uint32_t MAXPOS = 16;
++        constexpr std::uint32_t STEPS = 8;
++
++        {
++        Device device;
++        Stream stream = device.create_stream();
++
++        Glm5DsaHpuConfig config{};
++        config.hidden = H;
++        config.heads = HEADS;
++        config.head_dim = NOPE;
++        config.q_lora = QL;
++        config.kv_lora = KVL;
++        config.v_head = VH;
++        config.index_heads = IH;
++        config.index_dim = ID;
++        config.kpool = KPOOL;
++        config.top_k = TOPK;
++        config.max_positions = MAXPOS;
++        config.rms_eps = 1e-5f;
++
++        Glm5DsaHpuProjections projections(device, config);
++        Glm5DsaHpuState state = glm5_dsa_hpu_init_state(device, config);
++
++        Glm5DsaHpuWeights w;
++        auto upload = [&](const std::vector<std::uint16_t>& data) {
++            PinnedBuffer host = device.allocate_host(data.size() * 2);
++            std::memcpy(host.bytes().data(), data.data(), data.size() * 2);
++            DeviceBuffer dev = device.allocate_device(data.size() * 2);
++            auto t = stream.upload(dev, host, data.size() * 2);
++            t.wait();
++            return dev;
++        };
++        auto widen = [&](const std::vector<std::uint16_t>& data) {
++            std::vector<float> out(data.size());
++            for (std::size_t i = 0; i < data.size(); ++i) out[i] = bf16_val(data[i]);
++            return out;
++        };
++
++        w.attn_norm = upload(bf16_plane(H, 1, 1));
++        w.q_a = upload(bf16_plane(QL, H, 2));
++        w.q_b = upload(bf16_plane(HEADS * NOPE, QL, 3));
++        w.kv_a = upload(bf16_plane(KVL, H, 4));
++        w.iq_b = upload(bf16_plane(IH * ID, QL, 5));
++        w.ik = upload(bf16_plane(ID, H, 6));
++        w.ig = upload(bf16_plane(ID, H, 7));
++        w.iproj = upload(bf16_plane(IH, H, 8));
++        w.wo = upload(bf16_plane(H, HEADS * VH, 9));
++        w.q_a_norm = widen(bf16_plane(QL, 1, 10));
++        w.kv_a_norm = widen(bf16_plane(KVL, 1, 11));
++        // GGUF layouts: wk_b {nope, lora, heads}, wv_b {lora, v_head, heads}.
++        w.wk_b = widen(bf16_plane(NOPE * KVL, HEADS, 12));
++        w.wv_b = widen(bf16_plane(KVL * VH, HEADS, 13));
++        w.ik_ln_w = widen(bf16_plane(ID, 1, 14));
++        w.ik_ln_b = widen(bf16_plane(ID, 1, 15));
++        w.ape.resize(static_cast<std::size_t>(KPOOL) * ID);
++        for (std::size_t i = 0; i < w.ape.size(); ++i) {
++            w.ape[i] = source(static_cast<std::uint32_t>(i)) / 8;
++        }
++
++        for (std::uint32_t position = 0; position < STEPS; ++position) {
++            const auto hidden_in = bf16_plane(H, 1, 20 + position);
++            const auto out = glm5_dsa_hpu_decode_step(
++                device, stream, projections, w, state, config, hidden_in, position);
++            require(out.size() == H, "block output [hidden]");
++            for (std::uint32_t i = 0; i < H; ++i) {
++                if (!std::isfinite(bf16_val(out[i]))) {
++                    throw std::runtime_error("block output finite");
++                }
++            }
++        }
++        std::printf("ok: %u decode positions through the dsa block\n", STEPS);
++        }
++
++        fake_synapse::assert_clean();
++        std::puts("glm5 dsa hpu block passes lifecycle validation");
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        fake_synapse::assert_clean();
++        return 1;
++    }
++    return 0;
++}
+diff --git a/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp b/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp
+new file mode 100644
+index 0000000..fc4c6d8
+--- /dev/null
++++ b/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp
+@@ -0,0 +1,156 @@
++// GLM-5.3-Flash FFN half (dense and MoE) on the Gaudi2 runtime adapter,
++// against the fake_synapse test double. Both paths run their projections on
++// the MME and the SwiGLU / noaux_tc router / combine math on the host; this
++// validates the resource lifecycle (per-expert buffer residency, DMA leases).
++#include "core/gaudi2/glm5_hpu_mlp.h"
++#include "control.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++using namespace ninfer::gaudi2;
++
++namespace {
++
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::uint16_t round_bf16(float v) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &v, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++float bf16_val(std::uint16_t w) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(w) << 16;
++    float v;
++    std::memcpy(&v, &wide, 4);
++    return v;
++}
++
++std::vector<std::uint16_t> bf16_plane(std::uint32_t rows, std::uint32_t cols,
++                                      std::uint32_t seed) {
++    std::vector<std::uint16_t> o(static_cast<std::size_t>(rows) * cols);
++    for (std::size_t i = 0; i < o.size(); ++i) {
++        o[i] = round_bf16(source(static_cast<std::uint32_t>(i) * 3 + seed) / 16.0f);
++    }
++    return o;
++}
++
++} // namespace
++
++int run_dense(const Device& device, Stream& stream) {
++    constexpr std::uint32_t H = 64, FFN = 48;
++
++    Glm5MlpHpuConfig config{};
++    config.hidden = H;
++    config.ffn = FFN;
++    config.rms_eps = 1e-5f;
++    config.swiglu_limit = 7.0f;
++
++    Glm5MlpHpuProjections projections(device, config);
++
++    Glm5MlpHpuWeights w;
++    auto upload = [&](const std::vector<std::uint16_t>& data) {
++        PinnedBuffer host = device.allocate_host(data.size() * 2);
++        std::memcpy(host.bytes().data(), data.data(), data.size() * 2);
++        DeviceBuffer dev = device.allocate_device(data.size() * 2);
++        auto t = stream.upload(dev, host, data.size() * 2);
++        t.wait();
++        return dev;
++    };
++    w.ffn_norm = upload(bf16_plane(H, 1, 1));
++    w.gate = upload(bf16_plane(FFN, H, 2));
++    w.up = upload(bf16_plane(FFN, H, 3));
++    w.down = upload(bf16_plane(H, FFN, 4));
++
++    const auto hidden_in = bf16_plane(H, 1, 5);
++    const auto out = glm5_mlp_hpu_decode_step(device, stream, projections, w,
++                                              config, hidden_in);
++    require(out.size() == H, "dense output [hidden]");
++    for (std::uint32_t i = 0; i < H; ++i) {
++        if (!std::isfinite(bf16_val(out[i]))) throw std::runtime_error("dense finite");
++    }
++    std::puts("ok: dense mlp hpu step");
++    return 0;
++}
++
++int run_moe(const Device& device, Stream& stream) {
++    constexpr std::uint32_t H = 64, FFN = 32, EXPERTS = 6, TOP_K = 2;
++
++    Glm5MlpHpuConfig config{};
++    config.hidden = H;
++    config.ffn = FFN;
++    config.experts = EXPERTS;
++    config.top_k = TOP_K;
++    config.rms_eps = 1e-5f;
++    config.swiglu_limit = 7.0f;
++    config.routed_scaling_factor = 1.4f;
++
++    Glm5MlpHpuProjections projections(device, config);
++
++    Glm5MlpHpuWeights w;
++    auto upload = [&](const std::vector<std::uint16_t>& data) {
++        PinnedBuffer host = device.allocate_host(data.size() * 2);
++        std::memcpy(host.bytes().data(), data.data(), data.size() * 2);
++        DeviceBuffer dev = device.allocate_device(data.size() * 2);
++        auto t = stream.upload(dev, host, data.size() * 2);
++        t.wait();
++        return dev;
++    };
++    w.ffn_norm = upload(bf16_plane(H, 1, 10));
++    w.router = upload(bf16_plane(EXPERTS, H, 11));
++    w.gate = upload(bf16_plane(FFN, H, 12));       // shared expert
++    w.up = upload(bf16_plane(FFN, H, 13));
++    w.down = upload(bf16_plane(H, FFN, 14));
++    w.expert_gate.resize(EXPERTS);
++    w.expert_up.resize(EXPERTS);
++    w.expert_down.resize(EXPERTS);
++    for (std::uint32_t e = 0; e < EXPERTS; ++e) {
++        // Per-expert row blocks out of the stacked plane geometry.
++        w.expert_gate[e] = upload(bf16_plane(FFN, H, 20 + e));
++        w.expert_up[e] = upload(bf16_plane(FFN, H, 30 + e));
++        w.expert_down[e] = upload(bf16_plane(H, FFN, 40 + e));
++    }
++    w.router_bias.resize(EXPERTS);
++    for (std::uint32_t e = 0; e < EXPERTS; ++e) {
++        w.router_bias[e] = 0.05f * static_cast<float>(e);
++    }
++
++    for (std::uint32_t step = 0; step < 3; ++step) {
++        const auto hidden_in = bf16_plane(H, 1, 50 + step);
++        const auto out = glm5_mlp_hpu_decode_step(device, stream, projections, w,
++                                                  config, hidden_in);
++        require(out.size() == H, "moe output [hidden]");
++        for (std::uint32_t i = 0; i < H; ++i) {
++            if (!std::isfinite(bf16_val(out[i]))) throw std::runtime_error("moe finite");
++        }
++    }
++    std::puts("ok: moe hpu steps");
++    return 0;
++}
++
++int main() {
++    try {
++        {
++            Device device;
++            Stream stream = device.create_stream();
++            run_dense(device, stream);
++            run_moe(device, stream);
++        }
++        fake_synapse::assert_clean();
++        std::puts("glm5 mlp hpu blocks pass lifecycle validation");
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        fake_synapse::assert_clean();
++        return 1;
++    }
++    return 0;
++}
 diff --git a/src/core/gaudi2/tests/glm5_hpu_model_test.cpp b/src/core/gaudi2/tests/glm5_hpu_model_test.cpp
 new file mode 100644
-index 0000000..e2a3238
+index 0000000..29ad9de
 --- /dev/null
 +++ b/src/core/gaudi2/tests/glm5_hpu_model_test.cpp
-@@ -0,0 +1,165 @@
-+// Full-model HPU executor test: a one-KDA-layer model runs one decode step
-+// from a token id through the mHC chain → the KDA block (MME projections)
-+// → the head → the lm_head, producing [vocab] BF16 logits. The fake
-+// runtime validates the full resource lifecycle.
+@@ -0,0 +1,234 @@
++// Full-model HPU executor test: a two-layer model (KDA + dense MLP, DSA +
++// MoE) runs three decode steps from token ids through the full mHC chain,
++// both mixer kinds, both FFN kinds, the head mean, and the lm_head, producing
++// [vocab] BF16 logits each step. The fake runtime validates the full resource
++// lifecycle; the per-block math is anchored by the CUDA executor suite.
 +#include "core/gaudi2/glm5_hpu_model.h"
 +#include "core/gaudi2/glm5_hpu_block.h"
++#include "core/gaudi2/glm5_hpu_dsa.h"
++#include "core/gaudi2/glm5_hpu_mlp.h"
 +#include "control.h"
 +
 +#include <cmath>
@@ -6365,8 +7749,12 @@ index 0000000..e2a3238
 +
 +int main() {
 +    try {
++        // Layer 0: KDA mixer + dense MLP. Layer 1: DSA mixer + MoE.
 +        constexpr std::uint32_t H = 64, HK = 2, HD = 8, VOCAB = 32;
-+        constexpr std::uint32_t TOKEN = 5;
++        constexpr std::uint32_t HEADS = 4, NOPE = 16, QL = 32, KVL = 24, VH = 8;
++        constexpr std::uint32_t IH = 2, ID = 12, KPOOL = 4, TOPK = 8;
++        constexpr std::uint32_t FFN_DENSE = 48, EXPERTS = 6, TOP_E = 2, FFN_MOE = 32;
++        constexpr std::uint32_t MAX_POSITIONS = 16;
 +
 +        {
 +            Device device;
@@ -6375,14 +7763,29 @@ index 0000000..e2a3238
 +            config.hidden = H;
 +            config.kda_heads = HK;
 +            config.kda_head_dim = HD;
++            config.heads = HEADS;
++            config.head_dim = NOPE;
++            config.q_lora = QL;
++            config.kv_lora = KVL;
++            config.v_head = VH;
++            config.index_heads = IH;
++            config.index_dim = ID;
++            config.kpool = KPOOL;
++            config.top_k = TOPK;
++            config.ffn_dense = FFN_DENSE;
++            config.ffn_moe = FFN_MOE;
++            config.experts = EXPERTS;
++            config.num_experts_per_tok = TOP_E;
 +            config.vocab_size = VOCAB;
 +            config.rms_eps = 1e-5f;
 +            config.gate_lower_bound = -5.0f;
-+            config.layer_is_dsa = {false};
-+            config.layer_mlp_dense = {true};
++            config.swiglu_limit = 7.0f;
++            config.routed_scaling_factor = 1.4f;
++            config.layer_is_dsa = {false, true};
++            config.layer_mlp_dense = {true, false};
 +
 +            std::vector<DeviceBuffer> resident;
-+            auto upload = [&](const std::vector<std::uint16_t>& data) -> const void* {
++            auto upload_bf16 = [&](const std::vector<std::uint16_t>& data) -> const void* {
 +                PinnedBuffer host = device.allocate_host(data.size() * 2);
 +                std::memcpy(host.bytes().data(), data.data(), data.size() * 2);
 +                DeviceBuffer dev = device.allocate_device(data.size() * 2);
@@ -6391,57 +7794,94 @@ index 0000000..e2a3238
 +                resident.push_back(std::move(dev));
 +                return reinterpret_cast<const void*>(resident.back().address());
 +            };
++            auto upload_f32 = [&](const float* data, std::size_t count) -> const void* {
++                PinnedBuffer host = device.allocate_host(count * 4);
++                std::memcpy(host.bytes().data(), data, count * 4);
++                DeviceBuffer dev = device.allocate_device(count * 4);
++                auto t = stream.upload(dev, host, count * 4);
++                t.wait();
++                resident.push_back(std::move(dev));
++                return reinterpret_cast<const void*>(resident.back().address());
++            };
 +
 +            Glm5ModelWeights weights{};
-+            weights.token_embd = bf16_weight(upload(bf16_plane(VOCAB, H, 1)), VOCAB, H);
-+            weights.output_norm = bf16_weight(upload(bf16_plane(H, 1, 31)), H, 1);
-+            weights.lm_head = bf16_weight(upload(bf16_plane(VOCAB, H, 32)), VOCAB, H);
++            weights.token_embd = bf16_weight(upload_bf16(bf16_plane(VOCAB, H, 1)), VOCAB, H);
++            weights.output_norm = bf16_weight(upload_bf16(bf16_plane(H, 1, 31)), H, 1);
++            weights.lm_head = bf16_weight(upload_bf16(bf16_plane(VOCAB, H, 32)), VOCAB, H);
 +
-+            weights.layers.resize(1);
++            weights.layers.resize(2);
++            const std::uint32_t DI = HK * HD;
++
++            // ---- Layer 0: KDA + dense ----
 +            Glm5Layer& l0 = weights.layers[0];
 +            l0.is_dsa = false;
 +            l0.mlp_is_dense = true;
-+            const std::uint32_t DI = HK * HD;
-+            l0.kda.attn_norm = bf16_weight(upload(bf16_plane(H, 1, 50)), H, 1);
-+            l0.kda.wq = bf16_weight(upload(bf16_plane(DI, H, 60)), DI, H);
-+            l0.kda.wk = bf16_weight(upload(bf16_plane(DI, H, 61)), DI, H);
-+            l0.kda.wv = bf16_weight(upload(bf16_plane(DI, H, 62)), DI, H);
-+            l0.kda.conv_q = bf16_weight(upload(bf16_plane(4 * DI, 1, 63)), 4 * DI, 1);
-+            l0.kda.conv_k = bf16_weight(upload(bf16_plane(4 * DI, 1, 64)), 4 * DI, 1);
-+            l0.kda.conv_v = bf16_weight(upload(bf16_plane(4 * DI, 1, 65)), 4 * DI, 1);
-+            l0.kda.f_a = bf16_weight(upload(bf16_plane(HD, H, 66)), HD, H);
-+            l0.kda.f_b = bf16_weight(upload(bf16_plane(DI, HD, 67)), DI, HD);
-+            l0.kda.beta = bf16_weight(upload(bf16_plane(HK, H, 68)), HK, H);
-+            l0.kda.g_a = bf16_weight(upload(bf16_plane(HD, H, 69)), HD, H);
-+            l0.kda.g_b = bf16_weight(upload(bf16_plane(DI, HD, 70)), DI, HD);
-+            l0.kda.wo = bf16_weight(upload(bf16_plane(H, DI, 71)), H, DI);
++            l0.kda.attn_norm = bf16_weight(upload_bf16(bf16_plane(H, 1, 50)), H, 1);
++            l0.kda.wq = bf16_weight(upload_bf16(bf16_plane(DI, H, 60)), DI, H);
++            l0.kda.wk = bf16_weight(upload_bf16(bf16_plane(DI, H, 61)), DI, H);
++            l0.kda.wv = bf16_weight(upload_bf16(bf16_plane(DI, H, 62)), DI, H);
++            l0.kda.conv_q = bf16_weight(upload_bf16(bf16_plane(4 * DI, 1, 63)), 4 * DI, 1);
++            l0.kda.conv_k = bf16_weight(upload_bf16(bf16_plane(4 * DI, 1, 64)), 4 * DI, 1);
++            l0.kda.conv_v = bf16_weight(upload_bf16(bf16_plane(4 * DI, 1, 65)), 4 * DI, 1);
++            l0.kda.f_a = bf16_weight(upload_bf16(bf16_plane(HD, H, 66)), HD, H);
++            l0.kda.f_b = bf16_weight(upload_bf16(bf16_plane(DI, HD, 67)), DI, HD);
++            l0.kda.beta = bf16_weight(upload_bf16(bf16_plane(HK, H, 68)), HK, H);
++            l0.kda.g_a = bf16_weight(upload_bf16(bf16_plane(HD, H, 69)), HD, H);
++            l0.kda.g_b = bf16_weight(upload_bf16(bf16_plane(DI, HD, 70)), DI, HD);
++            l0.kda.wo = bf16_weight(upload_bf16(bf16_plane(H, DI, 71)), H, DI);
++            l0.dense_mlp.ffn_norm = bf16_weight(upload_bf16(bf16_plane(H, 1, 72)), H, 1);
++            l0.dense_mlp.gate = bf16_weight(upload_bf16(bf16_plane(FFN_DENSE, H, 73)), FFN_DENSE, H);
++            l0.dense_mlp.up = bf16_weight(upload_bf16(bf16_plane(FFN_DENSE, H, 74)), FFN_DENSE, H);
++            l0.dense_mlp.down = bf16_weight(upload_bf16(bf16_plane(H, FFN_DENSE, 75)), H, FFN_DENSE);
 +
-+            // mHC weight planes.
-+            l0.hc_attn_fn = bf16_weight(upload(bf16_plane(24, 4 * H, 80)), 24, 4 * H);
-+            resident.push_back([&] {
-+                PinnedBuffer host = device.allocate_host(24 * 4);
-+                std::memset(host.bytes().data(), 0, 24 * 4);
-+                DeviceBuffer dev = device.allocate_device(24 * 4);
-+                auto t = stream.upload(dev, host, 24 * 4);
-+                t.wait();
-+                return dev;
-+            }());
-+            l0.hc_attn_base.payload = reinterpret_cast<const void*>(
-+                resident.back().address());
-+            resident.push_back([&] {
-+                PinnedBuffer host = device.allocate_host(3 * 4);
-+                const float scale[3] = {0.7f, 0.5f, 0.9f};
-+                std::memcpy(host.bytes().data(), scale, 3 * 4);
-+                DeviceBuffer dev = device.allocate_device(3 * 4);
-+                auto t = stream.upload(dev, host, 3 * 4);
-+                t.wait();
-+                return dev;
-+            }());
-+            l0.hc_attn_scale.payload = reinterpret_cast<const void*>(
-+                resident.back().address());
++            // ---- Layer 1: DSA + MoE ----
++            Glm5Layer& l1 = weights.layers[1];
++            l1.is_dsa = true;
++            l1.mlp_is_dense = false;
++            l1.dsa.attn_norm = bf16_weight(upload_bf16(bf16_plane(H, 1, 100)), H, 1);
++            l1.dsa.q_a = bf16_weight(upload_bf16(bf16_plane(QL, H, 101)), QL, H);
++            l1.dsa.q_a_norm = bf16_weight(upload_bf16(bf16_plane(QL, 1, 102)), QL, 1);
++            l1.dsa.q_b = bf16_weight(upload_bf16(bf16_plane(HEADS * NOPE, QL, 103)), HEADS * NOPE, QL);
++            l1.dsa.kv_a = bf16_weight(upload_bf16(bf16_plane(KVL, H, 104)), KVL, H);
++            l1.dsa.kv_a_norm = bf16_weight(upload_bf16(bf16_plane(KVL, 1, 105)), KVL, 1);
++            l1.dsa.wk_b = bf16_weight(upload_bf16(bf16_plane(NOPE * KVL, HEADS, 106)), NOPE * KVL, HEADS);
++            l1.dsa.wv_b = bf16_weight(upload_bf16(bf16_plane(KVL * VH, HEADS, 107)), KVL * VH, HEADS);
++            l1.dsa.wo = bf16_weight(upload_bf16(bf16_plane(H, HEADS * VH, 108)), H, HEADS * VH);
++            l1.dsa.indexer_q_b = bf16_weight(upload_bf16(bf16_plane(IH * ID, QL, 109)), IH * ID, QL);
++            l1.dsa.indexer_k = bf16_weight(upload_bf16(bf16_plane(ID, H, 110)), ID, H);
++            l1.dsa.indexer_k_norm_w = bf16_weight(upload_bf16(bf16_plane(ID, 1, 111)), ID, 1);
++            l1.dsa.indexer_k_norm_b = bf16_weight(upload_bf16(bf16_plane(ID, 1, 112)), ID, 1);
++            l1.dsa.indexer_gate = bf16_weight(upload_bf16(bf16_plane(ID, H, 113)), ID, H);
++            l1.dsa.indexer_proj = bf16_weight(upload_bf16(bf16_plane(IH, H, 114)), IH, H);
++            l1.moe.ffn_norm = bf16_weight(upload_bf16(bf16_plane(H, 1, 120)), H, 1);
++            l1.moe.router = bf16_weight(upload_bf16(bf16_plane(EXPERTS, H, 121)), EXPERTS, H);
++            l1.moe.gate_exps = bf16_weight(upload_bf16(bf16_plane(EXPERTS * FFN_MOE, H, 122)), EXPERTS * FFN_MOE, H);
++            l1.moe.up_exps = bf16_weight(upload_bf16(bf16_plane(EXPERTS * FFN_MOE, H, 123)), EXPERTS * FFN_MOE, H);
++            l1.moe.down_exps = bf16_weight(upload_bf16(bf16_plane(EXPERTS * H, FFN_MOE, 124)), EXPERTS * H, FFN_MOE);
++            l1.moe.gate_shexp = bf16_weight(upload_bf16(bf16_plane(FFN_MOE, H, 125)), FFN_MOE, H);
++            l1.moe.up_shexp = bf16_weight(upload_bf16(bf16_plane(FFN_MOE, H, 126)), FFN_MOE, H);
++            l1.moe.down_shexp = bf16_weight(upload_bf16(bf16_plane(H, FFN_MOE, 127)), H, FFN_MOE);
++            static std::vector<float> moe_bias(EXPERTS);
++            for (std::uint32_t e = 0; e < EXPERTS; ++e) moe_bias[e] = 0.05f * static_cast<float>(e);
++            l1.moe_router_bias = moe_bias.data();
 +
-+            // KDA FP32 scalars (host-side; the model executor copies them
-+            // into the block executor's weight struct per step).
++            // mHC planes for both halves of both layers. The zero/gamma
++            // vectors outlive the calls (the payloads only store pointers).
++            static std::vector<float> zero24(24, 0.0f);
++            static std::vector<float> scale_attn = {0.7f, 0.5f, 0.9f};
++            static std::vector<float> scale_ffn = {0.6f, 0.4f, 0.8f};
++            auto bind_hc = [&](Glm5Layer& layer, std::uint32_t seed) {
++                layer.hc_attn_fn = bf16_weight(upload_bf16(bf16_plane(24, 4 * H, seed)), 24, 4 * H);
++                layer.hc_ffn_fn = bf16_weight(upload_bf16(bf16_plane(24, 4 * H, seed + 1)), 24, 4 * H);
++                layer.hc_attn_base.payload = upload_f32(zero24.data(), 24);
++                layer.hc_ffn_base.payload = upload_f32(zero24.data(), 24);
++                layer.hc_attn_scale.payload = upload_f32(scale_attn.data(), 3);
++                layer.hc_ffn_scale.payload = upload_f32(scale_ffn.data(), 3);
++            };
++            bind_hc(l0, 80);
++            bind_hc(l1, 90);
++
++            // KDA FP32 scalars (host side).
 +            static std::vector<float> dt_bias(DI), a_log(HK), o_norm(HD);
 +            for (std::uint32_t i = 0; i < DI; ++i) {
 +                dt_bias[i] = source(i * 3 + 1) / 8;
@@ -6455,27 +7895,37 @@ index 0000000..e2a3238
 +            weights.kda_scalars[0].a_log = a_log.data();
 +            weights.kda_scalars[0].o_norm_w = o_norm.data();
 +
-+            // ---- Model + decode ----
-+            Glm5HpuModel model(device, config);
++            // DSA ape plane (FP32 [kpool, index_dim]).
++            static std::vector<float> ape(KPOOL * ID);
++            for (std::size_t i = 0; i < ape.size(); ++i) ape[i] = source(static_cast<std::uint32_t>(i)) / 8;
++            weights.dsa_ape.push_back(ape.data());
++
++            // ---- Model + weights + three decode steps ----
++            Glm5HpuModel model(device, config, 4096, MAX_POSITIONS);
 +            model.upload_kda_weights(device, stream, weights, config);
++            model.upload_dsa_weights(device, stream, weights, config);
++            model.upload_mlp_weights(device, stream, weights, config);
 +
-+            auto logits = glm5_hpu_decode_step(device, stream, model, weights,
-+                                               config, TOKEN, 0);
-+
-+            require(logits.size() == VOCAB, "logits [vocab]");
-+            // Numerical correctness lives in the CUDA executor suite (WSL
-+            // 16/16); this test pins the full-model HPU lifecycle: every
-+            // recipe compiles, every weight upload DMA completes, the
-+            // chain runs end to end, and all resources release.
-+            std::printf("ok: logits[%u] produced\n", VOCAB);
++            for (std::uint32_t step = 0; step < 3; ++step) {
++                const std::uint32_t token = 5 + step;
++                auto logits = glm5_hpu_decode_step(device, stream, model, weights,
++                                                   config, token, step);
++                require(logits.size() == VOCAB, "logits [vocab]");
++                for (std::uint32_t i = 0; i < VOCAB; ++i) {
++                    const float v = bf16_val(logits[i]);
++                    if (!std::isfinite(v)) throw std::runtime_error("logits finite");
++                }
++                std::printf("step %u: logits[%u] all finite\n", step, VOCAB);
++            }
 +        }
 +        fake_synapse::assert_clean();
 +        std::puts("glm5 hpu model decode step passes lifecycle validation");
-+        return 0;
-+    } catch (const std::exception& e) {
-+        std::fprintf(stderr, "%s\n", e.what());
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        fake_synapse::assert_clean();
 +        return 1;
 +    }
++    return 0;
 +}
 diff --git a/src/core/gaudi2/tests/runtime_lifecycle_test.cpp b/src/core/gaudi2/tests/runtime_lifecycle_test.cpp
 new file mode 100644
