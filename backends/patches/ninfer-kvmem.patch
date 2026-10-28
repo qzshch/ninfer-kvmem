@@ -2977,10 +2977,10 @@ index e684873..86281fc 100644
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000..824b148
+index 0000000..9f0f97c
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,199 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -3127,6 +3127,17 @@ index 0000000..824b148
 +target_compile_definitions(ninfer-gaudi2-kernel-library-test PRIVATE
 +  NINFER_GAUDI2_TEST_KERNEL_LIB="$<TARGET_FILE:ninfer-gaudi2-test-kernel-lib>")
 +add_test(NAME ninfer-gaudi2-kernel-library COMMAND ninfer-gaudi2-kernel-library-test)
++
++# Gap 5: the Qwen GDN recurrence and paged KV attention on the fake runtime.
++add_executable(ninfer-gaudi2-qwen-hpu-test runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp
++  qwen_hpu.cpp paged_kv_hpu.cpp
++  tests/qwen_hpu_test.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
++target_compile_features(ninfer-gaudi2-qwen-hpu-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-qwen-hpu-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-qwen-hpu-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-qwen-hpu COMMAND ninfer-gaudi2-qwen-hpu-test)
 +
 +if(NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
 +  find_path(NINFER_SYNAPSE_INCLUDE_DIR synapse_api.h
@@ -6115,6 +6126,628 @@ index 0000000..7236c02
 +};
 +
 +} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/paged_kv_hpu.cpp b/src/core/gaudi2/paged_kv_hpu.cpp
+new file mode 100644
+index 0000000..b95d91f
+--- /dev/null
++++ b/src/core/gaudi2/paged_kv_hpu.cpp
+@@ -0,0 +1,130 @@
++// PagedKvHpuPool: HBM-resident paged KV storage with the KVMem window's
++// page geometry. See paged_kv_hpu.h.
++#include "core/gaudi2/paged_kv_hpu.h"
++
++#include <cstring>
++#include <stdexcept>
++#include <utility>
++
++namespace ninfer::gaudi2 {
++
++PagedKvHpuPool::PagedKvHpuPool(const Device& device, std::uint32_t heads,
++                               std::uint32_t head_dim, std::uint32_t pages)
++    : heads_(heads), head_dim_(head_dim), pages_(pages) {
++    if (heads == 0 || head_dim == 0 || pages == 0) {
++        throw std::invalid_argument("PagedKvHpuPool: geometry must be positive");
++    }
++    row_bytes_ = heads * head_dim * 2;
++    page_stride_bytes_ = kKvmemPageTokens * row_bytes_;
++    key_pages_.reserve(pages);
++    value_pages_.reserve(pages);
++    for (std::uint32_t p = 0; p < pages; ++p) {
++        key_pages_.push_back(device.allocate_device(page_stride_bytes_));
++        value_pages_.push_back(device.allocate_device(page_stride_bytes_));
++    }
++}
++
++std::uint32_t PagedKvHpuPool::valid_columns(std::uint32_t page) const noexcept {
++    // kvmem_window.cpp's valid_columns: min(page_tokens, frontier - page*64).
++    const std::uint64_t remaining = frontier_ - std::uint64_t{page} * kKvmemPageTokens;
++    return static_cast<std::uint32_t>(
++        std::min<std::uint64_t>(kKvmemPageTokens, remaining));
++}
++
++DeviceBuffer& PagedKvHpuPool::key_page(std::uint32_t page) const {
++    return const_cast<DeviceBuffer&>(key_pages_[page]);
++}
++DeviceBuffer& PagedKvHpuPool::value_page(std::uint32_t page) const {
++    return const_cast<DeviceBuffer&>(value_pages_[page]);
++}
++
++void PagedKvHpuPool::append(const Device& device, Stream& stream,
++                            const std::vector<std::uint16_t>& key_row,
++                            const std::vector<std::uint16_t>& value_row,
++                            std::uint32_t position) {
++    (void)device;
++    if (position != frontier_) {
++        throw std::invalid_argument("PagedKvHpuPool: appends must follow the frontier");
++    }
++    if (position >= pages_ * kKvmemPageTokens) {
++        throw std::out_of_range("PagedKvHpuPool: append beyond the pool capacity");
++    }
++    if (key_row.size() != heads_ * head_dim_ || value_row.size() != heads_ * head_dim_) {
++        throw std::invalid_argument("PagedKvHpuPool: row width mismatch");
++    }
++    const std::uint32_t page = position / kKvmemPageTokens;
++    const std::uint32_t column = position % kKvmemPageTokens;
++    const std::size_t offset = static_cast<std::size_t>(column) * row_bytes_;
++    auto put = [&](DeviceBuffer& plane, const std::vector<std::uint16_t>& row) {
++        PinnedBuffer staging = device.allocate_host(row_bytes_);
++        std::memcpy(staging.bytes().data(), row.data(), row_bytes_);
++        auto transfer = stream.upload(plane, staging, row_bytes_, offset);
++        transfer.wait();
++    };
++    put(key_pages_[page], key_row);
++    put(value_pages_[page], value_row);
++    ++frontier_;
++}
++
++void PagedKvHpuPool::truncate(std::uint32_t position) {
++    if (position > frontier_) {
++        throw std::invalid_argument("PagedKvHpuPool: cannot truncate forward");
++    }
++    // Page-granular semantics: the trailing (possibly partial) page is
++    // logically empty after the cut; its leading columns remain readable
++    // only through a later append overwriting them. The frontier moves.
++    frontier_ = position;
++}
++
++std::pair<std::vector<float>, std::vector<float>> PagedKvHpuPool::gather(
++    const Device& device, Stream& stream, std::uint32_t position) const {
++    if (position >= frontier_) {
++        throw std::invalid_argument("PagedKvHpuPool: gather beyond the frontier");
++    }
++    const std::uint32_t tokens = position + 1;
++    const std::size_t row_elements = static_cast<std::size_t>(heads_) * head_dim_;
++    std::vector<float> keys(tokens * row_elements), values(tokens * row_elements);
++
++    auto widen = [&](const std::vector<std::byte>& raw, float* destination) {
++        const auto* words = reinterpret_cast<const std::uint16_t*>(raw.data());
++        for (std::size_t i = 0; i < raw.size() / 2; ++i) {
++            const std::uint32_t wide = static_cast<std::uint32_t>(words[i]) << 16;
++            std::memcpy(destination + i, &wide, 4);
++        }
++    };
++    const std::uint32_t full_pages = tokens / kKvmemPageTokens;
++    const std::uint32_t tail_columns = tokens % kKvmemPageTokens;
++    for (std::uint32_t p = 0; p < full_pages; ++p) {
++        PinnedBuffer staging = device.allocate_host(page_stride_bytes_);
++        auto down = stream.download(staging, key_page(p), page_stride_bytes_);
++        down.wait();
++        widen(std::vector<std::byte>(staging.bytes().begin(), staging.bytes().end()),
++              keys.data() + static_cast<std::size_t>(p) * kKvmemPageTokens *
++                                row_elements);
++        PinnedBuffer staging_v = device.allocate_host(page_stride_bytes_);
++        auto down_v = stream.download(staging_v, value_page(p), page_stride_bytes_);
++        down_v.wait();
++        widen(std::vector<std::byte>(staging_v.bytes().begin(), staging_v.bytes().end()),
++              values.data() + static_cast<std::size_t>(p) * kKvmemPageTokens *
++                                  row_elements);
++    }
++    if (tail_columns > 0) {
++        const std::uint32_t p = full_pages;
++        const std::size_t bytes = static_cast<std::size_t>(tail_columns) * row_bytes_;
++        PinnedBuffer staging = device.allocate_host(bytes);
++        auto down = stream.download(staging, key_page(p), bytes);
++        down.wait();
++        widen(std::vector<std::byte>(staging.bytes().begin(), staging.bytes().end()),
++              keys.data() + static_cast<std::size_t>(p) * kKvmemPageTokens *
++                                row_elements);
++        PinnedBuffer staging_v = device.allocate_host(bytes);
++        auto down_v = stream.download(staging_v, value_page(p), bytes);
++        down_v.wait();
++        widen(std::vector<std::byte>(staging_v.bytes().begin(), staging_v.bytes().end()),
++              values.data() + static_cast<std::size_t>(p) * kKvmemPageTokens *
++                                  row_elements);
++    }
++    return {std::move(keys), std::move(values)};
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/paged_kv_hpu.h b/src/core/gaudi2/paged_kv_hpu.h
+new file mode 100644
+index 0000000..ae432cb
+--- /dev/null
++++ b/src/core/gaudi2/paged_kv_hpu.h
+@@ -0,0 +1,72 @@
++#pragma once
++// Paged KV cache pool on the Gaudi2 runtime adapter - the HPU foundation for
++// the KVMem window semantics (gap 5). The page geometry mirrors the CUDA
++// program's KVMem bridge (kvmem_window.cpp): 64-token pages, per-page valid
++// column counts, and history truncation at page granularity. The pool owns
++// its HBM pages; decode appends rows and the attention reader gathers over
++// the valid prefix through DMA.
++//
++// This is the storage layer only: paging OUT to host/disk tiers (the KVMem
++// MemoryBackend contract) stays on the CUDA program until the HPU path
++// grows its own window scheduler.
++
++#include "core/gaudi2/runtime.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++// The KVMem window's fixed page width (kvmem_window.cpp's page_tokens).
++inline constexpr std::uint32_t kKvmemPageTokens = 64;
++
++class PagedKvHpuPool {
++public:
++    // One page plane set: keys and values for [page_tokens, heads * head_dim]
++    // each (BF16). `pages` bounds the pool capacity (max_context =
++    // pages * page_tokens).
++    PagedKvHpuPool(const Device& device, std::uint32_t heads, std::uint32_t head_dim,
++                   std::uint32_t pages);
++    ~PagedKvHpuPool() = default;
++    PagedKvHpuPool(const PagedKvHpuPool&) = delete;
++    PagedKvHpuPool& operator=(const PagedKvHpuPool&) = delete;
++
++    // Appends one token's key/value rows at `position` (must equal the
++    // current frontier). Rows are BF16 words [heads * head_dim] each.
++    void append(const Device& device, Stream& stream,
++                const std::vector<std::uint16_t>& key_row,
++                const std::vector<std::uint16_t>& value_row, std::uint32_t position);
++
++    // Truncates history so the next append lands at `position` (the KVMem
++    // window's page-granular eviction: whole pages drop, a partial page
++    // keeps its leading columns).
++    void truncate(std::uint32_t position);
++
++    // Gathers the valid prefix [0, position+1) into host FP32 planes
++    // [tokens, heads*head_dim] (keys and values) through one DMA per page
++    // span - the attention reader's input.
++    [[nodiscard]] std::pair<std::vector<float>, std::vector<float>> gather(
++        const Device& device, Stream& stream, std::uint32_t position) const;
++
++    [[nodiscard]] std::uint32_t frontier() const noexcept { return frontier_; }
++    [[nodiscard]] std::uint32_t page_count() const noexcept { return pages_; }
++    [[nodiscard]] std::uint32_t heads() const noexcept { return heads_; }
++    [[nodiscard]] std::uint32_t head_dim() const noexcept { return head_dim_; }
++    [[nodiscard]] std::uint32_t page_stride_bytes() const noexcept {
++        return page_stride_bytes_;
++    }
++
++private:
++    [[nodiscard]] std::uint32_t valid_columns(std::uint32_t page) const noexcept;
++    DeviceBuffer& key_page(std::uint32_t page) const;
++    DeviceBuffer& value_page(std::uint32_t page) const;
++
++    std::vector<DeviceBuffer> key_pages_, value_pages_;
++    std::uint32_t heads_, head_dim_, pages_;
++    std::uint32_t row_bytes_ = 0;        // one token's row, bytes
++    std::uint32_t page_stride_bytes_ = 0;  // one page's plane, bytes
++    std::uint32_t frontier_ = 0;
++};
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/qwen_hpu.cpp b/src/core/gaudi2/qwen_hpu.cpp
+new file mode 100644
+index 0000000..76d0c93
+--- /dev/null
++++ b/src/core/gaudi2/qwen_hpu.cpp
+@@ -0,0 +1,307 @@
++// Qwen GDN recurrence and paged KV attention on the Gaudi2 runtime adapter.
++// See qwen_hpu.h for the contracts.
++#include "core/gaudi2/qwen_hpu.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <stdexcept>
++
++namespace ninfer::gaudi2 {
++namespace {
++
++float bf16_word_to_float(std::uint16_t word) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(word) << 16;
++    float value;
++    std::memcpy(&value, &wide, 4);
++    return value;
++}
++
++std::uint16_t float_to_bf16_word(float value) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &value, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++} // namespace
++
++QwenGdnHpuState::QwenGdnHpuState(const Device& device, const QwenGdnHpuConfig& config) {
++    if (config.head_dim == 0 || config.qk_heads == 0 || config.value_heads == 0 ||
++        config.value_heads < config.qk_heads ||
++        config.value_heads % config.qk_heads != 0) {
++        throw std::invalid_argument("QwenGdnHpuState: invalid head geometry");
++    }
++    floats_ = static_cast<std::size_t>(config.value_heads) * config.head_dim *
++              config.head_dim;
++    matrix_ = device.allocate_device(floats_ * 4);
++    auto stream = device.create_stream();
++    reset(device, stream);
++}
++
++void QwenGdnHpuState::reset(const Device& device, Stream& stream) {
++    PinnedBuffer zeros = device.allocate_host(floats_ * 4);
++    std::memset(zeros.bytes().data(), 0, floats_ * 4);
++    auto transfer = stream.upload(matrix_, zeros, floats_ * 4);
++    transfer.wait();
++}
++
++std::vector<std::uint16_t> qwen_gdn_hpu_step(
++    const Device& device, Stream& stream, QwenGdnHpuState& state,
++    const QwenGdnHpuConfig& config, std::span<const std::uint16_t> q,
++    std::span<const std::uint16_t> k, std::span<const std::uint16_t> v,
++    std::span<const float> g, std::span<const float> beta) {
++    const std::uint32_t d = config.head_dim;
++    const std::uint32_t hq = config.qk_heads, hv = config.value_heads;
++    if (q.size() != hq * d || k.size() != hq * d || v.size() != hv * d ||
++        g.size() != hv || beta.size() != hv) {
++        throw std::invalid_argument("qwen_gdn_hpu_step: operand width mismatch");
++    }
++
++    // Download the carried state, run the audited recurrence per value head,
++    // publish the state back.
++    PinnedBuffer host_state = device.allocate_host(state.matrix_floats() * 4);
++    auto down = stream.download(host_state, state.matrix(), state.matrix_floats() * 4);
++    down.wait();
++    std::vector<float> S(state.matrix_floats());
++    std::memcpy(S.data(), host_state.bytes().data(), state.matrix_floats() * 4);
++
++    const std::uint32_t group = hv / hq;
++    const float scale = 1.0f / std::sqrt(static_cast<float>(d));
++    const float l2_eps = 1e-6f;
++    std::vector<float> out(hv * d);
++
++    for (std::uint32_t h = 0; h < hv; ++h) {
++        const std::uint32_t qh = h / group;  // the contract's qh = floor(h/G)
++        float* Sh = S.data() + static_cast<std::size_t>(h) * d * d;
++
++        // Per-row L2 normalization (x / sqrt(sum(x^2) + 1e-6)) of the raw
++        // BF16 q/k rows.
++        const std::uint16_t* q_row = q.data() + static_cast<std::size_t>(qh) * d;
++        const std::uint16_t* k_row = k.data() + static_cast<std::size_t>(qh) * d;
++        std::vector<float> qn(d), kn(d);
++        if (config.normalize_qk) {
++            float qs = l2_eps, ks = l2_eps;
++            for (std::uint32_t i = 0; i < d; ++i) {
++                const float qv = bf16_word_to_float(q_row[i]);
++                const float kv = bf16_word_to_float(k_row[i]);
++                qs += qv * qv;
++                ks += kv * kv;
++            }
++            const float qi = 1.0f / std::sqrt(qs);
++            const float ki = 1.0f / std::sqrt(ks);
++            for (std::uint32_t i = 0; i < d; ++i) {
++                qn[i] = bf16_word_to_float(q_row[i]) * qi;
++                kn[i] = bf16_word_to_float(k_row[i]) * ki;
++            }
++        } else {
++            for (std::uint32_t i = 0; i < d; ++i) {
++                qn[i] = bf16_word_to_float(q_row[i]);
++                kn[i] = bf16_word_to_float(k_row[i]);
++            }
++        }
++
++        const float alpha = std::exp(g[h]);
++        const std::uint16_t* v_row = v.data() + static_cast<std::size_t>(h) * d;
++
++        // u = alpha * (S k); delta = beta * (v - u); S = alpha * S +
++        // outer(delta, k); out = scale * (S q).
++        std::vector<float> u(d, 0.0f);
++        for (std::uint32_t j = 0; j < d; ++j) {
++            float acc = 0;
++            for (std::uint32_t i = 0; i < d; ++i) {
++                acc += Sh[static_cast<std::size_t>(i) * d + j] * kn[i];
++            }
++            u[j] = alpha * acc;
++        }
++        std::vector<float> delta(d);
++        for (std::uint32_t j = 0; j < d; ++j) {
++            delta[j] = beta[h] * (bf16_word_to_float(v_row[j]) - u[j]);
++        }
++        for (std::uint32_t i = 0; i < d; ++i) {
++            for (std::uint32_t j = 0; j < d; ++j) {
++                Sh[static_cast<std::size_t>(i) * d + j] =
++                    alpha * Sh[static_cast<std::size_t>(i) * d + j] +
++                    delta[i] * kn[j];
++            }
++        }
++        for (std::uint32_t j = 0; j < d; ++j) {
++            float acc = 0;
++            for (std::uint32_t i = 0; i < d; ++i) {
++                acc += Sh[static_cast<std::size_t>(i) * d + j] * qn[i];
++            }
++            out[h * d + j] = scale * acc;
++        }
++    }
++
++    PinnedBuffer host_new = device.allocate_host(state.matrix_floats() * 4);
++    std::memcpy(host_new.bytes().data(), S.data(), state.matrix_floats() * 4);
++    auto up = stream.upload(state.matrix(), host_new, state.matrix_floats() * 4);
++    up.wait();
++
++    std::vector<std::uint16_t> result(hv * d);
++    for (std::uint32_t i = 0; i < hv * d; ++i) {
++        result[i] = float_to_bf16_word(out[i]);
++    }
++    return result;
++}
++
++// ---- Paged KV attention ----
++
++QwenAttnHpuProjections::QwenAttnHpuProjections(const Device& device,
++                                               const QwenAttnHpuConfig& config,
++                                               std::size_t max_workspace_bytes)
++    : wq{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden},
++         max_workspace_bytes},
++      wk{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden},
++         max_workspace_bytes},
++      wv{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden},
++         max_workspace_bytes},
++      wo{device, Bf16GemmShape{1, config.hidden, config.heads * config.head_dim},
++         max_workspace_bytes} {}
++
++std::vector<std::uint16_t> qwen_attn_hpu_decode(
++    const Device& device, Stream& stream, QwenAttnHpuProjections& projections,
++    const QwenAttnHpuWeights& w, PagedKvHpuPool& pool,
++    const QwenAttnHpuConfig& config, std::span<const std::uint16_t> hidden_in,
++    std::uint32_t position) {
++    const std::uint32_t h = config.hidden;
++    const std::uint32_t heads = config.heads;
++    const std::uint32_t d = config.head_dim;
++    if (hidden_in.size() != h) {
++        throw std::invalid_argument("qwen_attn_hpu_decode: hidden_in size mismatch");
++    }
++    if (pool.heads() != heads || pool.head_dim() != d) {
++        throw std::invalid_argument("qwen_attn_hpu_decode: pool geometry mismatch");
++    }
++
++    auto device_project = [&](Bf16Gemm& gemm, const DeviceBuffer& weight,
++                              const std::vector<float>& input,
++                              std::uint32_t in_cols) {
++        const std::uint32_t out_rows = static_cast<std::uint32_t>(gemm.shape().n);
++        PinnedBuffer host_in = device.allocate_host(in_cols * 2);
++        for (std::uint32_t i = 0; i < in_cols; ++i) {
++            const auto word = float_to_bf16_word(input[i]);
++            std::memcpy(host_in.bytes().data() + i * 2, &word, 2);
++        }
++        PinnedBuffer host_out = device.allocate_host(out_rows * 2);
++        DeviceBuffer dev_in = device.allocate_device(in_cols * 2);
++        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
++        auto up = stream.upload(dev_in, host_in, in_cols * 2);
++        up.wait();
++        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight), dev_out);
++        compute.wait();
++        auto down = stream.download(host_out, dev_out, out_rows * 2);
++        down.wait();
++        std::vector<float> result(out_rows);
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_out.bytes().data());
++        for (std::uint32_t r = 0; r < out_rows; ++r) {
++            result[r] = bf16_word_to_float(words[r]);
++        }
++        return result;
++    };
++
++    // RMSNorm.
++    std::vector<float> x(h);
++    {
++        PinnedBuffer host_w = device.allocate_host(h * 2);
++        auto dl = stream.download(host_w, const_cast<DeviceBuffer&>(w.norm), h * 2);
++        dl.wait();
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_w.bytes().data());
++        float square = 0;
++        for (std::uint32_t i = 0; i < h; ++i) {
++            const float value = bf16_word_to_float(hidden_in[i]);
++            square += value * value;
++        }
++        const float inverse = 1.0f / std::sqrt(square / h + config.rms_eps);
++        for (std::uint32_t i = 0; i < h; ++i) {
++            x[i] = bf16_word_to_float(hidden_in[i]) * inverse *
++                   bf16_word_to_float(words[i]);
++        }
++    }
++
++    std::vector<float> q_raw = device_project(projections.wq, w.wq, x, h);
++    std::vector<float> k_raw = device_project(projections.wk, w.wk, x, h);
++    std::vector<float> v_raw = device_project(projections.wv, w.wv, x, h);
++
++    // RoPE on this position's q and k (interleaved halves, the standard
++    // rotate-half form over the full head_dim with theta).
++    auto apply_rope = [&](std::vector<float>& rows) {
++        const float inv_theta_scale = 1.0f / config.rope_theta;
++        for (std::uint32_t head = 0; head < heads; ++head) {
++            float* row = rows.data() + head * d;
++            for (std::uint32_t i = 0; i < d / 2; ++i) {
++                const float freq = std::pow(inv_theta_scale,
++                                            2.0f * i / static_cast<float>(d));
++                const float angle = freq * static_cast<float>(position);
++                const float cos_a = std::cos(angle);
++                const float sin_a = std::sin(angle);
++                const float x0 = row[i];
++                const float x1 = row[i + d / 2];
++                row[i] = x0 * cos_a - x1 * sin_a;
++                row[i + d / 2] = x0 * sin_a + x1 * cos_a;
++            }
++        }
++    };
++    apply_rope(q_raw);
++    apply_rope(k_raw);
++
++    // Append the rotated rows into the pool, then gather the valid prefix.
++    auto to_words = [&](const std::vector<float>& rows) {
++        std::vector<std::uint16_t> words(rows.size());
++        for (std::size_t i = 0; i < rows.size(); ++i) {
++            words[i] = float_to_bf16_word(rows[i]);
++        }
++        return words;
++    };
++    pool.append(device, stream, to_words(k_raw), to_words(v_raw), position);
++    const auto [keys, values] = pool.gather(device, stream, position);
++    const std::uint32_t tokens = position + 1;
++
++    // Softmax attention per head over the gathered prefix.
++    std::vector<float> attn_out(static_cast<std::size_t>(heads) * d);
++    const float scale = 1.0f / std::sqrt(static_cast<float>(d));
++    for (std::uint32_t head = 0; head < heads; ++head) {
++        const float* q_row = q_raw.data() + head * d;
++        std::vector<float> logits(tokens);
++        float maximum = -std::numeric_limits<float>::infinity();
++        for (std::uint32_t t = 0; t < tokens; ++t) {
++            const float* k_row = keys.data() +
++                                 static_cast<std::size_t>(t) * heads * d + head * d;
++            float dot = 0;
++            for (std::uint32_t i = 0; i < d; ++i) {
++                dot += q_row[i] * k_row[i];
++            }
++            logits[t] = dot * scale;
++            maximum = std::max(maximum, logits[t]);
++        }
++        float denominator = 0;
++        for (std::uint32_t t = 0; t < tokens; ++t) {
++            logits[t] = std::exp(logits[t] - maximum);
++            denominator += logits[t];
++        }
++        const float inverse = 1.0f / denominator;
++        float* out_row = attn_out.data() + head * d;
++        for (std::uint32_t i = 0; i < d; ++i) out_row[i] = 0;
++        for (std::uint32_t t = 0; t < tokens; ++t) {
++            const float weight = logits[t] * inverse;
++            const float* v_row = values.data() +
++                                 static_cast<std::size_t>(t) * heads * d + head * d;
++            for (std::uint32_t i = 0; i < d; ++i) {
++                out_row[i] += weight * v_row[i];
++            }
++        }
++    }
++
++    // Output projection on the MME.
++    const std::vector<float> block_out =
++        device_project(projections.wo, w.wo, attn_out, heads * d);
++    std::vector<std::uint16_t> result(h);
++    for (std::uint32_t i = 0; i < h; ++i) {
++        result[i] = float_to_bf16_word(block_out[i]);
++    }
++    return result;
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/qwen_hpu.h b/src/core/gaudi2/qwen_hpu.h
+new file mode 100644
+index 0000000..fa7238e
+--- /dev/null
++++ b/src/core/gaudi2/qwen_hpu.h
+@@ -0,0 +1,89 @@
++#pragma once
++// Qwen GDN recurrence and full KV attention decode on the Gaudi2 runtime
++// adapter (gap 5). Both pieces follow the house pattern: matrix projections
++// ride the MME through closed Bf16Gemm recipes, the elementwise/recurrent
++// math runs on the host between launches.
++//
++// qwen_gdn_hpu_step implements the gated delta rule exactly as the engine's
++// audited contract states it (include/ninfer/ops/gated_delta_net.h):
++//   alpha = exp(g[h]); delta = beta * (v - alpha * S k); S = alpha S +
++//   outer(delta, k); out = scale * S q, with per-row L2 normalization of q/k
++// (eps 1e-6) and scale = 1/sqrt(head_dim). The state stays FP32 in HBM.
++//
++// qwen_attn_hpu_decode is standard grouped multi-head attention over the
++// paged KV pool (uniform head count, no GQA on this slice): q/k/v/o on the
++// MME, RoPE and the softmax attention on the host over gathered pages.
++
++#include "core/gaudi2/runtime.h"
++#include "core/gaudi2/paged_kv_hpu.h"
++#include "ops/gaudi2/bf16_gemm.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <span>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++struct QwenGdnHpuConfig {
++    std::uint32_t head_dim = 128;   // the contract's fixed state width
++    std::uint32_t qk_heads = 0;
++    std::uint32_t value_heads = 0;  // >= qk_heads, divisible by it
++    bool normalize_qk = true;
++};
++
++// One GDN decode step's persistent state: S[head_dim, head_dim] FP32 per
++// value head, HBM-resident, carried across steps.
++class QwenGdnHpuState {
++public:
++    QwenGdnHpuState(const Device& device, const QwenGdnHpuConfig& config);
++    // Re-zeroes every head's matrix (a fresh sequence's starting point).
++    void reset(const Device& device, Stream& stream);
++    [[nodiscard]] DeviceBuffer& matrix() noexcept { return matrix_; }
++    [[nodiscard]] const DeviceBuffer& matrix() const noexcept { return matrix_; }
++    [[nodiscard]] std::size_t matrix_floats() const noexcept { return floats_; }
++
++private:
++    DeviceBuffer matrix_;
++    std::size_t floats_ = 0;
++};
++
++// One token's GDN recurrence. `q`/`k` are [qk_heads * head_dim] BF16 words,
++// `v` [value_heads * head_dim], `g`/`beta` FP32 per value head (g in log
++// space). Returns out [value_heads * head_dim] BF16 words. The math is the
++// gated_delta_net contract verbatim (G = value_heads/qk_heads grouping).
++[[nodiscard]] std::vector<std::uint16_t> qwen_gdn_hpu_step(
++    const Device& device, Stream& stream, QwenGdnHpuState& state,
++    const QwenGdnHpuConfig& config, std::span<const std::uint16_t> q,
++    std::span<const std::uint16_t> k, std::span<const std::uint16_t> v,
++    std::span<const float> g, std::span<const float> beta);
++
++// ---- Full KV attention over the paged pool ----
++
++struct QwenAttnHpuConfig {
++    std::uint32_t hidden, heads, head_dim;
++    float rms_eps;
++    float rope_theta = 1000000.0f;
++};
++
++struct QwenAttnHpuWeights {
++    DeviceBuffer norm;     // BF16 [hidden]
++    DeviceBuffer wq, wk, wv, wo;  // [heads*head_dim, hidden] x3, [hidden, heads*head_dim]
++};
++
++struct QwenAttnHpuProjections {
++    Bf16Gemm wq, wk, wv, wo;
++    QwenAttnHpuProjections(const Device& device, const QwenAttnHpuConfig& config,
++                           std::size_t max_workspace_bytes = 4096);
++};
++
++// One decode step: RMSNorm (host) -> q/k/v (MME) -> RoPE on the appended
++// position (host) -> the token's rows into the pool -> softmax attention
++// over the gathered prefix (host) -> o (MME). Returns [hidden] BF16 words.
++[[nodiscard]] std::vector<std::uint16_t> qwen_attn_hpu_decode(
++    const Device& device, Stream& stream, QwenAttnHpuProjections& projections,
++    const QwenAttnHpuWeights& w, PagedKvHpuPool& pool,
++    const QwenAttnHpuConfig& config, std::span<const std::uint16_t> hidden_in,
++    std::uint32_t position);
++
++} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.cpp b/src/core/gaudi2/runtime.cpp
 new file mode 100644
 index 0000000..c5c686e
@@ -8870,6 +9503,230 @@ index 0000000..b20b0c9
 +                    library.kernel_names().size());
 +    } catch (const std::exception& error) {
 +        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        return 1;
++    }
++    return 0;
++}
+diff --git a/src/core/gaudi2/tests/qwen_hpu_test.cpp b/src/core/gaudi2/tests/qwen_hpu_test.cpp
+new file mode 100644
+index 0000000..caad441
+--- /dev/null
++++ b/src/core/gaudi2/tests/qwen_hpu_test.cpp
+@@ -0,0 +1,218 @@
++// Gap 5 slice on the fake runtime: the Qwen GDN recurrence and the paged
++// KV attention. The GDN check asserts the audited contract's identities on
++// hand-computable cases (beta=0 leaves the state untouched; the first full
++// step reduces to scale * v * (k.q)); the attention check walks 70 positions
++// across the 64-token page boundary and verifies the gathered prefix, the
++// truncation semantics, and finite outputs end to end.
++#include "core/gaudi2/qwen_hpu.h"
++#include "core/gaudi2/paged_kv_hpu.h"
++#include "control.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++using namespace ninfer::gaudi2;
++
++namespace {
++
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++
++float source(std::uint32_t i) {
++    return static_cast<float>(static_cast<int>(i % 17u) - 8) / 8.0f;
++}
++
++std::uint16_t round_bf16(float v) {
++    std::uint32_t bits;
++    std::memcpy(&bits, &v, 4);
++    bits += 0x7fffu + ((bits >> 16) & 1u);
++    return static_cast<std::uint16_t>(bits >> 16);
++}
++
++float bf16_val(std::uint16_t w) {
++    const std::uint32_t wide = static_cast<std::uint32_t>(w) << 16;
++    float v;
++    std::memcpy(&v, &wide, 4);
++    return v;
++}
++
++std::vector<std::uint16_t> bf16_plane(std::uint32_t count, std::uint32_t seed) {
++    std::vector<std::uint16_t> o(count);
++    for (std::size_t i = 0; i < o.size(); ++i) {
++        o[i] = round_bf16(source(static_cast<std::uint32_t>(i) * 3 + seed) / 16.0f);
++    }
++    return o;
++}
++
++void run_gdn(const Device& device, Stream& stream) {
++    QwenGdnHpuConfig config{};
++    config.head_dim = 8;
++    config.qk_heads = 1;
++    config.value_heads = 2;  // G = 2 grouping: both value heads share q/k head 0
++    config.normalize_qk = true;
++
++    QwenGdnHpuState state(device, config);
++
++    const auto q = bf16_plane(config.qk_heads * config.head_dim, 1);
++    const auto k = bf16_plane(config.qk_heads * config.head_dim, 2);
++    const auto v = bf16_plane(config.value_heads * config.head_dim, 3);
++
++    // Case 1: beta = 0 leaves the state at zero and the output at zero.
++    {
++        std::vector<float> g = {0.5f, -1.0f};
++        std::vector<float> beta = {0.0f, 0.0f};
++        const auto out = qwen_gdn_hpu_step(device, stream, state, config,
++                                           q, k, v, g, beta);
++        require(out.size() == config.value_heads * config.head_dim, "gdn out width");
++        for (const auto word : out) {
++            if (std::fabs(bf16_val(word)) > 1e-3f) {
++                throw std::runtime_error("gdn: beta=0 must emit zeros");
++            }
++        }
++    }
++
++    // Case 2: alpha = 1 (g = 0), beta = 1, from a zero state:
++    //   S' = outer(v, k_norm); out = scale * S' q_norm = scale * v (k.q)
++    // per value head (the grouped heads share the one q/k head).
++    {
++        std::vector<float> g = {0.0f, 0.0f};
++        std::vector<float> beta = {1.0f, 1.0f};
++        const auto out = qwen_gdn_hpu_step(device, stream, state, config,
++                                           q, k, v, g, beta);
++        const float scale = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
++        // Normalized k.q over head_dim=8.
++        float kn_sq = 1e-6f, qn_sq = 1e-6f;
++        for (std::uint32_t i = 0; i < config.head_dim; ++i) {
++            kn_sq += bf16_val(k[i]) * bf16_val(k[i]);
++            qn_sq += bf16_val(q[i]) * bf16_val(q[i]);
++        }
++        float dot = 0;
++        for (std::uint32_t i = 0; i < config.head_dim; ++i) {
++            dot += (bf16_val(k[i]) / std::sqrt(kn_sq)) * (bf16_val(q[i]) / std::sqrt(qn_sq));
++        }
++        for (std::uint32_t h = 0; h < config.value_heads; ++h) {
++            for (std::uint32_t i = 0; i < config.head_dim; ++i) {
++                const float expected =
++                    scale * bf16_val(v[h * config.head_dim + i]) * dot;
++                if (std::fabs(bf16_val(out[h * config.head_dim + i]) - expected) >
++                    2e-2f) {
++                    throw std::runtime_error("gdn: first-step identity mismatch");
++                }
++            }
++        }
++    }
++
++    // Case 3: a beta=0 step must not touch the state. Two parallel states
++    // take the same Case-2 update; one then sits through a beta=0 probe
++    // with arbitrary decay, the other does not. Both then repeat the
++    // Case-2 update - identical outputs prove the probe changed nothing.
++    {
++        std::vector<float> g0 = {0.0f, 0.0f};
++        std::vector<float> beta1 = {1.0f, 1.0f};
++        // g = 0 keeps alpha = 1: the contract's S update is alpha*S +
++        // outer(delta, k), so a zero beta only leaves S untouched when the
++        // decay is neutral too.
++        std::vector<float> g_probe = {0.0f, 0.0f};
++        std::vector<float> beta0 = {0.0f, 0.0f};
++
++        QwenGdnHpuState probed(device, config);
++        QwenGdnHpuState clean(device, config);
++        (void)qwen_gdn_hpu_step(device, stream, probed, config, q, k, v, g0, beta1);
++        (void)qwen_gdn_hpu_step(device, stream, clean, config, q, k, v, g0, beta1);
++        (void)qwen_gdn_hpu_step(device, stream, probed, config, q, k, v, g_probe, beta0);
++        const auto after_probe =
++            qwen_gdn_hpu_step(device, stream, probed, config, q, k, v, g0, beta1);
++        const auto without_probe =
++            qwen_gdn_hpu_step(device, stream, clean, config, q, k, v, g0, beta1);
++        for (std::size_t i = 0; i < after_probe.size(); ++i) {
++            if (after_probe[i] != without_probe[i]) {
++                throw std::runtime_error("gdn: beta=0 probe must not touch the state");
++            }
++        }
++    }
++    std::puts("ok: gdn contract identities");
++}
++
++void run_attention(const Device& device, Stream& stream) {
++    constexpr std::uint32_t H = 64, HEADS = 4, D = 16, PAGES = 4;
++
++    QwenAttnHpuConfig config{};
++    config.hidden = H;
++    config.heads = HEADS;
++    config.head_dim = D;
++    config.rms_eps = 1e-5f;
++    config.rope_theta = 10000.0f;
++
++    PagedKvHpuPool pool(device, HEADS, D, PAGES);
++    QwenAttnHpuProjections projections(device, config);
++
++    QwenAttnHpuWeights w;
++    auto upload = [&](const std::vector<std::uint16_t>& data) {
++        PinnedBuffer host = device.allocate_host(data.size() * 2);
++        std::memcpy(host.bytes().data(), data.data(), data.size() * 2);
++        DeviceBuffer dev = device.allocate_device(data.size() * 2);
++        auto t = stream.upload(dev, host, data.size() * 2);
++        t.wait();
++        return dev;
++    };
++    w.norm = upload(bf16_plane(H, 1));
++    w.wq = upload(bf16_plane(HEADS * D * H, 2));
++    w.wk = upload(bf16_plane(HEADS * D * H, 3));
++    w.wv = upload(bf16_plane(HEADS * D * H, 4));
++    w.wo = upload(bf16_plane(H * HEADS * D, 5));
++
++    // 70 positions crosses the 64-token page boundary.
++    for (std::uint32_t position = 0; position < 70; ++position) {
++        const auto hidden_in = bf16_plane(H, 10 + position);
++        const auto out = qwen_attn_hpu_decode(device, stream, projections, w,
++                                              pool, config, hidden_in, position);
++        require(out.size() == H, "attn out width");
++        for (std::uint32_t i = 0; i < H; ++i) {
++            if (!std::isfinite(bf16_val(out[i]))) {
++                throw std::runtime_error("attn out finite");
++            }
++        }
++    }
++    require(pool.frontier() == 70, "pool frontier after 70 appends");
++
++    // The gather exposes exactly the valid prefix.
++    {
++        const auto [keys, values] = pool.gather(device, stream, 69);
++        require(keys.size() == 70 * HEADS * D, "gather width");
++        require(values.size() == keys.size(), "gather value width");
++    }
++
++    // Truncation back into page 0, then append overwrites the tail.
++    {
++        pool.truncate(10);
++        require(pool.frontier() == 10, "frontier after truncate");
++        const auto hidden_in = bf16_plane(H, 99);
++        const auto out = qwen_attn_hpu_decode(device, stream, projections, w,
++                                              pool, config, hidden_in, 10);
++        require(out.size() == H, "attn out width after truncate");
++        require(pool.frontier() == 11, "frontier after re-append");
++    }
++    std::puts("ok: paged kv attention across the page boundary");
++}
++
++} // namespace
++
++int main() {
++    try {
++        {
++            Device device;
++            Stream stream = device.create_stream();
++            run_gdn(device, stream);
++            run_attention(device, stream);
++        }
++        fake_synapse::assert_clean();
++        std::puts("qwen hpu gdn + paged kv pass lifecycle validation");
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
++        fake_synapse::assert_clean();
 +        return 1;
 +    }
 +    return 0;
