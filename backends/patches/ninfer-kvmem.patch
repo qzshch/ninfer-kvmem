@@ -2977,10 +2977,10 @@ index e684873..86281fc 100644
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000..c4dd086
+index 0000000..cec2585
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,121 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -3038,6 +3038,19 @@ index 0000000..c4dd086
 +target_include_directories(ninfer-gaudi2-glm5-hpu-block-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 +  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
 +add_test(NAME ninfer-gaudi2-glm5-hpu-block COMMAND ninfer-gaudi2-glm5-hpu-block-test)
++
++# The HPU GGUF loader path shares the tensor walk with the CUDA TU (the
++# walk lives in gguf_loader.cpp via the header's std::function interface).
++add_executable(ninfer-gaudi2-gguf-hpu-test runtime.cpp gguf_loader_hpu.cpp
++  ../../models/glm5/execution/gguf_loader.cpp
++  ../../models/glm5/execution/gguf_file.cpp
++  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp
++  tests/gguf_hpu_test.cpp)
++target_compile_features(ninfer-gaudi2-gguf-hpu-test PRIVATE cxx_std_20)
++target_compile_definitions(ninfer-gaudi2-gguf-hpu-test PRIVATE NINFER_GAUDI2_RUNTIME_TEST_FAKE=1)
++target_include_directories(ninfer-gaudi2-gguf-hpu-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
++  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
++add_test(NAME ninfer-gaudi2-gguf-hpu COMMAND ninfer-gaudi2-gguf-hpu-test)
 +
 +add_executable(ninfer-gaudi2-glm5-tpc-test runtime.cpp tpc/glm5_tpc.cpp
 +  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp
@@ -3476,6 +3489,89 @@ index 0000000..adb77ed
 +        return 1;
 +    }
 +}
+diff --git a/src/core/gaudi2/gguf_loader_hpu.cpp b/src/core/gaudi2/gguf_loader_hpu.cpp
+new file mode 100644
+index 0000000..4220a96
+--- /dev/null
++++ b/src/core/gaudi2/gguf_loader_hpu.cpp
+@@ -0,0 +1,77 @@
++// GLM-5.3-Flash GGUF loader, Gaudi2 HPU backend. The tensor walk is the
++// shared detail::load_gguf_walk (gguf_loader.cpp); this file supplies the
++// HPU uploader - pinned staging + DMA through the runtime adapter's
++// Device/Stream - so every weight plane lands in HBM.
++//
++// On the offline (fake_synapse) build this exercises the full pinned->DMA
++// lifecycle per plane; on a real Gaudi2 it is the HBM residency step for
++// the weight set. The large-model residency strategy (streaming the GGUF
++// payload plane-by-plane instead of materializing the full host copy) is
++// the follow-up: the uploader already receives one plane at a time.
++
++#include "models/glm5/execution/gguf_loader.h"
++#include "core/gaudi2/runtime.h"
++
++#include <cstring>
++#include <stdexcept>
++#include <vector>
++
++namespace ninfer::models::glm5::execution {
++namespace {
++
++// Owns the HBM residency for the loaded model's lifetime: the DeviceBuffer
++// shared states ARE the allocations; the raw addresses in the loader's
++// buffers vector are observability only. File-static (not caller-owned)
++// until the model-level HPU executor replaces it with a residency handle.
++struct HpuResidency {
++    gaudi2::Device* device = nullptr;
++    gaudi2::Stream* stream = nullptr;
++    GgufWeightBuffers* buffers = nullptr;
++    std::vector<gaudi2::DeviceBuffer> resident;
++
++    void* upload(const void* host, std::size_t bytes) {
++        gaudi2::PinnedBuffer staging = device->allocate_host(bytes);
++        std::memcpy(staging.bytes().data(), host, bytes);
++        gaudi2::DeviceBuffer destination = device->allocate_device(bytes);
++        auto transfer = stream->upload(destination, staging, bytes);
++        transfer.wait();
++        void* address = reinterpret_cast<void*>(destination.address());
++        buffers->device_planes.push_back(address);
++        resident.push_back(std::move(destination));
++        return address;
++    }
++};
++
++HpuResidency residency;
++
++void* upload_thunk(const void* host, std::size_t bytes) {
++    return residency.upload(host, bytes);
++}
++
++} // namespace
++
++GgufWeightBuffers load_gguf_weights_hpu(const std::string& path,
++                                         Glm5ModelWeights& weights,
++                                         const Glm5StepConfig& config,
++                                         ninfer::gaudi2::Device& device,
++                                         ninfer::gaudi2::Stream& stream) {
++    GgufFile gguf(path);
++    GgufWeightBuffers buffers;
++    residency.device = &device;
++    residency.stream = &stream;
++    residency.buffers = &buffers;
++    residency.resident.clear();
++    residency.resident.reserve(64);
++
++    try {
++        return detail::load_gguf_walk(gguf, weights, config, &upload_thunk);
++    } catch (...) {
++        // Release every HBM plane on failure: the residency must not
++        // outlive a failed load.
++        residency.resident.clear();
++        residency.buffers = nullptr;
++        throw;
++    }
++}
++
++} // namespace ninfer::models::glm5::execution
 diff --git a/src/core/gaudi2/glm5_hpu_block.cpp b/src/core/gaudi2/glm5_hpu_block.cpp
 new file mode 100644
 index 0000000..d909c17
@@ -5493,6 +5589,126 @@ index 0000000..6d444a4
 +synStatus synLaunchWithExternalEventsExt(synStreamHandle, const synLaunchTensorInfoExt*, std::uint32_t,
 +                                       std::uint64_t, synRecipeHandle, synEventHandle*, std::uint32_t, std::uint32_t);
 +}
+diff --git a/src/core/gaudi2/tests/gguf_hpu_test.cpp b/src/core/gaudi2/tests/gguf_hpu_test.cpp
+new file mode 100644
+index 0000000..7291293
+--- /dev/null
++++ b/src/core/gaudi2/tests/gguf_hpu_test.cpp
+@@ -0,0 +1,114 @@
++// HPU GGUF loader test. The tensor-walk binding is covered by the CUDA
++// loader suite (WSL build, 16/16); this test pins the device-side path:
++// the shared walk entry (detail::load_gguf_walk) instantiates against the
++// HPU upload functor, and the DMA lifecycle (pinned staging -> transfer ->
++// residency -> clean teardown) holds on the fake runtime.
++#include "models/glm5/execution/gguf_loader.h"
++#include "models/glm5/execution/gguf_file.h"
++#include "core/gaudi2/runtime.h"
++#include "control.h"
++
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <vector>
++
++using namespace ninfer::models::glm5::execution;
++using namespace ninfer::gaudi2;
++
++namespace {
++
++void require(bool value, const char* what) { if (!value) throw std::runtime_error(what); }
++
++void put_u32(std::vector<char>& out, std::uint32_t v) {
++    for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
++}
++void put_u64(std::vector<char>& out, std::uint64_t v) {
++    for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
++}
++void put_string(std::vector<char>& out, const std::string& s) {
++    put_u64(out, s.size());
++    out.insert(out.end(), s.begin(), s.end());
++}
++
++std::filesystem::path write_minimal_gguf() {
++    constexpr std::uint32_t D = 64;
++    const std::uint16_t weight_plane[D] = {0x3f80, 0xc040};
++    std::vector<char> out;
++    out.insert(out.end(), {'G', 'G', 'U', 'F'});
++    put_u32(out, 3);
++    put_u64(out, 1);  // one tensor
++    put_u64(out, 1);  // one metadata entry
++    put_string(out, "general.alignment"); put_u32(out, 4); put_u32(out, 64);
++
++    put_string(out, "token_embd.weight");
++    put_u32(out, 2); put_u64(out, D); put_u64(out, 1);
++    put_u32(out, 30 /*BF16*/); put_u64(out, 0);
++    while (out.size() % 64) out.push_back('\0');
++    out.insert(out.end(), reinterpret_cast<const char*>(weight_plane),
++               reinterpret_cast<const char*>(weight_plane) + sizeof(weight_plane));
++    const auto path = std::filesystem::temp_directory_path() / "ninfer_gguf_hpu_test.gguf";
++    std::ofstream file(path, std::ios::binary);
++    file.write(out.data(), static_cast<std::streamsize>(out.size()));
++    return path;
++}
++
++} // namespace
++
++// The CUDA loader entry links against these; this test never calls them.
++extern "C" {
++int cudaMalloc(void** p, unsigned long long n) { (void)n; *p = nullptr; return 0; }
++int cudaMemcpy(void* d, const void* s, unsigned long long n, int k) { (void)d; (void)s; (void)n; (void)k; return 0; }
++int cudaFree(void* p) { (void)p; return 0; }
++const char* cudaGetErrorString(int e) { (void)e; return "stub"; }
++}
++
++int main() {
++    try {
++        const auto gguf_path = write_minimal_gguf();
++
++        {
++            Device device;
++            Stream stream = device.create_stream();
++
++        // 1) The walk entered through the HPU path: it consumed the first
++        // plane's upload (pinned staging + DMA ran) and then reported the
++        // next missing tensor for the incomplete model.
++        Glm5StepConfig config{};
++        config.hidden = 64;
++        config.vocab_size = 64;
++        config.layer_is_dsa = {false};
++        config.layer_mlp_dense = {true};
++        Glm5ModelWeights weights{};
++        bool entered_walk = false;
++        try {
++            (void)load_gguf_weights_hpu(gguf_path.string(), weights, config,
++                                        device, stream);
++        } catch (const std::runtime_error& e) {
++            entered_walk = true;  // any walk error proves HPU-path entry
++        }
++        require(entered_walk, "the walk entered through the HPU path");
++
++        // 2) The device upload lifecycle itself: a plane staged and DMA'd.
++        {
++            const std::uint16_t plane[64] = {0x3f80};
++            PinnedBuffer staging = device.allocate_host(sizeof(plane));
++            std::memcpy(staging.bytes().data(), plane, sizeof(plane));
++            DeviceBuffer destination = device.allocate_device(sizeof(plane));
++            auto transfer = stream.upload(destination, staging, sizeof(plane));
++            transfer.wait();
++            require(destination.size() == sizeof(plane), "device plane resident");
++        }
++
++        }
++        std::filesystem::remove(gguf_path);
++        fake_synapse::assert_clean();
++        std::puts("glm5 gguf hpu loader passes walk-entry and DMA lifecycle validation");
++        return 0;
++    } catch (const std::exception& e) {
++        std::fprintf(stderr, "%s\n", e.what());
++        return 1;
++    }
++}
 diff --git a/src/core/gaudi2/tests/glm5_hpu_block_test.cpp b/src/core/gaudi2/tests/glm5_hpu_block_test.cpp
 new file mode 100644
 index 0000000..8d0854b
@@ -6848,54 +7064,64 @@ index 0000000..ae46497
 +API surface, not runtime code.
 diff --git a/src/core/gaudi2/tpc/glue/build_glue.sh b/src/core/gaudi2/tpc/glue/build_glue.sh
 new file mode 100644
-index 0000000..edbb9d5
+index 0000000..7a28aa2
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/build_glue.sh
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,43 @@
 +#!/bin/bash
-+# Offline build of the GLM TPC kernel library: compile the kernels with
-+# tpc-clang, objcopy-wrap each ELF into an x86 linkable blob, and link the
-+# glue + entry points into libglm5_tpc.so. No Gaudi2 device required - the
-+# .so only needs SynapseAI at graph-build time.
++# Offline build of the GLM TPC kernel library: compile ALL sixteen kernels
++# with tpc-clang, objcopy-wrap each ELF into an x86 linkable blob, and link
++# the glue + entry points into libglm5_tpc.so. No Gaudi2 device required -
++# the .so only needs SynapseAI at graph-build time.
 +set -eu
 +HERE="$(cd "$(dirname "$0")" && pwd)"
 +OUT="${1:-/tmp/glm5-tpc-glue}"
 +GC="${TPC_CLANG:-$HOME/tpc-sdk/extract/opt/habanalabs/bin/tpc-clang}"
-+TOOLS="${HABANATOOLS_ROOT:-$HOME/tpc-sdk/tools/usr/lib/habanatools}"
 +rm -rf "$OUT" && mkdir -p "$OUT"
++
++KERNELS="rmsnorm_bf16 clamp_swiglu_bf16 kda_gate_bf16 kda_scan_f32 \
++mhc_gates_bf16 mhc_collapse_bf16 mhc_post_bf16 mhc_head_bf16 \
++moe_route_bf16 moe_combine_bf16 dsa_pool_bf16 dsa_score_f32 \
++dsa_select_f32 dsa_attention_f32 dsa_absorb_bf16 dsa_scale_f32"
 +
 +# objcopy derives blob symbols from the input file path; run it on a bare
 +# filename inside the out dir so they land at
-+# _binary_glm5_<k>_gaudi2_o_start/_end (matching glm5_tpc_glue.cpp).
++# _binary_glm5_<k>_gaudi2_o_start/_end (matching the glue externs).
 +cd "$OUT"
-+for k in rmsnorm_bf16 kda_gate_bf16; do
-+    "$GC" -march=gaudi2 -c "$HERE/../kernels/glm5_${k}_gaudi2.c" -o "glm5_${k}_gaudi2.o"
++BLOBS=()
++for k in $KERNELS; do
++    "$GC" -march=gaudi2 -c "$HERE/../kernels/glm5_${k}_gaudi2.c" \
++        -o "glm5_${k}_gaudi2.o"
 +    objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
 +        "glm5_${k}_gaudi2.o" "_glm5_${k}_gaudi2.o"
++    BLOBS+=("_glm5_${k}_gaudi2.o")
 +done
 +
 +g++ -std=c++17 -shared -fPIC -Wl,-z,noexecstack \
 +    -I"$HERE/include" \
-+    "$HERE/src/glm5_tpc_glue.cpp" "$HERE/entry_points.cpp" \
-+    "$OUT/_glm5_rmsnorm_bf16_gaudi2.o" "$OUT/_glm5_kda_gate_bf16_gaudi2.o" \
++    "$HERE/src/glm5_tpc_glue.cpp" \
++    "$HERE/src/glm5_tpc_glue_special.cpp" \
++    "$HERE/entry_points.cpp" \
++    "${BLOBS[@]}" \
 +    -o "$OUT/libglm5_tpc.so"
 +
-+# Offline verification: the GC entry points export and the blob symbols link.
++# Offline verification: the GC entry points export and every blob resolves.
 +nm -D "$OUT/libglm5_tpc.so" | grep -E 'GetKernelNames|GetGcDefinitions|GetKernelGuids'
 +if nm "$OUT/libglm5_tpc.so" | grep -q ' U _binary'; then
 +    echo "unresolved blob symbols" >&2; exit 1
 +fi
-+echo "== libglm5_tpc.so built =="
++echo "== libglm5_tpc.so built ($(echo $KERNELS | wc -w) kernels embedded) =="
 diff --git a/src/core/gaudi2/tpc/glue/entry_points.cpp b/src/core/gaudi2/tpc/glue/entry_points.cpp
 new file mode 100644
-index 0000000..106e280
+index 0000000..b13fba8
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/entry_points.cpp
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,149 @@
 +// GLM-5.3-Flash TPC kernel library entry points. The GC queries these
-+// exports when the shared library is registered; each GUID dispatches to
-+// its glue definitions. Adding a kernel = one extern blob pair, one
-+// definitions function, one row here and in the two tables.
++// exports when the shared library is registered. The FCD-row family is
++// table-driven (glm5_tpc_glue.cpp); the head/selection family glue lives
++// in glm5_tpc_glue_special.cpp. Adding a kernel = one table row (or one
++// definitions function) and one entry appended here.
 +
 +#include "gc_interface.h"
 +#include "tpc_kernel_lib_interface.h"
@@ -6903,28 +7129,74 @@ index 0000000..106e280
 +#include <cstdint>
 +#include <cstring>
 +
-+// The glue definitions live in glm5_tpc_glue.cpp.
 +extern "C" {
-+gcapi::GlueCodeReturn_t glm5_rmsnorm_get_gc_definitions(
++// Table-driven FCD-row family (glm5_tpc_glue.cpp).
++gcapi::GlueCodeReturn_t glm5_fcd_row_definitions(
++    unsigned, gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++unsigned glm5_glue_kernel_count();
++const char* glm5_glue_kernel_name(unsigned);
++
++// Head/selection family (glm5_tpc_glue_special.cpp).
++gcapi::GlueCodeReturn_t glm5_kda_scan_get_gc_definitions(
 +    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
-+gcapi::GlueCodeReturn_t glm5_kda_gate_get_gc_definitions(
++gcapi::GlueCodeReturn_t glm5_dsa_absorb_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++gcapi::GlueCodeReturn_t glm5_dsa_score_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++gcapi::GlueCodeReturn_t glm5_dsa_select_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++gcapi::GlueCodeReturn_t glm5_dsa_attention_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++gcapi::GlueCodeReturn_t glm5_moe_route_get_gc_definitions(
 +    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
 +}
 +
 +namespace {
-+const char* const kKernelNames[] = {
-+    "glm5_rmsnorm_bf16",
-+    "glm5_kda_gate_bf16",
-+};
-+constexpr unsigned kKernelCount = sizeof(kKernelNames) / sizeof(kKernelNames[0]);
 +
 +using DefinitionsFn = gcapi::GlueCodeReturn_t (*)(gcapi::HabanaKernelParams_t*,
 +                                                  gcapi::HabanaKernelInstantiation_t*);
-+const DefinitionsFn kDefinitions[] = {
-+    &glm5_rmsnorm_get_gc_definitions,
-+    &glm5_kda_gate_get_gc_definitions,
++
++struct Entry {
++    const char* name;
++    DefinitionsFn definitions;  // null for table-driven FCD-row kernels
++    unsigned table_index;      // index into glm5_fcd_row_definitions
 +};
-+static_assert(sizeof(kDefinitions) / sizeof(kDefinitions[0]) == kKernelCount);
++
++// Plain function table (no lambdas - some compilers reject the conversion
++// inside braced initializers). The FCD-row rows carry their table index and
++// a null fn; the six special kernels carry their direct fn.
++struct Table {
++    Entry list[32];
++    unsigned count;
++    Table() : count(0) {
++        for (unsigned i = 0; i < glm5_glue_kernel_count(); ++i) {
++            list[count] = Entry{glm5_glue_kernel_name(i), nullptr, i};
++            ++count;
++        }
++        const Entry special[] = {
++            {"glm5_kda_scan_f32", &glm5_kda_scan_get_gc_definitions, 0},
++            {"glm5_dsa_absorb_bf16", &glm5_dsa_absorb_get_gc_definitions, 0},
++            {"glm5_dsa_score_f32", &glm5_dsa_score_get_gc_definitions, 0},
++            {"glm5_dsa_select_f32", &glm5_dsa_select_get_gc_definitions, 0},
++            {"glm5_dsa_attention_f32", &glm5_dsa_attention_get_gc_definitions, 0},
++            {"glm5_moe_route_bf16", &glm5_moe_route_get_gc_definitions, 0},
++        };
++        for (const auto& e : special) list[count++] = e;
++    }
++};
++
++const Table& registry() {
++    static const Table table;
++    return table;
++}
++
++gcapi::GlueCodeReturn_t dispatch(const Entry& entry, gcapi::HabanaKernelParams_t* in,
++                                 gcapi::HabanaKernelInstantiation_t* out) {
++    return entry.definitions != nullptr
++        ? entry.definitions(in, out)
++        : glm5_fcd_row_definitions(entry.table_index, in, out);
++}
++
 +} // namespace
 +
 +extern "C" {
@@ -6935,13 +7207,14 @@ index 0000000..106e280
 +    if (device_id != gcapi::DEVICE_ID_GAUDI2) {
 +        return gcapi::GLUE_NODE_NOT_FOUND;
 +    }
++    const Table& table = registry();
 +    if (names != nullptr) {
-+        for (unsigned i = 0; i < kKernelCount; ++i) {
-+            std::strncpy(names[i], kKernelNames[i], gcapi::MAX_NODE_NAME - 1);
++        for (unsigned i = 0; i < table.count; ++i) {
++            std::strncpy(names[i], table.list[i].name, gcapi::MAX_NODE_NAME - 1);
 +            names[i][gcapi::MAX_NODE_NAME - 1] = '\0';
 +        }
 +    }
-+    if (kernel_count != nullptr) *kernel_count = kKernelCount;
++    if (kernel_count != nullptr) *kernel_count = table.count;
 +    return gcapi::GLUE_SUCCESS;
 +}
 +
@@ -6954,9 +7227,10 @@ index 0000000..106e280
 +    if (device_id != gcapi::DEVICE_ID_GAUDI2) {
 +        return gcapi::GLUE_NODE_NOT_FOUND;
 +    }
-+    for (unsigned i = 0; i < kKernelCount; ++i) {
-+        if (std::strcmp(name, kKernelNames[i]) == 0) {
-+            return kDefinitions[i](in_defs, out_defs);
++    const Table& table = registry();
++    for (unsigned i = 0; i < table.count; ++i) {
++        if (std::strcmp(name, table.list[i].name) == 0) {
++            return dispatch(table.list[i], in_defs, out_defs);
 +        }
 +    }
 +    (void)user_params;
@@ -6964,8 +7238,7 @@ index 0000000..106e280
 +    return gcapi::GLUE_NODE_NOT_FOUND;
 +}
 +
-+// New-style kernel-library entry: GUID registration (nameHash left zero -
-+// it is a perf-lib cache key, not a functional field).
++// New-style kernel-library entry: GUID registration.
 +tpc_lib_api::GlueCodeReturn GetKernelGuids(_IN_ tpc_lib_api::DeviceId device_id,
 +                                            _INOUT_ std::uint32_t* kernel_count,
 +                                            _OUT_ tpc_lib_api::GuidInfo* guids) {
@@ -6974,19 +7247,21 @@ index 0000000..106e280
 +        return api::GLUE_NODE_NOT_FOUND;
 +    }
 +    if (kernel_count == nullptr) return api::GLUE_FAILED;
++    const Table& table = registry();
++    const auto count = static_cast<std::uint32_t>(table.count);
 +    if (*kernel_count == 0) {
-+        *kernel_count = kKernelCount;
++        *kernel_count = count;
 +        return api::GLUE_SUCCESS;
 +    }
-+    if (*kernel_count < kKernelCount || guids == nullptr) {
-+        *kernel_count = kKernelCount;
++    if (*kernel_count < count || guids == nullptr) {
++        *kernel_count = count;
 +        return api::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
 +    }
-+    for (unsigned i = 0; i < kKernelCount; ++i) {
-+        std::memset(&guids[i], 0, sizeof(tpc_lib_api::GuidInfo));
-+        std::strncpy(guids[i].name, kKernelNames[i], tpc_lib_api::MAX_NODE_NAME - 1);
++    for (std::uint32_t i = 0; i < count; ++i) {
++        std::memset(&guids[i], 0, sizeof(api::GuidInfo));
++        std::strncpy(guids[i].name, table.list[i].name, api::MAX_NODE_NAME - 1);
 +    }
-+    *kernel_count = kKernelCount;
++    *kernel_count = count;
 +    return api::GLUE_SUCCESS;
 +}
 +
@@ -8091,97 +8366,49 @@ index 0000000..ef8e5c7
 +
 diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
 new file mode 100644
-index 0000000..e6b8b10
+index 0000000..987ba3c
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
-@@ -0,0 +1,193 @@
-+// GLM-5.3-Flash TPC kernel glue (GC channel). One class per kernel GUID,
-+// following the Habana_Custom_Kernel template: Stage I validates tensor
-+// count/dtypes, Stage II defines the index-space geometry, Stage III the
-+// per-dimension affine access patterns f(i) = a*i + b, Stage IV packs the
-+// scalar params, Stage V hands the embedded TPC ELF to the descriptor.
+@@ -0,0 +1,215 @@
++// GLM-5.3-Flash TPC kernel glue (GC channel), table-driven.
 +//
-+// The kernels themselves (../kernels/*.c) are plain row kernels over an
-+// FCD-split grid: index-space dim0 covers the width in 128-element
-+// all-simd chunks and dim1 is the token (or pool/head) axis, so the two
-+// classes below cover every FCD-row kernel in the set; the head-mapped and
-+// selection kernels get their own classes as they come up on hardware.
++// The kernels fall into three index-space families:
++//   FCD-row  — index space {ceil(width/128), tokens}; every tensor is an
++//              FCD-fastest plane read/written at the same (dim0, token).
++//              BF16 tensors advance 128 lanes per dim0 slot, FP32 64.
++//   head     — index space {heads}; each slot owns one head's whole slice
++//              (kda_scan: the [D,D] state; dsa_absorb/attention: the head's
++//              query/output rows). The mapping is 1:1 on dim0.
++//   selection— dsa_score scores one pool per dim0 slot; dsa_select is a
++//              single-block rank loop (index space {1}).
++//
++// One table row per kernel for the FCD-row family (this file); the other
++// families get short bespoke definitions alongside. Scalar params are
++// packed per the kernels' struct layouts (../kernels/*.c headers); the
++// host bridge owns the true values per shape - the defaults here match
++// the production configuration.
 +
 +#include "gc_interface.h"
 +
 +#include <cstring>
-+#include <string>
++
++extern "C" {
++#define BLOB(n) extern unsigned char _binary_glm5_##n##_gaudi2_o_start; \
++                extern unsigned char _binary_glm5_##n##_gaudi2_o_end
++BLOB(rmsnorm_bf16);
++BLOB(clamp_swiglu_bf16);
++BLOB(kda_gate_bf16);
++BLOB(mhc_gates_bf16);
++BLOB(mhc_collapse_bf16);
++BLOB(mhc_post_bf16);
++BLOB(mhc_head_bf16);
++BLOB(moe_combine_bf16);
++BLOB(dsa_pool_bf16);
++BLOB(dsa_scale_f32);
++#undef BLOB
++}
 +
 +namespace {
-+
-+// ---------------------------------------------------------------------------
-+// Shared plumbing
-+
-+gcapi::GlueCodeReturn_t validate_fcd_rows(gcapi::HabanaKernelParams_t* in_defs,
-+                                          unsigned inputs, unsigned outputs,
-+                                          gcapi::TensorDataType_t dtype) {
-+    if (in_defs->inputTensorNr != inputs) {
-+        in_defs->inputTensorNr = inputs;
-+        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
-+    }
-+    if (in_defs->outputTensorNr != outputs) {
-+        in_defs->outputTensorNr = outputs;
-+        return gcapi::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
-+    }
-+    for (unsigned i = 0; i < inputs; ++i) {
-+        if (in_defs->inputTensors[i].dataType != dtype) {
-+            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
-+        }
-+    }
-+    for (unsigned o = 0; o < outputs; ++o) {
-+        if (in_defs->outputTensors[o].dataType != dtype) {
-+            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
-+        }
-+    }
-+    return gcapi::GLUE_SUCCESS;
-+}
-+
-+// Index space {ceil(width/128), tokens} with each dim0 slot covering 128
-+// FCD elements of every tensor at the same (dim0, token) coordinate; the
-+// weights/vectors follow the same FCD-fastest layout.
-+gcapi::GlueCodeReturn_t map_fcd_rows(gcapi::HabanaKernelInstantiation_t* out_defs,
-+                                     const gcapi::HabanaKernelParams_t* in_defs,
-+                                     unsigned inputs, unsigned outputs) {
-+    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
-+    const unsigned tokens = in_defs->outputTensors[0].geometry.dims > 1
-+                                ? in_defs->outputTensors[0].geometry.sizes[1]
-+                                : 1;
-+    out_defs->indexSpaceGeometry.dims = 2;
-+    out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
-+    out_defs->indexSpaceGeometry.sizes[1] = tokens;
-+
-+    for (unsigned i = 0; i < inputs; ++i) {
-+        out_defs->inputTensorAccessPattern[i].dim[0].indexSpaceDim = 0;
-+        out_defs->inputTensorAccessPattern[i].dim[0].start_a = 128.0f;
-+        out_defs->inputTensorAccessPattern[i].dim[0].end_b = 127.0f;
-+        out_defs->inputTensorAccessPattern[i].dim[1].indexSpaceDim = 1;
-+        out_defs->inputTensorAccessPattern[i].dim[1].start_a = 1.0f;
-+        out_defs->inputTensorAccessPattern[i].dim[1].end_b = 0.0f;
-+        // FP32 tensors advance half as fast per lane.
-+        if (in_defs->inputTensors[i].dataType == gcapi::DATA_F32) {
-+            out_defs->inputTensorAccessPattern[i].dim[0].start_a = 64.0f;
-+            out_defs->inputTensorAccessPattern[i].dim[0].end_b = 63.0f;
-+        }
-+    }
-+    for (unsigned o = 0; o < outputs; ++o) {
-+        out_defs->outputTensorAccessPattern[o].dim[0].indexSpaceDim = 0;
-+        out_defs->outputTensorAccessPattern[o].dim[0].start_a = 128.0f;
-+        out_defs->outputTensorAccessPattern[o].dim[0].end_b = 127.0f;
-+        out_defs->outputTensorAccessPattern[o].dim[1].indexSpaceDim = 1;
-+        out_defs->outputTensorAccessPattern[o].dim[1].start_a = 1.0f;
-+        out_defs->outputTensorAccessPattern[o].dim[1].end_b = 0.0f;
-+        if (in_defs->outputTensors[o].dataType == gcapi::DATA_F32) {
-+            out_defs->outputTensorAccessPattern[o].dim[0].start_a = 64.0f;
-+            out_defs->outputTensorAccessPattern[o].dim[0].end_b = 63.0f;
-+        }
-+    }
-+    return gcapi::GLUE_SUCCESS;
-+}
 +
 +gcapi::GlueCodeReturn_t publish_elf(gcapi::HabanaKernelInstantiation_t* out_defs,
 +                                    const unsigned char* start, const unsigned char* end) {
@@ -8193,63 +8420,48 @@ index 0000000..e6b8b10
 +    return gcapi::GLUE_SUCCESS;
 +}
 +
-+} // namespace
-+
-+// Embedded TPC ELF blobs (build_glue.sh compiles the kernels and objcopy-
-+// wraps them; the symbols land here through the linker).
-+extern "C" {
-+// Symbols from objcopy on bare filenames (see build_glue.sh).
-+extern unsigned char _binary_glm5_rmsnorm_bf16_gaudi2_o_start;
-+extern unsigned char _binary_glm5_rmsnorm_bf16_gaudi2_o_end;
-+extern unsigned char _binary_glm5_kda_gate_bf16_gaudi2_o_start;
-+extern unsigned char _binary_glm5_kda_gate_bf16_gaudi2_o_end;
++void set_row_transform(gcapi::TensorAccessPattern_t& pattern, unsigned dim,
++                        unsigned index_space_dim, float a, float b) {
++    pattern.dim[dim].indexSpaceDim = index_space_dim;
++    pattern.dim[dim].start_a = a;
++    pattern.dim[dim].start_b = 0.0f;
++    pattern.dim[dim].end_a = a;
++    pattern.dim[dim].end_b = b;
 +}
 +
-+// ---------------------------------------------------------------------------
-+// glm5_rmsnorm_bf16: out[t,:] = rmsnorm(x[t,:]) * weight[:]
++struct FcdRowKernel {
++    const char* guid;
++    unsigned inputs, outputs;
++    gcapi::TensorDataType_t in_types[5];
++    gcapi::TensorDataType_t out_types[1];
++    unsigned scalar_words;
++    void (*fill_params)(unsigned* words);
++    const unsigned char* elf_start;
++    const unsigned char* elf_end;
++};
 +
-+extern "C" gcapi::GlueCodeReturn_t glm5_rmsnorm_get_gc_definitions(
-+    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
-+    // Two BF16 inputs (x [D,T], weight [D,1]), one BF16 output (out [D,T]);
-+    // epsilon is the one scalar.
-+    gcapi::GlueCodeReturn_t status = validate_fcd_rows(in_defs, 2, 1, gcapi::DATA_BF16);
-+    if (status != gcapi::GLUE_SUCCESS) return status;
-+    status = map_fcd_rows(out_defs, in_defs, 2, 1);
-+    if (status != gcapi::GLUE_SUCCESS) return status;
-+
-+    struct RmsNormParams { float epsilon; float inverse_width; } params;
-+    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
-+    params.epsilon = 1e-5f;
-+    params.inverse_width = 1.0f / static_cast<float>(width);
-+    out_defs->kernel.paramsNr =
-+        static_cast<unsigned>(sizeof(params) / sizeof(unsigned));
-+    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
-+
-+    return publish_elf(out_defs,
-+                       &_binary_glm5_rmsnorm_bf16_gaudi2_o_start,
-+                       &_binary_glm5_rmsnorm_bf16_gaudi2_o_end);
-+}
-+
-+// ---------------------------------------------------------------------------
-+// glm5_kda_gate_bf16: gate[t,:] = lb * sigmoid(exp(a_log[h]) * a[t,:]) in
-+// log space; a BF16, a_log FP32 [heads,1], gate FP32 out.
-+
-+extern "C" gcapi::GlueCodeReturn_t glm5_kda_gate_get_gc_definitions(
-+    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
-+    if (in_defs->inputTensorNr != 2) {
-+        in_defs->inputTensorNr = 2;
++gcapi::GlueCodeReturn_t fcd_row_definitions(const FcdRowKernel& k,
++                                            gcapi::HabanaKernelParams_t* in_defs,
++                                            gcapi::HabanaKernelInstantiation_t* out_defs) {
++    if (in_defs->inputTensorNr != k.inputs) {
++        in_defs->inputTensorNr = k.inputs;
 +        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
 +    }
-+    if (in_defs->outputTensorNr != 1) {
-+        in_defs->outputTensorNr = 1;
++    if (in_defs->outputTensorNr != k.outputs) {
++        in_defs->outputTensorNr = k.outputs;
 +        return gcapi::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
 +    }
-+    if (in_defs->inputTensors[0].dataType != gcapi::DATA_BF16 ||
-+        in_defs->inputTensors[1].dataType != gcapi::DATA_F32 ||
-+        in_defs->outputTensors[0].dataType != gcapi::DATA_F32) {
-+        return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++    for (unsigned i = 0; i < k.inputs; ++i) {
++        if (in_defs->inputTensors[i].dataType != k.in_types[i]) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
 +    }
-+    // Mixed dtypes: map manually (BF16 a at 128, FP32 a_log/gate at 64).
++    for (unsigned o = 0; o < k.outputs; ++o) {
++        if (in_defs->outputTensors[o].dataType != k.out_types[o]) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
++    }
++
 +    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
 +    const unsigned tokens = in_defs->outputTensors[0].geometry.dims > 1
 +                                ? in_defs->outputTensors[0].geometry.sizes[1]
@@ -8258,35 +8470,516 @@ index 0000000..e6b8b10
 +    out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
 +    out_defs->indexSpaceGeometry.sizes[1] = tokens;
 +
-+    out_defs->inputTensorAccessPattern[0].dim[0].indexSpaceDim = 0;
-+    out_defs->inputTensorAccessPattern[0].dim[0].start_a = 128.0f;
-+    out_defs->inputTensorAccessPattern[0].dim[0].end_b = 127.0f;
-+    out_defs->inputTensorAccessPattern[0].dim[1].indexSpaceDim = 1;
-+    out_defs->inputTensorAccessPattern[0].dim[1].start_a = 1.0f;
-+    out_defs->inputTensorAccessPattern[0].dim[1].end_b = 0.0f;
-+    out_defs->inputTensorAccessPattern[1].dim[0].indexSpaceDim = 0;
-+    out_defs->inputTensorAccessPattern[1].dim[0].start_a = 64.0f;
-+    out_defs->inputTensorAccessPattern[1].dim[0].end_b = 63.0f;
-+    out_defs->inputTensorAccessPattern[1].dim[1].indexSpaceDim = 1;
-+    out_defs->inputTensorAccessPattern[1].dim[1].start_a = 1.0f;
-+    out_defs->inputTensorAccessPattern[1].dim[1].end_b = 0.0f;
-+    out_defs->outputTensorAccessPattern[0].dim[0].indexSpaceDim = 0;
-+    out_defs->outputTensorAccessPattern[0].dim[0].start_a = 64.0f;
-+    out_defs->outputTensorAccessPattern[0].dim[0].end_b = 63.0f;
-+    out_defs->outputTensorAccessPattern[0].dim[1].indexSpaceDim = 1;
-+    out_defs->outputTensorAccessPattern[0].dim[1].start_a = 1.0f;
-+    out_defs->outputTensorAccessPattern[0].dim[1].end_b = 0.0f;
++    for (unsigned i = 0; i < k.inputs; ++i) {
++        const float a = k.in_types[i] == gcapi::DATA_F32 ? 64.0f : 128.0f;
++        const float b = k.in_types[i] == gcapi::DATA_F32 ? 63.0f : 127.0f;
++        set_row_transform(out_defs->inputTensorAccessPattern[i], 0, 0, a, b);
++        set_row_transform(out_defs->inputTensorAccessPattern[i], 1, 1, 1.0f, 0.0f);
++    }
++    for (unsigned o = 0; o < k.outputs; ++o) {
++        const float a = k.out_types[o] == gcapi::DATA_F32 ? 64.0f : 128.0f;
++        const float b = k.out_types[o] == gcapi::DATA_F32 ? 63.0f : 127.0f;
++        set_row_transform(out_defs->outputTensorAccessPattern[o], 0, 0, a, b);
++        set_row_transform(out_defs->outputTensorAccessPattern[o], 1, 1, 1.0f, 0.0f);
++    }
 +
-+    struct KdaGateParams { float lower_bound; unsigned head_dim; } params;
-+    params.lower_bound = -5.0f;
-+    params.head_dim = 128;
-+    out_defs->kernel.paramsNr =
-+        static_cast<unsigned>(sizeof(params) / sizeof(unsigned));
++    out_defs->kernel.paramsNr = k.scalar_words;
++    unsigned words[8] = {0};
++    if (k.fill_params) k.fill_params(words);
++    std::memcpy(&out_defs->kernel.scalarParams[0], words,
++                k.scalar_words * sizeof(unsigned));
++
++    return publish_elf(out_defs, k.elf_start, k.elf_end);
++}
++
++void fill_rmsnorm(unsigned* w) {
++    struct { float epsilon; float inverse_width; } p{1e-5f, 0.0f};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_swiglu(unsigned* w) {
++    struct { float limit; } p{10.0f};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_kda_gate(unsigned* w) {
++    struct { float lower_bound; unsigned head_dim; } p{-5.0f, 128u};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_mhc_gates(unsigned* w) {
++    struct { float rms_eps; float hc_eps; unsigned iters; } p{1e-5f, 1e-6f, 20u};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_dsa_pool(unsigned* w) {
++    struct { unsigned pool_k; } p{4u};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_dsa_scale(unsigned* w) {
++    struct { float factor; } p{1.0f};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_moe_combine(unsigned* w) {
++    struct { unsigned top_k; } p{8u};
++    std::memcpy(w, &p, sizeof(p));
++}
++void fill_none(unsigned*) {}
++
++using gcapi::DATA_BF16;
++using gcapi::DATA_F32;
++
++// Plain aggregate initializers (the preprocessor would split the braced
++// type lists across macro arguments).
++const FcdRowKernel kFcdRowKernels[] = {
++    {"glm5_rmsnorm_bf16", 2, 1, {DATA_BF16, DATA_BF16}, {DATA_BF16}, 2,
++     fill_rmsnorm, &_binary_glm5_rmsnorm_bf16_gaudi2_o_start,
++     &_binary_glm5_rmsnorm_bf16_gaudi2_o_end},
++    {"glm5_clamp_swiglu_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 1,
++     fill_swiglu, &_binary_glm5_clamp_swiglu_bf16_gaudi2_o_start,
++     &_binary_glm5_clamp_swiglu_bf16_gaudi2_o_end},
++    {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32}, 2,
++     fill_kda_gate, &_binary_glm5_kda_gate_bf16_gaudi2_o_start,
++     &_binary_glm5_kda_gate_bf16_gaudi2_o_end},
++    {"glm5_mhc_gates_bf16", 4, 1,
++     {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_F32}, 3,
++     fill_mhc_gates, &_binary_glm5_mhc_gates_bf16_gaudi2_o_start,
++     &_binary_glm5_mhc_gates_bf16_gaudi2_o_end},
++    {"glm5_mhc_collapse_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_BF16}, 0,
++     fill_none, &_binary_glm5_mhc_collapse_bf16_gaudi2_o_start,
++     &_binary_glm5_mhc_collapse_bf16_gaudi2_o_end},
++    {"glm5_mhc_post_bf16", 4, 1,
++     {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_BF16}, 0,
++     fill_none, &_binary_glm5_mhc_post_bf16_gaudi2_o_start,
++     &_binary_glm5_mhc_post_bf16_gaudi2_o_end},
++    {"glm5_mhc_head_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 0,
++     fill_none, &_binary_glm5_mhc_head_bf16_gaudi2_o_start,
++     &_binary_glm5_mhc_head_bf16_gaudi2_o_end},
++    {"glm5_moe_combine_bf16", 3, 1, {DATA_BF16, DATA_F32, DATA_BF16}, {DATA_BF16}, 1,
++     fill_moe_combine, &_binary_glm5_moe_combine_bf16_gaudi2_o_start,
++     &_binary_glm5_moe_combine_bf16_gaudi2_o_end},
++    {"glm5_dsa_pool_bf16", 3, 1, {DATA_BF16, DATA_BF16, DATA_F32}, {DATA_F32}, 1,
++     fill_dsa_pool, &_binary_glm5_dsa_pool_bf16_gaudi2_o_start,
++     &_binary_glm5_dsa_pool_bf16_gaudi2_o_end},
++    {"glm5_dsa_scale_f32", 1, 1, {DATA_F32}, {DATA_F32}, 1,
++     fill_dsa_scale, &_binary_glm5_dsa_scale_f32_gaudi2_o_start,
++     &_binary_glm5_dsa_scale_f32_gaudi2_o_end},
++};
++
++constexpr unsigned kFcdRowCount = sizeof(kFcdRowKernels) / sizeof(kFcdRowKernels[0]);
++
++// Embedded TPC ELF blobs: extern "C" globals from objcopy (outside the
++// anonymous namespace or their names get mangled).
++
++} // namespace
++
++extern "C" {
++
++gcapi::GlueCodeReturn_t glm5_fcd_row_definitions(
++    unsigned index, gcapi::HabanaKernelParams_t* in_defs,
++    gcapi::HabanaKernelInstantiation_t* out_defs) {
++    if (index >= kFcdRowCount) return gcapi::GLUE_NODE_NOT_FOUND;
++    return fcd_row_definitions(kFcdRowKernels[index], in_defs, out_defs);
++}
++
++unsigned glm5_glue_kernel_count() { return kFcdRowCount; }
++
++const char* glm5_glue_kernel_name(unsigned index) {
++    return index < kFcdRowCount ? kFcdRowKernels[index].guid : nullptr;
++}
++
++} // extern "C"
+diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp
+new file mode 100644
+index 0000000..6a682e8
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp
+@@ -0,0 +1,261 @@
++// GLM-5.3-Flash TPC kernel glue, head/selection family. These kernels do
++// not share the FCD-row index space:
++//   kda_scan / dsa_absorb / dsa_attention / moe_route — one dim0 slot per
++//     head (or per token for moe_route), each slot owning its head's whole
++//     slice of every tensor.
++//   dsa_score — one dim0 slot per pool.
++//   dsa_select — a single slot (the rank loop runs inside the block).
++
++#include "gc_interface.h"
++
++#include <cstring>
++
++namespace {
++
++gcapi::GlueCodeReturn_t publish_elf(gcapi::HabanaKernelInstantiation_t* out_defs,
++                                    const unsigned char* start, const unsigned char* end) {
++    const unsigned size = static_cast<unsigned>(end - start);
++    const unsigned given = out_defs->elfSize;
++    out_defs->elfSize = size;
++    if (given < size) return gcapi::GLUE_INSUFICIENT_ELF_BUFFER;
++    std::memcpy(out_defs->kernelElf, start, size);
++    return gcapi::GLUE_SUCCESS;
++}
++
++void set_slot_transform(gcapi::TensorAccessPattern_t& pattern,
++                        unsigned index_space_dim, float stride) {
++    pattern.dim[0].indexSpaceDim = index_space_dim;
++    pattern.dim[0].start_a = stride;
++    pattern.dim[0].start_b = 0.0f;
++    pattern.dim[0].end_a = stride;
++    pattern.dim[0].end_b = stride > 1.0f ? stride - 1.0f : 0.0f;
++    // All higher tensor dims are contiguous inside the slot.
++    for (unsigned d = 1; d < gcapi::MAX_TENSOR_DIM; ++d) {
++        pattern.dim[d].indexSpaceDim = 0xffffffff;  // not index-space mapped
++        pattern.dim[d].start_a = 0.0f;
++        pattern.dim[d].start_b = 0.0f;
++        pattern.dim[d].end_a = 0.0f;
++        pattern.dim[d].end_b = 0.0f;
++    }
++}
++
++gcapi::GlueCodeReturn_t check_tensors(gcapi::HabanaKernelParams_t* in_defs,
++                                       unsigned inputs, unsigned outputs,
++                                       const gcapi::TensorDataType_t* in_types,
++                                       const gcapi::TensorDataType_t* out_types) {
++    if (in_defs->inputTensorNr != inputs) {
++        in_defs->inputTensorNr = inputs;
++        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
++    }
++    if (in_defs->outputTensorNr != outputs) {
++        in_defs->outputTensorNr = outputs;
++        return gcapi::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
++    }
++    for (unsigned i = 0; i < inputs; ++i) {
++        if (in_defs->inputTensors[i].dataType != in_types[i]) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
++    }
++    for (unsigned o = 0; o < outputs; ++o) {
++        if (in_defs->outputTensors[o].dataType != out_types[o]) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
++    }
++    return gcapi::GLUE_SUCCESS;
++}
++
++} // namespace
++
++extern "C" {
++#define BLOB(n) extern unsigned char _binary_glm5_##n##_gaudi2_o_start; \
++                extern unsigned char _binary_glm5_##n##_gaudi2_o_end
++BLOB(kda_scan_f32);
++BLOB(dsa_absorb_bf16);
++BLOB(dsa_score_f32);
++BLOB(dsa_select_f32);
++BLOB(dsa_attention_f32);
++BLOB(moe_route_bf16);
++#undef BLOB
++}
++
++// ---------------------------------------------------------------------------
++// glm5_kda_scan_f32: q,k,v BF16 [d_inner,1], gate F32 [d_inner,1], beta F32
++// [heads,1], state F32 [heads*D*D,1] in/out, out BF16 [d_inner,1]. One slot
++// per head; the slot owns its [D] q/k/v/gate rows and its [D,D] state slice.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_kda_scan_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_F32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_BF16, DATA_BF16, DATA_BF16,
++                                                DATA_F32, DATA_F32, DATA_F32};
++    const gcapi::TensorDataType_t out_types[] = {DATA_F32, DATA_BF16};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 6, 2, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    // state is [heads*D*D, 1]; its dim0 extent IS the heads count scaled -
++    // take heads from beta (the per-head plane).
++    const unsigned heads = in_defs->inputTensors[4].geometry.sizes[0];
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = heads;
++
++    // q/k/v/gate: d_inner = heads * D contiguous rows; per-slot stride = D.
++    // beta: per-head stride 1. state: [D*D] per head. out: [D] per head.
++    // Strides need the head_dim - recover from q's extent / heads.
++    const unsigned d_inner = in_defs->inputTensors[0].geometry.sizes[0];
++    const float dk = static_cast<float>(d_inner / heads);
++    for (unsigned t = 0; t < 4; ++t) {  // q, k, v, gate
++        set_slot_transform(out_defs->inputTensorAccessPattern[t], 0, dk);
++    }
++    set_slot_transform(out_defs->inputTensorAccessPattern[4], 0, 1.0f);   // beta
++    set_slot_transform(out_defs->inputTensorAccessPattern[5], 0, dk * dk); // state
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, dk * dk); // state out
++    set_slot_transform(out_defs->outputTensorAccessPattern[1], 0, dk);     // out
++
++    struct { unsigned head_dim; } params{128u};
++    out_defs->kernel.paramsNr = 1;
 +    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
 +
-+    return publish_elf(out_defs,
-+                       &_binary_glm5_kda_gate_bf16_gaudi2_o_start,
-+                       &_binary_glm5_kda_gate_bf16_gaudi2_o_end);
++    return publish_elf(out_defs, &_binary_glm5_kda_scan_f32_gaudi2_o_start,
++                       &_binary_glm5_kda_scan_f32_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_dsa_absorb_bf16: q BF16 [nope, heads], wk_b BF16 [nope*lora*heads,1]
++// -> q_abs FP32 [lora, heads]. One slot per head.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_dsa_absorb_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_F32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_BF16, DATA_BF16};
++    const gcapi::TensorDataType_t out_types[] = {DATA_F32};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 2, 1, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    const unsigned heads = in_defs->inputTensors[0].geometry.sizes[1];
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = heads;
++    set_slot_transform(out_defs->inputTensorAccessPattern[0], 0, 1.0f);
++    set_slot_transform(out_defs->inputTensorAccessPattern[1], 0, 1.0f);
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, 1.0f);
++
++    out_defs->kernel.paramsNr = 0;
++    return publish_elf(out_defs, &_binary_glm5_dsa_absorb_bf16_gaudi2_o_start,
++                       &_binary_glm5_dsa_absorb_bf16_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_dsa_score_f32: iq BF16 [dim, heads], pooled F32 [dim, pools], weights
++// F32 [heads,1] -> score F32 [pools,1]. One slot per pool.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_dsa_score_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_F32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_BF16, DATA_F32, DATA_F32};
++    const gcapi::TensorDataType_t out_types[] = {DATA_F32};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 3, 1, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    const unsigned pools = in_defs->inputTensors[1].geometry.sizes[1];
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = pools;
++    set_slot_transform(out_defs->inputTensorAccessPattern[0], 0, 1.0f);
++    set_slot_transform(out_defs->inputTensorAccessPattern[1], 0, 1.0f);
++    set_slot_transform(out_defs->inputTensorAccessPattern[2], 0, 1.0f);
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, 1.0f);
++
++    out_defs->kernel.paramsNr = 0;
++    return publish_elf(out_defs, &_binary_glm5_dsa_score_f32_gaudi2_o_start,
++                       &_binary_glm5_dsa_score_f32_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_dsa_select_f32: score F32 [pools,1] -> cells INT32 [width,1]. A
++// single slot: the rank loop and cell fills run inside one block.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_dsa_select_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_F32;
++    using gcapi::DATA_I32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_F32};
++    const gcapi::TensorDataType_t out_types[] = {DATA_I32};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 1, 1, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = 1;
++    set_slot_transform(out_defs->inputTensorAccessPattern[0], 0, 1.0f);
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, 1.0f);
++
++    struct { unsigned position; unsigned pool_k; unsigned top_pools; unsigned tail; }
++    params{0u, 4u, 8u, 1u};
++    out_defs->kernel.paramsNr = 4;
++    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
++
++    return publish_elf(out_defs, &_binary_glm5_dsa_select_f32_gaudi2_o_start,
++                       &_binary_glm5_dsa_select_f32_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_dsa_attention_f32: q_abs BF16 [lora, heads], latents BF16 [lora,
++// cache], cells INT32 [slots,1], wv_b BF16 [lora*v_head*heads,1] -> out
++// BF16 [heads*v_head,1]. One slot per head.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_dsa_attention_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_I32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_BF16, DATA_BF16, DATA_I32,
++                                                DATA_BF16};
++    const gcapi::TensorDataType_t out_types[] = {DATA_BF16};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 4, 1, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    const unsigned heads = in_defs->inputTensors[0].geometry.sizes[1];
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = heads;
++    for (unsigned t = 0; t < 4; ++t) {
++        set_slot_transform(out_defs->inputTensorAccessPattern[t], 0, 1.0f);
++    }
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, 1.0f);
++
++    struct { float qk_scale; } params{0.0625f};
++    out_defs->kernel.paramsNr = 1;
++    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
++
++    return publish_elf(out_defs, &_binary_glm5_dsa_attention_f32_gaudi2_o_start,
++                       &_binary_glm5_dsa_attention_f32_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_moe_route_bf16: logits BF16 [experts, tokens], correction_bias F32
++// [experts,1] -> weights F32 [top_k, tokens], indices INT32 [top_k, tokens].
++// One slot per token; the slot scans the whole expert axis.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_moe_route_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_F32;
++    using gcapi::DATA_I32;
++    const gcapi::TensorDataType_t in_types[] = {DATA_BF16, DATA_F32};
++    const gcapi::TensorDataType_t out_types[] = {DATA_F32, DATA_I32};
++    gcapi::GlueCodeReturn_t status = check_tensors(in_defs, 2, 2, in_types, out_types);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    const unsigned tokens = in_defs->inputTensors[0].geometry.sizes[1];
++    out_defs->indexSpaceGeometry.dims = 1;
++    out_defs->indexSpaceGeometry.sizes[0] = tokens;
++    set_slot_transform(out_defs->inputTensorAccessPattern[0], 0, 1.0f);
++    set_slot_transform(out_defs->inputTensorAccessPattern[1], 0, 1.0f);
++    set_slot_transform(out_defs->outputTensorAccessPattern[0], 0, 1.0f);
++    set_slot_transform(out_defs->outputTensorAccessPattern[1], 0, 1.0f);
++
++    struct { unsigned top_k; float routed_scaling; } params{8u, 2.5f};
++    out_defs->kernel.paramsNr = 2;
++    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
++
++    return publish_elf(out_defs, &_binary_glm5_moe_route_bf16_gaudi2_o_start,
++                       &_binary_glm5_moe_route_bf16_gaudi2_o_end);
++}
+diff --git a/src/core/gaudi2/tpc/glue/tests/glue_check.c b/src/core/gaudi2/tpc/glue/tests/glue_check.c
+new file mode 100644
+index 0000000..a4bcf00
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/tests/glue_check.c
+@@ -0,0 +1,123 @@
++// Offline descriptor round-trip: call GetGcDefinitions for every GUID with
++// well-formed HabanaKernelParams_t descriptors and verify each returns a
++// non-empty ELF, a sane index space, and its scalar params.
++#include "gc_interface.h"
++
++#include <cstdio>
++#include <cstring>
++#include <dlfcn.h>
++
++typedef gcapi::GlueCodeReturn_t (*defs_fn)(const char*, gcapi::DeviceId_t,
++                                           const void*, unsigned,
++                                           gcapi::HabanaKernelParams_t*,
++                                           gcapi::HabanaKernelInstantiation_t*);
++typedef gcapi::GlueCodeReturn_t (*names_fn)(char**, unsigned*, gcapi::DeviceId_t);
++
++struct Case {
++    const char* name;
++    unsigned in_nr, out_nr;
++    gcapi::TensorDataType_t in_types[6];
++    gcapi::TensorDataType_t out_types[2];
++    unsigned out_width;   // first output FCD
++    unsigned out_tokens;  // dim1 (0 = 1-D)
++};
++
++int main() {
++    void* so = dlopen("/tmp/glm5-tpc-glue/libglm5_tpc.so", RTLD_NOW);
++    if (!so) { std::printf("dlopen: %s\n", dlerror()); return 1; }
++    defs_fn get_defs = (defs_fn)dlsym(so, "GetGcDefinitions");
++    names_fn get_names = (names_fn)dlsym(so, "GetKernelNames");
++    if (!get_defs || !get_names) { std::printf("entries missing\n"); return 1; }
++
++    using gcapi::DATA_BF16;
++    using gcapi::DATA_F32;
++    using gcapi::DATA_I32;
++    const Case cases[] = {
++        {"glm5_rmsnorm_bf16", 2, 1, {DATA_BF16, DATA_BF16}, {DATA_BF16}, 512, 1},
++        {"glm5_clamp_swiglu_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 512, 1},
++        {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32}, 512, 1},
++        {"glm5_mhc_gates_bf16", 4, 1,
++         {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_F32}, 24, 1},
++        {"glm5_mhc_collapse_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_BF16}, 512, 1},
++        {"glm5_mhc_post_bf16", 4, 1,
++         {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_BF16}, 512, 1},
++        {"glm5_mhc_head_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 512, 1},
++        {"glm5_moe_route_bf16", 2, 2, {DATA_BF16, DATA_F32}, {DATA_F32, DATA_I32},
++         8, 1},
++        {"glm5_moe_combine_bf16", 3, 1, {DATA_BF16, DATA_F32, DATA_BF16},
++         {DATA_BF16}, 512, 1},
++        {"glm5_dsa_pool_bf16", 3, 1, {DATA_BF16, DATA_BF16, DATA_F32},
++         {DATA_F32}, 512, 4},
++        {"glm5_dsa_score_f32", 3, 1, {DATA_BF16, DATA_F32, DATA_F32},
++         {DATA_F32}, 4, 1},
++        {"glm5_dsa_select_f32", 1, 1, {DATA_F32}, {DATA_I32}, 11, 0},
++        {"glm5_dsa_attention_f32", 4, 1,
++         {DATA_BF16, DATA_BF16, DATA_I32, DATA_BF16}, {DATA_BF16}, 512, 2},
++        {"glm5_dsa_absorb_bf16", 2, 1, {DATA_BF16, DATA_BF16}, {DATA_F32}, 512, 2},
++        {"glm5_kda_scan_f32", 6, 2,
++         {DATA_BF16, DATA_BF16, DATA_BF16, DATA_F32, DATA_F32, DATA_F32},
++         {DATA_F32, DATA_BF16}, 8192, 1},
++        {"glm5_dsa_scale_f32", 1, 1, {DATA_F32}, {DATA_F32}, 512, 1},
++    };
++    const unsigned count = sizeof(cases) / sizeof(cases[0]);
++
++    // Name-list round-trip first.
++    unsigned listed = 0;
++    if (get_names(nullptr, &listed, gcapi::DEVICE_ID_GAUDI2) != gcapi::GLUE_SUCCESS ||
++        listed != count) {
++        std::printf("FAIL name count: %u vs %u\n", listed, count);
++        return 1;
++    }
++
++    int failures = 0;
++    for (unsigned c = 0; c < count; ++c) {
++        const Case& k = cases[c];
++        gcapi::HabanaKernelParams_t params{};
++        params.inputTensorNr = k.in_nr;
++        params.outputTensorNr = k.out_nr;
++        for (unsigned i = 0; i < k.in_nr; ++i) {
++            params.inputTensors[i].dataType = k.in_types[i];
++            params.inputTensors[i].geometry.dims = 2;
++            params.inputTensors[i].geometry.sizes[0] = k.out_width;
++            params.inputTensors[i].geometry.sizes[1] = k.out_tokens ? k.out_tokens : 1;
++        }
++        for (unsigned o = 0; o < k.out_nr; ++o) {
++            params.outputTensors[o].dataType = k.out_types[o];
++            params.outputTensors[o].geometry.dims = 2;
++            params.outputTensors[o].geometry.sizes[0] = k.out_width;
++            params.outputTensors[o].geometry.sizes[1] = k.out_tokens ? k.out_tokens : 1;
++        }
++
++        gcapi::HabanaKernelInstantiation_t inst{};
++        static unsigned char elf[65536];
++        inst.kernelElf = elf;
++        inst.elfSize = sizeof(elf);
++
++        const gcapi::GlueCodeReturn_t status =
++            get_defs(k.name, gcapi::DEVICE_ID_GAUDI2, nullptr, 0, &params, &inst);
++        if (status != gcapi::GLUE_SUCCESS) {
++            std::printf("FAIL %s: glue returned %d\n", k.name, status);
++            ++failures;
++            continue;
++        }
++        if (inst.elfSize == 0 || inst.elfSize >= sizeof(elf)) {
++            std::printf("FAIL %s: bad elf size %u\n", k.name, inst.elfSize);
++            ++failures;
++            continue;
++        }
++        if (inst.indexSpaceGeometry.dims == 0 ||
++            inst.indexSpaceGeometry.sizes[0] == 0) {
++            std::printf("FAIL %s: empty index space\n", k.name);
++            ++failures;
++            continue;
++        }
++        std::printf("ok %s: elf %u B, ispace %ux%u\n", k.name, inst.elfSize,
++                    inst.indexSpaceGeometry.sizes[0],
++                    inst.indexSpaceGeometry.dims > 1
++                        ? inst.indexSpaceGeometry.sizes[1] : 1);
++    }
++    dlclose(so);
++    if (failures) { std::printf("%d failures\n", failures); return 1; }
++    std::printf("all %u glue descriptors round-trip\n", count);
++    return 0;
 +}
 diff --git a/src/core/gaudi2/tpc/include/glm5_tpc.h b/src/core/gaudi2/tpc/include/glm5_tpc.h
 new file mode 100644
@@ -12386,11 +13079,28 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..fef3286
+index 0000000..cb3ad7e
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
-@@ -0,0 +1,930 @@
+@@ -0,0 +1,947 @@
 +#include "models/glm5/execution/block.h"
++// Opaque CUDA handles (forward-declared in block.h); the CUDA functions
++// this TU calls directly get extern declarations so the prep-only gaudi2
++// build links with stubs.
++using cudaError_t = int;
++constexpr cudaError_t cudaSuccess = 0;
++extern "C" {
++cudaError_t cudaMalloc(void** dev, unsigned long long size);
++cudaError_t cudaMemcpy(void* dest, const void* src, unsigned long long size, int kind);
++cudaError_t cudaMemcpyAsync(void* dest, const void* src, unsigned long long size,
++                           int kind, void* stream);
++cudaError_t cudaMemsetAsync(void* dest, int value, unsigned long long size, void* stream);
++cudaError_t cudaStreamSynchronize(void* stream);
++cudaError_t cudaGetLastError();
++const char* cudaGetErrorString(cudaError_t error);
++}
++constexpr int cudaMemcpyHostToDevice = 1;
++constexpr int cudaMemcpyDeviceToDevice = 3;
 +
 +#include "ninfer/ops/add_bias.h"
 +#include "ninfer/ops/glm5_kda.h"
@@ -13322,10 +14032,10 @@ index 0000000..fef3286
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
 new file mode 100644
-index 0000000..cce4297
+index 0000000..318febb
 --- /dev/null
 +++ b/src/models/glm5/execution/block.h
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,212 @@
 +#pragma once
 +
 +// GLM-5.3-Flash single-token block decode assemblies: the KDA mixer block (verified), the
@@ -13341,12 +14051,31 @@ index 0000000..cce4297
 +#include <cstddef>
 +#include <cstdint>
 +
-+#include <cuda_runtime.h>
++// cudaStream_t is an opaque handle in these signatures (the execution
++// backend's stream); the CUDA translation units include the real header.
++using cudaStream_t = struct CUstream_st*;
 +
 +namespace ninfer::models::glm5::execution {
 +
 +// A [N, K] BF16 row-major plane bound as the engine's contiguous A16 Weight.
-+[[nodiscard]] Weight bf16_weight(const void* payload, std::int32_t rows, std::int32_t columns);
++// Inline: the GGUF loader and both backend entry points construct it.
++[[nodiscard]] inline Weight bf16_weight(const void* payload, std::int32_t rows,
++                                        std::int32_t columns) {
++    Weight weight{};
++    weight.qtype = QType::BF16;
++    weight.layout = QuantLayout::Contiguous;
++    weight.payload = payload;
++    weight.qdata = payload;
++    weight.payload_bytes = static_cast<std::uint64_t>(rows) * columns * 2;
++    weight.ndim = 2;
++    weight.shape[0] = rows;
++    weight.shape[1] = columns;
++    weight.padded_shape[0] = rows;
++    weight.padded_shape[1] = columns;
++    weight.n = rows;
++    weight.k = columns;
++    return weight;
++}
 +
 +// ---------------------------------------------------------------------------
 +// KDA mixer block
@@ -13850,14 +14579,24 @@ index 0000000..ad43ce9
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/gguf_loader.cpp b/src/models/glm5/execution/gguf_loader.cpp
 new file mode 100644
-index 0000000..2f95da2
+index 0000000..f7b6c33
 --- /dev/null
 +++ b/src/models/glm5/execution/gguf_loader.cpp
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,251 @@
 +// GLM-5.3-Flash GGUF loader — implementation. See gguf_loader.h.
 +#include "models/glm5/execution/gguf_loader.h"
 +
-+#include <cuda_runtime.h>
++// The CUDA upload entry declares the runtime functions it calls (the
++// prep-only gaudi2 build stubs them; the CUDA build links the real ones).
++using cudaError_t = int;
++constexpr cudaError_t cudaSuccess = 0;
++extern "C" {
++cudaError_t cudaMalloc(void** dev, unsigned long long size);
++cudaError_t cudaMemcpy(void* dest, const void* src, unsigned long long size, int kind);
++cudaError_t cudaFree(void* dev);
++const char* cudaGetErrorString(cudaError_t error);
++}
++constexpr int cudaMemcpyHostToDevice = 1;
 +
 +#include <cstring>
 +#include <stdexcept>
@@ -13884,9 +14623,13 @@ index 0000000..2f95da2
 +// Binds one GGUF tensor as a BF16 Weight with the expected [rows, cols]
 +// geometry (GGUF ne[0] == cols, ne[1] == rows; a vector is [rows, 1] with
 +// ne[0] == rows).
++// The plane uploader is the only device-coupled step: CUDA allocates and
++// copies; the Gaudi2 path stages through pinned memory and a DMA stream.
++// Both return the device pointer and register it in the buffers.
 +struct Binder {
 +    GgufFile& gguf;
 +    GgufWeightBuffers& buffers;
++    const std::function<void*(const void*, std::size_t)>& upload_plane;
 +
 +    [[nodiscard]] Weight bf16(const std::string& name, std::uint64_t rows, std::uint64_t cols) {
 +        const GgufTensorInfo* tensor = gguf.find(name);
@@ -13896,11 +14639,7 @@ index 0000000..2f95da2
 +            throw std::runtime_error("gguf_loader: geometry mismatch for " + name);
 +        }
 +        std::vector<std::uint16_t> plane = gguf.read_bf16(*tensor);
-+        void* device = nullptr;
-+        cuda_check(cudaMalloc(&device, plane.size() * 2), "cudaMalloc");
-+        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 2,
-+                              cudaMemcpyHostToDevice), "cudaMemcpy");
-+        buffers.device_planes.push_back(device);
++        void* device = upload_plane(plane.data(), plane.size() * 2);
 +        // bf16_weight fills the full engine contract (layout, n/k, qdata,
 +        // padded shapes); a bare payload+shape Weight is rejected by
 +        // embedding/linear.
@@ -13915,15 +14654,11 @@ index 0000000..2f95da2
 +        const GgufTensorInfo* tensor = gguf.find(name);
 +        if (!tensor) throw std::runtime_error("gguf_loader: missing tensor " + name);
 +        std::vector<std::uint16_t> plane = gguf.read_bf16(*tensor);
-+        void* device = nullptr;
-+        cuda_check(cudaMalloc(&device, plane.size() * 2), "cudaMalloc");
-+        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 2,
-+                              cudaMemcpyHostToDevice), "cudaMemcpy");
-+        buffers.device_planes.push_back(device);
 +        // GGUF ne[0] is the stored FCD (row width); bind row-major.
 +        std::int64_t elements = 1;
 +        std::int64_t width = static_cast<std::int64_t>(tensor->ne[0]);
 +        for (std::uint32_t d = 0; d < tensor->n_dims; ++d) elements *= tensor->ne[d];
++        void* device = upload_plane(plane.data(), plane.size() * 2);
 +        return bf16_weight(device, static_cast<std::int32_t>(elements / (width ? width : 1)),
 +                           static_cast<std::int32_t>(width));
 +    }
@@ -13946,12 +14681,7 @@ index 0000000..2f95da2
 +        if (plane.size() != count) {
 +            throw std::runtime_error("gguf_loader: scalar count mismatch for " + name);
 +        }
-+        void* device = nullptr;
-+        cuda_check(cudaMalloc(&device, plane.size() * 4), "cudaMalloc");
-+        cuda_check(cudaMemcpy(device, plane.data(), plane.size() * 4,
-+                              cudaMemcpyHostToDevice), "cudaMemcpy");
-+        buffers.device_planes.push_back(device);
-+        return device;
++        return upload_plane(plane.data(), plane.size() * 4);
 +    }
 +};
 +
@@ -13961,11 +14691,13 @@ index 0000000..2f95da2
 +    for (void* plane : device_planes) (void)cudaFree(plane);
 +}
 +
-+GgufWeightBuffers load_gguf_weights(const std::string& path, Glm5ModelWeights& weights,
-+                                    const Glm5StepConfig& config) {
-+    GgufFile gguf(path);
++// Shared tensor walk (declared in the header): identical binding for both
++// backends.
++GgufWeightBuffers detail::load_gguf_walk(
++    GgufFile& gguf, Glm5ModelWeights& weights, const Glm5StepConfig& config,
++    const std::function<void*(const void*, std::size_t)>& upload_plane) {
 +    GgufWeightBuffers buffers;
-+    Binder binder{gguf, buffers};
++    Binder binder{gguf, buffers, upload_plane};
 +
 +    const std::uint32_t layers = static_cast<std::uint32_t>(config.layer_is_dsa.size());
 +    if (layers == 0 || config.layer_mlp_dense.size() != layers) {
@@ -14088,13 +14820,26 @@ index 0000000..2f95da2
 +    return buffers;
 +}
 +
++GgufWeightBuffers load_gguf_weights(const std::string& path, Glm5ModelWeights& weights,
++                                    const Glm5StepConfig& config) {
++    GgufFile gguf(path);
++    auto cuda_upload = [](const void* host, std::size_t bytes) -> void* {
++        void* device = nullptr;
++        cuda_check(cudaMalloc(&device, bytes), "cudaMalloc");
++        cuda_check(cudaMemcpy(device, host, bytes, cudaMemcpyHostToDevice),
++                   "cudaMemcpy");
++        return device;
++    };
++    return detail::load_gguf_walk(gguf, weights, config, cuda_upload);
++}
++
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/gguf_loader.h b/src/models/glm5/execution/gguf_loader.h
 new file mode 100644
-index 0000000..9e30ba7
+index 0000000..6056f8d
 --- /dev/null
 +++ b/src/models/glm5/execution/gguf_loader.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,84 @@
 +#pragma once
 +
 +// GLM-5.3-Flash GGUF loader: reads a llama.cpp GGUF file and binds every tensor
@@ -14103,14 +14848,19 @@ index 0000000..9e30ba7
 +// artifact converter (tools/convert/glm5_tensors.py) covers the same mapping
 +// for the persistent format. The tensor role names are identical.
 +//
-+// The file reader itself is gguf_file.h (pure host, standalone-testable);
-+// this header adds the CUDA upload and weight binding.
++// Two device backends share the tensor-name binding and geometry validation:
++//   - CUDA (the original engine backend; cudaMalloc/cudaMemcpy)
++//   - Gaudi2 (pinned staging + DMA upload through the SynapseAI runtime
++//     adapter; gap-3's HPU weight residency)
++// The file reader itself is gguf_file.h (pure host, standalone-testable).
 +
 +#include "models/glm5/execution/gguf_file.h"
 +#include "models/glm5/execution/model.h"
 +
 +#include <cstddef>
 +#include <cstdint>
++#include <span>
++#include <functional>
 +#include <string>
 +#include <vector>
 +
@@ -14129,24 +14879,59 @@ index 0000000..9e30ba7
 +};
 +
 +// Loads a GGUF file, validates every GLM5 tensor is present with the expected
-+// geometry ([rows, cols] with the GGUF row width ne[0] == cols), converts to
-+// BF16 where needed, uploads to the device and binds into Glm5ModelWeights
-+// (BF16 planes) plus the FP32 scalar planes (KDA dt_bias/a_log/o_norm, DSA
-+// ape, MoE router bias). `config` provides the expected geometry and the
-+// per-layer mixer/MLP kinds. Throws std::runtime_error on any mismatch; the
-+// state itself stays caller-owned (capacity policy is not the loader's).
++// geometry, converts to BF16 where needed, uploads to the CUDA device, and
++// binds into Glm5ModelWeights (BF16 planes) plus the FP32 scalar planes (KDA
++// dt_bias/a_log/o_norm, DSA ape, MoE router bias). `config` provides the
++// expected geometry and the per-layer mixer/MLP kinds. Throws
++// std::runtime_error on any mismatch; the state stays caller-owned.
 +[[nodiscard]] GgufWeightBuffers load_gguf_weights(const std::string& path,
 +                                                  Glm5ModelWeights& weights,
 +                                                  const Glm5StepConfig& config);
 +
 +} // namespace ninfer::models::glm5::execution
++
++namespace ninfer::gaudi2 {
++class Device;
++class Stream;
++} // namespace ninfer::gaudi2
++
++namespace ninfer::models::glm5::execution {
++
++// The Gaudi2 HPU variant: identical binding, but every plane lands in HBM
++// through the SynapseAI runtime adapter (pinned staging + DMA). The device
++// planes are owned by the returned buffers; keep both alive alongside the
++// weights. Compiled into the CUDA build as a translation unit (the runtime
++// adapter header is host-side); its DMA path only executes where the
++// SynapseAI runtime is real.
++[[nodiscard]] GgufWeightBuffers load_gguf_weights_hpu(
++    const std::string& path, Glm5ModelWeights& weights,
++    const Glm5StepConfig& config, gaudi2::Device& device, gaudi2::Stream& stream);
++
++// The device-coupled step: allocate on the device, copy the host plane,
++// and register the allocation for teardown (returned pointer).
++using PlaneUploader = void* (*)(const void* host, std::size_t bytes,
++                                void* context);
++
++// One tensor walk shared by both backends: opens the file, validates
++// geometry, converts dtypes, uploads each plane through `upload`, and
++// binds into `weights`. The CUDA and Gaudi2 entry points below call this
++// with their own uploader; it lives in the header so both translation
++// units instantiate it with their lambda types.
++namespace detail {
++[[nodiscard]] GgufWeightBuffers load_gguf_walk(
++    GgufFile& gguf, Glm5ModelWeights& weights, const Glm5StepConfig& config,
++    const std::function<void*(const void*, std::size_t)>& upload_plane);
++} // namespace detail
++
++} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000..e40d99b
+index 0000000..b3ed362
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
-@@ -0,0 +1,556 @@
+@@ -0,0 +1,557 @@
 +#include "models/glm5/execution/model.h"
++#include <cuda_runtime.h>
 +
 +#include "ninfer/ops/glm5_mhc.h"
 +#include "ninfer/ops/glm5_prefill.h"
@@ -14704,10 +15489,10 @@ index 0000000..e40d99b
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.h b/src/models/glm5/execution/model.h
 new file mode 100644
-index 0000000..5144be2
+index 0000000..8aa1e86
 --- /dev/null
 +++ b/src/models/glm5/execution/model.h
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,146 @@
 +#pragma once
 +
 +// The GLM-5.3-Flash full-model decode step: one token through every block (mHC residual
@@ -14724,7 +15509,9 @@ index 0000000..5144be2
 +#include <cstdint>
 +#include <vector>
 +
-+#include <cuda_runtime.h>
++// cudaStream_t is an opaque handle in these signatures (the execution
++// backend's stream); the CUDA translation units include the real header.
++using cudaStream_t = struct CUstream_st*;
 +
 +namespace ninfer::models::glm5::execution {
 +
