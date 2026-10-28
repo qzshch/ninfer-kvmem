@@ -3478,10 +3478,10 @@ index 0000000..adb77ed
 +}
 diff --git a/src/core/gaudi2/glm5_hpu_block.cpp b/src/core/gaudi2/glm5_hpu_block.cpp
 new file mode 100644
-index 0000000..e7339d6
+index 0000000..d909c17
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_block.cpp
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,399 @@
 +#include "core/gaudi2/glm5_hpu_block.h"
 +#include "ops/gaudi2/bf16_gemm.h"
 +
@@ -3610,8 +3610,29 @@ index 0000000..e7339d6
 +           d_inner * d_inner * config.heads * 4 + 1024;
 +}
 +
++Glm5KdaHpuProjections::Glm5KdaHpuProjections(const Device& device,
++                                               const Glm5KdaHpuConfig& config,
++                                               std::size_t max_workspace_bytes)
++    // Bf16Gemm computes Y[1,N] = A[1,K] * W[N,K]^T and the block weights are
++    // stored [out, in] = [N, K], so every projection binds directly.
++    : wq{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden}, max_workspace_bytes},
++      wk{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden}, max_workspace_bytes},
++      wv{device, Bf16GemmShape{1, config.heads * config.head_dim, config.hidden}, max_workspace_bytes},
++      f_a{device, Bf16GemmShape{1, config.head_dim, config.hidden}, max_workspace_bytes},
++      g_a{device, Bf16GemmShape{1, config.head_dim, config.hidden}, max_workspace_bytes},
++      f_b{device, Bf16GemmShape{1, config.heads * config.head_dim, config.head_dim}, max_workspace_bytes},
++      g_b{device, Bf16GemmShape{1, config.heads * config.head_dim, config.head_dim}, max_workspace_bytes},
++      beta{device, Bf16GemmShape{1, config.heads, config.hidden}, max_workspace_bytes},
++      wo{device, Bf16GemmShape{1, config.hidden, config.heads * config.head_dim}, max_workspace_bytes} {}
++
++Glm5KdaHpuProjections glm5_kda_hpu_make_projections(const Device& device,
++                                                    const Glm5KdaHpuConfig& config,
++                                                    std::size_t max_workspace_bytes) {
++    return Glm5KdaHpuProjections{device, config, max_workspace_bytes};
++}
++
 +std::vector<std::uint16_t> glm5_kda_hpu_decode_step(
-+    const Device& device, Stream& stream, Bf16Gemm& gemm,
++    const Device& device, Stream& stream, Glm5KdaHpuProjections& projections,
 +    const Glm5KdaHpuWeights& w, Glm5KdaHpuState& state,
 +    const Glm5KdaHpuConfig& config,
 +    std::span<const std::uint16_t> hidden_in) {
@@ -3658,60 +3679,39 @@ index 0000000..e7339d6
 +        }
 +    }
 +
-+    // ---- Stage 2: Three projections on MME ----
-+    auto project = [&](const DeviceBuffer& weight, std::uint32_t out_rows) {
-+        // Upload input as BF16, run GEMM, download result.
-+        PinnedBuffer host_in = device.allocate_host(hidden * 2);
-+        PinnedBuffer host_out = device.allocate_host(out_rows * 2);
-+        DeviceBuffer dev_in = device.allocate_device(hidden * 2);
-+        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
-+        // Round x to BF16 words.
-+        std::vector<std::uint16_t> x_bf16(hidden);
-+        for (std::uint32_t i = 0; i < hidden; ++i) {
-+            x_bf16[i] = float_to_bf16_word(x[i]);
++    // ---- Stage 2: every projection on the MME ----
++    // device_project: upload the FP32 operand rounded to BF16, run this
++    // projection's static recipe against its pre-uploaded weight plane,
++    // download the BF16 result widened to FP32.
++    auto device_project = [&](Bf16Gemm& gemm, const DeviceBuffer& weight,
++                              const std::vector<float>& input,
++                              std::uint32_t in_cols) {
++        const std::uint32_t out_rows = static_cast<std::uint32_t>(gemm.shape().n);
++        PinnedBuffer host_in = device.allocate_host(in_cols * 2);
++        for (std::uint32_t i = 0; i < in_cols; ++i) {
++            const auto word = float_to_bf16_word(input[i]);
++            std::memcpy(host_in.bytes().data() + i * 2, &word, 2);
 +        }
-+        std::memcpy(host_in.bytes().data(), x_bf16.data(), hidden * 2);
-+        auto up = stream.upload(dev_in, host_in, hidden * 2);
++        PinnedBuffer host_out = device.allocate_host(out_rows * 2);
++        DeviceBuffer dev_in = device.allocate_device(in_cols * 2);
++        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
++        auto up = stream.upload(dev_in, host_in, in_cols * 2);
 +        up.wait();
 +        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight), dev_out);
 +        compute.wait();
 +        auto down = stream.download(host_out, dev_out, out_rows * 2);
 +        down.wait();
-+        std::vector<std::uint16_t> result(out_rows);
-+        std::memcpy(result.data(), host_out.bytes().data(), out_rows * 2);
-+        return result;
-+    };
-+
-+    // NOTE: Bf16Gemm computes Y[M,N] = A[M,K] * W[N,K]^T.
-+    // For a linear y = W @ x with W [out, in], we need:
-+    //   A = x as [M=1, K=in], W = weight as [N=out, K=in].
-+    // The gemm was constructed with a fixed shape; we assume it matches this block.
-+    // For now, the projections are done on host to avoid the shape mismatch
-+    // (each projection has a different [N,K] and would need its own Bf16Gemm).
-+    // This is the "correctness first" path: the MME path composes once the
-+    // per-shape Bf16Gemm instances are constructed.
-+    auto gemv_bf16 = [&](const DeviceBuffer& weight, std::uint32_t out_rows,
-+                         std::uint32_t in_cols) {
-+        // Download the weight, do the GEMV on host in FP32.
-+        PinnedBuffer host_w = device.allocate_host(static_cast<std::size_t>(out_rows) * in_cols * 2);
-+        auto dl = stream.download(host_w, const_cast<DeviceBuffer&>(weight),
-+                                  static_cast<std::size_t>(out_rows) * in_cols * 2);
-+        dl.wait();
-+        std::vector<float> result(out_rows, 0.0f);
-+        const auto* wf = reinterpret_cast<const std::uint16_t*>(host_w.bytes().data());
++        std::vector<float> result(out_rows);
++        const auto* words = reinterpret_cast<const std::uint16_t*>(host_out.bytes().data());
 +        for (std::uint32_t r = 0; r < out_rows; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < in_cols; ++c) {
-+                acc += bf16_word_to_float(wf[static_cast<std::size_t>(r) * in_cols + c]) * x[c];
-+            }
-+            result[r] = acc;
++            result[r] = bf16_word_to_float(words[r]);
 +        }
 +        return result;
 +    };
 +
-+    std::vector<float> q_raw = gemv_bf16(w.wq, d_inner, hidden);
-+    std::vector<float> k_raw = gemv_bf16(w.wk, d_inner, hidden);
-+    std::vector<float> v_raw = gemv_bf16(w.wv, d_inner, hidden);
++    std::vector<float> q_raw = device_project(projections.wq, w.wq, x, hidden);
++    std::vector<float> k_raw = device_project(projections.wk, w.wk, x, hidden);
++    std::vector<float> v_raw = device_project(projections.wv, w.wv, x, hidden);
 +
 +    // ---- Stage 3: Conv + SiLU on host ----
 +    auto conv_silu = [&](std::vector<float>& raw, const std::vector<float>& conv_w,
@@ -3755,34 +3755,13 @@ index 0000000..e7339d6
 +    std::vector<float> kc = conv_silu(k_raw, w.conv_k, state.conv_k);
 +    std::vector<float> vc = conv_silu(v_raw, w.conv_v, state.conv_v);
 +
-+    // ---- Stage 4: Gate + beta on host ----
-+    std::vector<float> f_a_out(head_dim);
-+    {
-+        // Project through f_a.
-+        PinnedBuffer host_fa = device.allocate_host(head_dim * hidden * 2);
-+        auto dl = stream.download(host_fa, const_cast<DeviceBuffer&>(w.f_a), head_dim * hidden * 2);
-+        dl.wait();
-+        const auto* fa = reinterpret_cast<const std::uint16_t*>(host_fa.bytes().data());
-+        for (std::uint32_t r = 0; r < head_dim; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < hidden; ++c) {
-+                acc += bf16_word_to_float(fa[static_cast<std::size_t>(r) * hidden + c]) * x[c];
-+            }
-+            f_a_out[r] = acc;
-+        }
-+    }
++    // ---- Stage 4: gate chain projections on the MME, gates on host ----
++    const std::vector<float> f_a_out = device_project(projections.f_a, w.f_a, x, hidden);
 +    std::vector<float> gate_pre(d_inner);
 +    {
-+        PinnedBuffer host_fb = device.allocate_host(d_inner * head_dim * 2);
-+        auto dl = stream.download(host_fb, const_cast<DeviceBuffer&>(w.f_b), d_inner * head_dim * 2);
-+        dl.wait();
-+        const auto* fb = reinterpret_cast<const std::uint16_t*>(host_fb.bytes().data());
++        const std::vector<float> f_b_out = device_project(projections.f_b, w.f_b, f_a_out, head_dim);
 +        for (std::uint32_t r = 0; r < d_inner; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < head_dim; ++c) {
-+                acc += bf16_word_to_float(fb[static_cast<std::size_t>(r) * head_dim + c]) * f_a_out[c];
-+            }
-+            gate_pre[r] = acc + w.dt_bias[r];
++            gate_pre[r] = f_b_out[r] + w.dt_bias[r];
 +        }
 +    }
 +    std::vector<float> gate(d_inner);
@@ -3793,16 +3772,9 @@ index 0000000..e7339d6
 +    }
 +    std::vector<float> beta(heads);
 +    {
-+        PinnedBuffer host_beta = device.allocate_host(heads * hidden * 2);
-+        auto dl = stream.download(host_beta, const_cast<DeviceBuffer&>(w.beta), heads * hidden * 2);
-+        dl.wait();
-+        const auto* bp = reinterpret_cast<const std::uint16_t*>(host_beta.bytes().data());
++        const std::vector<float> beta_logits = device_project(projections.beta, w.beta, x, hidden);
 +        for (std::uint32_t r = 0; r < heads; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < hidden; ++c) {
-+                acc += bf16_word_to_float(bp[static_cast<std::size_t>(r) * hidden + c]) * x[c];
-+            }
-+            beta[r] = sigmoid(acc);
++            beta[r] = sigmoid(beta_logits[r]);
 +        }
 +    }
 +
@@ -3879,35 +3851,9 @@ index 0000000..e7339d6
 +        up.wait();
 +    }
 +
-+    // ---- Stage 6: Output gate on host ----
-+    std::vector<float> g_a_out(head_dim);
-+    {
-+        PinnedBuffer host_ga = device.allocate_host(head_dim * hidden * 2);
-+        auto dl = stream.download(host_ga, const_cast<DeviceBuffer&>(w.g_a), head_dim * hidden * 2);
-+        dl.wait();
-+        const auto* ga = reinterpret_cast<const std::uint16_t*>(host_ga.bytes().data());
-+        for (std::uint32_t r = 0; r < head_dim; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < hidden; ++c) {
-+                acc += bf16_word_to_float(ga[static_cast<std::size_t>(r) * hidden + c]) * x[c];
-+            }
-+            g_a_out[r] = acc;
-+        }
-+    }
-+    std::vector<float> g2(d_inner);
-+    {
-+        PinnedBuffer host_gb = device.allocate_host(d_inner * head_dim * 2);
-+        auto dl = stream.download(host_gb, const_cast<DeviceBuffer&>(w.g_b), d_inner * head_dim * 2);
-+        dl.wait();
-+        const auto* gb = reinterpret_cast<const std::uint16_t*>(host_gb.bytes().data());
-+        for (std::uint32_t r = 0; r < d_inner; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < head_dim; ++c) {
-+                acc += bf16_word_to_float(gb[static_cast<std::size_t>(r) * head_dim + c]) * g_a_out[c];
-+            }
-+            g2[r] = acc;
-+        }
-+    }
++    // ---- Stage 6: output-gate projections on the MME, gating on host ----
++    const std::vector<float> g_a_out = device_project(projections.g_a, w.g_a, x, hidden);
++    const std::vector<float> g2 = device_project(projections.g_b, w.g_b, g_a_out, head_dim);
 +    std::vector<float> gated(d_inner);
 +    for (std::uint32_t h = 0; h < heads; ++h) {
 +        float mean = 0;
@@ -3923,21 +3869,8 @@ index 0000000..e7339d6
 +        }
 +    }
 +
-+    // ---- Stage 7: wo projection ----
-+    std::vector<float> block_out(hidden);
-+    {
-+        PinnedBuffer host_wo = device.allocate_host(hidden * d_inner * 2);
-+        auto dl = stream.download(host_wo, const_cast<DeviceBuffer&>(w.wo), hidden * d_inner * 2);
-+        dl.wait();
-+        const auto* wop = reinterpret_cast<const std::uint16_t*>(host_wo.bytes().data());
-+        for (std::uint32_t r = 0; r < hidden; ++r) {
-+            float acc = 0;
-+            for (std::uint32_t c = 0; c < d_inner; ++c) {
-+                acc += bf16_word_to_float(wop[static_cast<std::size_t>(r) * d_inner + c]) * gated[c];
-+            }
-+            block_out[r] = acc;
-+        }
-+    }
++    // ---- Stage 7: wo projection on the MME ----
++    const std::vector<float> block_out = device_project(projections.wo, w.wo, gated, d_inner);
 +
 +    // Round to BF16.
 +    std::vector<std::uint16_t> result(hidden);
@@ -3950,10 +3883,10 @@ index 0000000..e7339d6
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_block.h b/src/core/gaudi2/glm5_hpu_block.h
 new file mode 100644
-index 0000000..9fb965b
+index 0000000..97e46a1
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_block.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,104 @@
 +#pragma once
 +// GLM-5.3-Flash block execution on the Gaudi2 SynapseAI runtime adapter.
 +//
@@ -3968,6 +3901,7 @@ index 0000000..9fb965b
 +// contract.
 +
 +#include "core/gaudi2/runtime.h"
++#include "ops/gaudi2/bf16_gemm.h"
 +#include "core/gaudi2/block_fp8.h"
 +
 +#include <cstddef>
@@ -4028,8 +3962,26 @@ index 0000000..9fb965b
 +// projections (MME) -> conv+SiLU (host) -> gate (host) -> delta recurrence
 +// (host) -> output gate (host) -> wo (MME). Returns the block output
 +// [hidden] BF16 words. All device traffic uses the runtime's DMA leases.
++// One static Bf16Gemm recipe per distinct projection shape: every matrix
++// multiply in the block runs on the MME (the early host-GEMV bridge is
++// gone). Recipes compile once per block instance.
++struct Glm5KdaHpuProjections {
++    Bf16Gemm wq, wk, wv;        // [1, d_inner, hidden]
++    Bf16Gemm f_a, g_a;          // [1, head_dim, hidden]
++    Bf16Gemm f_b, g_b;          // [1, d_inner, head_dim]
++    Bf16Gemm beta;              // [1, heads, hidden]
++    Bf16Gemm wo;                // [1, hidden, d_inner]
++
++    Glm5KdaHpuProjections(const Device& device, const Glm5KdaHpuConfig& config,
++                          std::size_t max_workspace_bytes);
++};
++
++[[nodiscard]] Glm5KdaHpuProjections glm5_kda_hpu_make_projections(
++    const Device& device, const Glm5KdaHpuConfig& config,
++    std::size_t max_workspace_bytes = 4096);
++
 +[[nodiscard]] std::vector<std::uint16_t> glm5_kda_hpu_decode_step(
-+    const Device& device, Stream& stream, Bf16Gemm& gemm,
++    const Device& device, Stream& stream, Glm5KdaHpuProjections& projections,
 +    const Glm5KdaHpuWeights& w, Glm5KdaHpuState& state,
 +    const Glm5KdaHpuConfig& config,
 +    std::span<const std::uint16_t> hidden_in);
@@ -5543,10 +5495,10 @@ index 0000000..6d444a4
 +}
 diff --git a/src/core/gaudi2/tests/glm5_hpu_block_test.cpp b/src/core/gaudi2/tests/glm5_hpu_block_test.cpp
 new file mode 100644
-index 0000000..066517b
+index 0000000..8d0854b
 --- /dev/null
 +++ b/src/core/gaudi2/tests/glm5_hpu_block_test.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,132 @@
 +// GLM-5.3-Flash KDA block on the Gaudi2 runtime adapter, against the fake_synapse
 +// asynchronous test double. The elementwise work runs on host between device
 +// allocations and GEMM launches; this validates the resource ownership model
@@ -5636,15 +5588,14 @@ index 0000000..066517b
 +    {
 +        Device device;
 +        auto stream = device.create_stream();
-+        Bf16GemmShape gemm_shape{1, DI, H};
-+        Bf16Gemm gemm(device, gemm_shape, 4096);
++        Glm5KdaHpuProjections projections = glm5_kda_hpu_make_projections(device, config);
 +
 +        auto weights = glm5_kda_hpu_upload_weights(
 +            device, attn_norm, wq, wk, wv, f_a, f_b, beta_w, g_a, g_b, wo,
 +            dt_bias, a_log, o_norm, conv_q, conv_k, conv_v);
 +        auto state = glm5_kda_hpu_init_state(device, config);
 +
-+        result = glm5_kda_hpu_decode_step(device, stream, gemm, weights, state,
++        result = glm5_kda_hpu_decode_step(device, stream, projections, weights, state,
 +                                          config, hidden_in);
 +        require(result.size() == H, "output size");
 +        for (std::uint32_t i = 0; i < H; ++i) {
@@ -5654,7 +5605,7 @@ index 0000000..066517b
 +        std::vector<float> hidden2_f(H);
 +        for (std::uint32_t i = 0; i < H; ++i) { hidden2_f[i] = source(i * 7 + 1) / 3; }
 +        auto hidden2 = round_bf16(hidden2_f);
-+        result2 = glm5_kda_hpu_decode_step(device, stream, gemm, weights, state,
++        result2 = glm5_kda_hpu_decode_step(device, stream, projections, weights, state,
 +                                           config, hidden2);
 +    }
 +    // All device resources released by the scope above.
@@ -6831,6 +6782,1512 @@ index 0000000..ece5ca1
 +}
 +
 +} // namespace ninfer::gaudi2::tpc
+diff --git a/src/core/gaudi2/tpc/glue/README.md b/src/core/gaudi2/tpc/glue/README.md
+new file mode 100644
+index 0000000..ae46497
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/README.md
+@@ -0,0 +1,58 @@
++# GLM-5.3-Flash TPC kernel library glue (SynapseAI GC channel)
++
++This directory is the bridge that turns the TPC-C kernels in `../kernels/`
++into loadable SynapseAI custom kernels: the GC (Graph Compiler) calls into a
++host shared library at graph-build time to fetch each kernel's ELF, its index
++space, access patterns, and scalar parameters. The layout follows Intel's
++Habana_Custom_Kernel template (BSD-3):
++
++```
++glue/
++  include/            # vendored SDK headers (gc_interface.h etc.) - see below
++  src/glm5_tpc_glue.cpp   # one glue class per kernel GUID
++  entry_points.cpp    # GetKernelGuids / InstantiateTpcKernel exports
++  build_glue.sh       # offline build: tpc-clang -> objcopy blob -> .so
++```
++
++## Channel
++
++- **Old interface** (`GetKernelNames` / `GetGcDefinitions`): the glue class
++  validates tensor count/dtypes, defines the index-space geometry and the
++  per-dimension affine access patterns `f(i) = a*i + b` that map index space
++  to tensor elements, packs the scalar params struct, and memcpy's the
++  kernel ELF (embedded via `objcopy -I binary`) into the descriptor.
++- **New interface** (`tpc_kernel_lib_interface.h`): `GetKernelGuids` /
++  `InstantiateTpcKernel` wrap the same definitions.
++
++Both land in one `libglm5_tpc.so`; `synInitialize`-time loading of that
++library (via `LD_PRELOAD` or the SynapseAI kernel-lib registry) makes the
++GUIDs below resolvable by `synNodeCreateWithId`.
++
++## GUIDs and index spaces (production shapes)
++
++| GUID | Kernel | Index space | Mapping |
++|---|---|---|---|
++| `glm5_rmsnorm_bf16` | rmsnorm | {D/128 (rounded), T} | all-simd dim0, token dim1 |
++| `glm5_kda_gate_bf16` | kda gate | {D/128, T} | as rmsnorm; scalars lb, head_dim |
++
++The remaining fourteen kernels follow the same two patterns (FCD-split row
++kernels) or the head/selection shapes documented in `../kernels/README.md`;
++each gets its glue class as it is brought up on hardware.
++
++## Offline build (WSL, no Gaudi2 required)
++
++```
++bash build_glue.sh
++```
++
++compiles every kernel with `tpc-clang -march=gaudi2`, wraps each ELF with
++`objcopy -I binary` (the `_binary__..._start/end` symbols), and links the
++glue + entry points into `libglm5_tpc.so`. The .so needs a SynapseAI
++runtime to actually load (graph build invokes it); offline we verify the
++exports and the ELF blob sizes.
++
++## Vendored headers
++
++`gc_interface.h` and `tpc_kernel_lib_interface.h` come from the
++`habanatools` package (Habana vault, BSD-3 licensed SDK tools). They are
++API surface, not runtime code.
+diff --git a/src/core/gaudi2/tpc/glue/build_glue.sh b/src/core/gaudi2/tpc/glue/build_glue.sh
+new file mode 100644
+index 0000000..edbb9d5
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/build_glue.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++# Offline build of the GLM TPC kernel library: compile the kernels with
++# tpc-clang, objcopy-wrap each ELF into an x86 linkable blob, and link the
++# glue + entry points into libglm5_tpc.so. No Gaudi2 device required - the
++# .so only needs SynapseAI at graph-build time.
++set -eu
++HERE="$(cd "$(dirname "$0")" && pwd)"
++OUT="${1:-/tmp/glm5-tpc-glue}"
++GC="${TPC_CLANG:-$HOME/tpc-sdk/extract/opt/habanalabs/bin/tpc-clang}"
++TOOLS="${HABANATOOLS_ROOT:-$HOME/tpc-sdk/tools/usr/lib/habanatools}"
++rm -rf "$OUT" && mkdir -p "$OUT"
++
++# objcopy derives blob symbols from the input file path; run it on a bare
++# filename inside the out dir so they land at
++# _binary_glm5_<k>_gaudi2_o_start/_end (matching glm5_tpc_glue.cpp).
++cd "$OUT"
++for k in rmsnorm_bf16 kda_gate_bf16; do
++    "$GC" -march=gaudi2 -c "$HERE/../kernels/glm5_${k}_gaudi2.c" -o "glm5_${k}_gaudi2.o"
++    objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
++        "glm5_${k}_gaudi2.o" "_glm5_${k}_gaudi2.o"
++done
++
++g++ -std=c++17 -shared -fPIC -Wl,-z,noexecstack \
++    -I"$HERE/include" \
++    "$HERE/src/glm5_tpc_glue.cpp" "$HERE/entry_points.cpp" \
++    "$OUT/_glm5_rmsnorm_bf16_gaudi2.o" "$OUT/_glm5_kda_gate_bf16_gaudi2.o" \
++    -o "$OUT/libglm5_tpc.so"
++
++# Offline verification: the GC entry points export and the blob symbols link.
++nm -D "$OUT/libglm5_tpc.so" | grep -E 'GetKernelNames|GetGcDefinitions|GetKernelGuids'
++if nm "$OUT/libglm5_tpc.so" | grep -q ' U _binary'; then
++    echo "unresolved blob symbols" >&2; exit 1
++fi
++echo "== libglm5_tpc.so built =="
+diff --git a/src/core/gaudi2/tpc/glue/entry_points.cpp b/src/core/gaudi2/tpc/glue/entry_points.cpp
+new file mode 100644
+index 0000000..106e280
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/entry_points.cpp
+@@ -0,0 +1,99 @@
++// GLM-5.3-Flash TPC kernel library entry points. The GC queries these
++// exports when the shared library is registered; each GUID dispatches to
++// its glue definitions. Adding a kernel = one extern blob pair, one
++// definitions function, one row here and in the two tables.
++
++#include "gc_interface.h"
++#include "tpc_kernel_lib_interface.h"
++
++#include <cstdint>
++#include <cstring>
++
++// The glue definitions live in glm5_tpc_glue.cpp.
++extern "C" {
++gcapi::GlueCodeReturn_t glm5_rmsnorm_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++gcapi::GlueCodeReturn_t glm5_kda_gate_get_gc_definitions(
++    gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*);
++}
++
++namespace {
++const char* const kKernelNames[] = {
++    "glm5_rmsnorm_bf16",
++    "glm5_kda_gate_bf16",
++};
++constexpr unsigned kKernelCount = sizeof(kKernelNames) / sizeof(kKernelNames[0]);
++
++using DefinitionsFn = gcapi::GlueCodeReturn_t (*)(gcapi::HabanaKernelParams_t*,
++                                                  gcapi::HabanaKernelInstantiation_t*);
++const DefinitionsFn kDefinitions[] = {
++    &glm5_rmsnorm_get_gc_definitions,
++    &glm5_kda_gate_get_gc_definitions,
++};
++static_assert(sizeof(kDefinitions) / sizeof(kDefinitions[0]) == kKernelCount);
++} // namespace
++
++extern "C" {
++
++// Old-style GC entry: name list + per-name definitions.
++gcapi::GlueCodeReturn_t GetKernelNames(_OUT_ char** names, unsigned* kernel_count,
++                                        gcapi::DeviceId_t device_id) {
++    if (device_id != gcapi::DEVICE_ID_GAUDI2) {
++        return gcapi::GLUE_NODE_NOT_FOUND;
++    }
++    if (names != nullptr) {
++        for (unsigned i = 0; i < kKernelCount; ++i) {
++            std::strncpy(names[i], kKernelNames[i], gcapi::MAX_NODE_NAME - 1);
++            names[i][gcapi::MAX_NODE_NAME - 1] = '\0';
++        }
++    }
++    if (kernel_count != nullptr) *kernel_count = kKernelCount;
++    return gcapi::GLUE_SUCCESS;
++}
++
++gcapi::GlueCodeReturn_t GetGcDefinitions(_IN_ const char* name,
++                                         _IN_ gcapi::DeviceId_t device_id,
++                                         _IN_ const gcapi::UserParams_t user_params,
++                                         _IN_ unsigned params_size,
++                                         _IN_ gcapi::HabanaKernelParams_t* in_defs,
++                                         _OUT_ gcapi::HabanaKernelInstantiation_t* out_defs) {
++    if (device_id != gcapi::DEVICE_ID_GAUDI2) {
++        return gcapi::GLUE_NODE_NOT_FOUND;
++    }
++    for (unsigned i = 0; i < kKernelCount; ++i) {
++        if (std::strcmp(name, kKernelNames[i]) == 0) {
++            return kDefinitions[i](in_defs, out_defs);
++        }
++    }
++    (void)user_params;
++    (void)params_size;
++    return gcapi::GLUE_NODE_NOT_FOUND;
++}
++
++// New-style kernel-library entry: GUID registration (nameHash left zero -
++// it is a perf-lib cache key, not a functional field).
++tpc_lib_api::GlueCodeReturn GetKernelGuids(_IN_ tpc_lib_api::DeviceId device_id,
++                                            _INOUT_ std::uint32_t* kernel_count,
++                                            _OUT_ tpc_lib_api::GuidInfo* guids) {
++    namespace api = tpc_lib_api;
++    if (device_id != api::DEVICE_ID_GAUDI2) {
++        return api::GLUE_NODE_NOT_FOUND;
++    }
++    if (kernel_count == nullptr) return api::GLUE_FAILED;
++    if (*kernel_count == 0) {
++        *kernel_count = kKernelCount;
++        return api::GLUE_SUCCESS;
++    }
++    if (*kernel_count < kKernelCount || guids == nullptr) {
++        *kernel_count = kKernelCount;
++        return api::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
++    }
++    for (unsigned i = 0; i < kKernelCount; ++i) {
++        std::memset(&guids[i], 0, sizeof(tpc_lib_api::GuidInfo));
++        std::strncpy(guids[i].name, kKernelNames[i], tpc_lib_api::MAX_NODE_NAME - 1);
++    }
++    *kernel_count = kKernelCount;
++    return api::GLUE_SUCCESS;
++}
++
++} // extern "C"
+diff --git a/src/core/gaudi2/tpc/glue/include/gc_interface.h b/src/core/gaudi2/tpc/glue/include/gc_interface.h
+new file mode 100644
+index 0000000..2cc5e28
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/include/gc_interface.h
+@@ -0,0 +1,596 @@
++/*****************************************************************************
++* Copyright (C) 2018 HabanaLabs, Ltd.
++* All Rights Reserved.
++*
++* Unauthorized copying of this file, via any medium is strictly prohibited.
++* Proprietary and confidential.
++*
++* Authors:
++* Tzachi Cohen <tcohen@habana.ai>
++* Doron Singer <dsinger@habana.ai>
++******************************************************************************
++*/
++
++#ifndef GRAPH_COMPILER_INTERFACE_H
++#define GRAPH_COMPILER_INTERFACE_H
++
++#include <stdint.h>
++
++#define _IN_
++#define _INOUT_
++#define _OUT_
++
++/* name of function entry points */
++#define KERNEL_NAMES_ENTRY_POINT_NAME "GetKernelNames"
++#define KERNEL_NAMES_SUPPORTING_DYNAMIC_SHAPES_ENTRY_POINT_NAME "GetKernelSupportingDynamicShapeNames"
++#define KERNEL_QUERY_ENTRY_POINT_NAME "HabanaKernel"
++#define KERNEL_QUERY_SUPPORTING_DYNAMIC_SHAPES_ENTRY_POINT_NAME "HabanaKernelV2"
++
++namespace gcapi
++{
++
++static const unsigned MAX_TENSORS_GOYA       = 8;
++static const unsigned MAX_TENSORS_GAUDI      = 16;
++
++static const unsigned MAX_TENSOR_NR            = MAX_TENSORS_GAUDI;
++static const unsigned MAX_TENSOR_DIM           = 5;
++static const unsigned MAX_HABANA_DIM           = 25; // same as synapse HABANA_DIM_MAX
++static const unsigned MAX_TENSORS_PARAMS_NR    = 32; /* number of scalar parameters passed to TPC program */
++static const unsigned MAX_NODE_NAME            = 64;
++static const unsigned MAX_HABANA_NODE_NAME     = 512;
++static const unsigned MAX_USER_PARAMS_SIZE     = 128;
++typedef void*       UserParams_t;
++
++typedef enum _DeviceId_t
++{
++    DEVICE_ID_DALI              = 0 ,
++    DEVICE_ID_GOYA              = 0 ,
++    DEVICE_ID_GAUDI             = 1 ,
++    DEVICE_ID_GAUDI2            = 3 ,
++    DEVICE_ID_GAUDI3            = 5 ,
++    // MUST BE LAST
++    DEVICE_ID_MAX               = 6
++} DeviceId_t;
++
++typedef enum _GlueCodeReturn_t
++{
++    GLUE_SUCCESS                            = 0 ,
++    GLUE_NODE_NOT_FOUND                     = 1 ,
++    GLUE_INSUFICIENT_ISA_BUFFER             = 2 ,
++    GLUE_INCOMPATIBLE_INPUT_COUNT           = 3 ,
++    GLUE_INCOMPATIBLE_INPUT_SIZE            = 4 ,
++    GLUE_INCOMPATIBLE_OUTPUT_COUNT          = 5 ,
++    GLUE_INCOMPATIBLE_OUTPUT_SIZE           = 6 ,
++    GLUE_INCOMPATIBLE_DATA_TYPE             = 7 ,
++    GLUE_UNSUPPORTED_LAYER_CONFIGURATION    = 8 ,
++    GLUE_INSUFICIENT_AUX_BUFFER_SIZE        = 9 ,
++    GLUE_UNSUPPORTED_QUANT_PARAMS           = 10,
++    GLUE_UNSUPPORTED_BROADCAST_MODE         = 11,
++    GLUE_UNSUPPORTED_API_VERSION            = 12,
++    GLUE_NON_STATIC_INPUT_TENSOR            = 13,
++    GLUE_KERNEL_REQUIRE_REDUCIBLE_TENSOR    = 14,
++    GLUE_KERNEL_REQUIRE_CONTIGUOUS_TENSOR   = 15,
++    GLUE_KERNEL_INVALID_SCALAR_ARGUMENT     = 16,
++    GLUE_UNSUPPORTED_LOW_FCD_INPUT          = 17,
++    GLUE_INSUFICIENT_ELF_BUFFER             = 18,
++    GLUE_MISSING_PRIVATE_STRUCTURE          = 19,
++    GLUE_UNSUPPORTED_5D_TENSORS             = 20,
++    GLUE_CGUID_GRAPH_UNCHANGED              = 21,
++    GLUE_FAILED                             = 400,
++} GlueCodeReturn_t;
++
++
++/***************************************************************************************
++ * The functions below can be optionally implemented by the kernel plug-in
++ ***************************************************************************************
++ */
++
++#define GET_SUPPORTED_LAYOUTS_ENTRY_POINT_NAME "GetSupportedLayouts"
++
++typedef struct _TensorDataLayout
++{
++  char layout[MAX_TENSOR_DIM];
++} TensorDataLayout;
++
++typedef struct _TensorDataLayoutV3
++{
++  char layout[MAX_HABANA_DIM];
++} TensorDataLayoutV3;
++
++typedef struct _NodeDataLayouts
++{
++  TensorDataLayout inputs[MAX_TENSOR_NR];
++  TensorDataLayout outputs[MAX_TENSOR_NR];
++} NodeDataLayouts;
++
++typedef struct _NodeDataLayoutsV2
++{
++  TensorDataLayout inputs[MAX_TENSOR_NR];
++  TensorDataLayout outputs[MAX_TENSOR_NR];
++  TensorDataLayout shapeTensors[MAX_TENSOR_NR];
++} NodeDataLayoutsV2;
++
++typedef struct _NodeDataLayoutsV3
++{
++  TensorDataLayoutV3 inputs[MAX_TENSOR_NR];
++  TensorDataLayoutV3 outputs[MAX_TENSOR_NR];
++  TensorDataLayoutV3 shapeTensors[MAX_TENSOR_NR];
++} NodeDataLayoutsV3;
++
++typedef struct _NodeName
++{
++  char name[MAX_NODE_NAME];
++} NodeName;
++
++/*
++ ***************************************************************************************************
++ *   @brief Informs graph compiler about supported data layouts of specific kernel
++ *
++ *   @param deviceId            [in]        Device ID
++ *   @param nodeName            [in]        kernel GUID.
++ *   @param supportedLayouts    [out]       Array holding supported layouts. The array is allocated
++ *                                          by the caller. 'xxxxx' stands for data layout agnostic
++ *                                          kernel.
++ *   @param layoutCount         [in/out]    in  - Size of 'supportedLayouts' array.
++ *                                          out - Number of supported layouts for the kernel in
++ *                                                question.
++ *
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++
++typedef GlueCodeReturn_t(*pfnGetSupportedDataLayout)
++(
++    _IN_     DeviceId_t         deviceId,
++    _IN_     NodeName*          nodeName,
++    _OUT_    NodeDataLayouts*   supportedLayouts,
++    _INOUT_  unsigned*          layoutCount
++);
++
++typedef struct _TensorGeometry_t
++{
++    unsigned dims;
++    /* Array holding the size of the tensor in each dimension, fastest changing
++     * dimension first. */
++    unsigned sizes[MAX_TENSOR_DIM];
++    /*  This array holds description of any transpose operation that may have been applied to the
++     *  tensor between the creation of the private structure and the call into glue code. If the
++     *  permutation array does not hold identity mapping, the glue code may need to re-interpret
++     *  the private structure in a different way. For example, in a reduce operation the private
++     *  structure holds a parameter defining an axis to be reduced. If the axis in question has been
++     *  transposed, glue-code should re-interpret the axis to its transpose destination. */
++    unsigned permutation[MAX_TENSOR_DIM];
++}  TensorGeometry_t;
++
++typedef struct _TensorGeometryV2_t
++{
++    unsigned dims;
++    /* Array holding the max size of the tensor in each dimension, fastest changing
++     * dimension first. */
++    union {
++        unsigned maxSizes[MAX_TENSOR_DIM];
++        /* Support of non-dynamic shapes kernels */
++        unsigned sizes[MAX_TENSOR_DIM];
++    };
++    /* Array holding the min size of the tensor in each dimension, fastest changing
++ * dimension first. */
++    unsigned minSizes[MAX_TENSOR_DIM];
++    /*  This array holds description of any transpose operation that may have been applied to the
++     *  tensor between the creation of the private structure and the call into glue code. If the
++     *  permutation array does not hold identity mapping, the glue code may need to re-interpret
++     *  the private structure in a different way. For example, in a reduce operation the private
++     *  structure holds a parameter defining an axis to be reduced. If the axis in question has been
++     *  transposed, glue-code should re-interpret the axis to its transpose destination. */
++    unsigned permutation[MAX_TENSOR_DIM];
++}  TensorGeometryV2_t;
++
++/*
++ * _TensorGeometryV3_t allows creating high rank tensors (N dims as < N <= MAX_HABANA_DIM).
++ */
++typedef struct _TensorGeometryV3_t
++{
++    unsigned dims;
++    /* Array holding the max size of the tensor in each dimension, fastest changing
++     * dimension first. */
++    union {
++        unsigned maxSizes[MAX_HABANA_DIM];
++        /* Support of non-dynamic shapes kernels */
++        unsigned sizes[MAX_HABANA_DIM];
++    };
++    /* Array holding the min size of the tensor in each dimension, fastest changing
++ * dimension first. */
++    unsigned minSizes[MAX_HABANA_DIM];
++    /*  This array holds description of any transpose operation that may have been applied to the
++     *  tensor between the creation of the private structure and the call into glue code. If the
++     *  permutation array does not hold identity mapping, the glue code may need to re-interpret
++     *  the private structure in a different way. For example, in a reduce operation the private
++     *  structure holds a parameter defining an axis to be reduced. If the axis in question has been
++     *  transposed, glue-code should re-interpret the axis to its transpose destination. */
++    unsigned permutation[MAX_HABANA_DIM];
++}  TensorGeometryV3_t;
++
++/*
++ * _TensorGeometryV4_t support uint64_t tensor sizes.
++ */
++typedef struct _TensorGeometryV4_t
++{
++    unsigned dims;
++    union {
++        uint64_t maxSizes[MAX_HABANA_DIM];
++        /* Support of non-dynamic shapes kernels */
++        uint64_t sizes[MAX_HABANA_DIM];
++    };
++    uint64_t minSizes[MAX_HABANA_DIM];
++    unsigned permutation[MAX_HABANA_DIM];
++}  TensorGeometryV4_t;
++
++typedef enum _TensorDataType_t
++{
++    DATA_F32    = 0,
++    DATA_F16    = 1,
++    DATA_I32    = 2,
++    DATA_I16    = 3,
++    DATA_I8     = 4,
++    DATA_U8     = 5,
++    DATA_BF16   = 6,
++    DATA_U16    = 7,
++    DATA_U32    = 8,
++    DATA_I4     = 9,
++    DATA_U4     = 10,
++    DATA_F8_152 = 11,
++    DATA_F8_143 = 12,
++    DATA_I64    = 13,
++    DATA_U64    = 14,
++    NUM_DATATYPES = 15
++} TensorDataType_t;
++
++typedef enum _KernelType_t
++{
++    KERNEL_TYPE_INFERENCE        = 0,
++    KERNEL_TYPE_TRAINING_FWD     = 1,
++    KERNEL_TYPE_TRAINING_BWD     = 2
++} KernelType_t;
++
++typedef struct _TensorQuantizationParam
++{
++    double scale;
++    union
++    {
++        int8_t zeroPoint;
++        uint8_t zeroPointU8;
++        int8_t  fp8bias;
++    };
++} TensorQuantizationParam;
++
++typedef struct _Tensor_t
++{
++    TensorGeometry_t        geometry;
++    TensorDataType_t        dataType;
++    TensorQuantizationParam quantizationParam;
++    union {
++        struct {
++            unsigned  :1;  //reserved
++            unsigned  Reducible:1;   /* The tensor is nested in reduction capable memory*/
++            unsigned  :30; //reserved.
++        };
++      unsigned   Value;
++    };
++    unsigned                reserved_1; /* explicit alignment of the struct */
++    const void*             pData;      /* Graph Compiler should pass a pointer to the tensor data,
++                                         * for any tensor that is defined as a model parameter. */
++    unsigned                reserved[6];
++} Tensor_t;
++
++typedef struct _TensorV2_t
++{
++    TensorGeometryV2_t        geometry;
++    TensorDataType_t          dataType;
++    TensorQuantizationParam   quantizationParam;
++    union {
++        struct {
++            unsigned  :1;  //reserved
++            unsigned  Reducible:1;   /* The tensor is nested in reduction capable memory*/
++            unsigned  :30; //reserved.
++        };
++        unsigned   Value;
++    };
++    unsigned                  reserved_1; /* explicit alignment of the struct */
++    const void*               pData;      /* Graph Compiler should pass a pointer to the tensor data,
++                                           * for any tensor that is defined as a model parameter. */
++    /* data layout of the tensor */
++    TensorDataLayout layout;
++    unsigned                  reserved[10];
++} TensorV2_t;
++
++/*
++ * _TensorV3_t supports high rank tensors (N dims as < N <= HIGH_RANK_MAX_TENSOR_DIM).
++ */
++typedef struct _TensorV3_t
++{
++    TensorGeometryV3_t        geometry;
++    TensorDataType_t          dataType;
++    TensorQuantizationParam   quantizationParam;
++    union {
++        struct {
++            unsigned  :1;  //reserved
++            unsigned  Reducible:1;   /* The tensor is nested in reduction capable memory*/
++            unsigned  :30; //reserved.
++        };
++        unsigned   Value;
++    };
++    unsigned                  reserved_1; /* explicit alignment of the struct */
++    const void*               pData;      /* Graph Compiler should pass a pointer to the tensor data,
++                                       * for any tensor that is defined as a model parameter. */
++    /* data layout of the tensor */
++    TensorDataLayout layout;
++    unsigned                  reserved[10];
++} TensorV3_t;
++
++/*
++ * _TensorV4_t support uint64_t tensor sizes.
++ */
++typedef struct _TensorV4_t
++{
++    TensorGeometryV4_t        geometry;
++    TensorDataType_t          dataType;
++    TensorQuantizationParam   quantizationParam;
++    union {
++        struct {
++            unsigned  :1; //reserved
++            unsigned  Reducible:1;
++            unsigned  :30;//reserved.
++        };
++        unsigned   Value;
++    };
++    unsigned                  reserved_1;
++    const void*               pData;
++    TensorDataLayout layout;
++    unsigned                  reserved[10];
++} TensorV4_t;
++
++/* The caller is responsible to allocate the buffer pointed by 'pData'
++ * and the callee is responsible to fill it. If the buffer is not large enough the callee will
++ * return 'GLUE_INSUFICIENT_AUX_BUFFER_SIZE' return value and specify required buffer size
++ * in 'bufferSize' parameter. */
++typedef struct _AuxTensor_t
++{
++    _OUT_   TensorGeometry_t  geometry;
++    _OUT_   TensorDataType_t  dataType;
++    _IN_    void*             pData;
++    _INOUT_ unsigned          bufferSize; /* the buffer size is defined in bytes. */
++} AuxTensor_t;
++
++typedef struct _AuxTensorV2_t
++{
++    _OUT_   TensorGeometryV2_t  geometry;
++    _OUT_   TensorDataType_t    dataType;
++    _IN_    void*               pData;
++    _INOUT_ unsigned            bufferSize; /* the buffer size is defined in bytes. */
++} AuxTensorV2_t;
++
++typedef struct _DimTransform_t
++{
++    union {
++        unsigned dim;           /* The dimension in the index-space this
++                                 * tensor dimension transform corresponds to. */
++        unsigned indexSpaceDim;
++    };
++    float           start_a;
++    float           start_b;
++    float           end_a;
++    float           end_b;
++} DimTransform_t;
++
++typedef struct _TensorAccessPattern_t
++{
++    union {
++        struct {
++            unsigned  allRequired :1;           /* Declares the kernel may access any part of the tensor
++                                                 * from any index space invocation  */
++            unsigned  inputReusabilityBinding:1;/* Relevant to output tensors only.
++                                                 * Marks the input reusability mask as binding
++                                                 * instead of an optimization suggestion */
++            unsigned  dropTensor :1;            /* The tensor is no longer relevant and should be dropped */
++            unsigned  memsetBeforeExecution :1; /* Kernel requests GC to memset the kernel before
++                                                   execution for Read-Modify-Write operations*/
++            unsigned  inputsReusability :16;    /* Relevant to output tensors only.
++                                                 * A bit field respective to 16 input tensors,
++                                                 * so that any single input could be aliased to any
++                                                 * single output*/
++            unsigned  sparseAccess:1;           /* This hints Graph compiler that the tensor is sparsely
++                                                 * accessed to help it optmize memory allocation decisions*/
++            unsigned  noRmwAccess:1;            /* Overrides RMW store indication in ELF header */
++            unsigned  fullyAccessed:1;          /* Declares the kernel accessing the entire tensor
++                                                 * When fullyAccessed=1 it means that the tensor is fully accessed by
++                                                 * the kernel for *all* test conditions/data
++                                                 * When fullyAccessed=0 it means that the kernel may sparsely access
++                                                 * the tensor.*/
++            unsigned  :9; //reserved.
++        };
++        unsigned   Value;
++    };
++    union {
++        DimTransform_t dim[MAX_TENSOR_DIM];        /* For each tensor dimension the glue-code define DimTransform_t,
++                                                    * dim corresponds to a tensor dimension */
++        DimTransform_t tensorDim[MAX_TENSOR_DIM];
++    };
++} TensorAccessPattern_t;
++
++
++typedef struct _ProgramFlags {
++  union {
++    struct {
++      unsigned  printfUsed :1;
++      unsigned  specialFunctionsUsed :1;
++      unsigned  :30; //reserved .
++    };
++    unsigned   Value;
++  };
++} ProgramFlags;
++
++/* on error the kernel database will return the expected */
++typedef struct _HabanaKernelParams_t
++{
++    _IN_     int          apiVersion;
++    union{
++        _IN_     char         nodeName[MAX_NODE_NAME];       /* shall be cleaned up                   */
++        _IN_     char         guidName[MAX_NODE_NAME];       /* aligned to synapse api, i.e. pGuid    */
++    };
++    _IN_     UserParams_t NodeParams;                    /* user specific. */
++    _IN_     DeviceId_t   deviceId;                      /* asic ID */
++    _IN_     KernelType_t kernelType;                    /* deprecated, don't use */
++    _INOUT_  Tensor_t     inputTensors[MAX_TENSOR_NR];   /* array of the input tensor handles.*/
++    _INOUT_  unsigned     inputTensorNr;                 /* the number of input tensors */
++    _INOUT_  Tensor_t     outputTensors[MAX_TENSOR_NR];  /* array of the output tensor handles. */
++    _INOUT_  unsigned     outputTensorNr;                /* the number of output tensors. */
++    _IN_     unsigned     debugFlags;                    /* for internal use.- used to debug/profile
++                                                          *  programs. */
++    _IN_     unsigned     NodeParamsSize;                /* Size of struct pointed by NodeParams */
++    _IN_     unsigned     maxAvailableTpc;               /* Kernel writer should know that it will get any number between 1 and maxAvailableTpc
++                                                          * Kernels that rely on number of TPC in the index space should expose index space size with maxAvailableTpc
++                                                          * Examples: Sparse segment sum, Embedding bag kernels, etc .. */
++    _IN_     unsigned     useDeterministic;              /* When useDeterministic=1, perfLib shall choose determistic speciailization */
++    _IN_     uint64_t     uniqueNodeId;                  /* unique node id for the nodeName provided by the bridge to be able to easily trace in the logs */
++             unsigned     reserved[25];
++} HabanaKernelParams_t;
++
++typedef struct _HabanaKernelParamsV2_t
++{
++    _IN_     int            apiVersion;
++    union{
++        _IN_     char         nodeName[MAX_NODE_NAME];     /* shall be cleaned up                   */
++        _IN_     char         guidName[MAX_NODE_NAME];     /* aligned to synapse api, i.e. pGuid    */
++    };
++    _IN_     UserParams_t   NodeParams;                    /* user specific. */
++    _IN_     DeviceId_t     deviceId;                      /* asic ID */
++    _IN_     KernelType_t   kernelType;                    /* deprecated, don't use */
++    _INOUT_  TensorV2_t     inputTensors[MAX_TENSOR_NR];   /* array of the input tensor handles.*/
++    _INOUT_  unsigned       inputTensorNr;                 /* the number of input tensors */
++    _INOUT_  TensorV2_t     outputTensors[MAX_TENSOR_NR];  /* array of the output tensor handles. */
++    _INOUT_  unsigned       outputTensorNr;                /* the number of output tensors. */
++    _IN_     unsigned       debugFlags;                    /* for internal use.- used to debug/profile
++                                                            *  programs. */
++    _IN_     unsigned       NodeParamsSize;                /* Size of struct pointed by NodeParams */
++    _IN_     unsigned       maxAvailableTpc;               /* Kernel writer should know that it will get any number between 1 and maxAvailableTpc
++                                                            * Kernels that rely on number of TPC in the index space should expose index space size with maxAvailableTpc
++                                                            * Examples: Sparse segment sum, Embedding bag kernels, etc .. */
++    _IN_     unsigned       useDeterministic;              /* When useDeterministic=1, perfLib shall choose determistic speciailization */
++    _IN_     uint64_t       uniqueNodeId;                  /* unique node id for the nodeName provided by the bridge to be able to easily trace in the logs */
++             unsigned       reserved[25];
++} HabanaKernelParamsV2_t;
++
++typedef struct _DeviceKernel_t
++{
++    _IN_    void*    kernelBinary;  /* A buffer in the host address space to which the kernel binary
++                                     *  should be written. Allocated by GC */
++    _INOUT_ unsigned binarySize;    /* The size of the buffer supplied by GC. Updated by glue code
++                                     * to reflect the size needed for the buffer */
++    _OUT_   uint32_t scalarParams[MAX_TENSORS_PARAMS_NR];
++    _OUT_   unsigned paramsNr;
++} DeviceKernel_t;
++
++typedef union _PadValue
++{
++    float           fValue;
++    unsigned        u32Value;
++    int             i32Value;
++    unsigned short  u16Value;
++    short           i16Value;
++    unsigned char   u8Value;
++    char            i8Value;
++} PadValue;
++
++typedef struct _HabanaKernelInstantiation_t
++{
++    _OUT_   TensorGeometry_t      indexSpaceGeometry;
++    _OUT_   TensorAccessPattern_t inputTensorAccessPattern[MAX_TENSOR_NR];
++    _OUT_   PadValue              inputPadValues[MAX_TENSOR_NR];
++    _OUT_   TensorAccessPattern_t outputTensorAccessPattern[MAX_TENSOR_NR];
++    _INOUT_ AuxTensor_t           auxiliaryTensors[MAX_TENSOR_NR];
++    _OUT_   unsigned              auxiliaryTensorCount;
++    _INOUT_ DeviceKernel_t        kernel;
++    _OUT_   ProgramFlags          flags;
++    _INOUT_ void*                 kernelElf;
++    _INOUT_ unsigned              elfSize;
++    _OUT_   PadValue              outputMemsetValues[MAX_TENSOR_NR];
++    _OUT_   unsigned              auxNotRequiringInit; /* This is a bit mask is defining which aux
++                                                        *  tensor should be regarded as SRAM
++                                                        * scratch pad aux tensor*/
++            unsigned              reserved[16];
++} HabanaKernelInstantiation_t;
++
++
++typedef struct _HabanaKernelInstantiationV2_t
++{
++    _OUT_   TensorGeometryV2_t      indexSpaceGeometry;
++    _OUT_   TensorAccessPattern_t   inputTensorAccessPattern[MAX_TENSOR_NR];
++    _OUT_   PadValue                inputPadValues[MAX_TENSOR_NR];
++    _OUT_   TensorAccessPattern_t   outputTensorAccessPattern[MAX_TENSOR_NR];
++    _INOUT_ AuxTensorV2_t           auxiliaryTensors[MAX_TENSOR_NR];
++    _OUT_   unsigned                auxiliaryTensorCount;
++    _INOUT_ DeviceKernel_t          kernel;
++    _OUT_   ProgramFlags            flags;
++    _INOUT_ void*                   kernelElf;
++    _INOUT_ unsigned                elfSize;
++    _OUT_   PadValue                outputMemsetValues[MAX_TENSOR_NR];
++    _OUT_   unsigned                auxNotRequiringInit; /* This is a bit mask is defining which aux
++                                                          * tensor should be regarded as SRAM
++                                                          * scratch pad aux tensor*/
++            unsigned                reserved[16];
++} HabanaKernelInstantiationV2_t;
++
++typedef GlueCodeReturn_t(*pfnGetKernelNames)
++(
++    _OUT_ char**    names,
++    unsigned*       kernelCount,
++    DeviceId_t      deviceId
++);
++
++typedef GlueCodeReturn_t(*pfnGetKernelSupportingDynamicShapeNames)
++(
++        _OUT_ char**    names,
++        unsigned*       kernelCount,
++        DeviceId_t      deviceId
++);
++
++typedef GlueCodeReturn_t(*pfnHabanaKernel)
++(
++    _INOUT_ HabanaKernelParams_t *          params,
++    _INOUT_ HabanaKernelInstantiation_t*    instance
++);
++
++typedef GlueCodeReturn_t(*pfnHabanaKernelV2)
++(
++        _INOUT_ HabanaKernelParamsV2_t *          params,
++        _INOUT_ HabanaKernelInstantiation_t*    instance
++);
++
++#define GET_SUPPORTED_LAYOUTS_V2_ENTRY_POINT_NAME "GetSupportedLayoutsV2"
++
++/*
++ ***************************************************************************************************
++ *   @brief Informs graph compiler about supported data layoutsV2 of specific kernel
++ *
++ *   @param paramsV2            [in]        Device ID, GUID, nodeParams, tensors geometry
++ *   @param supportedLayouts    [out]       Array holding supported layouts. The array is allocated
++ *                                          by the caller. 'xxxxx' stands for data layout agnostic
++ *                                          kernel.
++ *   @param layoutCount         [in/out]    in  - Size of 'supportedLayouts' array.
++ *                                          out - Number of supported layouts for the kernel in
++ *                                                question.
++ *
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++typedef GlueCodeReturn_t(*pfnGetSupportedDataLayoutV2)
++(
++    _IN_     HabanaKernelParamsV2_t* paramsV2,
++    _OUT_    NodeDataLayoutsV2*      supportedLayoutsV2,
++    _INOUT_  unsigned*               layoutCount
++);
++
++
++
++} /* name space gcapi */
++
++#endif /* GRAPH_COMPILER_INTERFACE_H */
+diff --git a/src/core/gaudi2/tpc/glue/include/tpc_kernel_lib_interface.h b/src/core/gaudi2/tpc/glue/include/tpc_kernel_lib_interface.h
+new file mode 100644
+index 0000000..ef8e5c7
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/include/tpc_kernel_lib_interface.h
+@@ -0,0 +1,490 @@
++/**********************************************************************
++Copyright (c) 2022 Habana Labs.
++
++Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
++
++*   Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
++*   Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or
++other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
++WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
++DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
++NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++* Tzachi Cohen <tcohen@habana.ai>
++********************************************************************/
++
++
++#ifndef TPC_KERNEL_LIB_INTERFACE_H
++#define TPC_KERNEL_LIB_INTERFACE_H
++
++#include <stdint.h>
++
++#define _IN_
++#define _INOUT_
++#define _OUT_
++
++namespace tpc_lib_api
++{
++
++/* name of function entry points */
++#define KERNEL_GUIDS_ENTRY_POINT_NAME               "GetKernelGuids"
++#define KERNEL_INSTANTIATION_ENTRY_POINT_NAME       "InstantiateTpcKernel"
++#define GET_SUPPORTED_DATA_LAYOUTS_ENTRY_POINT_NAME "GetSupportedDataLayouts"
++#define GET_SHAPE_INFERENCE_ENTRY_POINT_NAME        "GetShapeInference"
++#define GET_LIB_VERSION_ENTRY_POINT_NAME            "GetLibVersion"
++
++static const uint32_t MAX_SCALAR_PARAMS         = 32; /* number of scalar parameters passed to TPC program */
++static const uint32_t MAX_NODE_NAME             = 64;
++static const uint32_t MAX_INDEX_SPACE_DIM_SIZE  = 5;
++static const uint32_t MAX_TENSOR_DIM            = 25;
++
++typedef enum _DeviceId
++{
++    DEVICE_ID_GAUDI             = 1 ,
++    DEVICE_ID_GAUDI2            = 3 ,
++    DEVICE_ID_GAUDI3            = 4 ,
++    // MUST BE LAST
++    DEVICE_ID_MAX               = 5
++} DeviceId;
++
++typedef enum _GlueCodeReturn
++{
++    GLUE_SUCCESS                            = 0 ,
++    GLUE_NODE_NOT_FOUND                     = 1 ,
++    GLUE_INSUFFICIENT_ISA_BUFFER            = 2 ,
++    GLUE_INCOMPATIBLE_INPUT_COUNT           = 3 ,
++    GLUE_INCOMPATIBLE_INPUT_SIZE            = 4 ,
++    GLUE_INCOMPATIBLE_OUTPUT_COUNT          = 5 ,
++    GLUE_INCOMPATIBLE_OUTPUT_SIZE           = 6 ,
++    GLUE_INCOMPATIBLE_DATA_TYPE             = 7 ,
++    GLUE_UNSUPPORTED_LAYER_CONFIGURATION    = 8 ,
++    GLUE_INSUFFICIENT_AUX_BUFFER_SIZE       = 9 ,
++    GLUE_UNSUPPORTED_QUANT_PARAMS           = 10,
++    GLUE_UNSUPPORTED_BROADCAST_MODE         = 11,
++    GLUE_UNSUPPORTED_API_VERSION            = 12,
++    GLUE_NON_STATIC_INPUT_TENSOR            = 13,
++    GLUE_KERNEL_REQUIRE_REDUCIBLE_TENSOR    = 14,
++    GLUE_INVALID_SHAPE_INFERENCE_ID         = 15,
++    GLUE_KERNEL_INVALID_SCALAR_ARGUMENT     = 16,
++    GLUE_UNSUPPORTED_LOW_FCD_INPUT          = 17,
++    GLUE_INSUFFICIENT_ELF_BUFFER            = 18,
++    GLUE_MISSING_PRIVATE_STRUCTURE          = 19,
++    GLUE_UNSUPPORTED_5D_TENSORS             = 20,
++    GLUE_CGUID_GRAPH_UNCHANGED              = 21,
++    GLUE_SIF_NULL_PTR                       = 22,
++    GLUE_UNSUPPORTED_DYNAMIC_SHAPE          = 23,
++    GLUE_UNSUPPORTED_HUGE_TENSORS           = 24,
++    GLUE_FAILED                             = 400,
++} GlueCodeReturn;
++
++typedef enum _TensorDataType
++{
++    DATA_I4     = 1 << 0,
++    DATA_U4     = 1 << 1,
++    DATA_I8     = 1 << 2,
++    DATA_U8     = 1 << 3,
++    DATA_F8_152 = 1 << 4,
++    DATA_F8_143 = 1 << 5,
++    DATA_I16    = 1 << 6,
++    DATA_U16    = 1 << 7,
++    DATA_BF16   = 1 << 8,
++    DATA_F16    = 1 << 9,
++    DATA_I32    = 1 << 10,
++    DATA_U32    = 1 << 11,
++    DATA_F32    = 1 << 12,
++    DATA_I64    = 1 << 13,
++    DATA_U64    = 1 << 14,
++    NUM_DATATYPES = 15
++} TensorDataType;
++
++typedef struct _TensorDataLayout
++{
++    char layout[MAX_TENSOR_DIM];
++} TensorDataLayout;
++
++typedef struct _NodeDataLayouts
++{
++    TensorDataLayout* inputs;
++    uint32_t          inputTensorNr;
++    TensorDataLayout* outputs;
++    uint32_t          outputTensorNr;
++    TensorDataLayout* shapeTensors;
++    uint32_t          shapeTensorNr;
++} NodeDataLayouts;
++
++typedef struct _UniqueShapeInferenceHash {
++    union {
++        struct {
++            uint64_t  hashValue :56;     // should be filled by glueCode
++            uint64_t  sharedObjectId :8; // reserved - used by graphCompiler
++
++        };
++        uint64_t   Value;
++    };
++} UniqueShapeInferenceHash;
++
++typedef struct _GuidInfo
++{
++    char                      name[MAX_NODE_NAME];
++    UniqueShapeInferenceHash  nameHash;
++                            /* This hash can be optionally generated by the perf library, it is a utility
++                             to accelerate lookup operations within the operator library.
++                             The hash is provided by perf-lib on "GetKernelGuids" and returned to perf-lib,
++                             by graph compiler on "InstantiateTpcKernel" or other entry points.*/
++    union {
++        struct {
++                uint32_t  supportsDynamicShapes:1; /* kernel supports dynamic shapes*/
++                uint32_t  supports64bit:1;         /* kernels supports 64b sizes */
++                uint32_t  :30; //reserved.
++        };
++        uint32_t kernelProperties;
++    };
++} GuidInfo;
++
++typedef struct   _UserParams
++{
++    void*       nodeParams;
++    uint32_t    nodeParamsSize;
++} UserParams;
++
++typedef union _ElementValue
++{
++    float           fValue;
++    uint32_t        u32Value;
++    int32_t         i32Value;
++    uint16_t        u16Value;
++    int16_t         i16Value;
++    uint8_t         u8Value;
++    int8_t          i8Value;
++    uint64_t        u64Value;
++    int64_t         i64Value;
++} ElementValue;
++
++typedef struct _TensorGeometry
++{
++    /* Rank of the tensor */
++    uint32_t        dims;
++    /* Array holding the size of the tensor in each dimension, fastest changing
++     * dimension first.
++     * if maxSizes == minSizes, shape is static.
++     * if minSizes < maxSize the size of the tensor in TPC execution time may be any value between
++     * minsize and maxSize. Index space geometry should be returned according to maxSize.
++     * The dynamic shapes logic in GC uses only the maxSizes, which then represent the final
++     * shape (regardless of whether gc infer max shapes, min shapes or actual shapes)
++     * Some of the dynamic shapes logic (namely, the logical operations) also need to take into account
++     * strides, which is why there is a union between minSizes and strides.
++     *
++     * The strides can ONLY be used during runtime and within selected SIFs (GC-provided only)
++     * amd SMFs.
++     * They MUST NOT be set or used in any glue code calls such as instantiate.
++     */
++    uint64_t        maxSizes[MAX_TENSOR_DIM];
++    union {
++        uint64_t        minSizes[MAX_TENSOR_DIM];
++        uint64_t        strides [MAX_TENSOR_DIM];
++    };
++    TensorDataType  dataType;
++}  TensorGeometry;
++
++typedef struct _TensorQuantizationParam
++{
++    union {
++        int8_t  zeroPoint;
++        uint8_t zeroPointU8;
++        int8_t  fp8bias;
++    };
++    double scale;
++} TensorQuantizationParam;
++
++typedef struct _Tensor
++{
++    TensorGeometry          geometry;
++    TensorQuantizationParam quantizationParam; /* relevant only for fp8/int8/uint8/int16 datatypes*/
++    TensorDataLayout        layout;
++    union {
++        struct {
++            uint32_t  Reducible:1;  /* The tensor is nested in reduction capable memory*/
++            uint32_t  Null:1;       /* The tensor is not provided - in case of optional input/output*/
++            uint32_t  :30; //reserved.
++        };
++        uint32_t   flags;
++    };
++    /* Point to tensor content, if it is known statically on graph compiler time.*/
++    const void*             pData;
++    /*  This array holds description of any transpose operation that may have been applied to the
++     *  tensor between the creation of the private structure and the call into glue code. If the
++     *  permutation array does not hold identity mapping, the glue code may need to re-interpret
++     *  the private structure in a different way. For example, in a reduce operation the private
++     *  structure holds a parameter defining an axis to be reduced. If the axis in question has been
++     *  transposed, glue-code should re-interpret the axis to its transpose destination. */
++    uint32_t permutation[MAX_TENSOR_DIM];
++    uint32_t reserved[6];
++} Tensor;
++
++typedef struct _AuxTensor
++{
++    _OUT_   TensorGeometry    geometry;
++    _IN_    void*             pData;
++    _INOUT_ uint64_t          bufferSize; /* the buffer size is defined in bytes. */
++    union {
++        struct {
++            uint32_t  sramAlloc:1;  /* This flag instruct GC to allocate the aux tensor in SRAM memory*/
++            uint32_t  noInit:1;     /* This flag indicate the aux tensor will be used as scratch pad
++                                       hence no init is necessary. 'pData' field will be ignored*/
++            uint32_t  :30; //reserved.
++        };
++        uint32_t   flags;
++    };
++    uint32_t  reserved[6];
++} AuxTensor;
++
++
++typedef struct _DimIndexSpaceMapping
++{
++    uint32_t        indexSpaceDim; /* The dimension in the index-space this
++                                    * tensor dimension transform corresponds to. */
++    float           a;
++    float           start_b;
++    float           end_b;
++    bool            allRequired;
++} DimIndexSpaceMapping;
++
++typedef struct _TensorAccessPattern
++{
++    union {
++        struct {
++            uint32_t  allRequired :1;           /* Declares the kernel may access any part of the tensor
++                                                 * from any index space invocation  */
++
++            uint32_t  memsetBeforeExecution :1; /* Kernel requests GC to memset the kernel before
++                                                   execution */
++            uint32_t  inputsReusability :16;    /* Relevant to output tensors only.
++                                                 * A bit field respective to 16 input tensors,
++                                                 * For memory efficiency purposes, it specifies if the
++                                                 * output tensor can be nested on the same memory as the input*/
++            uint32_t  inputReusabilityBinding:1;/* Relevant to output tensors only.
++                                                 * Marks the input reusability mask as binding
++                                                 * instead of an optimization suggestion */
++            uint32_t  sparseAccess:1;           /* This hints Graph compiler that the tensor is sparsely
++                                                 * accessed to help it optimize memory allocation decisions*/
++            uint32_t  noRmwAccess:1;            /* Overrides RMW store indication in ELF header */
++            uint32_t  fullyAccessedOnce:1;      /* Declares the kernel accessing the entire tensor once
++                                                 * When fullyAccessed=1 it means that the tensor is fully accessed by
++                                                 * the kernel for *all* test conditions/data
++                                                 * When fullyAccessed=0 it means that the kernel may sparsely access
++                                                 * the tensor or read it multiple times.*/
++            uint32_t fullyWritten : 1;          /* This hints Graph compiler that the tensor is sparsely
++                                                 * accessed to help it optimize memory allocation decisions*/
++            uint32_t : 8;                       // reserved.
++        };
++        uint32_t   Value;
++    };
++    // an array of index space mapping data per dimension.
++    DimIndexSpaceMapping   mapping[MAX_TENSOR_DIM];
++    ElementValue           memsetValue;/* determines the value to memset if requested 'memsetBeforeExecution'*/
++    uint32_t  reserved[6];
++} TensorAccessPattern;
++
++typedef struct _HabanaKernelParams
++{
++_IN_    int        apiVersion;
++_IN_    DeviceId   deviceId;                /* asic ID */
++_IN_    GuidInfo   guid;                    /* GUID of node in the graph */
++_IN_    UserParams nodeParams;              /* Kernel specific parameters */
++_IN_    Tensor*    inputTensors;            /* array of the input tensor */
++_IN_    uint32_t   inputTensorNr;           /* the number of input tensors */
++_IN_    Tensor*    outputTensors;           /* array of the output tensor  */
++_IN_    uint32_t   outputTensorNr;          /* the number of output tensors. */
++_IN_    uint32_t   maxAvailableTpc;         /* The maximum amount of TPC engines the kernel will execute on.*/
++_IN_    uint32_t   useDeterministic;        /* directive to return deterministic version of program */
++_IN_    uint64_t   uniqueNodeId;            /* provided to be able to easily trace in the logs */
++_IN_    uint32_t   debugFlags;              /* for internal use.- used to debug/profile */
++_IN_    uint16_t   validInputTensors;       /* Valid input tensors bit mask */
++_IN_    uint16_t   validOutputTensors;      /* Valid output tensors bit mask */
++        uint32_t   reserved[24];
++} HabanaKernelParams;
++
++
++typedef struct _DeviceKernel
++{
++    _IN_    void*    kernelElf  ;   /* A buffer in the host address space to which the kernel binary elf
++                                     *  should be written. Allocated by GC */
++    _INOUT_ uint32_t elfSize;       /* The size of the buffer supplied by GC. Updated by glue code
++                                     * to reflect the size needed for the buffer */
++    _OUT_   uint32_t scalarParams[MAX_SCALAR_PARAMS];
++    _OUT_   uint32_t paramsNr;
++} DeviceKernel;
++
++
++typedef struct _HabanaKernelInstantiation
++{
++    _OUT_   uint32_t             indexSpaceRank;
++    _OUT_   uint64_t             indexSpaceGeometry[MAX_INDEX_SPACE_DIM_SIZE];
++    _OUT_   TensorAccessPattern* inputTensorAccessPattern;
++    _OUT_   TensorAccessPattern* outputTensorAccessPattern;
++    _INOUT_ AuxTensor*           auxiliaryTensors; // see comment below
++    _INOUT_ uint32_t             auxiliaryTensorNr;
++    _INOUT_ DeviceKernel         kernel;
++    _OUT_   uint32_t             preferredSplitDim;  /* Set a dimension that GC code-gen pass must
++                                                    partiotion with each partition size of 1.
++                                                    This dimension must be set as allRequired within
++                                                    DimIndexSpaceMapping for all tensors.
++                                                    At the GC code_gen level (after slice pass),
++                                                    GC must begin with this dimension with each
++                                                    partition size of 1 and may continue to other
++                                                    dimensions in case preferredSplitDim is smaller
++                                                    than maxAvailableTpc
++                                                    API:
++                                                    0 - Disabled feature (default),
++                                                    Otherwise: (preferredSplitDim-1) is dim to split
++                                                    E.g.: 1 means dim0 (FCD), etc.
++                                                */
++    uint32_t                     reserved[15];
++} HabanaKernelInstantiation;
++// In order to reduce hand shakes between GC and PERF lib for aux tensors,
++// auxiliaryTensors* list is statically allocated by GC as AuxTensor[MAX_AUX_NUM],
++// where MAX_AUX_NUM is defined to be 16. auxiliaryTensorNr will be set
++// by GC to MAX_AUX_NUM.
++//
++// PERF lib will then set auxiliaryTensorNr to the actual number of aux tensors
++// required by the kernel (0-15, usually not more than 2), and set the required
++// aux parameters accordingly.
++
++typedef struct _NodeTensorPermutation
++{
++    uint32_t permutation[MAX_TENSOR_DIM];
++} NodeTensorPermutation;
++
++
++typedef struct _TensorShapeInfo
++{
++    TensorGeometry geometry;
++    uint32_t *hostAddress; // can be null
++    uint32_t reserved[8];
++} TensorShapeInfo;
++
++
++typedef struct _ShapeInferenceParams
++{
++    int                     apiVersion;
++    uint64_t                uniqueNodeId;       /* Provided to be able to easily trace in the logs */
++    GuidInfo                guid;               // transition to using a pointer to guidInfo. will be removed
++    TensorShapeInfo**       inputTensors;       /* Pointer to array of the input tensor shapes */
++    uint32_t                inputTensorsNr;     /* The number of input tensors shapes */
++    UserParams              nodeParams;         /* User specific params */
++    uint32_t                outputTensorsNr;    /* The number of output tensors shapes that was set during graph */
++                                                /* creation according to max bucket size. */
++    NodeTensorPermutation*  inputPermutations;  /* Either null, meaning all permutations are trivial */
++                                                /* or inputTensorsNr permutations for all input tensors */
++    NodeTensorPermutation*  outputPermutations; /* Ditto for output tensors. */
++    GuidInfo*               pGuid;              // transition to using only the pointer. guid (above) will be removed
++    uint32_t                maxAvailableTpc;    //
++    uint32_t                reserved[3];
++} ShapeInferenceParams;
++
++
++typedef struct _ShapeInferenceOutput
++{
++    TensorShapeInfo**       outputTensors;  // Pointer to array of the output tensor shapes
++    uint32_t*               invalidMask;    // Invalid bit mask per output shape tensor
++                                            // only bits 0...('outputTensorsNr'-1) are meaningful.
++                                            // Assumed that the invalidMask is initialized to 0 by the caller.
++                                            // E.g. if the bit0 (LSB) = 1,then output shape
++                                            // tensor0 is invalid.
++    uint32_t                reserved[6];
++} ShapeInferenceOutput;
++
++
++/*
++ ***************************************************************************************************
++ *   @brief through this entry point the kernel library report supported GUIDs
++ *
++ *   @param deviceId          [in]    Queries device ID
++ *   @param kernelCount   [in/out]    Pointer to size of 'names' array.
++ *                                    Size of 'names'is a 2d array of size [kernelCount][MAX_NODE_NAME]
++ *                                    If the pointed value is zero, the callee is expected to fill requested size
++ *   @param guids           [out]     list of supported guids to be filled by the callee.
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++typedef GlueCodeReturn(*pfnGetKernelGuids)
++(
++    _IN_    DeviceId        deviceId,
++    _INOUT_ uint32_t*       kernelCount,
++    _OUT_   GuidInfo*       guids);
++
++/*
++ ***************************************************************************************************
++ *   @brief Kernel instantiation enty point
++ *
++ *   @param HabanaKernelParams          [in]        Input parameters describing the node
++ *   @param HabanaKernelInstantiation   [in/out]    All properties required to integrate the node
++ *                                                  into a recipe.
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++typedef GlueCodeReturn(*pfnInstantiateTpcKernel)
++(
++    _IN_    const HabanaKernelParams*       params,
++    _INOUT_ HabanaKernelInstantiation*      instance
++);
++
++/*
++ ***************************************************************************************************
++ *   @brief Informs graph compiler about supported data layouts of specific kernel
++ *
++ *   @param params              [in]        Input parameters describing the node
++ *   @param supportedLayouts    [out]       Array holding supported layouts. The array is allocated
++ *                                          by the caller. 'xxxxx' stands for data layout agnostic
++ *                                          kernel.
++ *   @param layoutCount         [in/out]    in  - Size of 'supportedLayouts' array.
++ *                                          out - Number of supported layouts for the kernel in
++ *                                                question.
++ *
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++
++typedef GlueCodeReturn(*pfnGetSupportedDataLayout)
++(
++    _IN_     const HabanaKernelParams*  params,
++    _OUT_    NodeDataLayouts*           supportedLayouts,
++    _INOUT_  uint32_t*                  layoutCount
++);
++
++/*
++ ***************************************************************************************************
++ *   @brief Given the input sizes of a specific node, the function returns the size of the output tensors.
++ *
++ *   @param inputParams     [in]        shape inference input params
++ *   @param outputData      [out]       shape inference calculated outputs
++ *
++ *   @return               The status of the operation
++ ***************************************************************************************************
++ */
++typedef GlueCodeReturn(*pfnGetShapeInference)
++(
++    _IN_           DeviceId              deviceId,
++    _IN_     const ShapeInferenceParams* inputParams,
++    _OUT_          ShapeInferenceOutput* outputData
++);
++
++/*
++ ***************************************************************************************************
++ *   @brief supplies graph compiler library version for coherency checks
++ *   between graph compiler and runtime
++ *
++ *
++ *   @return               Unique library Version
++ ***************************************************************************************************
++ */
++
++typedef uint64_t (*pfnGetLibVersion)();
++
++
++} /* name space tpc_lib_api */
++
++#endif /* TPC_KERNEL_LIB_INTERFACE_H */
++
+diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
+new file mode 100644
+index 0000000..e6b8b10
+--- /dev/null
++++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
+@@ -0,0 +1,193 @@
++// GLM-5.3-Flash TPC kernel glue (GC channel). One class per kernel GUID,
++// following the Habana_Custom_Kernel template: Stage I validates tensor
++// count/dtypes, Stage II defines the index-space geometry, Stage III the
++// per-dimension affine access patterns f(i) = a*i + b, Stage IV packs the
++// scalar params, Stage V hands the embedded TPC ELF to the descriptor.
++//
++// The kernels themselves (../kernels/*.c) are plain row kernels over an
++// FCD-split grid: index-space dim0 covers the width in 128-element
++// all-simd chunks and dim1 is the token (or pool/head) axis, so the two
++// classes below cover every FCD-row kernel in the set; the head-mapped and
++// selection kernels get their own classes as they come up on hardware.
++
++#include "gc_interface.h"
++
++#include <cstring>
++#include <string>
++
++namespace {
++
++// ---------------------------------------------------------------------------
++// Shared plumbing
++
++gcapi::GlueCodeReturn_t validate_fcd_rows(gcapi::HabanaKernelParams_t* in_defs,
++                                          unsigned inputs, unsigned outputs,
++                                          gcapi::TensorDataType_t dtype) {
++    if (in_defs->inputTensorNr != inputs) {
++        in_defs->inputTensorNr = inputs;
++        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
++    }
++    if (in_defs->outputTensorNr != outputs) {
++        in_defs->outputTensorNr = outputs;
++        return gcapi::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
++    }
++    for (unsigned i = 0; i < inputs; ++i) {
++        if (in_defs->inputTensors[i].dataType != dtype) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
++    }
++    for (unsigned o = 0; o < outputs; ++o) {
++        if (in_defs->outputTensors[o].dataType != dtype) {
++            return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++        }
++    }
++    return gcapi::GLUE_SUCCESS;
++}
++
++// Index space {ceil(width/128), tokens} with each dim0 slot covering 128
++// FCD elements of every tensor at the same (dim0, token) coordinate; the
++// weights/vectors follow the same FCD-fastest layout.
++gcapi::GlueCodeReturn_t map_fcd_rows(gcapi::HabanaKernelInstantiation_t* out_defs,
++                                     const gcapi::HabanaKernelParams_t* in_defs,
++                                     unsigned inputs, unsigned outputs) {
++    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
++    const unsigned tokens = in_defs->outputTensors[0].geometry.dims > 1
++                                ? in_defs->outputTensors[0].geometry.sizes[1]
++                                : 1;
++    out_defs->indexSpaceGeometry.dims = 2;
++    out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
++    out_defs->indexSpaceGeometry.sizes[1] = tokens;
++
++    for (unsigned i = 0; i < inputs; ++i) {
++        out_defs->inputTensorAccessPattern[i].dim[0].indexSpaceDim = 0;
++        out_defs->inputTensorAccessPattern[i].dim[0].start_a = 128.0f;
++        out_defs->inputTensorAccessPattern[i].dim[0].end_b = 127.0f;
++        out_defs->inputTensorAccessPattern[i].dim[1].indexSpaceDim = 1;
++        out_defs->inputTensorAccessPattern[i].dim[1].start_a = 1.0f;
++        out_defs->inputTensorAccessPattern[i].dim[1].end_b = 0.0f;
++        // FP32 tensors advance half as fast per lane.
++        if (in_defs->inputTensors[i].dataType == gcapi::DATA_F32) {
++            out_defs->inputTensorAccessPattern[i].dim[0].start_a = 64.0f;
++            out_defs->inputTensorAccessPattern[i].dim[0].end_b = 63.0f;
++        }
++    }
++    for (unsigned o = 0; o < outputs; ++o) {
++        out_defs->outputTensorAccessPattern[o].dim[0].indexSpaceDim = 0;
++        out_defs->outputTensorAccessPattern[o].dim[0].start_a = 128.0f;
++        out_defs->outputTensorAccessPattern[o].dim[0].end_b = 127.0f;
++        out_defs->outputTensorAccessPattern[o].dim[1].indexSpaceDim = 1;
++        out_defs->outputTensorAccessPattern[o].dim[1].start_a = 1.0f;
++        out_defs->outputTensorAccessPattern[o].dim[1].end_b = 0.0f;
++        if (in_defs->outputTensors[o].dataType == gcapi::DATA_F32) {
++            out_defs->outputTensorAccessPattern[o].dim[0].start_a = 64.0f;
++            out_defs->outputTensorAccessPattern[o].dim[0].end_b = 63.0f;
++        }
++    }
++    return gcapi::GLUE_SUCCESS;
++}
++
++gcapi::GlueCodeReturn_t publish_elf(gcapi::HabanaKernelInstantiation_t* out_defs,
++                                    const unsigned char* start, const unsigned char* end) {
++    const unsigned size = static_cast<unsigned>(end - start);
++    const unsigned given = out_defs->elfSize;
++    out_defs->elfSize = size;
++    if (given < size) return gcapi::GLUE_INSUFICIENT_ELF_BUFFER;
++    std::memcpy(out_defs->kernelElf, start, size);
++    return gcapi::GLUE_SUCCESS;
++}
++
++} // namespace
++
++// Embedded TPC ELF blobs (build_glue.sh compiles the kernels and objcopy-
++// wraps them; the symbols land here through the linker).
++extern "C" {
++// Symbols from objcopy on bare filenames (see build_glue.sh).
++extern unsigned char _binary_glm5_rmsnorm_bf16_gaudi2_o_start;
++extern unsigned char _binary_glm5_rmsnorm_bf16_gaudi2_o_end;
++extern unsigned char _binary_glm5_kda_gate_bf16_gaudi2_o_start;
++extern unsigned char _binary_glm5_kda_gate_bf16_gaudi2_o_end;
++}
++
++// ---------------------------------------------------------------------------
++// glm5_rmsnorm_bf16: out[t,:] = rmsnorm(x[t,:]) * weight[:]
++
++extern "C" gcapi::GlueCodeReturn_t glm5_rmsnorm_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    // Two BF16 inputs (x [D,T], weight [D,1]), one BF16 output (out [D,T]);
++    // epsilon is the one scalar.
++    gcapi::GlueCodeReturn_t status = validate_fcd_rows(in_defs, 2, 1, gcapi::DATA_BF16);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++    status = map_fcd_rows(out_defs, in_defs, 2, 1);
++    if (status != gcapi::GLUE_SUCCESS) return status;
++
++    struct RmsNormParams { float epsilon; float inverse_width; } params;
++    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
++    params.epsilon = 1e-5f;
++    params.inverse_width = 1.0f / static_cast<float>(width);
++    out_defs->kernel.paramsNr =
++        static_cast<unsigned>(sizeof(params) / sizeof(unsigned));
++    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
++
++    return publish_elf(out_defs,
++                       &_binary_glm5_rmsnorm_bf16_gaudi2_o_start,
++                       &_binary_glm5_rmsnorm_bf16_gaudi2_o_end);
++}
++
++// ---------------------------------------------------------------------------
++// glm5_kda_gate_bf16: gate[t,:] = lb * sigmoid(exp(a_log[h]) * a[t,:]) in
++// log space; a BF16, a_log FP32 [heads,1], gate FP32 out.
++
++extern "C" gcapi::GlueCodeReturn_t glm5_kda_gate_get_gc_definitions(
++    gcapi::HabanaKernelParams_t* in_defs, gcapi::HabanaKernelInstantiation_t* out_defs) {
++    if (in_defs->inputTensorNr != 2) {
++        in_defs->inputTensorNr = 2;
++        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
++    }
++    if (in_defs->outputTensorNr != 1) {
++        in_defs->outputTensorNr = 1;
++        return gcapi::GLUE_INCOMPATIBLE_OUTPUT_COUNT;
++    }
++    if (in_defs->inputTensors[0].dataType != gcapi::DATA_BF16 ||
++        in_defs->inputTensors[1].dataType != gcapi::DATA_F32 ||
++        in_defs->outputTensors[0].dataType != gcapi::DATA_F32) {
++        return gcapi::GLUE_INCOMPATIBLE_DATA_TYPE;
++    }
++    // Mixed dtypes: map manually (BF16 a at 128, FP32 a_log/gate at 64).
++    const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
++    const unsigned tokens = in_defs->outputTensors[0].geometry.dims > 1
++                                ? in_defs->outputTensors[0].geometry.sizes[1]
++                                : 1;
++    out_defs->indexSpaceGeometry.dims = 2;
++    out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
++    out_defs->indexSpaceGeometry.sizes[1] = tokens;
++
++    out_defs->inputTensorAccessPattern[0].dim[0].indexSpaceDim = 0;
++    out_defs->inputTensorAccessPattern[0].dim[0].start_a = 128.0f;
++    out_defs->inputTensorAccessPattern[0].dim[0].end_b = 127.0f;
++    out_defs->inputTensorAccessPattern[0].dim[1].indexSpaceDim = 1;
++    out_defs->inputTensorAccessPattern[0].dim[1].start_a = 1.0f;
++    out_defs->inputTensorAccessPattern[0].dim[1].end_b = 0.0f;
++    out_defs->inputTensorAccessPattern[1].dim[0].indexSpaceDim = 0;
++    out_defs->inputTensorAccessPattern[1].dim[0].start_a = 64.0f;
++    out_defs->inputTensorAccessPattern[1].dim[0].end_b = 63.0f;
++    out_defs->inputTensorAccessPattern[1].dim[1].indexSpaceDim = 1;
++    out_defs->inputTensorAccessPattern[1].dim[1].start_a = 1.0f;
++    out_defs->inputTensorAccessPattern[1].dim[1].end_b = 0.0f;
++    out_defs->outputTensorAccessPattern[0].dim[0].indexSpaceDim = 0;
++    out_defs->outputTensorAccessPattern[0].dim[0].start_a = 64.0f;
++    out_defs->outputTensorAccessPattern[0].dim[0].end_b = 63.0f;
++    out_defs->outputTensorAccessPattern[0].dim[1].indexSpaceDim = 1;
++    out_defs->outputTensorAccessPattern[0].dim[1].start_a = 1.0f;
++    out_defs->outputTensorAccessPattern[0].dim[1].end_b = 0.0f;
++
++    struct KdaGateParams { float lower_bound; unsigned head_dim; } params;
++    params.lower_bound = -5.0f;
++    params.head_dim = 128;
++    out_defs->kernel.paramsNr =
++        static_cast<unsigned>(sizeof(params) / sizeof(unsigned));
++    std::memcpy(&out_defs->kernel.scalarParams[0], &params, sizeof(params));
++
++    return publish_elf(out_defs,
++                       &_binary_glm5_kda_gate_bf16_gaudi2_o_start,
++                       &_binary_glm5_kda_gate_bf16_gaudi2_o_end);
++}
 diff --git a/src/core/gaudi2/tpc/include/glm5_tpc.h b/src/core/gaudi2/tpc/include/glm5_tpc.h
 new file mode 100644
 index 0000000..4890ea2
