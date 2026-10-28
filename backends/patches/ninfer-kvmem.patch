@@ -5935,14 +5935,15 @@ index 0000000..bf7bdfd
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/kernel_library.cpp b/src/core/gaudi2/kernel_library.cpp
 new file mode 100644
-index 0000000..e7296eb
+index 0000000..b29cbf2
 --- /dev/null
 +++ b/src/core/gaudi2/kernel_library.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +// TPC kernel-library loader: the OS-level load of a gc glue shared object
 +// plus the GUID handshake. See kernel_library.h.
 +#include "core/gaudi2/kernel_library.h"
 +
++#include <cstdint>
 +#include <cstring>
 +#include <stdexcept>
 +#include <utility>
