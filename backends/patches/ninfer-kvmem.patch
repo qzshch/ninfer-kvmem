@@ -2977,10 +2977,10 @@ index e684873..86281fc 100644
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000..c72c443
+index 0000000..824b148
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,188 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -3109,6 +3109,24 @@ index 0000000..c72c443
 +target_include_directories(ninfer-gaudi2-glm5-tpc-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 +  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fake_synapse")
 +add_test(NAME ninfer-gaudi2-glm5-tpc COMMAND ninfer-gaudi2-glm5-tpc-test)
++
++# Gap 1: the kernel-library loader against a stub glue shared object. The
++# stub is a test double (never a fallback kernel library); the loader binds
++# the same entry points the real tpc-clang glue exports.
++add_library(ninfer-gaudi2-test-kernel-lib MODULE tests/kernel_lib_stub.cpp)
++target_compile_features(ninfer-gaudi2-test-kernel-lib PRIVATE cxx_std_20)
++target_include_directories(ninfer-gaudi2-test-kernel-lib PRIVATE
++  "${CMAKE_CURRENT_SOURCE_DIR}/tpc/glue/include")
++set_target_properties(ninfer-gaudi2-test-kernel-lib PROPERTIES PREFIX "")
++
++add_executable(ninfer-gaudi2-kernel-library-test kernel_library.cpp
++  tests/kernel_library_test.cpp)
++target_compile_features(ninfer-gaudi2-kernel-library-test PRIVATE cxx_std_20)
++target_include_directories(ninfer-gaudi2-kernel-library-test PRIVATE
++  "${CMAKE_CURRENT_SOURCE_DIR}/../.." "${CMAKE_CURRENT_SOURCE_DIR}/tpc/glue/include")
++target_compile_definitions(ninfer-gaudi2-kernel-library-test PRIVATE
++  NINFER_GAUDI2_TEST_KERNEL_LIB="$<TARGET_FILE:ninfer-gaudi2-test-kernel-lib>")
++add_test(NAME ninfer-gaudi2-kernel-library COMMAND ninfer-gaudi2-kernel-library-test)
 +
 +if(NINFER_GAUDI2_NATIVE_RUNTIME OR NINFER_GAUDI2_SDK_HEADER_CHECK)
 +  find_path(NINFER_SYNAPSE_INCLUDE_DIR synapse_api.h
@@ -5904,6 +5922,199 @@ index 0000000..bf7bdfd
 +};
 +
 +} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/kernel_library.cpp b/src/core/gaudi2/kernel_library.cpp
+new file mode 100644
+index 0000000..e7296eb
+--- /dev/null
++++ b/src/core/gaudi2/kernel_library.cpp
+@@ -0,0 +1,120 @@
++// TPC kernel-library loader: the OS-level load of a gc glue shared object
++// plus the GUID handshake. See kernel_library.h.
++#include "core/gaudi2/kernel_library.h"
++
++#include <cstring>
++#include <stdexcept>
++#include <utility>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <dlfcn.h>
++#endif
++
++namespace ninfer::gaudi2 {
++namespace {
++
++constexpr tpc_lib_api::DeviceId kGaudi2LibDeviceId = tpc_lib_api::DEVICE_ID_GAUDI2;
++constexpr gcapi::DeviceId_t kGaudi2GcDeviceId = gcapi::DEVICE_ID_GAUDI2;
++
++#if defined(_WIN32)
++void* open_module(const char* path) { return LoadLibraryA(path); }
++void* module_symbol(void* handle, const char* name) {
++    return reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name));
++}
++void close_module(void* handle) { FreeLibrary(static_cast<HMODULE>(handle)); }
++std::string loader_error() { return "LoadLibraryA failed"; }
++#else
++void* open_module(const char* path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
++void* module_symbol(void* handle, const char* name) { return dlsym(handle, name); }
++void close_module(void* handle) { dlclose(handle); }
++std::string loader_error() {
++    const char* text = dlerror();
++    return text != nullptr ? text : "dlopen failed";
++}
++#endif
++
++} // namespace
++
++KernelLibrary::KernelLibrary(const char* library_path) : path_(library_path) {
++    module_ = open_module(library_path);
++    if (module_ == nullptr) {
++        throw std::runtime_error("kernel_library: cannot load " + path_ + ": " +
++                                 loader_error());
++    }
++    get_kernel_guids_ = reinterpret_cast<tpc_lib_api::pfnGetKernelGuids>(
++        module_symbol(module_, "GetKernelGuids"));
++    get_gc_definitions_ =
++        reinterpret_cast<decltype(get_gc_definitions_)>(module_symbol(module_, "GetGcDefinitions"));
++    if (get_kernel_guids_ == nullptr || get_gc_definitions_ == nullptr) {
++        close_module(module_);
++        module_ = nullptr;
++        throw std::runtime_error(
++            "kernel_library: " + path_ +
++            " does not export the kernel-library entry points");
++    }
++
++    // GUID enumeration: size query first, then the filled array.
++    std::uint32_t count = 0;
++    if (get_kernel_guids_(kGaudi2LibDeviceId, &count, nullptr) !=
++            tpc_lib_api::GLUE_SUCCESS ||
++        count == 0) {
++        close_module(module_);
++        module_ = nullptr;
++        throw std::runtime_error("kernel_library: " + path_ + " reports no kernels");
++    }
++    std::vector<tpc_lib_api::GuidInfo> guids(count);
++    if (get_kernel_guids_(kGaudi2LibDeviceId, &count, guids.data()) !=
++        tpc_lib_api::GLUE_SUCCESS) {
++        close_module(module_);
++        module_ = nullptr;
++        throw std::runtime_error("kernel_library: " + path_ +
++                                 " failed to fill its GUID list");
++    }
++    names_.reserve(count);
++    for (std::uint32_t k = 0; k < count; ++k) {
++        guids[k].name[tpc_lib_api::MAX_NODE_NAME - 1] = '\0';
++        names_.emplace_back(guids[k].name);
++    }
++}
++
++KernelLibrary::~KernelLibrary() {
++    if (module_ != nullptr) close_module(module_);
++}
++
++KernelLibrary::KernelLibrary(KernelLibrary&& other) noexcept
++    : module_(other.module_), get_kernel_guids_(other.get_kernel_guids_),
++      get_gc_definitions_(other.get_gc_definitions_), names_(std::move(other.names_)),
++      path_(std::move(other.path_)) {
++    other.module_ = nullptr;
++    other.get_kernel_guids_ = nullptr;
++    other.get_gc_definitions_ = nullptr;
++}
++
++KernelLibrary& KernelLibrary::operator=(KernelLibrary&& other) noexcept {
++    if (this != &other) {
++        this->~KernelLibrary();
++        module_ = other.module_;
++        get_kernel_guids_ = other.get_kernel_guids_;
++        get_gc_definitions_ = other.get_gc_definitions_;
++        names_ = std::move(other.names_);
++        path_ = std::move(other.path_);
++        other.module_ = nullptr;
++        other.get_kernel_guids_ = nullptr;
++        other.get_gc_definitions_ = nullptr;
++    }
++    return *this;
++}
++
++unsigned KernelLibrary::definitions(
++    const char* kernel_name, gcapi::HabanaKernelParams_t* params,
++    gcapi::HabanaKernelInstantiation_t* instance) const {
++    return get_gc_definitions_(kernel_name, kGaudi2GcDeviceId,
++                               gcapi::UserParams_t{}, 0, params, instance);
++}
++
++} // namespace ninfer::gaudi2
+diff --git a/src/core/gaudi2/kernel_library.h b/src/core/gaudi2/kernel_library.h
+new file mode 100644
+index 0000000..7236c02
+--- /dev/null
++++ b/src/core/gaudi2/kernel_library.h
+@@ -0,0 +1,61 @@
++#pragma once
++// TPC kernel-library loading for the Gaudi2 runtime adapter (gap 1: the
++// bridge between the gc glue shared objects - like libglm5_tpc.so built by
++// tpc/glue - and the runtime that launches custom-kernel nodes).
++//
++// The loader binds the kernel-library contract the graph compiler defines
++// (tpc/glue/include/tpc_kernel_lib_interface.h, gc_interface.h): GetKernelGuids
++// reports the library's GUIDs; GetGcDefinitions returns one kernel's
++// instantiation descriptor (index space, access patterns, ELF blob, scalar
++// params) when driven with well-formed tensor parameters. This class owns
++// the OS-level load and the entry-point binding, enumerates the GUIDs, and
++// forwards definition queries - so an engine session holds the same handle
++// the graph compiler would, and the glue's side of the contract is proven
++// in-process before real hardware repeats it.
++
++#include "tpc/glue/include/gc_interface.h"
++#include "tpc/glue/include/tpc_kernel_lib_interface.h"
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++namespace ninfer::gaudi2 {
++
++class KernelLibrary {
++public:
++    // Loads the shared object, resolves GetKernelGuids/GetGcDefinitions, and
++    // enumerates the kernels the library reports for Gaudi2. Throws
++    // std::runtime_error on any failure; nothing stays loaded.
++    explicit KernelLibrary(const char* library_path);
++    ~KernelLibrary();
++    KernelLibrary(const KernelLibrary&) = delete;
++    KernelLibrary& operator=(const KernelLibrary&) = delete;
++    KernelLibrary(KernelLibrary&&) noexcept;
++    KernelLibrary& operator=(KernelLibrary&&) noexcept;
++
++    // The GUID names this library exports (the instantiation descriptor
++    // itself comes from definitions(), driven with per-kernel geometry).
++    [[nodiscard]] const std::vector<std::string>& kernel_names() const noexcept {
++        return names_;
++    }
++    [[nodiscard]] const std::string& path() const noexcept { return path_; }
++
++    // Forwards one GetGcDefinitions query (the caller supplies the tensor
++    // descriptors, exactly like the graph compiler would). Returns the glue
++    // status; `instance` carries the result on success.
++    [[nodiscard]] unsigned definitions(
++        const char* kernel_name, gcapi::HabanaKernelParams_t* params,
++        gcapi::HabanaKernelInstantiation_t* instance) const;
++
++private:
++    void* module_ = nullptr;  // HMODULE on Windows, void* from dlopen elsewhere
++    tpc_lib_api::pfnGetKernelGuids get_kernel_guids_ = nullptr;
++    gcapi::GlueCodeReturn_t (*get_gc_definitions_)(
++        const char*, gcapi::DeviceId_t, const gcapi::UserParams_t, unsigned,
++        gcapi::HabanaKernelParams_t*, gcapi::HabanaKernelInstantiation_t*) = nullptr;
++    std::vector<std::string> names_;
++    std::string path_;
++};
++
++} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.cpp b/src/core/gaudi2/runtime.cpp
 new file mode 100644
 index 0000000..c5c686e
@@ -8485,6 +8696,180 @@ index 0000000..2b2f860
 +    } catch (const std::exception& error) {
 +        std::fprintf(stderr, "FAIL: %s\n", error.what());
 +        fake_synapse::assert_clean();
++        return 1;
++    }
++    return 0;
++}
+diff --git a/src/core/gaudi2/tests/kernel_lib_stub.cpp b/src/core/gaudi2/tests/kernel_lib_stub.cpp
+new file mode 100644
+index 0000000..b482515
+--- /dev/null
++++ b/src/core/gaudi2/tests/kernel_lib_stub.cpp
+@@ -0,0 +1,93 @@
++// A minimal kernel-library shared object for the loader test: exports the
++// two entry points the KernelLibrary binds (GetKernelGuids new-style and
++// GetGcDefinitions old-style) and serves two fake kernels with static ELF
++// blobs and descriptors shaped like the real glue's FCD-row family. This is
++// a test double, not a fallback kernel library.
++#include "gc_interface.h"
++#include "tpc_kernel_lib_interface.h"
++
++#include <cstdint>
++#include <cstring>
++
++#if defined(_WIN32)
++#define KLIB_EXPORT __declspec(dllexport)
++#else
++#define KLIB_EXPORT __attribute__((visibility("default")))
++#endif
++
++namespace {
++
++constexpr unsigned char kElfBlob[32] = {
++    0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++    1, 0, 0xf4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++};
++
++struct FakeKernel {
++    const char* name;
++    unsigned width;
++    unsigned tokens;
++};
++
++constexpr FakeKernel kKernels[] = {
++    {"test_fcd_row", 64, 4},
++    {"test_row_wide", 256, 1},
++};
++constexpr unsigned kKernelCount = sizeof(kKernels) / sizeof(kKernels[0]);
++
++} // namespace
++
++extern "C" {
++
++KLIB_EXPORT tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId device_id,
++                                           std::uint32_t* kernel_count,
++                                           tpc_lib_api::GuidInfo* guids) {
++    if (device_id != tpc_lib_api::DEVICE_ID_GAUDI2) {
++        return tpc_lib_api::GLUE_NODE_NOT_FOUND;
++    }
++    if (kernel_count == nullptr) return tpc_lib_api::GLUE_FAILED;
++    if (*kernel_count == 0) {
++        *kernel_count = kKernelCount;
++        return tpc_lib_api::GLUE_SUCCESS;
++    }
++    if (*kernel_count < kKernelCount || guids == nullptr) {
++        *kernel_count = kKernelCount;
++        return tpc_lib_api::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
++    }
++    for (unsigned i = 0; i < kKernelCount; ++i) {
++        std::memset(&guids[i], 0, sizeof(guids[i]));
++        std::strncpy(guids[i].name, kKernels[i].name, tpc_lib_api::MAX_NODE_NAME - 1);
++    }
++    *kernel_count = kKernelCount;
++    return tpc_lib_api::GLUE_SUCCESS;
++}
++
++KLIB_EXPORT gcapi::GlueCodeReturn_t GetGcDefinitions(
++    const char* name, gcapi::DeviceId_t device_id, const gcapi::UserParams_t,
++    unsigned, gcapi::HabanaKernelParams_t* params,
++    gcapi::HabanaKernelInstantiation_t* out) {
++    if (device_id != gcapi::DEVICE_ID_GAUDI2) return gcapi::GLUE_NODE_NOT_FOUND;
++    unsigned index = kKernelCount;
++    for (unsigned i = 0; i < kKernelCount; ++i) {
++        if (std::strcmp(name, kKernels[i].name) == 0) index = i;
++    }
++    if (index == kKernelCount) return gcapi::GLUE_NODE_NOT_FOUND;
++    if (params == nullptr || params->inputTensorNr == 0 ||
++        params->outputTensorNr == 0) {
++        return gcapi::GLUE_INCOMPATIBLE_INPUT_COUNT;
++    }
++    if (out == nullptr) return gcapi::GLUE_FAILED;
++    out->indexSpaceGeometry.dims = 2;
++    out->indexSpaceGeometry.sizes[0] = kKernels[index].width;
++    out->indexSpaceGeometry.sizes[1] = kKernels[index].tokens;
++    if (out->kernelElf != nullptr) {
++        if (out->elfSize < sizeof(kElfBlob)) {
++            out->elfSize = sizeof(kElfBlob);
++            return gcapi::GLUE_INSUFICIENT_ISA_BUFFER;
++        }
++        std::memcpy(out->kernelElf, kElfBlob, sizeof(kElfBlob));
++    }
++    out->elfSize = sizeof(kElfBlob);
++    return gcapi::GLUE_SUCCESS;
++}
++
++} // extern "C"
+diff --git a/src/core/gaudi2/tests/kernel_library_test.cpp b/src/core/gaudi2/tests/kernel_library_test.cpp
+new file mode 100644
+index 0000000..b20b0c9
+--- /dev/null
++++ b/src/core/gaudi2/tests/kernel_library_test.cpp
+@@ -0,0 +1,69 @@
++// Kernel-library loader test: the stub shared object loads through the
++// runtime's KernelLibrary, its GUIDs enumerate, and a driven descriptor
++// query returns the full instantiation (index space, ELF blob) - the same
++// handshake the graph compiler performs against real glue libraries.
++#include "core/gaudi2/kernel_library.h"
++
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++
++#ifndef NINFER_GAUDI2_TEST_KERNEL_LIB
++#error "the test needs the stub library path from CMake"
++#endif
++constexpr const char* kStubName = NINFER_GAUDI2_TEST_KERNEL_LIB;
++
++namespace {
++void require(bool value, const char* what) {
++    if (!value) throw std::runtime_error(what);
++}
++} // namespace
++
++int main() {
++    try {
++        ninfer::gaudi2::KernelLibrary library(kStubName);
++        require(library.kernel_names().size() == 2, "two kernels enumerated");
++        require(library.kernel_names()[0] == "test_fcd_row", "first kernel name");
++        require(library.kernel_names()[1] == "test_row_wide", "second kernel name");
++
++        // Drive one definitions query with well-formed tensor parameters
++        // (the graph compiler's side of the handshake).
++        gcapi::HabanaKernelParams_t params{};
++        params.inputTensorNr = 1;
++        params.outputTensorNr = 1;
++        params.inputTensors[0].dataType = gcapi::DATA_BF16;
++        params.inputTensors[0].geometry.dims = 2;
++        params.inputTensors[0].geometry.sizes[0] = 64;
++        params.inputTensors[0].geometry.sizes[1] = 4;
++        params.outputTensors[0].dataType = gcapi::DATA_BF16;
++        params.outputTensors[0].geometry.dims = 2;
++        params.outputTensors[0].geometry.sizes[0] = 64;
++        params.outputTensors[0].geometry.sizes[1] = 4;
++
++        unsigned char elf[256];
++        gcapi::HabanaKernelInstantiation_t instance{};
++        instance.kernelElf = elf;
++        instance.elfSize = sizeof(elf);
++        const unsigned status =
++            library.definitions("test_fcd_row", &params, &instance);
++        require(status == gcapi::GLUE_SUCCESS, "definitions query succeeds");
++        require(instance.indexSpaceGeometry.dims == 2, "index space rank");
++        require(instance.indexSpaceGeometry.sizes[0] == 64, "index space width");
++        require(instance.elfSize == 32, "elf size");
++        require(elf[0] == 0x7f && elf[1] == 'E' && elf[2] == 'L' && elf[3] == 'F',
++                "elf blob delivered");
++
++        // An unknown kernel name surfaces the glue's own status.
++        const unsigned missing =
++            library.definitions("no_such_kernel", &params, &instance);
++        require(missing == gcapi::GLUE_NODE_NOT_FOUND, "unknown kernel rejected");
++
++        std::printf("ok: %zu kernels, descriptor round-trip and rejection pass\n",
++                    library.kernel_names().size());
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "FAIL: %s\n", error.what());
 +        return 1;
 +    }
 +    return 0;
