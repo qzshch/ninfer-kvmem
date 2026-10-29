@@ -130,7 +130,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd pkg-config libhwloc-dev
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd pkg-config libhwloc-dev liburing-dev
       - uses: actions/checkout@v4
       - name: Trust the checked-out workspace in the CUDA container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -144,7 +144,7 @@ jobs:
           python3 scripts/prepare-backends.py --backend ninfer --check
       - name: Compile the patched ninfer model chain
         run: |
-          cmake -S backends/ninfer -B build-ninfer -G Ninja             -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
+          cmake -S backends/ninfer -B build-ninfer -G Ninja             -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a             -DNINFER_BUILD_ENGINE=OFF -DNINFER_BUILD_PRODUCT_SUPPORT=OFF
           cmake --build build-ninfer --target ninfer_model_loading --parallel 2
       - name: Identify the compiler toolchain
         id: toolchain
