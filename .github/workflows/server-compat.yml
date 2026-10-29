@@ -130,7 +130,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd pkg-config libhwloc-dev
       - uses: actions/checkout@v4
       - name: Trust the checked-out workspace in the CUDA container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
