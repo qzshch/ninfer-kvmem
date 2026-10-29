@@ -60,6 +60,14 @@ jobs:
         run: |
           python3 scripts/prepare-backends.py --backend llamacpp
           python3 scripts/prepare-backends.py --backend llamacpp --check
+      - name: Prepare the pinned ninfer integration
+        run: |
+          python3 scripts/prepare-backends.py --backend ninfer
+          python3 scripts/prepare-backends.py --backend ninfer --check
+      - name: Compile the patched ninfer model chain
+        run: |
+          cmake -S backends/ninfer -B build-ninfer -G Ninja             -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
+          cmake --build build-ninfer --target ninfer_model_loading --parallel 2
       - name: Configure host and model-free server tests
         run: >-
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

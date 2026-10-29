@@ -10387,10 +10387,10 @@ index 0000000..ef8e5c7
 +
 diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
 new file mode 100644
-index 0000000..4bceeb8
+index 0000000..43c01e6
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,364 @@
 +// GLM-5.3-Flash TPC kernel glue, FCD-row family (table-driven).
 +//
 +// Review R2/R3 corrections baked into this version:
@@ -10599,12 +10599,21 @@ index 0000000..4bceeb8
 +        out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
 +        out_defs->indexSpaceGeometry.sizes[1] = tokens;
 +        for (unsigned i = 0; i < k.inputs; ++i) {
-+            set_element_transform(out_defs->inputTensorAccessPattern[i], 1);
++            // dim0: slot s owns elements [s*128, s*128+127]; dim1: the token
++            // axis follows index dim1 1:1. The earlier helper call only
++            // touched pattern dim[0] (immediately overwritten below) and
++            // left the TOKEN axis unmapped - review T1's {width, 2}
++            // descriptor exposed the unreachable second token row.
 +            out_defs->inputTensorAccessPattern[i].dim[0].indexSpaceDim = 0;
 +            out_defs->inputTensorAccessPattern[i].dim[0].start_a = 128.0f;
 +            out_defs->inputTensorAccessPattern[i].dim[0].start_b = 0.0f;
 +            out_defs->inputTensorAccessPattern[i].dim[0].end_a = 128.0f;
 +            out_defs->inputTensorAccessPattern[i].dim[0].end_b = 127.0f;
++            out_defs->inputTensorAccessPattern[i].dim[1].indexSpaceDim = 1;
++            out_defs->inputTensorAccessPattern[i].dim[1].start_a = 1.0f;
++            out_defs->inputTensorAccessPattern[i].dim[1].start_b = 0.0f;
++            out_defs->inputTensorAccessPattern[i].dim[1].end_a = 1.0f;
++            out_defs->inputTensorAccessPattern[i].dim[1].end_b = 0.0f;
 +        }
 +        // a_log {heads, 1}: the head axis follows the slot index 1:1 (the
 +        // kernel reads a_log[slot]); the 128-wide transform above would
@@ -10617,12 +10626,16 @@ index 0000000..4bceeb8
 +            out_defs->inputTensorAccessPattern[1].dim[0].end_b = 0.0f;
 +        }
 +        for (unsigned o = 0; o < k.outputs; ++o) {
-+            set_element_transform(out_defs->outputTensorAccessPattern[o], 1);
 +            out_defs->outputTensorAccessPattern[o].dim[0].indexSpaceDim = 0;
 +            out_defs->outputTensorAccessPattern[o].dim[0].start_a = 128.0f;
 +            out_defs->outputTensorAccessPattern[o].dim[0].start_b = 0.0f;
 +            out_defs->outputTensorAccessPattern[o].dim[0].end_a = 128.0f;
 +            out_defs->outputTensorAccessPattern[o].dim[0].end_b = 127.0f;
++            out_defs->outputTensorAccessPattern[o].dim[1].indexSpaceDim = 1;
++            out_defs->outputTensorAccessPattern[o].dim[1].start_a = 1.0f;
++            out_defs->outputTensorAccessPattern[o].dim[1].start_b = 0.0f;
++            out_defs->outputTensorAccessPattern[o].dim[1].end_a = 1.0f;
++            out_defs->outputTensorAccessPattern[o].dim[1].end_b = 0.0f;
 +        }
 +        return publish_elf(out_defs, k.elf_start, k.elf_end);
 +    }
@@ -11068,10 +11081,10 @@ index 0000000..c3f9f19
 +}
 diff --git a/src/core/gaudi2/tpc/glue/tests/glue_check.c b/src/core/gaudi2/tpc/glue/tests/glue_check.c
 new file mode 100644
-index 0000000..1fa08f3
+index 0000000..2cb875d
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/tests/glue_check.c
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,183 @@
 +// Offline descriptor round-trip: call GetGcDefinitions for every GUID with
 +// well-formed HabanaKernelParams_t descriptors and verify each returns a
 +// non-empty ELF, a sane index space, and its scalar params.
@@ -11223,6 +11236,23 @@ index 0000000..1fa08f3
 +        // double division produces a non-zero but wrong space.
 +        const unsigned got1 = inst.indexSpaceGeometry.dims > 1
 +                                  ? inst.indexSpaceGeometry.sizes[1] : 1;
++        // Access-pattern audit for the vector-slot kernel: BOTH tensor axes
++        // must map (dim0 -> slots at stride 128, dim1 -> tokens 1:1). The
++        // unmapped token axis of review T1 left multi-token descriptors
++        // half-unreachable while the index space still looked right.
++        if (std::strcmp(k.name, "glm5_kda_gate_bf16") == 0) {
++            const gcapi::TensorAccessPattern_t* pat =
++                inst.inputTensorAccessPattern;
++            if (!pat || pat[0].dim[0].indexSpaceDim != 0 ||
++                pat[0].dim[0].start_a != 128.0f ||
++                pat[0].dim[1].indexSpaceDim != 1 ||
++                pat[0].dim[1].start_a != 1.0f) {
++                std::printf("FAIL %s: access pattern axes unmapped
++", k.name);
++                ++failures;
++                continue;
++            }
++        }
 +        if (inst.indexSpaceGeometry.sizes[0] != k.ispace0 || got1 != k.ispace1) {
 +            std::printf("FAIL %s: ispace %ux%u, expected %ux%u\n", k.name,
 +                        inst.indexSpaceGeometry.sizes[0], got1,
@@ -15284,7 +15314,7 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..f25f723
+index 0000000..49d65d4
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
 @@ -0,0 +1,935 @@
@@ -15350,7 +15380,7 @@ index 0000000..f25f723
 +                      const Tensor& a_log, const Tensor& o_norm_w, Tensor& conv_q_state,
 +                      Tensor& conv_k_state, Tensor& conv_v_state, Tensor& matrix_state,
 +                      float gate_lower_bound, std::uint32_t heads, std::uint32_t head_dim,
-+                      float rms_eps, Tensor& block_out, void* scratch, cudaStream_t stream,
++                      float rms_eps, Tensor& block_out, void* scratch, const CudaExecutionView& execution,
 +                      KdaBlockDebug* debug) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    const std::int32_t d_inner =
@@ -15391,17 +15421,17 @@ index 0000000..f25f723
 +    // non-const output references, so every scratch plane gets a named Tensor.
 +    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, 1});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    if (debug && debug->normed) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->normed->data, normed, hidden * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +    Tensor q_raw_t(q_raw, DType::BF16, {d_inner, 1});
 +    Tensor k_raw_t(k_raw, DType::BF16, {d_inner, 1});
 +    Tensor v_raw_t(v_raw, DType::BF16, {d_inner, 1});
-+    ops::linear(normed_t, w.wq, q_raw_t, stream);
-+    ops::linear(normed_t, w.wk, k_raw_t, stream);
-+    ops::linear(normed_t, w.wv, v_raw_t, stream);
++    ops::linear(normed_t, w.wq, q_raw_t, execution);
++    ops::linear(normed_t, w.wk, k_raw_t, execution);
++    ops::linear(normed_t, w.wv, v_raw_t, execution);
 +    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), DType::BF16, {4, d_inner});
 +    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), DType::BF16, {4, d_inner});
 +    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), DType::BF16, {4, d_inner});
@@ -15411,16 +15441,16 @@ index 0000000..f25f723
 +    Tensor q_conv_view(q_conv, DType::BF16, {1, d_inner});
 +    Tensor k_conv_view(k_conv, DType::BF16, {1, d_inner});
 +    Tensor v_conv_view(v_conv, DType::BF16, {1, d_inner});
-+    ops::glm5_kda_conv(q_raw_view, conv_q_w, conv_q_state, q_conv_view, stream);
-+    ops::glm5_kda_conv(k_raw_view, conv_k_w, conv_k_state, k_conv_view, stream);
-+    ops::glm5_kda_conv(v_raw_view, conv_v_w, conv_v_state, v_conv_view, stream);
++    ops::glm5_kda_conv(q_raw_view, conv_q_w, conv_q_state, q_conv_view, execution.stream());
++    ops::glm5_kda_conv(k_raw_view, conv_k_w, conv_k_state, k_conv_view, execution.stream());
++    ops::glm5_kda_conv(v_raw_view, conv_v_w, conv_v_state, v_conv_view, execution.stream());
 +    if (debug && debug->q_conv) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->q_conv->data, q_conv, d_inner * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +        CUDA_CHECK(cudaMemcpyAsync(debug->k_conv->data, k_conv, d_inner * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +        CUDA_CHECK(cudaMemcpyAsync(debug->v_conv->data, v_conv, d_inner * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +    // prefill reads the same conv planes in [D, T] order.
 +    Tensor q_conv_t(q_conv, DType::BF16, {d_inner, 1});
@@ -15435,43 +15465,43 @@ index 0000000..f25f723
 +    Tensor beta_logits_t(beta_logits, DType::BF16, {hs, 1});
 +    Tensor gate_t(gate_log, DType::FP32, {d_inner, 1});
 +    Tensor beta_t(beta_f32, DType::FP32, {hs, 1});
-+    ops::linear(normed_t, w.f_a, stage_t, stream);
-+    ops::linear(stage_t, w.f_b, gate_pre_t, stream);
-+    ops::add_bias(dt_bias, gate_pre_t, stream);
-+    ops::linear(normed_t, w.beta, beta_logits_t, stream);
++    ops::linear(normed_t, w.f_a, stage_t, execution);
++    ops::linear(stage_t, w.f_b, gate_pre_t, execution);
++    ops::add_bias(dt_bias, gate_pre_t, execution);
++    ops::linear(normed_t, w.beta, beta_logits_t, execution);
 +    Tensor gate_pre_view(gate_pre, DType::BF16, {1, d_inner});
 +    Tensor gate_view(gate_log, DType::FP32, {1, d_inner});
 +    Tensor beta_view(beta_f32, DType::FP32, {1, hs});
 +    Tensor beta_logits_view(beta_logits, DType::BF16, {1, hs});
 +    if (debug && debug->gate_pre) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->gate_pre->data, gate_pre, d_inner * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +    if (debug && debug->beta_logits) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->beta_logits->data, beta_logits, heads * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +    ops::glm5_kda_gating(gate_pre_view, beta_logits_view, a_log, gate_lower_bound, gate_view,
-+                         beta_view, stream);
++                         beta_view, execution);
 +    if (debug && debug->gate) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->gate->data, gate_log, static_cast<std::size_t>(d_inner) * 4,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +        CUDA_CHECK(cudaMemcpyAsync(debug->beta->data, beta_f32, heads * 4,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    // The output gate's two stages, then the single-token prefill and wo.
 +    Tensor g2_t(g2, DType::BF16, {d_inner, 1});
 +    Tensor prefill_t(prefill_out, DType::BF16, {d_inner, 1});
-+    ops::linear(normed_t, w.g_a, stage_t, stream);
-+    ops::linear(stage_t, w.g_b, g2_t, stream);
++    ops::linear(normed_t, w.g_a, stage_t, execution);
++    ops::linear(stage_t, w.g_b, g2_t, execution);
 +    ops::glm5_kda_prefill(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, g2_t, o_norm_w,
-+                          matrix_state, prefill_t, stream);
++                          matrix_state, prefill_t, execution);
 +    if (debug && debug->prefill_out) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->prefill_out->data, prefill_out, d_inner * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
-+    ops::linear(prefill_t, w.wo, block_out, stream);
++    ops::linear(prefill_t, w.wo, block_out, execution);
 +}
 +
 +
@@ -15508,7 +15538,7 @@ index 0000000..f25f723
 +                      std::uint32_t head_dim, std::uint32_t q_lora, std::uint32_t kv_lora,
 +                      std::uint32_t v_head, std::uint32_t index_heads, std::uint32_t index_dim,
 +                      std::uint32_t kpool, std::uint32_t top_k, Tensor& block_out, void* scratch,
-+                      cudaStream_t stream) {
++                      const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    if (hidden <= 0 || hidden_in.ne[1] != 1 || hidden_in.dtype != DType::BF16) {
 +        throw std::invalid_argument("dsa_block_decode: hidden_in must be BF16 [hidden, 1]");
@@ -15544,16 +15574,16 @@ index 0000000..f25f723
 +    // norm(hidden) once; every projection reads it.
 +    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, 1});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    // q side: q_a -> norm -> q_b, then absorb W_K_B per head (FP32 out).
 +    Tensor q_latent_t(q_latent, DType::BF16, {static_cast<std::int32_t>(q_lora), 1});
-+    ops::linear(normed_t, w.q_a, q_latent_t, stream);
++    ops::linear(normed_t, w.q_a, q_latent_t, execution);
 +    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
-+    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, stream);
++    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
 +    Tensor q_heads_t(q_heads, DType::BF16, {static_cast<std::int32_t>(heads * head_dim), 1});
-+    ops::linear(q_latent_t, w.q_b, q_heads_t, stream);
++    ops::linear(q_latent_t, w.q_b, q_heads_t, execution);
 +    Tensor q_heads_view(q_heads, DType::BF16,
 +                        {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(head_dim)});
 +    Tensor q_abs_t(q_abs, DType::FP32,
@@ -15561,37 +15591,37 @@ index 0000000..f25f723
 +    const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), DType::BF16,
 +                           {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(kv_lora),
 +                            static_cast<std::int32_t>(heads)});
-+    ops::glm5_dsa_absorb(q_heads_view, wk_b_view, q_abs_t, stream);
++    ops::glm5_dsa_absorb(q_heads_view, wk_b_view, q_abs_t, execution.stream());
 +
 +    // kv side: compress, norm, write this token's latent row.
 +    Tensor latent_t(latent, DType::BF16, {static_cast<std::int32_t>(kv_lora), 1});
-+    ops::linear(normed_t, w.kv_a, latent_t, stream);
++    ops::linear(normed_t, w.kv_a, latent_t, execution);
 +    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
-+    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, stream);
++    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
 +    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(latents.data) +
 +                                   static_cast<std::size_t>(position) * kv_lora * 2,
-+                               latent, kv_lora * 2, cudaMemcpyDeviceToDevice, stream));
++                               latent, kv_lora * 2, cudaMemcpyDeviceToDevice, execution));
 +
 +    // Indexer planes: query from the q latent, LayerNorm'd key and gate from the hidden.
 +    Tensor iq_t(iq, DType::BF16, {static_cast<std::int32_t>(index_heads * index_dim), 1});
-+    ops::linear(q_latent_t, w.indexer_q_b, iq_t, stream);
++    ops::linear(q_latent_t, w.indexer_q_b, iq_t, execution);
 +    Tensor ik_raw_t(ik_raw, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
-+    ops::linear(normed_t, w.indexer_k, ik_raw_t, stream);
++    ops::linear(normed_t, w.indexer_k, ik_raw_t, execution);
 +    Tensor ik_normed_t(ik_normed, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
 +    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
 +    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
-+    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, stream);
++    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, execution);
 +    Tensor ig_t(ig, DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
-+    ops::linear(normed_t, w.indexer_gate, ig_t, stream);
++    ops::linear(normed_t, w.indexer_gate, ig_t, execution);
 +    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ik_plane.data) +
 +                                   static_cast<std::size_t>(position) * index_dim * 2,
-+                               ik_normed, index_dim * 2, cudaMemcpyDeviceToDevice, stream));
++                               ik_normed, index_dim * 2, cudaMemcpyDeviceToDevice, execution));
 +    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(ig_plane.data) +
 +                                   static_cast<std::size_t>(position) * index_dim * 2,
-+                               ig, index_dim * 2, cudaMemcpyDeviceToDevice, stream));
++                               ig, index_dim * 2, cudaMemcpyDeviceToDevice, execution));
 +
 +    // Re-pool every completed pool (decode path; incremental re-pooling is a later
 +    // optimization that the streaming protocol in the research notes describes).
@@ -15606,10 +15636,10 @@ index 0000000..f25f723
 +                          {pool_tokens, static_cast<std::int32_t>(index_dim)});
 +        Tensor pooled_t(pool_scratch, DType::FP32,
 +                        {static_cast<std::int32_t>(completed), static_cast<std::int32_t>(index_dim)});
-+        ops::glm5_dsa_pool(ik_history, ig_history, indexer_ape, pooled_t, stream);
++        ops::glm5_dsa_pool(ik_history, ig_history, indexer_ape, pooled_t, execution.stream());
 +        CUDA_CHECK(cudaMemcpyAsync(pooled.data, pool_scratch,
 +                                   static_cast<std::size_t>(completed) * index_dim * 4,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    // Head weights: the linear op emits BF16; the score op wants FP32 pre-scaled by
@@ -15617,18 +15647,18 @@ index 0000000..f25f723
 +    // [index_heads] plane); a fused cast kernel replaces it later.
 +    {
 +        Tensor weights_t(weights_bf, DType::BF16, {static_cast<std::int32_t>(index_heads), 1});
-+        ops::linear(normed_t, w.indexer_proj, weights_t, stream);
++        ops::linear(normed_t, w.indexer_proj, weights_t, execution);
 +        std::vector<std::uint16_t> host_bf(index_heads);
 +        CUDA_CHECK(cudaMemcpyAsync(host_bf.data(), weights_bf, index_heads * 2,
-+                                   cudaMemcpyDeviceToHost, stream));
-+        CUDA_CHECK(cudaStreamSynchronize(stream));
++                                   cudaMemcpyDeviceToHost, execution));
++        CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
 +        std::vector<float> host_f32(index_heads);
 +        const float scale = std::sqrt(1.0f / (static_cast<float>(index_dim) * index_heads));
 +        for (std::uint32_t h = 0; h < index_heads; ++h) {
 +            host_f32[h] = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&host_bf[h])) * scale;
 +        }
 +        CUDA_CHECK(cudaMemcpyAsync(weights_f32, host_f32.data(), index_heads * 4,
-+                                   cudaMemcpyHostToDevice, stream));
++                                   cudaMemcpyHostToDevice, execution));
 +    }
 +
 +    // Score -> select -> attention. With no completed pool the selection is tail-only.
@@ -15639,9 +15669,9 @@ index 0000000..f25f723
 +                       {static_cast<std::int32_t>(index_heads), static_cast<std::int32_t>(index_dim)});
 +        Tensor score_t(scores, DType::FP32, {static_cast<std::int32_t>(completed)});
 +        Tensor w_view(weights_f32, DType::FP32, {static_cast<std::int32_t>(index_heads)});
-+        ops::glm5_dsa_score(iq_view, pooled_t, w_view, score_t, stream);
++        ops::glm5_dsa_score(iq_view, pooled_t, w_view, score_t, execution.stream());
 +        ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool), true,
-+                             cells, stream);
++                             cells, execution);
 +    } else {
 +        std::vector<std::int32_t> tail_row(cells.ne[0], -1);
 +        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
@@ -15650,7 +15680,7 @@ index 0000000..f25f723
 +        }
 +        CUDA_CHECK(cudaMemcpyAsync(cells.data, tail_row.data(),
 +                                   static_cast<std::size_t>(cells.ne[0]) * 4,
-+                                   cudaMemcpyHostToDevice, stream));
++                                   cudaMemcpyHostToDevice, execution));
 +    }
 +
 +    // The attention op takes BF16 queries; round the FP32 absorbed queries to BF16 (the
@@ -15659,15 +15689,15 @@ index 0000000..f25f723
 +        std::vector<float> host_f32(static_cast<std::size_t>(heads) * kv_lora);
 +        CUDA_CHECK(cudaMemcpyAsync(host_f32.data(), q_abs,
 +                                   static_cast<std::size_t>(heads) * kv_lora * 4,
-+                                   cudaMemcpyDeviceToHost, stream));
-+        CUDA_CHECK(cudaStreamSynchronize(stream));
++                                   cudaMemcpyDeviceToHost, execution));
++        CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
 +        std::vector<std::uint16_t> host_bf(host_f32.size());
 +        for (std::size_t i = 0; i < host_f32.size(); ++i) {
 +            *reinterpret_cast<float*>(&host_f32[i]) = host_f32[i];
 +            host_bf[i] = __bfloat16_as_ushort(__float2bfloat16(host_f32[i]));
 +        }
 +        CUDA_CHECK(cudaMemcpyAsync(q_abs, host_bf.data(), host_bf.size() * 2,
-+                                   cudaMemcpyHostToDevice, stream));
++                                   cudaMemcpyHostToDevice, execution));
 +    }
 +    Tensor q_abs_bf(q_abs, DType::BF16,
 +                    {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(kv_lora)});
@@ -15676,8 +15706,8 @@ index 0000000..f25f723
 +                            static_cast<std::int32_t>(heads)});
 +    Tensor attn_t(attn_out, DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
 +    ops::glm5_dsa_attention(q_abs_bf, latents, cells, wv_b_view, attn_t,
-+                            static_cast<std::int32_t>(head_dim), stream);
-+    ops::linear(attn_t, w.wo, block_out, stream);
++                            static_cast<std::int32_t>(head_dim), execution);
++    ops::linear(attn_t, w.wo, block_out, execution);
 +}
 +
 +
@@ -15690,7 +15720,7 @@ index 0000000..f25f723
 +
 +void dense_mlp_decode(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
 +                      float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
-+                      cudaStream_t stream) {
++                      const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    auto* cursor = static_cast<std::uint8_t*>(scratch);
 +    auto take = [&](std::size_t bytes) {
@@ -15707,17 +15737,17 @@ index 0000000..f25f723
 +
 +    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, 1});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
 +    Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
-+    ops::linear(normed_t, w.gate, gate_t, stream);
-+    ops::linear(normed_t, w.up, up_t, stream);
++    ops::linear(normed_t, w.gate, gate_t, execution);
++    ops::linear(normed_t, w.up, up_t, execution);
 +    Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +    Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +    Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
-+    ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++    ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, execution.stream());
 +    Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
-+    ops::linear(act_t, w.down, out, stream);
++    ops::linear(act_t, w.down, out, execution);
 +}
 +
 +std::size_t moe_block_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn,
@@ -15730,7 +15760,7 @@ index 0000000..f25f723
 +void moe_block_decode(const MoeBlockWeights& w, const Tensor& hidden_in, const Tensor& router_bias,
 +                      float rms_eps, float swiglu_limit, float routed_scaling_factor,
 +                      std::uint32_t experts, std::uint32_t top_k, std::uint32_t ffn, Tensor& out,
-+                      void* scratch, cudaStream_t stream) {
++                      void* scratch, const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    auto* cursor = static_cast<std::uint8_t*>(scratch);
 +    auto take = [&](std::size_t bytes) {
@@ -15753,26 +15783,26 @@ index 0000000..f25f723
 +
 +    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, 1});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    Tensor logits_t(logits, DType::BF16, {static_cast<std::int32_t>(experts), 1});
-+    ops::linear(normed_t, w.router, logits_t, stream);
++    ops::linear(normed_t, w.router, logits_t, execution);
 +    Tensor weights_t(weights_f32, DType::FP32, {static_cast<std::int32_t>(top_k)});
 +    Tensor indices_t(indices, DType::I32, {static_cast<std::int32_t>(top_k)});
 +    ops::glm5_moe_route(logits_t, router_bias, static_cast<std::int32_t>(top_k),
-+                        routed_scaling_factor, weights_t, indices_t, stream);
++                        routed_scaling_factor, weights_t, indices_t, execution);
 +
 +    // Selected experts sequentially; each expert's weights are its row block of the
 +    // stacked planes, addressed by offsetting the base Weight.
 +    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
 +        std::int32_t expert = -1;
 +        CUDA_CHECK(cudaMemcpyAsync(&expert, static_cast<const void*>(indices) + slot * 4, 4,
-+                                   cudaMemcpyDeviceToHost, stream));
-+        CUDA_CHECK(cudaStreamSynchronize(stream));
++                                   cudaMemcpyDeviceToHost, execution));
++        CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
 +        if (expert < 0 || static_cast<std::uint32_t>(expert) >= experts) {
 +            CUDA_CHECK(cudaMemsetAsync(static_cast<std::uint8_t*>(stacked) +
 +                                           static_cast<std::size_t>(slot) * hidden * 2,
-+                                       0, static_cast<std::size_t>(hidden) * 2, stream));
++                                       0, static_cast<std::size_t>(hidden) * 2, execution));
 +            continue;
 +        }
 +        const auto base = static_cast<std::uint32_t>(expert);
@@ -15803,38 +15833,38 @@ index 0000000..f25f723
 +
 +        Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
 +        Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
-+        ops::linear(normed_t, gate_w, gate_t, stream);
-+        ops::linear(normed_t, up_w, up_t, stream);
++        ops::linear(normed_t, gate_w, gate_t, execution);
++        ops::linear(normed_t, up_w, up_t, execution);
 +        Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +        Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +        Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
-+        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, execution.stream());
 +        Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
 +        Tensor down_t(expert_down, DType::BF16, {hidden, 1});
-+        ops::linear(act_t, down_w, down_t, stream);
++        ops::linear(act_t, down_w, down_t, execution);
 +        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(stacked) +
 +                                       static_cast<std::size_t>(slot) * hidden * 2,
 +                                   expert_down, static_cast<std::size_t>(hidden) * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    // Shared expert (unweighted) plus the weighted routed combine.
 +    {
 +        Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
 +        Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
-+        ops::linear(normed_t, w.gate_shexp, gate_t, stream);
-+        ops::linear(normed_t, w.up_shexp, up_t, stream);
++        ops::linear(normed_t, w.gate_shexp, gate_t, execution);
++        ops::linear(normed_t, w.up_shexp, up_t, execution);
 +        Tensor gate_view(gate, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +        Tensor up_view(up, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
 +        Tensor act_view(activated, DType::BF16, {1, static_cast<std::int32_t>(ffn)});
-+        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, stream);
++        ops::glm5_swiglu(gate_view, up_view, swiglu_limit, act_view, execution.stream());
 +        Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), 1});
 +        Tensor shared_t(shared_out, DType::BF16, {hidden, 1});
-+        ops::linear(act_t, w.down_shexp, shared_t, stream);
++        ops::linear(act_t, w.down_shexp, shared_t, execution);
 +    }
 +    Tensor stacked_t(stacked, DType::BF16, {static_cast<std::int32_t>(top_k), hidden});
 +    Tensor shared_t2(shared_out, DType::BF16, {static_cast<std::int32_t>(hidden), 1});
-+    ops::glm5_moe_combine(stacked_t, weights_t, shared_t2, out, stream);
++    ops::glm5_moe_combine(stacked_t, weights_t, shared_t2, out, execution.stream());
 +}
 +
 +
@@ -15862,7 +15892,7 @@ index 0000000..f25f723
 +                       Tensor& conv_q_state, Tensor& conv_k_state, Tensor& conv_v_state,
 +                       Tensor& matrix_state, float gate_lower_bound, std::uint32_t heads,
 +                       std::uint32_t head_dim, float rms_eps, std::uint32_t chunk,
-+                       Tensor& block_out, void* scratch, cudaStream_t stream) {
++                       Tensor& block_out, void* scratch, const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    const std::int32_t tokens = hidden_in.ne[1];
 +    const auto d_inner = static_cast<std::int32_t>(heads * head_dim);
@@ -15899,14 +15929,14 @@ index 0000000..f25f723
 +
 +    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, tokens});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    Tensor q_raw_t(q_raw, DType::BF16, {d_inner, tokens});
 +    Tensor k_raw_t(k_raw, DType::BF16, {d_inner, tokens});
 +    Tensor v_raw_t(v_raw, DType::BF16, {d_inner, tokens});
-+    ops::linear(normed_t, w.wq, q_raw_t, stream);
-+    ops::linear(normed_t, w.wk, k_raw_t, stream);
-+    ops::linear(normed_t, w.wv, v_raw_t, stream);
++    ops::linear(normed_t, w.wq, q_raw_t, execution);
++    ops::linear(normed_t, w.wk, k_raw_t, execution);
++    ops::linear(normed_t, w.wv, v_raw_t, execution);
 +
 +    // The conv kernel's memory order (channel fastest: t*d_inner + ch) is
 +    // exactly the [d_inner, T] FCD layout of the linear outputs; the op's
@@ -15923,9 +15953,9 @@ index 0000000..f25f723
 +    Tensor q_conv_label(q_conv, DType::BF16, {tokens, d_inner});
 +    Tensor k_conv_label(k_conv, DType::BF16, {tokens, d_inner});
 +    Tensor v_conv_label(v_conv, DType::BF16, {tokens, d_inner});
-+    ops::glm5_kda_conv(q_raw_label, conv_q_w, conv_q_state, q_conv_label, stream);
-+    ops::glm5_kda_conv(k_raw_label, conv_k_w, conv_k_state, k_conv_label, stream);
-+    ops::glm5_kda_conv(v_raw_label, conv_v_w, conv_v_state, v_conv_label, stream);
++    ops::glm5_kda_conv(q_raw_label, conv_q_w, conv_q_state, q_conv_label, execution.stream());
++    ops::glm5_kda_conv(k_raw_label, conv_k_w, conv_k_state, k_conv_label, execution.stream());
++    ops::glm5_kda_conv(v_raw_label, conv_v_w, conv_v_state, v_conv_label, execution.stream());
 +
 +    // Decay gate and beta over the whole plane.
 +    const auto hd = static_cast<std::int32_t>(head_dim);
@@ -15935,10 +15965,10 @@ index 0000000..f25f723
 +    Tensor beta_logits_t(beta_logits, DType::BF16, {hs, tokens});
 +    Tensor gate_t(gate_log, DType::FP32, {d_inner, tokens});
 +    Tensor beta_t(beta_f32, DType::FP32, {hs, tokens});
-+    ops::linear(normed_t, w.f_a, stage_t, stream);
-+    ops::linear(stage_t, w.f_b, gate_pre_t, stream);
-+    ops::add_bias(dt_bias, gate_pre_t, stream);
-+    ops::linear(normed_t, w.beta, beta_logits_t, stream);
++    ops::linear(normed_t, w.f_a, stage_t, execution);
++    ops::linear(stage_t, w.f_b, gate_pre_t, execution);
++    ops::add_bias(dt_bias, gate_pre_t, execution);
++    ops::linear(normed_t, w.beta, beta_logits_t, execution);
 +    // Same memory-order story as the conv: the gating kernel indexes
 +    // t*d_inner + ch, so the [·, T] FCD planes pass through with their ne
 +    // labels swapped; its outputs land in the chunk scan's expected layout.
@@ -15947,17 +15977,17 @@ index 0000000..f25f723
 +    Tensor gate_label(gate_log, DType::FP32, {tokens, d_inner});
 +    Tensor beta_label(beta_f32, DType::FP32, {tokens, static_cast<std::int32_t>(heads)});
 +    ops::glm5_kda_gating(gate_pre_label, beta_logits_label, a_log, gate_lower_bound,
-+                         gate_label, beta_label, stream);
++                         gate_label, beta_label, execution);
 +
 +    // Output-gate projections, then the chunked scan and the batched gate.
 +    Tensor g2_t(g2, DType::BF16, {d_inner, tokens});
-+    ops::linear(normed_t, w.g_a, stage_t, stream);
-+    ops::linear(stage_t, w.g_b, g2_t, stream);
++    ops::linear(normed_t, w.g_a, stage_t, execution);
++    ops::linear(stage_t, w.g_b, g2_t, execution);
 +    Tensor scan_t(scan_out, DType::BF16, {d_inner, tokens});
 +    ops::glm5_kda_chunk(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, matrix_state,
-+                        scan_t, chunk, stream);
-+    ops::glm5_kda_outgate(scan_t, g2_t, o_norm_w, scan_t, stream);
-+    ops::linear(scan_t, w.wo, block_out, stream);
++                        scan_t, chunk, execution);
++    ops::glm5_kda_outgate(scan_t, g2_t, o_norm_w, scan_t, execution.stream());
++    ops::linear(scan_t, w.wo, block_out, execution);
 +}
 +
 +std::size_t dsa_block_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
@@ -15998,7 +16028,7 @@ index 0000000..f25f723
 +                       std::uint32_t head_dim, std::uint32_t q_lora, std::uint32_t kv_lora,
 +                       std::uint32_t v_head, std::uint32_t index_heads,
 +                       std::uint32_t index_dim, std::uint32_t kpool, std::uint32_t top_k,
-+                       Tensor& block_out, void* scratch, cudaStream_t stream) {
++                       Tensor& block_out, void* scratch, const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    const std::int32_t tokens = hidden_in.ne[1];
 +    if (hidden <= 0 || tokens <= 0 || hidden_in.dtype != DType::BF16) {
@@ -16032,24 +16062,24 @@ index 0000000..f25f723
 +
 +    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, tokens});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    // q side, batched.
 +    Tensor q_latent_t(q_latent, DType::BF16, {static_cast<std::int32_t>(q_lora), tokens});
-+    ops::linear(normed_t, w.q_a, q_latent_t, stream);
++    ops::linear(normed_t, w.q_a, q_latent_t, execution);
 +    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
-+    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, stream);
++    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
 +    Tensor q_heads_t(q_heads, DType::BF16,
 +                     {static_cast<std::int32_t>(heads * head_dim), tokens});
-+    ops::linear(q_latent_t, w.q_b, q_heads_t, stream);
++    ops::linear(q_latent_t, w.q_b, q_heads_t, execution);
 +
 +    // kv side, batched; write every token's latent row into the cache.
 +    Tensor latent_t(latent, DType::BF16, {static_cast<std::int32_t>(kv_lora), tokens});
-+    ops::linear(normed_t, w.kv_a, latent_t, stream);
++    ops::linear(normed_t, w.kv_a, latent_t, execution);
 +    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
-+    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, stream);
++    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
 +    {
 +        // Strided scatter: destination rows first_position..+T of the cache
 +        // (FCD kv_lora), source the batched plane's columns.
@@ -16058,23 +16088,23 @@ index 0000000..f25f723
 +                                     static_cast<std::size_t>(kv_lora) * 2,   // cache row pitch
 +                                     latent, static_cast<std::size_t>(kv_lora) * 2,  // src pitch
 +                                     static_cast<std::size_t>(kv_lora) * 2, tokens,
-+                                     cudaMemcpyDeviceToDevice, stream));
++                                     cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    // Indexer planes, batched, then the history scatter.
 +    Tensor iq_t(iq, DType::BF16,
 +                {static_cast<std::int32_t>(index_heads * index_dim), tokens});
-+    ops::linear(q_latent_t, w.indexer_q_b, iq_t, stream);
++    ops::linear(q_latent_t, w.indexer_q_b, iq_t, execution);
 +    Tensor ik_raw_t(ik_raw, DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
-+    ops::linear(normed_t, w.indexer_k, ik_raw_t, stream);
++    ops::linear(normed_t, w.indexer_k, ik_raw_t, execution);
 +    Tensor ik_normed_t(ik_normed, DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
 +    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
 +    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
-+    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, stream);
++    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, execution);
 +    Tensor ig_t(ig, DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
-+    ops::linear(normed_t, w.indexer_gate, ig_t, stream);
++    ops::linear(normed_t, w.indexer_gate, ig_t, execution);
 +    const std::pair<const void*, Tensor*> scatters[] = {{ik_normed, &ik_plane},
 +                                                          {ig, &ig_plane}};
 +    for (const auto& scatter : scatters) {
@@ -16083,7 +16113,7 @@ index 0000000..f25f723
 +                static_cast<std::size_t>(first_position) * index_dim * 2,
 +            static_cast<std::size_t>(index_dim) * 2, scatter.first,
 +            static_cast<std::size_t>(index_dim) * 2, static_cast<std::size_t>(index_dim) * 2,
-+            tokens, cudaMemcpyDeviceToDevice, stream));
++            tokens, cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    // Head weights are position-DEPENDENT (they project each token's own
@@ -16092,12 +16122,12 @@ index 0000000..f25f723
 +    {
 +        Tensor weights_t(weights_bf, DType::BF16,
 +                         {static_cast<std::int32_t>(index_heads), tokens});
-+        ops::linear(normed_t, w.indexer_proj, weights_t, stream);
++        ops::linear(normed_t, w.indexer_proj, weights_t, execution);
 +        Tensor weights_scaled(weights_f32, DType::FP32,
 +                              {static_cast<std::int32_t>(index_heads), tokens});
 +        const float scale =
 +            std::sqrt(1.0f / (static_cast<float>(index_dim) * index_heads));
-+        ops::glm5_cast_bf16_to_f32_scaled(weights_t, scale, weights_scaled, stream);
++        ops::glm5_cast_bf16_to_f32_scaled(weights_t, scale, weights_scaled, execution.stream());
 +    }
 +
 +    // One pooling pass over every completed pool of the whole visible history.
@@ -16112,7 +16142,7 @@ index 0000000..f25f723
 +        Tensor pooled_t(pooled.data, DType::FP32,
 +                        {static_cast<std::int32_t>(completed),
 +                         static_cast<std::int32_t>(index_dim)});
-+        ops::glm5_dsa_pool(ik_history, ig_history, indexer_ape, pooled_t, stream);
++        ops::glm5_dsa_pool(ik_history, ig_history, indexer_ape, pooled_t, execution.stream());
 +    }
 +
 +    // Per-position selection chain: score over THIS position's visible pools.
@@ -16127,14 +16157,14 @@ index 0000000..f25f723
 +                            {hsi, nli, tokens});
 +        const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), DType::BF16,
 +                               {nli, kli, hsi});
-+        ops::glm5_dsa_absorb_batch(q_heads_view, wk_b_view, q_abs_t, stream);
++        ops::glm5_dsa_absorb_batch(q_heads_view, wk_b_view, q_abs_t, execution.stream());
 +    }
 +    Tensor q_abs_bf_t(q_abs_bf, DType::BF16,
 +                      {static_cast<std::int32_t>(heads * kv_lora), tokens});
 +    {
 +        Tensor q_abs_f32_view(q_abs, DType::FP32,
 +                              {static_cast<std::int32_t>(heads * kv_lora), tokens});
-+        ops::cast_fp32_to_bf16(q_abs_f32_view, q_abs_bf_t, stream);
++        ops::cast_fp32_to_bf16(q_abs_f32_view, q_abs_bf_t, execution);
 +    }
 +    for (std::uint32_t t = 0; t < static_cast<std::uint32_t>(tokens); ++t) {
 +        const std::uint32_t position = first_position + t;
@@ -16152,9 +16182,9 @@ index 0000000..f25f723
 +            Tensor w_view(static_cast<std::uint8_t*>(weights_f32) +
 +                              static_cast<std::size_t>(t) * index_heads * 4,
 +                          DType::FP32, {static_cast<std::int32_t>(index_heads)});
-+            ops::glm5_dsa_score(iq_view, pooled_view, w_view, score_t, stream);
++            ops::glm5_dsa_score(iq_view, pooled_view, w_view, score_t, execution.stream());
 +            ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool),
-+                                 true, cells, stream);
++                                 true, cells, execution);
 +        } else {
 +            std::vector<std::int32_t> tail_row(cells.ne[0], -1);
 +            for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
@@ -16162,7 +16192,7 @@ index 0000000..f25f723
 +            }
 +            CUDA_CHECK(cudaMemcpyAsync(cells.data, tail_row.data(),
 +                                       static_cast<std::size_t>(cells.ne[0]) * 4,
-+                                       cudaMemcpyHostToDevice, stream));
++                                       cudaMemcpyHostToDevice, execution));
 +        }
 +        Tensor q_abs_col(static_cast<std::uint8_t*>(q_abs_bf) +
 +                             static_cast<std::size_t>(t) * heads * kv_lora * 2,
@@ -16177,11 +16207,11 @@ index 0000000..f25f723
 +                            static_cast<std::size_t>(t) * heads * v_head * 2,
 +                        DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
 +        ops::glm5_dsa_attention(q_abs_col, latents, cells, wv_b_view, attn_col,
-+                                static_cast<std::int32_t>(head_dim), stream);
++                                static_cast<std::int32_t>(head_dim), execution);
 +    }
 +    Tensor attn_t(attn_out, DType::BF16,
 +                  {static_cast<std::int32_t>(heads * v_head), tokens});
-+    ops::linear(attn_t, w.wo, block_out, stream);
++    ops::linear(attn_t, w.wo, block_out, execution);
 +}
 +
 +std::size_t dense_mlp_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t ffn,
@@ -16194,7 +16224,7 @@ index 0000000..f25f723
 +
 +void dense_mlp_prefill(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
 +                       float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
-+                       cudaStream_t stream) {
++                       const CudaExecutionView& execution) {
 +    const std::int32_t hidden = hidden_in.ne[0];
 +    const std::int32_t tokens = hidden_in.ne[1];
 +    auto* cursor = static_cast<std::uint8_t*>(scratch);
@@ -16212,23 +16242,23 @@ index 0000000..f25f723
 +
 +    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, DType::BF16, {hidden, tokens});
-+    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, stream);
++    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    Tensor gate_t(gate, DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
 +    Tensor up_t(up, DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
-+    ops::linear(normed_t, w.gate, gate_t, stream);
-+    ops::linear(normed_t, w.up, up_t, stream);
++    ops::linear(normed_t, w.gate, gate_t, execution);
++    ops::linear(normed_t, w.up, up_t, execution);
 +    Tensor act_t(activated, DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
-+    ops::glm5_swiglu(gate_t, up_t, swiglu_limit, act_t, stream);
-+    ops::linear(act_t, w.down, out, stream);
++    ops::glm5_swiglu(gate_t, up_t, swiglu_limit, act_t, execution.stream());
++    ops::linear(act_t, w.down, out, execution);
 +}
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
 new file mode 100644
-index 0000000..318febb
+index 0000000..352e425
 --- /dev/null
 +++ b/src/models/glm5/execution/block.h
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,217 @@
 +#pragma once
 +
 +// GLM-5.3-Flash single-token block decode assemblies: the KDA mixer block (verified), the
@@ -16246,7 +16276,12 @@ index 0000000..318febb
 +
 +// cudaStream_t is an opaque handle in these signatures (the execution
 +// backend's stream); the CUDA translation units include the real header.
-+using cudaStream_t = struct CUstream_st*;
++
++namespace ninfer {
++// Opaque execution handle (defined in core/device.h); the CUDA
++// translation units include the real header.
++class CudaExecutionView;
++}
 +
 +namespace ninfer::models::glm5::execution {
 +
@@ -16305,7 +16340,7 @@ index 0000000..318febb
 +                      const Tensor& a_log, const Tensor& o_norm_w, Tensor& conv_q_state,
 +                      Tensor& conv_k_state, Tensor& conv_v_state, Tensor& matrix_state,
 +                      float gate_lower_bound, std::uint32_t heads, std::uint32_t head_dim,
-+                      float rms_eps, Tensor& block_out, void* scratch, cudaStream_t stream,
++                      float rms_eps, Tensor& block_out, void* scratch, const CudaExecutionView& execution,
 +                      KdaBlockDebug* debug = nullptr);
 +
 +// ---------------------------------------------------------------------------
@@ -16349,7 +16384,7 @@ index 0000000..318febb
 +                      float rms_eps, std::uint32_t heads, std::uint32_t head_dim,
 +                      std::uint32_t q_lora, std::uint32_t kv_lora, std::uint32_t v_head,
 +                      std::uint32_t index_heads, std::uint32_t index_dim, std::uint32_t kpool,
-+                      std::uint32_t top_k, Tensor& block_out, void* scratch, cudaStream_t stream);
++                      std::uint32_t top_k, Tensor& block_out, void* scratch, const CudaExecutionView& execution);
 +
 +// ---------------------------------------------------------------------------
 +// MLP blocks
@@ -16379,7 +16414,7 @@ index 0000000..318febb
 +// norm -> gate/up -> clamped SwiGLU -> down. `hidden_in` BF16 [hidden,1], `out` BF16 [hidden,1].
 +void dense_mlp_decode(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
 +                      float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
-+                      cudaStream_t stream);
++                      const CudaExecutionView& execution);
 +
 +// norm -> router -> sigmoid/noaux_tc top-k -> per-expert gate/up/SwiGLU/down (the decode
 +// path runs the selected experts sequentially through the plain linear op) -> weighted
@@ -16387,7 +16422,7 @@ index 0000000..318febb
 +void moe_block_decode(const MoeBlockWeights& w, const Tensor& hidden_in, const Tensor& router_bias,
 +                      float rms_eps, float swiglu_limit, float routed_scaling_factor,
 +                      std::uint32_t experts, std::uint32_t top_k, std::uint32_t ffn, Tensor& out,
-+                      void* scratch, cudaStream_t stream);
++                      void* scratch, const CudaExecutionView& execution);
 +
 +// ---------------------------------------------------------------------------
 +// Batched (chunked) prefill executors: the same math as the decode path over
@@ -16408,7 +16443,7 @@ index 0000000..318febb
 +                       Tensor& conv_q_state, Tensor& conv_k_state, Tensor& conv_v_state,
 +                       Tensor& matrix_state, float gate_lower_bound, std::uint32_t heads,
 +                       std::uint32_t head_dim, float rms_eps, std::uint32_t chunk,
-+                       Tensor& block_out, void* scratch, cudaStream_t stream);
++                       Tensor& block_out, void* scratch, const CudaExecutionView& execution);
 +
 +[[nodiscard]] std::size_t dsa_block_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
 +                                                          std::uint32_t head_dim,
@@ -16429,7 +16464,7 @@ index 0000000..318febb
 +                       std::uint32_t head_dim, std::uint32_t q_lora, std::uint32_t kv_lora,
 +                       std::uint32_t v_head, std::uint32_t index_heads,
 +                       std::uint32_t index_dim, std::uint32_t kpool, std::uint32_t top_k,
-+                       Tensor& block_out, void* scratch, cudaStream_t stream);
++                       Tensor& block_out, void* scratch, const CudaExecutionView& execution);
 +
 +[[nodiscard]] std::size_t dense_mlp_prefill_scratch_bytes(std::uint32_t hidden,
 +                                                          std::uint32_t ffn,
@@ -16437,7 +16472,7 @@ index 0000000..318febb
 +
 +void dense_mlp_prefill(const DenseMlpWeights& w, const Tensor& hidden_in, float rms_eps,
 +                       float swiglu_limit, std::uint32_t ffn, Tensor& out, void* scratch,
-+                       cudaStream_t stream);
++                       const CudaExecutionView& execution);
 +
 +
 +} // namespace ninfer::models::glm5::execution
@@ -17171,7 +17206,7 @@ index 0000000..154b80b
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000..b3ed362
+index 0000000..3606355
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
 @@ -0,0 +1,557 @@
@@ -17244,7 +17279,7 @@ index 0000000..b3ed362
 +void glm5_decode_step(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                      const Glm5StepConfig& config, const Tensor& token_embedding,
 +                      std::uint32_t position, Tensor& logits, void* scratch,
-+                      cudaStream_t stream, Tensor* hidden_out) {
++                      const CudaExecutionView& execution, Tensor* hidden_out) {
 +    const std::int32_t hidden = static_cast<std::int32_t>(config.hidden);
 +    const auto hc = 4u;
 +    if (token_embedding.ne[0] != hidden || token_embedding.ne[1] != 1 ||
@@ -17278,7 +17313,7 @@ index 0000000..b3ed362
 +    // Initialize the residual: four copies of the token embedding.
 +    for (std::uint32_t n = 0; n < hc; ++n) {
 +        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(residual) + n * h2,
-+                                   token_embedding.data, h2, cudaMemcpyDeviceToDevice, stream));
++                                   token_embedding.data, h2, cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    std::size_t kda_index = 0, dsa_index = 0;
@@ -17300,7 +17335,7 @@ index 0000000..b3ed362
 +            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution);
 +        }
 +        Tensor block_out_t(block_out, DType::BF16, {hidden, 1});
 +        if (config.layer_is_dsa[layer]) {
@@ -17315,7 +17350,7 @@ index 0000000..b3ed362
 +                             state.dsa_pooled[dsa_index], state.dsa_cells[dsa_index], position,
 +                             config.rms_eps, config.heads, config.head_dim, config.q_lora,
 +                             config.kv_lora, config.v_head, config.index_heads, config.index_dim,
-+                             config.kpool, config.top_k, block_out_t, cursor, stream);
++                             config.kpool, config.top_k, block_out_t, cursor, execution);
 +            ++dsa_index;
 +        } else {
 +            const auto& scalars = w.kda_scalars[kda_index];
@@ -17329,18 +17364,18 @@ index 0000000..b3ed362
 +                             state.kda_conv_q[kda_index], state.kda_conv_k[kda_index],
 +                             state.kda_conv_v[kda_index], state.kda_matrix[kda_index],
 +                             config.gate_lower_bound, config.kda_heads, config.kda_head_dim,
-+                             config.rms_eps, block_out_t, cursor, stream);
++                             config.rms_eps, block_out_t, cursor, execution);
 +            ++kda_index;
 +        }
 +        // mHC post: residual = post*block + comb @ residual.
 +        {
 +            // First copy the current residual out (the post reads it), then write in place.
-+            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, h2 * hc, cudaMemcpyDeviceToDevice, stream));
++            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, h2 * hc, cudaMemcpyDeviceToDevice, execution.stream()));
 +            Tensor residual_in(residual_copy, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
 +            Tensor bt(block_out, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
 +            Tensor bt_view(block_out, DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
 +            Tensor residual_out(residual, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
-+            ops::glm5_mhc_post(bt_view, residual_in, post_t, comb_t, residual_out, stream);
++            ops::glm5_mhc_post(bt_view, residual_in, post_t, comb_t, residual_out, execution.stream());
 +        }
 +
 +        // ---- FFN half: mHC pre -> norm -> MLP -> mHC post ----
@@ -17350,25 +17385,25 @@ index 0000000..b3ed362
 +            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution);
 +        }
 +        if (config.layer_mlp_dense[layer]) {
 +            dense_mlp_decode(lw.dense_mlp, collapsed_t, config.rms_eps, config.swiglu_limit,
-+                             config.ffn_dense, block_out_t, cursor, stream);
++                             config.ffn_dense, block_out_t, cursor, execution);
 +        } else {
 +            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), DType::FP32,
 +                                      {static_cast<std::int32_t>(config.experts), 1});
 +            moe_block_decode(lw.moe, collapsed_t, router_bias, config.rms_eps,
 +                             config.swiglu_limit, config.routed_scaling_factor, config.experts,
 +                             config.num_experts_per_tok, config.ffn_moe, block_out_t, cursor,
-+                             stream);
++                             execution);
 +        }
 +        {
-+            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, h2 * hc, cudaMemcpyDeviceToDevice, stream));
++            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, h2 * hc, cudaMemcpyDeviceToDevice, execution.stream()));
 +            Tensor residual_in(residual_copy, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
 +            Tensor bt_view(block_out, DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
 +            Tensor residual_out(residual, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
-+            ops::glm5_mhc_post(bt_view, residual_in, post_t, comb_t, residual_out, stream);
++            ops::glm5_mhc_post(bt_view, residual_in, post_t, comb_t, residual_out, execution.stream());
 +        }
 +    }
 +
@@ -17376,17 +17411,17 @@ index 0000000..b3ed362
 +    {
 +        Tensor residual_view(residual, DType::BF16, {1, static_cast<std::int32_t>(hc * config.hidden)});
 +        Tensor head_mhc(head_mean, DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
-+        ops::glm5_mhc_head(residual_view, head_mhc, stream);
++        ops::glm5_mhc_head(residual_view, head_mhc, execution.stream());
 +        Tensor head_t(head_mean, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
 +        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), DType::BF16,
 +                                   {hidden, 1});
 +        Tensor final_t(final_normed, DType::BF16, {hidden, 1});
-+        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, stream);
-+        ops::linear(final_t, w.lm_head, logits, stream);
++        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, execution);
++        ops::linear(final_t, w.lm_head, logits, execution);
 +        if (hidden_out) {
 +            CUDA_CHECK(cudaMemcpyAsync(hidden_out->data, final_normed,
 +                                       static_cast<std::size_t>(hidden) * 2,
-+                                       cudaMemcpyDeviceToDevice, stream));
++                                       cudaMemcpyDeviceToDevice, execution));
 +        }
 +    }
 +}
@@ -17399,7 +17434,7 @@ index 0000000..b3ed362
 +}
 +
 +void glm5_embed_token(const Glm5ModelWeights& w, std::uint32_t token_id,
-+                      std::uint32_t hidden, Tensor& out, cudaStream_t stream) {
++                      std::uint32_t hidden, Tensor& out, const CudaExecutionView& execution) {
 +    if (out.ne[0] != static_cast<std::int32_t>(hidden) || out.ne[1] != 1 ||
 +        out.dtype != DType::BF16) {
 +        throw std::invalid_argument("glm5_embed_token: out must be BF16 [hidden, 1]");
@@ -17408,23 +17443,23 @@ index 0000000..b3ed362
 +    void* id_device = nullptr;
 +    CUDA_CHECK(cudaMalloc(&id_device, 4));
 +    const std::int32_t id_host = static_cast<std::int32_t>(token_id);
-+    CUDA_CHECK(cudaMemcpyAsync(id_device, &id_host, 4, cudaMemcpyHostToDevice, stream));
++    CUDA_CHECK(cudaMemcpyAsync(id_device, &id_host, 4, cudaMemcpyHostToDevice, execution.stream()));
 +    Tensor ids(id_device, DType::I32, {1});
-+    ops::embedding(ids, w.token_embd, out, stream);
-+    CUDA_CHECK(cudaStreamSynchronize(stream));
++    ops::embedding(ids, w.token_embd, out, execution);
++    CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
 +    CUDA_CHECK(cudaFree(id_device));
 +}
 +
 +void glm5_decode_token(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                       const Glm5StepConfig& config, std::uint32_t token_id,
 +                       std::uint32_t position, Tensor& logits, void* scratch,
-+                       cudaStream_t stream, Tensor* hidden_out) {
++                       const CudaExecutionView& execution, Tensor* hidden_out) {
 +    auto* cursor = static_cast<std::uint8_t*>(scratch);
 +    void* embedding = cursor;
 +    cursor += (static_cast<std::size_t>(config.hidden) * 2 + 15) & ~std::size_t{15};
 +    Tensor embedded(embedding, DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
-+    glm5_embed_token(w, token_id, config.hidden, embedded, stream);
-+    glm5_decode_step(w, state, config, embedded, position, logits, cursor, stream, hidden_out);
++    glm5_embed_token(w, token_id, config.hidden, embedded, execution);
++    glm5_decode_step(w, state, config, embedded, position, logits, cursor, execution, hidden_out);
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -17442,7 +17477,7 @@ index 0000000..b3ed362
 +void glm5_prefill(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                  const Glm5StepConfig& config, const Tensor& token_ids,
 +                  std::uint32_t first_position, Tensor& last_hidden, Tensor& last_logits,
-+                  void* scratch, cudaStream_t stream) {
++                  void* scratch, const CudaExecutionView& execution) {
 +    const std::uint32_t tokens = token_ids.ne[0];
 +    if (tokens == 0 || token_ids.dtype != DType::I32) {
 +        throw std::invalid_argument("glm5_prefill: token_ids must be I32 [T]");
@@ -17455,10 +17490,10 @@ index 0000000..b3ed362
 +        std::int32_t id = 0;
 +        CUDA_CHECK(cudaMemcpyAsync(&id,
 +                                   static_cast<const std::int32_t*>(token_ids.data) + t, 4,
-+                                   cudaMemcpyDeviceToHost, stream));
-+        CUDA_CHECK(cudaStreamSynchronize(stream));
++                                   cudaMemcpyDeviceToHost, execution));
++        CUDA_CHECK(cudaStreamSynchronize(execution.stream()));
 +        glm5_decode_token(w, state, config, static_cast<std::uint32_t>(id),
-+                          first_position + t, last_logits, scratch, stream, &last_hidden);
++                          first_position + t, last_logits, scratch, execution, &last_hidden);
 +        // After the last token, save the final hidden state for the caller.
 +        // The decode step writes logits; the hidden state is the final normed
 +        // output that the mHC head produced. For the prefill result we copy
@@ -17550,7 +17585,7 @@ index 0000000..b3ed362
 +                          const Glm5StepConfig& config, const Tensor& token_ids,
 +                          std::uint32_t first_position, std::uint32_t chunk,
 +                          Tensor& last_hidden, Tensor& last_logits, void* scratch,
-+                          cudaStream_t stream) {
++                          const CudaExecutionView& execution) {
 +    const std::int32_t hidden = static_cast<std::int32_t>(config.hidden);
 +    const std::int32_t tokens = token_ids.ne[0];
 +    const auto hc = 4u;
@@ -17593,14 +17628,14 @@ index 0000000..b3ed362
 +    // [T, H]), so the four streams fill by strided copies straight from the
 +    // gather - no transpose, no re-layout.
 +    Tensor embedded_t(embedded, DType::BF16, {hidden, tokens});
-+    ops::embedding(token_ids, w.token_embd, embedded_t, stream);
++    ops::embedding(token_ids, w.token_embd, embedded_t, execution);
 +    for (std::uint32_t n = 0; n < hc; ++n) {
 +        CUDA_CHECK(cudaMemcpy2DAsync(
 +            static_cast<std::uint8_t*>(residual) + static_cast<std::size_t>(n) * hidden * 2,
 +            static_cast<std::size_t>(hidden) * 2 * hc,  // stream pitch (4H apart)
 +            embedded, static_cast<std::size_t>(hidden) * 2,
 +            static_cast<std::size_t>(hidden) * 2, tokens,
-+            cudaMemcpyDeviceToDevice, stream));
++            cudaMemcpyDeviceToDevice, execution));
 +    }
 +
 +    std::size_t kda_index = 0, dsa_index = 0;
@@ -17625,7 +17660,7 @@ index 0000000..b3ed362
 +            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution);
 +        }
 +        if (config.layer_is_dsa[layer]) {
 +            const auto ape_ptr = w.dsa_ape[dsa_index];
@@ -17638,7 +17673,7 @@ index 0000000..b3ed362
 +                              first_position, config.rms_eps, config.heads, config.head_dim,
 +                              config.q_lora, config.kv_lora, config.v_head,
 +                              config.index_heads, config.index_dim, config.kpool,
-+                              config.top_k, block_out_t, block_scratch, stream);
++                              config.top_k, block_out_t, block_scratch, execution);
 +            ++dsa_index;
 +        } else {
 +            const auto& scalars = w.kda_scalars[kda_index];
@@ -17652,15 +17687,15 @@ index 0000000..b3ed362
 +                              state.kda_conv_q[kda_index], state.kda_conv_k[kda_index],
 +                              state.kda_conv_v[kda_index], state.kda_matrix[kda_index],
 +                              config.gate_lower_bound, config.kda_heads, config.kda_head_dim,
-+                              config.rms_eps, chunk, block_out_t, block_scratch, stream);
++                              config.rms_eps, chunk, block_out_t, block_scratch, execution);
 +            ++kda_index;
 +        }
 +        {
 +            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, ht * 4 * 2,
-+                                       cudaMemcpyDeviceToDevice, stream));
++                                       cudaMemcpyDeviceToDevice, execution));
 +            Tensor residual_in(residual_copy, DType::BF16,
 +                               {tokens, static_cast<std::int32_t>(hc * config.hidden)});
-+            ops::glm5_mhc_post(block_out_row, residual_in, post_t, comb_t, residual_t, stream);
++            ops::glm5_mhc_post(block_out_row, residual_in, post_t, comb_t, residual_t, execution.stream());
 +        }
 +
 +        // ---- FFN half ----
@@ -17670,12 +17705,12 @@ index 0000000..b3ed362
 +            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), DType::FP32, {24});
 +            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, stream);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution);
 +        }
 +        if (config.layer_mlp_dense[layer]) {
 +            dense_mlp_prefill(lw.dense_mlp, collapsed_block, config.rms_eps,
 +                              config.swiglu_limit, config.ffn_dense, block_out_t,
-+                              block_scratch, stream);
++                              block_scratch, execution);
 +        } else {
 +            // MoE v1: the single-token executor per token of the chunk.
 +            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), DType::FP32,
@@ -17690,15 +17725,15 @@ index 0000000..b3ed362
 +                moe_block_decode(lw.moe, column_in, router_bias, config.rms_eps,
 +                                 config.swiglu_limit, config.routed_scaling_factor,
 +                                 config.experts, config.num_experts_per_tok, config.ffn_moe,
-+                                 column_out, block_scratch, stream);
++                                 column_out, block_scratch, execution);
 +            }
 +        }
 +        {
 +            CUDA_CHECK(cudaMemcpyAsync(residual_copy, residual, ht * 4 * 2,
-+                                       cudaMemcpyDeviceToDevice, stream));
++                                       cudaMemcpyDeviceToDevice, execution));
 +            Tensor residual_in(residual_copy, DType::BF16,
 +                               {tokens, static_cast<std::int32_t>(hc * config.hidden)});
-+            ops::glm5_mhc_post(block_out_row, residual_in, post_t, comb_t, residual_t, stream);
++            ops::glm5_mhc_post(block_out_row, residual_in, post_t, comb_t, residual_t, execution.stream());
 +        }
 +    }
 +
@@ -17708,36 +17743,36 @@ index 0000000..b3ed362
 +        Tensor head_mhc(collapsed, DType::BF16, {tokens, hidden});
 +        Tensor residual_final(residual, DType::BF16,
 +                              {tokens, static_cast<std::int32_t>(hc * config.hidden)});
-+        ops::glm5_mhc_head(residual_final, head_mhc, stream);
++        ops::glm5_mhc_head(residual_final, head_mhc, execution.stream());
 +        // Same memory re-labelled: the head's [T, H] output is the rmsnorm's
 +        // {hidden, T} input.
 +        Tensor head_t(collapsed, DType::BF16, {hidden, tokens});
 +        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), DType::BF16,
 +                                   {hidden, 1});
 +        Tensor final_t(final_normed, DType::BF16, {hidden, tokens});
-+        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, stream);
++        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, execution);
 +        // A [vocab, T] logits plane would dominate the scratch; the prefill
 +        // contract only needs the last token's row, so the lm_head runs once
 +        // on that column.
 +        Tensor last_column(static_cast<std::uint8_t*>(final_normed) +
 +                               static_cast<std::size_t>(tokens - 1) * hidden * 2,
 +                           DType::BF16, {hidden, 1});
-+        ops::linear(last_column, w.lm_head, last_logits, stream);
++        ops::linear(last_column, w.lm_head, last_logits, execution);
 +        CUDA_CHECK(cudaMemcpyAsync(last_hidden.data,
 +                                   static_cast<std::uint8_t*>(final_normed) +
 +                                       static_cast<std::size_t>(tokens - 1) * hidden * 2,
 +                                   static_cast<std::size_t>(hidden) * 2,
-+                                   cudaMemcpyDeviceToDevice, stream));
++                                   cudaMemcpyDeviceToDevice, execution));
 +    }
 +}
 +
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.h b/src/models/glm5/execution/model.h
 new file mode 100644
-index 0000000..8aa1e86
+index 0000000..42938c6
 --- /dev/null
 +++ b/src/models/glm5/execution/model.h
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,151 @@
 +#pragma once
 +
 +// The GLM-5.3-Flash full-model decode step: one token through every block (mHC residual
@@ -17756,7 +17791,12 @@ index 0000000..8aa1e86
 +
 +// cudaStream_t is an opaque handle in these signatures (the execution
 +// backend's stream); the CUDA translation units include the real header.
-+using cudaStream_t = struct CUstream_st*;
++
++namespace ninfer {
++// Opaque execution handle (defined in core/device.h); the CUDA
++// translation units include the real header.
++class CudaExecutionView;
++}
 +
 +namespace ninfer::models::glm5::execution {
 +
@@ -17831,18 +17871,18 @@ index 0000000..8aa1e86
 +void glm5_decode_step(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                      const Glm5StepConfig& config, const Tensor& token_embedding,
 +                      std::uint32_t position, Tensor& logits, void* scratch,
-+                      cudaStream_t stream, Tensor* hidden_out = nullptr);
++                      const CudaExecutionView& execution, Tensor* hidden_out = nullptr);
 +
 +// Embedding lookup: gathers the token's row from the model's embedding table.
 +// `token_id` is the vocabulary index; `out` is BF16 [hidden, 1].
 +void glm5_embed_token(const Glm5ModelWeights& w, std::uint32_t token_id,
-+                      std::uint32_t hidden, Tensor& out, cudaStream_t stream);
++                      std::uint32_t hidden, Tensor& out, const CudaExecutionView& execution);
 +
 +// Convenience wrapper: embedding + decode_step in one call.
 +void glm5_decode_token(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                       const Glm5StepConfig& config, std::uint32_t token_id,
 +                       std::uint32_t position, Tensor& logits, void* scratch,
-+                       cudaStream_t stream, Tensor* hidden_out = nullptr);
++                       const CudaExecutionView& execution, Tensor* hidden_out = nullptr);
 +
 +[[nodiscard]] std::size_t glm5_embed_scratch_bytes(std::uint32_t hidden);
 +
@@ -17862,7 +17902,7 @@ index 0000000..8aa1e86
 +void glm5_prefill(const Glm5ModelWeights& w, Glm5DecodeState& state,
 +                  const Glm5StepConfig& config, const Tensor& token_ids,
 +                  std::uint32_t first_position, Tensor& last_hidden, Tensor& last_logits,
-+                  void* scratch, cudaStream_t stream);
++                  void* scratch, const CudaExecutionView& execution);
 +
 +[[nodiscard]] std::size_t glm5_prefill_scratch_bytes(const Glm5StepConfig& config,
 +                                                      std::uint32_t max_tokens);
@@ -17878,7 +17918,7 @@ index 0000000..8aa1e86
 +                          const Glm5StepConfig& config, const Tensor& token_ids,
 +                          std::uint32_t first_position, std::uint32_t chunk,
 +                          Tensor& last_hidden, Tensor& last_logits, void* scratch,
-+                          cudaStream_t stream);
++                          const CudaExecutionView& execution);
 +
 +[[nodiscard]] std::size_t glm5_prefill_chunked_scratch_bytes(
 +    const Glm5StepConfig& config, std::uint32_t max_tokens, std::uint32_t first_position);
@@ -25045,6 +25085,18 @@ index 0000000..e317a8a
 +        {"history_restored_bytes", m.history_restored_bytes}};
 +}
 +} // namespace ninfer::serve
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 888c041..76ca682 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -15,6 +15,7 @@ if(NINFER_BUILD_ENGINE)
+   endif()
+   include(models/qwen4_exp/tests.cmake)
+   include(models/glm5next/tests.cmake)
++  include(models/glm5/tests.cmake)
+ endif()
+ include(ops/tests.cmake)
+ include(distributed/tests.cmake)
 diff --git a/tests/convert/test_dense_geometry.py b/tests/convert/test_dense_geometry.py
 new file mode 100644
 index 0000000..b71be65
@@ -31204,10 +31256,10 @@ index 0000000..0eff353
 +}
 diff --git a/tests/models/glm5/test_decode_step.cpp b/tests/models/glm5/test_decode_step.cpp
 new file mode 100644
-index 0000000..b66127b
+index 0000000..8cd679c
 --- /dev/null
 +++ b/tests/models/glm5/test_decode_step.cpp
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,601 @@
 +// The GLM-5.3-Flash full decode step (mHC residual loop across a mixed layer stack)
 +// against a host oracle that chains the same per-block references. Two blocks at a small
 +// geometry: a KDA+MoE block then a DSA+dense block, covering both mixers and both MLPs.
@@ -31229,6 +31281,7 @@ index 0000000..b66127b
 +#include <exception>
 +#include <string>
 +#include <vector>
++#include "core/device.h"
 +
 +namespace {
 +
@@ -31810,10 +31863,10 @@ index 0000000..b66127b
 +}
 diff --git a/tests/models/glm5/test_dsa_mlp_blocks.cpp b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 new file mode 100644
-index 0000000..8254c26
+index 0000000..13c6399
 --- /dev/null
 +++ b/tests/models/glm5/test_dsa_mlp_blocks.cpp
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,658 @@
 +// The GLM-5.3-Flash DSA block and the dense/MoE MLP blocks against chained host oracles
 +// with BF16 rounding at every representation boundary (the pattern the verified KDA block
 +// test established). Small probes pin the wiring; the audited geometry runs end to end.
@@ -31835,6 +31888,7 @@ index 0000000..8254c26
 +#include <exception>
 +#include <string>
 +#include <vector>
++#include "core/device.h"
 +
 +namespace {
 +
@@ -32473,10 +32527,10 @@ index 0000000..8254c26
 +}
 diff --git a/tests/models/glm5/test_embed_prefill.cpp b/tests/models/glm5/test_embed_prefill.cpp
 new file mode 100644
-index 0000000..295fc9a
+index 0000000..060243b
 --- /dev/null
 +++ b/tests/models/glm5/test_embed_prefill.cpp
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,323 @@
 +// Embedding lookup and multi-token prefill smoke: feed token IDs through the
 +// full decode chain (embedding + mHC + mixer + MLP + lm_head) and verify the
 +// logits are finite and differ between tokens (non-degenerate).
@@ -32493,6 +32547,7 @@ index 0000000..295fc9a
 +#include <cstdio>
 +#include <exception>
 +#include <vector>
++#include "core/device.h"
 +
 +namespace {
 +
@@ -33015,10 +33070,10 @@ index 0000000..1316f5a
 +}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
-index 0000000..f45b39d
+index 0000000..c248c1a
 --- /dev/null
 +++ b/tests/models/glm5/test_kda_block.cpp
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,449 @@
 +// The GLM-5.3-Flash KDA block decode assembly against the host reference: the projections
 +// run as FP64 GEMV oracles, the mixer pieces call models/glm5/reference, and the whole
 +// chain is compared on the device at the audited 64x128 geometry and a small probe.
@@ -33040,6 +33095,7 @@ index 0000000..f45b39d
 +#include <string>
 +#include <algorithm>
 +#include <vector>
++#include "core/device.h"
 +
 +namespace {
 +
@@ -33469,10 +33525,10 @@ index 0000000..f45b39d
 +}
 diff --git a/tests/models/glm5/test_prefill_chunked.cpp b/tests/models/glm5/test_prefill_chunked.cpp
 new file mode 100644
-index 0000000..336b213
+index 0000000..26499c7
 --- /dev/null
 +++ b/tests/models/glm5/test_prefill_chunked.cpp
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,404 @@
 +// GLM-5.3-Flash chunked prefill vs the per-token decode path, end to end on
 +// the device: the same weights and token sequence run twice — T sequential
 +// glm5_decode_token calls against one glm5_prefill_chunked call (chunk < T,
@@ -33494,6 +33550,7 @@ index 0000000..336b213
 +#include <exception>
 +#include <string>
 +#include <vector>
++#include "core/device.h"
 +
 +namespace {
 +
