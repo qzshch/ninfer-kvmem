@@ -15314,7 +15314,7 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..408f269
+index 0000000..e67c7d8
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
 @@ -0,0 +1,935 @@
@@ -15419,7 +15419,7 @@ index 0000000..408f269
 +
 +    // norm(hidden), then the three projections and their causal convs. The ops take
 +    // non-const output references, so every scratch plane gets a named Tensor.
-+    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, 1});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    if (debug && debug->normed) {
@@ -15432,9 +15432,9 @@ index 0000000..408f269
 +    ops::linear(normed_t, w.wq, q_raw_t, execution);
 +    ops::linear(normed_t, w.wk, k_raw_t, execution);
 +    ops::linear(normed_t, w.wv, v_raw_t, execution);
-+    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), DType::BF16, {4, d_inner});
-+    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), DType::BF16, {4, d_inner});
-+    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), DType::BF16, {4, d_inner});
++    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), execution.device(), DType::BF16, {4, d_inner});
++    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), execution.device(), DType::BF16, {4, d_inner});
++    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), execution.device(), DType::BF16, {4, d_inner});
 +    Tensor q_raw_view(q_raw, execution.device(), DType::BF16, {1, d_inner});
 +    Tensor k_raw_view(k_raw, execution.device(), DType::BF16, {1, d_inner});
 +    Tensor v_raw_view(v_raw, execution.device(), DType::BF16, {1, d_inner});
@@ -15482,7 +15482,7 @@ index 0000000..408f269
 +                                   cudaMemcpyDeviceToDevice, execution.stream()));
 +    }
 +    ops::glm5_kda_gating(gate_pre_view, beta_logits_view, a_log, gate_lower_bound, gate_view,
-+                         beta_view, execution);
++                         beta_view, execution.stream());
 +    if (debug && debug->gate) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->gate->data, gate_log, static_cast<std::size_t>(d_inner) * 4,
 +                                   cudaMemcpyDeviceToDevice, execution.stream()));
@@ -15496,7 +15496,7 @@ index 0000000..408f269
 +    ops::linear(normed_t, w.g_a, stage_t, execution);
 +    ops::linear(stage_t, w.g_b, g2_t, execution);
 +    ops::glm5_kda_prefill(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, g2_t, o_norm_w,
-+                          matrix_state, prefill_t, execution);
++                          matrix_state, prefill_t, execution.stream());
 +    if (debug && debug->prefill_out) {
 +        CUDA_CHECK(cudaMemcpyAsync(debug->prefill_out->data, prefill_out, d_inner * 2,
 +                                   cudaMemcpyDeviceToDevice, execution.stream()));
@@ -15572,14 +15572,14 @@ index 0000000..408f269
 +    void* attn_out = take(static_cast<std::size_t>(heads) * v_head * 2);
 +
 +    // norm(hidden) once; every projection reads it.
-+    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, 1});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    // q side: q_a -> norm -> q_b, then absorb W_K_B per head (FP32 out).
 +    Tensor q_latent_t(q_latent, execution.device(), DType::BF16, {static_cast<std::int32_t>(q_lora), 1});
 +    ops::linear(normed_t, w.q_a, q_latent_t, execution);
-+    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), DType::BF16,
++    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), execution.device(), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
 +    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
 +    Tensor q_heads_t(q_heads, execution.device(), DType::BF16, {static_cast<std::int32_t>(heads * head_dim), 1});
@@ -15588,7 +15588,7 @@ index 0000000..408f269
 +                        {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(head_dim)});
 +    Tensor q_abs_t(q_abs, execution.device(), DType::FP32,
 +                   {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(kv_lora)});
-+    const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), DType::BF16,
++    const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), execution.device(), DType::BF16,
 +                           {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(kv_lora),
 +                            static_cast<std::int32_t>(heads)});
 +    ops::glm5_dsa_absorb(q_heads_view, wk_b_view, q_abs_t, execution.stream());
@@ -15596,7 +15596,7 @@ index 0000000..408f269
 +    // kv side: compress, norm, write this token's latent row.
 +    Tensor latent_t(latent, execution.device(), DType::BF16, {static_cast<std::int32_t>(kv_lora), 1});
 +    ops::linear(normed_t, w.kv_a, latent_t, execution);
-+    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), DType::BF16,
++    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), execution.device(), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
 +    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
 +    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(latents.data) +
@@ -15609,9 +15609,9 @@ index 0000000..408f269
 +    Tensor ik_raw_t(ik_raw, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
 +    ops::linear(normed_t, w.indexer_k, ik_raw_t, execution);
 +    Tensor ik_normed_t(ik_normed, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
-+    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), DType::BF16,
++    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
-+    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), DType::BF16,
++    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
 +    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, execution);
 +    Tensor ig_t(ig, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), 1});
@@ -15671,7 +15671,7 @@ index 0000000..408f269
 +        Tensor w_view(weights_f32, execution.device(), DType::FP32, {static_cast<std::int32_t>(index_heads)});
 +        ops::glm5_dsa_score(iq_view, pooled_t, w_view, score_t, execution.stream());
 +        ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool), true,
-+                             cells, execution);
++                             cells, execution.stream());
 +    } else {
 +        std::vector<std::int32_t> tail_row(cells.ne[0], -1);
 +        for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
@@ -15701,12 +15701,12 @@ index 0000000..408f269
 +    }
 +    Tensor q_abs_bf(q_abs, execution.device(), DType::BF16,
 +                    {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(kv_lora)});
-+    const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), DType::BF16,
++    const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), execution.device(), DType::BF16,
 +                           {static_cast<std::int32_t>(kv_lora), static_cast<std::int32_t>(v_head),
 +                            static_cast<std::int32_t>(heads)});
 +    Tensor attn_t(attn_out, execution.device(), DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
 +    ops::glm5_dsa_attention(q_abs_bf, latents, cells, wv_b_view, attn_t,
-+                            static_cast<std::int32_t>(head_dim), execution);
++                            static_cast<std::int32_t>(head_dim), execution.stream());
 +    ops::linear(attn_t, w.wo, block_out, execution);
 +}
 +
@@ -15735,7 +15735,7 @@ index 0000000..408f269
 +    void* up = take(ffn * 2);
 +    void* activated = take(ffn * 2);
 +
-+    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, 1});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    Tensor gate_t(gate, execution.device(), DType::BF16, {static_cast<std::int32_t>(ffn), 1});
@@ -15781,7 +15781,7 @@ index 0000000..408f269
 +    void* indices = take(top_k * 4);
 +    void* shared_out = take(hidden * 2);
 +
-+    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, 1});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
@@ -15790,7 +15790,7 @@ index 0000000..408f269
 +    Tensor weights_t(weights_f32, execution.device(), DType::FP32, {static_cast<std::int32_t>(top_k)});
 +    Tensor indices_t(indices, execution.device(), DType::I32, {static_cast<std::int32_t>(top_k)});
 +    ops::glm5_moe_route(logits_t, router_bias, static_cast<std::int32_t>(top_k),
-+                        routed_scaling_factor, weights_t, indices_t, execution);
++                        routed_scaling_factor, weights_t, indices_t, execution.stream());
 +
 +    // Selected experts sequentially; each expert's weights are its row block of the
 +    // stacked planes, addressed by offsetting the base Weight.
@@ -15927,7 +15927,7 @@ index 0000000..408f269
 +    void* beta_f32 = take(static_cast<std::size_t>(heads) * tokens * 4);
 +    void* scan_out = take(plane_b);
 +
-+    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, tokens});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
@@ -15941,9 +15941,9 @@ index 0000000..408f269
 +    // The conv kernel's memory order (channel fastest: t*d_inner + ch) is
 +    // exactly the [d_inner, T] FCD layout of the linear outputs; the op's
 +    // {tokens, d_inner} ne label just needs re-stickering on the same memory.
-+    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), DType::BF16, {4, d_inner});
-+    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), DType::BF16, {4, d_inner});
-+    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), DType::BF16, {4, d_inner});
++    const Tensor conv_q_w(const_cast<void*>(w.conv_q.payload), execution.device(), DType::BF16, {4, d_inner});
++    const Tensor conv_k_w(const_cast<void*>(w.conv_k.payload), execution.device(), DType::BF16, {4, d_inner});
++    const Tensor conv_v_w(const_cast<void*>(w.conv_v.payload), execution.device(), DType::BF16, {4, d_inner});
 +    Tensor q_raw_label(q_raw, execution.device(), DType::BF16, {tokens, d_inner});
 +    Tensor k_raw_label(k_raw, execution.device(), DType::BF16, {tokens, d_inner});
 +    Tensor v_raw_label(v_raw, execution.device(), DType::BF16, {tokens, d_inner});
@@ -15977,7 +15977,7 @@ index 0000000..408f269
 +    Tensor gate_label(gate_log, execution.device(), DType::FP32, {tokens, d_inner});
 +    Tensor beta_label(beta_f32, execution.device(), DType::FP32, {tokens, static_cast<std::int32_t>(heads)});
 +    ops::glm5_kda_gating(gate_pre_label, beta_logits_label, a_log, gate_lower_bound,
-+                         gate_label, beta_label, execution);
++                         gate_label, beta_label, execution.stream());
 +
 +    // Output-gate projections, then the chunked scan and the batched gate.
 +    Tensor g2_t(g2, execution.device(), DType::BF16, {d_inner, tokens});
@@ -15985,9 +15985,9 @@ index 0000000..408f269
 +    ops::linear(stage_t, w.g_b, g2_t, execution);
 +    Tensor scan_t(scan_out, execution.device(), DType::BF16, {d_inner, tokens});
 +    ops::glm5_kda_chunk(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, matrix_state,
-+                        scan_t, chunk, execution);
++                        scan_t, chunk, execution.stream());
 +    ops::glm5_kda_outgate(scan_t, g2_t, o_norm_w, scan_t, execution.stream());
-+    ops::linear(scan_t, w.wo, block_out, execution);
++    ops::linear(scan_t, w.wo, block_out, execution.stream());
 +}
 +
 +std::size_t dsa_block_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
@@ -16060,14 +16060,14 @@ index 0000000..408f269
 +    // One reusable score column (each position overwrites its visible prefix).
 +    void* scores = take(static_cast<std::size_t>(completed_total ? completed_total : 1) * 4);
 +
-+    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.attn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, tokens});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +
 +    // q side, batched.
 +    Tensor q_latent_t(q_latent, execution.device(), DType::BF16, {static_cast<std::int32_t>(q_lora), tokens});
 +    ops::linear(normed_t, w.q_a, q_latent_t, execution);
-+    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), DType::BF16,
++    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), execution.device(), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
 +    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
 +    Tensor q_heads_t(q_heads, execution.device(), DType::BF16,
@@ -16077,7 +16077,7 @@ index 0000000..408f269
 +    // kv side, batched; write every token's latent row into the cache.
 +    Tensor latent_t(latent, execution.device(), DType::BF16, {static_cast<std::int32_t>(kv_lora), tokens});
 +    ops::linear(normed_t, w.kv_a, latent_t, execution);
-+    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), DType::BF16,
++    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), execution.device(), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
 +    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
 +    {
@@ -16098,9 +16098,9 @@ index 0000000..408f269
 +    Tensor ik_raw_t(ik_raw, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
 +    ops::linear(normed_t, w.indexer_k, ik_raw_t, execution);
 +    Tensor ik_normed_t(ik_normed, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
-+    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), DType::BF16,
++    const Tensor ln_w(const_cast<void*>(w.indexer_k_norm_w.payload), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
-+    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), DType::BF16,
++    const Tensor ln_b(const_cast<void*>(w.indexer_k_norm_b.payload), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(index_dim)});
 +    ops::layer_norm(ik_raw_t, ln_w, ln_b, 1e-6f, ik_normed_t, execution);
 +    Tensor ig_t(ig, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_dim), tokens});
@@ -16155,7 +16155,7 @@ index 0000000..408f269
 +        Tensor q_abs_t(q_abs, execution.device(), DType::FP32, {hsi, kli, tokens});
 +        Tensor q_heads_view(q_heads, execution.device(), DType::BF16,
 +                            {hsi, nli, tokens});
-+        const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), DType::BF16,
++        const Tensor wk_b_view(const_cast<void*>(w.wk_b.payload), execution.device(), DType::BF16,
 +                               {nli, kli, hsi});
 +        ops::glm5_dsa_absorb_batch(q_heads_view, wk_b_view, q_abs_t, execution.stream());
 +    }
@@ -16184,7 +16184,7 @@ index 0000000..408f269
 +                          DType::FP32, {static_cast<std::int32_t>(index_heads)});
 +            ops::glm5_dsa_score(iq_view, pooled_view, w_view, score_t, execution.stream());
 +            ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool),
-+                                 true, cells, execution);
++                                 true, cells, execution.stream());
 +        } else {
 +            std::vector<std::int32_t> tail_row(cells.ne[0], -1);
 +            for (std::uint32_t m = 0; m + 1 < kpool; ++m) {
@@ -16199,7 +16199,7 @@ index 0000000..408f269
 +                         DType::BF16,
 +                         {static_cast<std::int32_t>(heads),
 +                          static_cast<std::int32_t>(kv_lora)});
-+        const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), DType::BF16,
++        const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), execution.device(), DType::BF16,
 +                               {static_cast<std::int32_t>(kv_lora),
 +                                static_cast<std::int32_t>(v_head),
 +                                static_cast<std::int32_t>(heads)});
@@ -16207,7 +16207,7 @@ index 0000000..408f269
 +                            static_cast<std::size_t>(t) * heads * v_head * 2,
 +                        DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
 +        ops::glm5_dsa_attention(q_abs_col, latents, cells, wv_b_view, attn_col,
-+                                static_cast<std::int32_t>(head_dim), execution);
++                                static_cast<std::int32_t>(head_dim), execution.stream());
 +    }
 +    Tensor attn_t(attn_out, execution.device(), DType::BF16,
 +                  {static_cast<std::int32_t>(heads * v_head), tokens});
@@ -16240,7 +16240,7 @@ index 0000000..408f269
 +    void* up = take(static_cast<std::size_t>(ffn) * tokens * 2);
 +    void* activated = take(static_cast<std::size_t>(ffn) * tokens * 2);
 +
-+    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), DType::BF16, {hidden, 1});
++    const Tensor norm_weight(const_cast<void*>(w.ffn_norm.payload), execution.device(), DType::BF16, {hidden, 1});
 +    Tensor normed_t(normed, execution.device(), DType::BF16, {hidden, tokens});
 +    ops::rmsnorm(hidden_in, norm_weight, rms_eps, false, normed_t, execution);
 +    Tensor gate_t(gate, execution.device(), DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
@@ -16249,7 +16249,7 @@ index 0000000..408f269
 +    ops::linear(normed_t, w.up, up_t, execution);
 +    Tensor act_t(activated, execution.device(), DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
 +    ops::glm5_swiglu(gate_t, up_t, swiglu_limit, act_t, execution.stream());
-+    ops::linear(act_t, w.down, out, execution);
++    ops::linear(act_t, w.down, out, execution.stream());
 +}
 +
 +} // namespace ninfer::models::glm5::execution
@@ -17206,7 +17206,7 @@ index 0000000..154b80b
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000..d694d41
+index 0000000..4b65a72
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
 @@ -0,0 +1,557 @@
@@ -17330,17 +17330,17 @@ index 0000000..d694d41
 +
 +        // ---- attention half: mHC pre -> norm -> mixer -> mHC post ----
 +        {
-+            const Tensor fn(const_cast<void*>(lw.hc_attn_fn.payload), DType::BF16,
++            const Tensor fn(const_cast<void*>(lw.hc_attn_fn.payload), execution.device(), DType::BF16,
 +                            {24, static_cast<std::int32_t>(hc * config.hidden)});
-+            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), DType::FP32, {24});
-+            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), DType::FP32, {3});
++            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), execution.device(), DType::FP32, {24});
++            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), execution.device(), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, execution);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution.stream());
 +        }
 +        Tensor block_out_t(block_out, execution.device(), DType::BF16, {hidden, 1});
 +        if (config.layer_is_dsa[layer]) {
 +            const auto ape_ptr = w.dsa_ape[dsa_index];
-+            Tensor ape_t(const_cast<void*>(ape_ptr), DType::FP32,
++            Tensor ape_t(const_cast<void*>(ape_ptr), execution.device(), DType::FP32,
 +                         {static_cast<std::int32_t>(config.kpool),
 +                          static_cast<std::int32_t>(config.index_dim)});
 +            // The DSA block executor applies its own attn_norm internally; pass the
@@ -17354,11 +17354,11 @@ index 0000000..d694d41
 +            ++dsa_index;
 +        } else {
 +            const auto& scalars = w.kda_scalars[kda_index];
-+            Tensor dt(const_cast<void*>(scalars.dt_bias), DType::BF16,
++            Tensor dt(const_cast<void*>(scalars.dt_bias), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(config.kda_heads * config.kda_head_dim)});
-+            Tensor alog(const_cast<void*>(scalars.a_log), DType::FP32,
++            Tensor alog(const_cast<void*>(scalars.a_log), execution.device(), DType::FP32,
 +                        {static_cast<std::int32_t>(config.kda_heads)});
-+            Tensor onw(const_cast<void*>(scalars.o_norm_w), DType::FP32,
++            Tensor onw(const_cast<void*>(scalars.o_norm_w), execution.device(), DType::FP32,
 +                       {static_cast<std::int32_t>(config.kda_head_dim)});
 +            kda_block_decode(lw.kda, collapsed_t, dt, alog, onw,
 +                             state.kda_conv_q[kda_index], state.kda_conv_k[kda_index],
@@ -17380,18 +17380,18 @@ index 0000000..d694d41
 +
 +        // ---- FFN half: mHC pre -> norm -> MLP -> mHC post ----
 +        {
-+            const Tensor fn(const_cast<void*>(lw.hc_ffn_fn.payload), DType::BF16,
++            const Tensor fn(const_cast<void*>(lw.hc_ffn_fn.payload), execution.device(), DType::BF16,
 +                            {24, static_cast<std::int32_t>(hc * config.hidden)});
-+            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), DType::FP32, {24});
-+            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), DType::FP32, {3});
++            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), execution.device(), DType::FP32, {24});
++            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), execution.device(), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, execution);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution.stream());
 +        }
 +        if (config.layer_mlp_dense[layer]) {
 +            dense_mlp_decode(lw.dense_mlp, collapsed_t, config.rms_eps, config.swiglu_limit,
 +                             config.ffn_dense, block_out_t, cursor, execution);
 +        } else {
-+            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), DType::FP32,
++            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), execution.device(), DType::FP32,
 +                                      {static_cast<std::int32_t>(config.experts), 1});
 +            moe_block_decode(lw.moe, collapsed_t, router_bias, config.rms_eps,
 +                             config.swiglu_limit, config.routed_scaling_factor, config.experts,
@@ -17413,7 +17413,7 @@ index 0000000..d694d41
 +        Tensor head_mhc(head_mean, execution.device(), DType::BF16, {1, static_cast<std::int32_t>(config.hidden)});
 +        ops::glm5_mhc_head(residual_view, head_mhc, execution.stream());
 +        Tensor head_t(head_mean, execution.device(), DType::BF16, {static_cast<std::int32_t>(config.hidden), 1});
-+        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), DType::BF16,
++        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), execution.device(), DType::BF16,
 +                                   {hidden, 1});
 +        Tensor final_t(final_normed, execution.device(), DType::BF16, {hidden, 1});
 +        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, execution);
@@ -17655,16 +17655,16 @@ index 0000000..d694d41
 +
 +        // ---- attention half ----
 +        {
-+            const Tensor fn(const_cast<void*>(lw.hc_attn_fn.payload), DType::BF16,
++            const Tensor fn(const_cast<void*>(lw.hc_attn_fn.payload), execution.device(), DType::BF16,
 +                            {24, static_cast<std::int32_t>(hc * config.hidden)});
-+            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), DType::FP32, {24});
-+            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), DType::FP32, {3});
++            const Tensor base(const_cast<void*>(lw.hc_attn_base.payload), execution.device(), DType::FP32, {24});
++            const Tensor scale(const_cast<void*>(lw.hc_attn_scale.payload), execution.device(), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, execution);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution.stream());
 +        }
 +        if (config.layer_is_dsa[layer]) {
 +            const auto ape_ptr = w.dsa_ape[dsa_index];
-+            Tensor ape_t(const_cast<void*>(ape_ptr), DType::FP32,
++            Tensor ape_t(const_cast<void*>(ape_ptr), execution.device(), DType::FP32,
 +                         {static_cast<std::int32_t>(config.kpool),
 +                          static_cast<std::int32_t>(config.index_dim)});
 +            dsa_block_prefill(lw.dsa, collapsed_block, ape_t, state.dsa_latents[dsa_index],
@@ -17677,11 +17677,11 @@ index 0000000..d694d41
 +            ++dsa_index;
 +        } else {
 +            const auto& scalars = w.kda_scalars[kda_index];
-+            Tensor dt(const_cast<void*>(scalars.dt_bias), DType::BF16,
++            Tensor dt(const_cast<void*>(scalars.dt_bias), execution.device(), DType::BF16,
 +                      {static_cast<std::int32_t>(config.kda_heads * config.kda_head_dim)});
-+            Tensor alog(const_cast<void*>(scalars.a_log), DType::FP32,
++            Tensor alog(const_cast<void*>(scalars.a_log), execution.device(), DType::FP32,
 +                        {static_cast<std::int32_t>(config.kda_heads)});
-+            Tensor onw(const_cast<void*>(scalars.o_norm_w), DType::FP32,
++            Tensor onw(const_cast<void*>(scalars.o_norm_w), execution.device(), DType::FP32,
 +                       {static_cast<std::int32_t>(config.kda_head_dim)});
 +            kda_block_prefill(lw.kda, collapsed_block, dt, alog, onw,
 +                              state.kda_conv_q[kda_index], state.kda_conv_k[kda_index],
@@ -17700,12 +17700,12 @@ index 0000000..d694d41
 +
 +        // ---- FFN half ----
 +        {
-+            const Tensor fn(const_cast<void*>(lw.hc_ffn_fn.payload), DType::BF16,
++            const Tensor fn(const_cast<void*>(lw.hc_ffn_fn.payload), execution.device(), DType::BF16,
 +                            {24, static_cast<std::int32_t>(hc * config.hidden)});
-+            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), DType::FP32, {24});
-+            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), DType::FP32, {3});
++            const Tensor base(const_cast<void*>(lw.hc_ffn_base.payload), execution.device(), DType::FP32, {24});
++            const Tensor scale(const_cast<void*>(lw.hc_ffn_scale.payload), execution.device(), DType::FP32, {3});
 +            ops::glm5_mhc_pre(residual_t, fn, base, scale, config.rms_eps, 1e-6f, 20,
-+                              pre_t, post_t, comb_t, collapsed_mhc, execution);
++                              pre_t, post_t, comb_t, collapsed_mhc, execution.stream());
 +        }
 +        if (config.layer_mlp_dense[layer]) {
 +            dense_mlp_prefill(lw.dense_mlp, collapsed_block, config.rms_eps,
@@ -17713,7 +17713,7 @@ index 0000000..d694d41
 +                              block_scratch, execution);
 +        } else {
 +            // MoE v1: the single-token executor per token of the chunk.
-+            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), DType::FP32,
++            const Tensor router_bias(const_cast<void*>(lw.moe_router_bias), execution.device(), DType::FP32,
 +                                      {static_cast<std::int32_t>(config.experts), 1});
 +            for (std::int32_t t = 0; t < tokens; ++t) {
 +                Tensor column_in(static_cast<std::uint8_t*>(collapsed) +
@@ -17747,7 +17747,7 @@ index 0000000..d694d41
 +        // Same memory re-labelled: the head's [T, H] output is the rmsnorm's
 +        // {hidden, T} input.
 +        Tensor head_t(collapsed, execution.device(), DType::BF16, {hidden, tokens});
-+        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), DType::BF16,
++        const Tensor output_norm_w(const_cast<void*>(w.output_norm.payload), execution.device(), DType::BF16,
 +                                   {hidden, 1});
 +        Tensor final_t(final_normed, execution.device(), DType::BF16, {hidden, tokens});
 +        ops::rmsnorm(head_t, output_norm_w, config.rms_eps, false, final_t, execution);
@@ -31255,7 +31255,7 @@ index 0000000..0eff353
 +}
 diff --git a/tests/models/glm5/test_decode_step.cpp b/tests/models/glm5/test_decode_step.cpp
 new file mode 100644
-index 0000000..d782a8d
+index 0000000..1952930
 --- /dev/null
 +++ b/tests/models/glm5/test_decode_step.cpp
 @@ -0,0 +1,604 @@
@@ -31821,9 +31821,9 @@ index 0000000..d782a8d
 +        test::GuardedDeviceBuffer d_logits(VOCAB * 2);
 +
 +        {
-+            Tensor token_t(const_cast<void*>(d_token.data()), DType::BF16,
++            Tensor token_t(const_cast<void*>(d_token.data()), view_device(), DType::BF16,
 +                           {static_cast<std::int32_t>(H), 1});
-+            Tensor logits_t(const_cast<void*>(d_logits.data()), DType::BF16,
++            Tensor logits_t(const_cast<void*>(d_logits.data()), view_device(), DType::BF16,
 +                            {static_cast<std::int32_t>(VOCAB), 1});
 +            execution::glm5_decode_step(mw, state, config, token_t, CACHE - 1, logits_t,
 +                                        d_scratch.data(), nullptr);
@@ -31865,7 +31865,7 @@ index 0000000..d782a8d
 +}
 diff --git a/tests/models/glm5/test_dsa_mlp_blocks.cpp b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 new file mode 100644
-index 0000000..13c6399
+index 0000000..c2b1f2a
 --- /dev/null
 +++ b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 @@ -0,0 +1,658 @@
@@ -32180,21 +32180,21 @@ index 0000000..13c6399
 +    w.indexer_proj = execution::bf16_weight(d_iproj.data(), index_heads, hidden);
 +
 +    {
-+        Tensor hidden_t(const_cast<void*>(d_hidden.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
-+        Tensor ape_t(const_cast<void*>(d_ape.data()), DType::FP32,
++        Tensor hidden_t(const_cast<void*>(d_hidden.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor ape_t(const_cast<void*>(d_ape.data()), view_device(), DType::FP32,
 +                     {static_cast<std::int32_t>(kpool), static_cast<std::int32_t>(index_dim)});
-+        Tensor latents_t(const_cast<void*>(d_latents.data()), DType::BF16,
++        Tensor latents_t(const_cast<void*>(d_latents.data()), view_device(), DType::BF16,
 +                         {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(kv_lora)});
-+        Tensor ikh_t(const_cast<void*>(d_ikh.data()), DType::BF16,
++        Tensor ikh_t(const_cast<void*>(d_ikh.data()), view_device(), DType::BF16,
 +                     {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(index_dim)});
-+        Tensor igh_t(const_cast<void*>(d_igh.data()), DType::BF16,
++        Tensor igh_t(const_cast<void*>(d_igh.data()), view_device(), DType::BF16,
 +                     {static_cast<std::int32_t>(cache), static_cast<std::int32_t>(index_dim)});
-+        Tensor pooled_t(const_cast<void*>(d_pooled.data()), DType::FP32,
++        Tensor pooled_t(const_cast<void*>(d_pooled.data()), view_device(), DType::FP32,
 +                        {static_cast<std::int32_t>(std::max<std::uint32_t>(completed, 1)),
 +                         static_cast<std::int32_t>(index_dim)});
-+        Tensor cells_t(const_cast<void*>(d_cells.data()), DType::I32,
++        Tensor cells_t(const_cast<void*>(d_cells.data()), view_device(), DType::I32,
 +                       {static_cast<std::int32_t>(width)});
-+        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor out_t(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +        execution::dsa_block_decode(w, hidden_t, ape_t, latents_t, ikh_t, igh_t, pooled_t,
 +                                    cells_t, position, 1e-5f, heads, head_dim, q_lora, kv_lora,
 +                                    v_head, index_heads, index_dim, kpool, top_k, out_t,
@@ -32226,22 +32226,22 @@ index 0000000..13c6399
 +            width, BT, 0));
 +
 +        auto make_views = [&](auto& lat, auto& ik, auto& ig, auto& pool, auto& cells) {
-+            Tensor lat_t(lat.data(), DType::BF16, {static_cast<std::int32_t>(cache),
++            Tensor lat_t(lat.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(cache),
 +                                                 static_cast<std::int32_t>(kv_lora)});
-+            Tensor ik_t(ik.data(), DType::BF16, {static_cast<std::int32_t>(cache),
++            Tensor ik_t(ik.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(cache),
 +                                               static_cast<std::int32_t>(index_dim)});
-+            Tensor ig_t(ig.data(), DType::BF16, {static_cast<std::int32_t>(cache),
++            Tensor ig_t(ig.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(cache),
 +                                               static_cast<std::int32_t>(index_dim)});
-+            Tensor pool_t(pool.data(), DType::FP32,
++            Tensor pool_t(pool.data(), view_device(), DType::FP32,
 +                          {static_cast<std::int32_t>(std::max<std::uint32_t>(completed, 1)),
 +                           static_cast<std::int32_t>(index_dim)});
-+            Tensor cells_t(cells.data(), DType::I32, {static_cast<std::int32_t>(width)});
++            Tensor cells_t(cells.data(), view_device(), DType::I32, {static_cast<std::int32_t>(width)});
 +            return std::tuple{lat_t, ik_t, ig_t, pool_t, cells_t};
 +        };
 +        {
 +            auto [lat_t, ik_t, ig_t, pool_t, cells_t] =
 +                make_views(d_lat_a, d_ik_a, d_ig_a, d_pool_a, d_cells_a);
-+            Tensor ape_t(const_cast<void*>(d_ape.data()), DType::FP32,
++            Tensor ape_t(const_cast<void*>(d_ape.data()), view_device(), DType::FP32,
 +                         {static_cast<std::int32_t>(kpool),
 +                          static_cast<std::int32_t>(index_dim)});
 +            for (std::uint32_t t = 0; t < BT; ++t) {
@@ -32261,12 +32261,12 @@ index 0000000..13c6399
 +        {
 +            auto [lat_t, ik_t, ig_t, pool_t, cells_t] =
 +                make_views(d_lat_b, d_ik_b, d_ig_b, d_pool_b, d_cells_b);
-+            Tensor ape_t(const_cast<void*>(d_ape.data()), DType::FP32,
++            Tensor ape_t(const_cast<void*>(d_ape.data()), view_device(), DType::FP32,
 +                         {static_cast<std::int32_t>(kpool),
 +                          static_cast<std::int32_t>(index_dim)});
-+            Tensor batch_t(d_seq.data(), DType::BF16,
++            Tensor batch_t(d_seq.data(), view_device(), DType::BF16,
 +                           {static_cast<std::int32_t>(hidden), static_cast<std::int32_t>(BT)});
-+            Tensor out_t(d_out_b.data(), DType::BF16,
++            Tensor out_t(d_out_b.data(), view_device(), DType::BF16,
 +                         {static_cast<std::int32_t>(hidden), static_cast<std::int32_t>(BT)});
 +            execution::dsa_block_prefill(w, batch_t, ape_t, lat_t, ik_t, ig_t, pool_t, cells_t,
 +                                         0, 1e-5f, heads, head_dim, q_lora, kv_lora,
@@ -32362,8 +32362,8 @@ index 0000000..13c6399
 +        w.gate = execution::bf16_weight(d_g.data(), ffn, hidden);
 +        w.up = execution::bf16_weight(d_u.data(), ffn, hidden);
 +        w.down = execution::bf16_weight(d_d.data(), hidden, ffn);
-+        Tensor ht(const_cast<void*>(d_h.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
-+        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor ht(const_cast<void*>(d_h.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +        execution::dense_mlp_decode(w, ht, 1e-5f, 10.0f, ffn, ot, d_scratch.data(), nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
 +        check("dense_mlp", represented(download<__nv_bfloat16>(d_out)),
@@ -32490,9 +32490,9 @@ index 0000000..13c6399
 +    w.gate_shexp = execution::bf16_weight(d_gsh.data(), ffn, hidden);
 +    w.up_shexp = execution::bf16_weight(d_ush.data(), ffn, hidden);
 +    w.down_shexp = execution::bf16_weight(d_dsh.data(), hidden, ffn);
-+    Tensor ht(const_cast<void*>(d_h.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
-+    Tensor bt(const_cast<void*>(d_bias.data()), DType::FP32, {static_cast<std::int32_t>(experts)});
-+    Tensor ot(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++    Tensor ht(const_cast<void*>(d_h.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
++    Tensor bt(const_cast<void*>(d_bias.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(experts)});
++    Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +    execution::moe_block_decode(w, ht, bt, 1e-5f, 10.0f, 2.5f, experts, top_k, ffn, ot,
 +                                d_scratch.data(), nullptr);
 +    CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -32529,7 +32529,7 @@ index 0000000..13c6399
 +}
 diff --git a/tests/models/glm5/test_embed_prefill.cpp b/tests/models/glm5/test_embed_prefill.cpp
 new file mode 100644
-index 0000000..2bb995b
+index 0000000..5c1cc02
 --- /dev/null
 +++ b/tests/models/glm5/test_embed_prefill.cpp
 @@ -0,0 +1,326 @@
@@ -32740,13 +32740,13 @@ index 0000000..2bb995b
 +                                execution::glm5_embed_scratch_bytes(H);
 +    test::GuardedDeviceBuffer d_scratch(scratch);
 +    test::GuardedDeviceBuffer d_logits(VOCAB * 2);
-+    Tensor logits_t(const_cast<void*>(d_logits.data()), DType::BF16,
++    Tensor logits_t(const_cast<void*>(d_logits.data()), view_device(), DType::BF16,
 +                    {static_cast<std::int32_t>(VOCAB), 1});
 +
 +    // ---- embedding lookup only (no decode step) to isolate ----
 +    {
 +        test::GuardedDeviceBuffer d_out(H * 2);
-+        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16,
++        Tensor out_t(const_cast<void*>(d_out.data()), view_device(), DType::BF16,
 +                     {static_cast<std::int32_t>(H), 1});
 +        execution::glm5_embed_token(mw, 5, H, out_t, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -32802,8 +32802,8 @@ index 0000000..2bb995b
 +        test::GuardedDeviceBuffer d_ids(sizeof(ids));
 +        d_ids.copy_from_host(ids, sizeof(ids));
 +        test::GuardedDeviceBuffer d_last_hidden(H * 2);
-+        Tensor ids_t(const_cast<void*>(d_ids.data()), DType::I32, {3});
-+        Tensor last_hidden_t(const_cast<void*>(d_last_hidden.data()), DType::BF16,
++        Tensor ids_t(const_cast<void*>(d_ids.data()), view_device(), DType::I32, {3});
++        Tensor last_hidden_t(const_cast<void*>(d_last_hidden.data()), view_device(), DType::BF16,
 +                             {static_cast<std::int32_t>(H), 1});
 +        const std::size_t pscratch = execution::glm5_prefill_scratch_bytes(config, 3);
 +        test::GuardedDeviceBuffer d_pscratch(pscratch);
@@ -33075,7 +33075,7 @@ index 0000000..1316f5a
 +}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
-index 0000000..c248c1a
+index 0000000..80dc1c6
 --- /dev/null
 +++ b/tests/models/glm5/test_kda_block.cpp
 @@ -0,0 +1,449 @@
@@ -33292,24 +33292,24 @@ index 0000000..c248c1a
 +        d_dbg_gpre(d_inner * 2), d_dbg_blog(heads * 2);
 +    execution::KdaBlockDebug dbg{};
 +    if (debug) {
-+        static Tensor t_dbg_normed(const_cast<void*>(d_dbg_normed.data()), DType::BF16, {static_cast<std::int32_t>(hidden), 1});
++        static Tensor t_dbg_normed(const_cast<void*>(d_dbg_normed.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden), 1});
 +        dbg.normed = &t_dbg_normed;
-+        static Tensor t_dbg_q_conv(const_cast<void*>(d_dbg_qc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        static Tensor t_dbg_q_conv(const_cast<void*>(d_dbg_qc.data()), view_device(), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
 +        dbg.q_conv = &t_dbg_q_conv;
-+        static Tensor t_dbg_k_conv(const_cast<void*>(d_dbg_kc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        static Tensor t_dbg_k_conv(const_cast<void*>(d_dbg_kc.data()), view_device(), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
 +        dbg.k_conv = &t_dbg_k_conv;
-+        static Tensor t_dbg_v_conv(const_cast<void*>(d_dbg_vc.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        static Tensor t_dbg_v_conv(const_cast<void*>(d_dbg_vc.data()), view_device(), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
 +        dbg.v_conv = &t_dbg_v_conv;
-+        static Tensor t_dbg_gate(const_cast<void*>(d_dbg_gate.data()), DType::FP32, {1, static_cast<std::int32_t>(d_inner)});
++        static Tensor t_dbg_gate(const_cast<void*>(d_dbg_gate.data()), view_device(), DType::FP32, {1, static_cast<std::int32_t>(d_inner)});
 +        dbg.gate = &t_dbg_gate;
-+        static Tensor t_dbg_beta(const_cast<void*>(d_dbg_beta.data()), DType::FP32, {1, static_cast<std::int32_t>(heads)});
++        static Tensor t_dbg_beta(const_cast<void*>(d_dbg_beta.data()), view_device(), DType::FP32, {1, static_cast<std::int32_t>(heads)});
 +        dbg.beta = &t_dbg_beta;
-+        static Tensor t_dbg_prefill_out(const_cast<void*>(d_dbg_prefill.data()), DType::BF16, {static_cast<std::int32_t>(d_inner), 1});
++        static Tensor t_dbg_prefill_out(const_cast<void*>(d_dbg_prefill.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner), 1});
 +        dbg.prefill_out = &t_dbg_prefill_out;
 +
-+        static Tensor t_dbg_gpre(const_cast<void*>(d_dbg_gpre.data()), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
++        static Tensor t_dbg_gpre(const_cast<void*>(d_dbg_gpre.data()), view_device(), DType::BF16, {1, static_cast<std::int32_t>(d_inner)});
 +        dbg.gate_pre = &t_dbg_gpre;
-+        static Tensor t_dbg_blog(const_cast<void*>(d_dbg_blog.data()), DType::BF16, {1, static_cast<std::int32_t>(heads)});
++        static Tensor t_dbg_blog(const_cast<void*>(d_dbg_blog.data()), view_device(), DType::BF16, {1, static_cast<std::int32_t>(heads)});
 +        dbg.beta_logits = &t_dbg_blog;
 +    }
 +
@@ -33329,16 +33329,16 @@ index 0000000..c248c1a
 +    w.wo = execution::bf16_weight(d_wo.data(), hidden, d_inner);
 +
 +    {
-+        Tensor hidden_t(const_cast<void*>(d_hidden.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
-+        Tensor dt_t(const_cast<void*>(d_dt.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+        Tensor alog_t(const_cast<void*>(d_alog.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+        Tensor onw_t(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(head_dim)});
-+        Tensor cqs(const_cast<void*>(d_conv_q.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+        Tensor cks(const_cast<void*>(d_conv_k.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+        Tensor cvs(const_cast<void*>(d_conv_v.data()), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+        Tensor ms(const_cast<void*>(d_matrix.data()), DType::FP32,
++        Tensor hidden_t(const_cast<void*>(d_hidden.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor dt_t(const_cast<void*>(d_dt.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor alog_t(const_cast<void*>(d_alog.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor onw_t(const_cast<void*>(d_onw.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(head_dim)});
++        Tensor cqs(const_cast<void*>(d_conv_q.data()), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor cks(const_cast<void*>(d_conv_k.data()), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor cvs(const_cast<void*>(d_conv_v.data()), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++        Tensor ms(const_cast<void*>(d_matrix.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(heads)});
-+        Tensor out_t(const_cast<void*>(d_out.data()), DType::BF16, {static_cast<std::int32_t>(hidden)});
++        Tensor out_t(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +        execution::kda_block_decode(w, hidden_t, dt_t, alog_t, onw_t, cqs, cks, cvs, ms, -5.0f,
 +                                    heads, head_dim, 1e-5f, out_t, d_scratch.data(), nullptr,
 +                                    debug ? &dbg : nullptr);
@@ -33420,15 +33420,15 @@ index 0000000..c248c1a
 +             d_cv_a = upload(conv_state0), d_ms_a = upload(matrix_state0);
 +        test::GuardedDeviceBuffer d_out_a(hidden * BT * 2);
 +        {
-+            Tensor cqs(d_cq_a.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor cks(d_ck_a.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor cvs(d_cv_a.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor ms(d_ms_a.data(), DType::FP32,
++            Tensor cqs(d_cq_a.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor cks(d_ck_a.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor cvs(d_cv_a.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor ms(d_ms_a.data(), view_device(), DType::FP32,
 +                      {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(head_dim),
 +                       static_cast<std::int32_t>(heads)});
-+            Tensor dt_t(const_cast<void*>(d_dt.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+            Tensor alog_t(const_cast<void*>(d_alog.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+            Tensor onw_t(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(head_dim)});
++            Tensor dt_t(const_cast<void*>(d_dt.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++            Tensor alog_t(const_cast<void*>(d_alog.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++            Tensor onw_t(const_cast<void*>(d_onw.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(head_dim)});
 +            for (std::uint32_t t = 0; t < BT; ++t) {
 +                Tensor column(reinterpret_cast<void*>(static_cast<std::uint8_t*>(d_hidden_a.data()) +
 +                                                       static_cast<std::size_t>(t) * hidden * 2),
@@ -33450,18 +33450,18 @@ index 0000000..c248c1a
 +        test::GuardedDeviceBuffer d_scratch_b(
 +            execution::kda_block_prefill_scratch_bytes(hidden, heads, head_dim, BT));
 +        {
-+            Tensor batch_t(d_hidden_a.data(), DType::BF16,
++            Tensor batch_t(d_hidden_a.data(), view_device(), DType::BF16,
 +                           {static_cast<std::int32_t>(hidden), static_cast<std::int32_t>(BT)});
-+            Tensor dt_t(const_cast<void*>(d_dt.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+            Tensor alog_t(const_cast<void*>(d_alog.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+            Tensor onw_t(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(head_dim)});
-+            Tensor cqs(d_cq_b.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor cks(d_ck_b.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor cvs(d_cv_b.data(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
-+            Tensor ms(d_ms_b.data(), DType::FP32,
++            Tensor dt_t(const_cast<void*>(d_dt.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++            Tensor alog_t(const_cast<void*>(d_alog.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++            Tensor onw_t(const_cast<void*>(d_onw.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(head_dim)});
++            Tensor cqs(d_cq_b.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor cks(d_ck_b.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor cvs(d_cv_b.data(), view_device(), DType::FP32, {3, static_cast<std::int32_t>(d_inner)});
++            Tensor ms(d_ms_b.data(), view_device(), DType::FP32,
 +                      {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(head_dim),
 +                       static_cast<std::int32_t>(heads)});
-+            Tensor out_t(d_out_b.data(), DType::BF16,
++            Tensor out_t(d_out_b.data(), view_device(), DType::BF16,
 +                         {static_cast<std::int32_t>(hidden), static_cast<std::int32_t>(BT)});
 +            execution::kda_block_prefill(w, batch_t, dt_t, alog_t, onw_t, cqs, cks, cvs, ms,
 +                                         -5.0f, heads, head_dim, 1e-5f, BCH, out_t,
@@ -33530,7 +33530,7 @@ index 0000000..c248c1a
 +}
 diff --git a/tests/models/glm5/test_prefill_chunked.cpp b/tests/models/glm5/test_prefill_chunked.cpp
 new file mode 100644
-index 0000000..297c6b9
+index 0000000..0cc5f38
 --- /dev/null
 +++ b/tests/models/glm5/test_prefill_chunked.cpp
 @@ -0,0 +1,407 @@
@@ -33869,8 +33869,8 @@ index 0000000..297c6b9
 +    // Path A: T sequential decode tokens.
 +    test::GuardedDeviceBuffer d_logits_a(VOCAB * 2);
 +    test::GuardedDeviceBuffer d_hidden_a(H * 2);
-+    Tensor logits_a(d_logits_a.data(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
-+    Tensor hidden_a(d_hidden_a.data(), DType::BF16, {static_cast<std::int32_t>(H)});
++    Tensor logits_a(d_logits_a.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
++    Tensor hidden_a(d_hidden_a.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(H)});
 +    const std::size_t scratch_decode =
 +        execution::glm5_decode_step_scratch_bytes(config, T - 1) + execution::glm5_embed_scratch_bytes(H) + 256;
 +    std::vector<std::uint8_t> scratch_a(scratch_decode);
@@ -33886,11 +33886,11 @@ index 0000000..297c6b9
 +    std::vector<std::int32_t> ids(T);
 +    for (std::uint32_t t = 0; t < T; ++t) ids[t] = static_cast<std::int32_t>(TOKENS[t]);
 +    auto d_ids = upload(ids);
-+    Tensor ids_t(d_ids.data(), DType::I32, {static_cast<std::int32_t>(T)});
++    Tensor ids_t(d_ids.data(), view_device(), DType::I32, {static_cast<std::int32_t>(T)});
 +    test::GuardedDeviceBuffer d_logits_b(VOCAB * 2);
 +    test::GuardedDeviceBuffer d_hidden_b(H * 2);
-+    Tensor logits_b(d_logits_b.data(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
-+    Tensor hidden_b(d_hidden_b.data(), DType::BF16, {static_cast<std::int32_t>(H)});
++    Tensor logits_b(d_logits_b.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(VOCAB)});
++    Tensor hidden_b(d_hidden_b.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(H)});
 +    const std::size_t scratch_chunked =
 +        execution::glm5_prefill_chunked_scratch_bytes(config, T, 0);
 +    void* d_scratch_b = nullptr;
