@@ -4677,10 +4677,10 @@ index 0000000..54b22d7
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_mlp.cpp b/src/core/gaudi2/glm5_hpu_mlp.cpp
 new file mode 100644
-index 0000000..297a535
+index 0000000..9ac8133
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_mlp.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,223 @@
 +// GLM-5.3-Flash FFN half on the Gaudi2 runtime adapter. The math mirrors the
 +// CUDA dense_mlp_decode / moe_block_decode: projections on the MME, the
 +// clamped SwiGLU / noaux_tc router / combine on the host between launches.
@@ -4757,6 +4757,7 @@ index 0000000..297a535
 +    }
 +
 +    auto device_project = [&](Bf16Gemm& gemm, const DeviceBuffer& weight,
++                              std::uint64_t weight_offset,
 +                              const std::vector<float>& input,
 +                              std::uint32_t in_cols) {
 +        const std::uint32_t out_rows = static_cast<std::uint32_t>(gemm.shape().n);
@@ -4770,7 +4771,8 @@ index 0000000..297a535
 +        DeviceBuffer dev_out = device.allocate_device(out_rows * 2);
 +        auto up = stream.upload(dev_in, host_in, in_cols * 2);
 +        up.wait();
-+        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight), dev_out);
++        auto compute = gemm.launch(stream, dev_in, const_cast<DeviceBuffer&>(weight),
++                                   dev_out, weight_offset);
 +        compute.wait();
 +        auto down = stream.download(host_out, dev_out, out_rows * 2);
 +        down.wait();
@@ -4782,20 +4784,24 @@ index 0000000..297a535
 +        return result;
 +    };
 +    // The dense SwiGLU chain: gate/up on the MME, activation on the host, down
-+    // on the MME. Every expert (routed or shared) reuses the same recipes
-+    // against its own weight buffers.
++    // on the MME. Routed experts bind their row blocks by offset; the shared
++    // expert binds its own planes at offset 0.
 +    auto swiglu_expert = [&](Bf16Gemm& gate_gemm, Bf16Gemm& up_gemm, Bf16Gemm& down_gemm,
 +                             const DeviceBuffer& gate_w, const DeviceBuffer& up_w,
 +                             const DeviceBuffer& down_w,
++                             std::uint64_t gate_off, std::uint64_t up_off,
++                             std::uint64_t down_off,
 +                             const std::vector<float>& normed) {
-+        const std::vector<float> g = device_project(gate_gemm, gate_w, normed, hidden);
-+        const std::vector<float> u = device_project(up_gemm, up_w, normed, hidden);
++        const std::vector<float> g =
++            device_project(gate_gemm, gate_w, gate_off, normed, hidden);
++        const std::vector<float> u =
++            device_project(up_gemm, up_w, up_off, normed, hidden);
 +        std::vector<float> activated(ffn);
 +        for (std::uint32_t i = 0; i < ffn; ++i) {
 +            activated[i] = bf16_word_to_float(
 +                float_to_bf16_word(swiglu(g[i], u[i], config.swiglu_limit)));
 +        }
-+        return device_project(down_gemm, down_w, activated, ffn);
++        return device_project(down_gemm, down_w, down_off, activated, ffn);
 +    };
 +
 +    // ---- Stage 1: RMSNorm on host ----
@@ -4821,7 +4827,7 @@ index 0000000..297a535
 +        // ---- Dense path ----
 +        const std::vector<float> block_out =
 +            swiglu_expert(projections.gate, projections.up, projections.down,
-+                          w.gate, w.up, w.down, normed);
++                          w.gate, w.up, w.down, 0, 0, 0, normed);
 +        std::vector<std::uint16_t> result(hidden);
 +        for (std::uint32_t i = 0; i < hidden; ++i) {
 +            result[i] = float_to_bf16_word(block_out[i]);
@@ -4837,7 +4843,7 @@ index 0000000..297a535
 +    // score = sigmoid(logit); ranks by score + bias with ties to the lower
 +    // expert; the ORIGINAL scores are normalized and scaled.
 +    const std::vector<float> logits = device_project(
-+        projections.router, w.router, normed, hidden);
++        projections.router, w.router, 0, normed, hidden);
 +    std::vector<float> score(experts);
 +    for (std::uint32_t e = 0; e < experts; ++e) score[e] = sigmoid(logits[e]);
 +    std::vector<float> weights(top_k, 0.0f);
@@ -4875,14 +4881,17 @@ index 0000000..297a535
 +            continue;
 +        }
 +        stacked[slot] = swiglu_expert(projections.gate, projections.up, projections.down,
-+                                      w.expert_gate[expert], w.expert_up[expert],
-+                                      w.expert_down[expert], normed);
++                                      w.gate_exps_plane, w.up_exps_plane,
++                                      w.down_exps_plane,
++                                      w.expert_gate_offset[expert],
++                                      w.expert_up_offset[expert],
++                                      w.expert_down_offset[expert], normed);
 +    }
 +
 +    // Shared expert (unweighted) plus the weighted routed combine.
 +    const std::vector<float> shared = swiglu_expert(
 +        projections.shared_gate, projections.shared_up, projections.shared_down,
-+        w.gate, w.up, w.down, normed);
++        w.gate, w.up, w.down, 0, 0, 0, normed);
 +    std::vector<std::uint16_t> result(hidden);
 +    for (std::uint32_t i = 0; i < hidden; ++i) {
 +        float acc = shared[i];
@@ -4897,10 +4906,10 @@ index 0000000..297a535
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_mlp.h b/src/core/gaudi2/glm5_hpu_mlp.h
 new file mode 100644
-index 0000000..534ddf5
+index 0000000..680021a
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_mlp.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +#pragma once
 +// GLM-5.3-Flash FFN half (dense MLP and MoE blocks) on the Gaudi2 SynapseAI
 +// runtime adapter. Same contract as the other HPU block executors: matrix
@@ -4941,10 +4950,13 @@ index 0000000..534ddf5
 +    // Dense (and the MoE router / shared expert) planes.
 +    DeviceBuffer gate, up, down;    // dense: [ffn, hidden] / [ffn, hidden] / [hidden, ffn]
 +    DeviceBuffer router;            // MoE: BF16 [experts, hidden]
-+    // Per-expert row blocks (MoE only), each dense-shaped.
-+    std::vector<DeviceBuffer> expert_gate;   // [experts] each BF16 [ffn, hidden]
-+    std::vector<DeviceBuffer> expert_up;     // [experts] each BF16 [ffn, hidden]
-+    std::vector<DeviceBuffer> expert_down;   // [experts] each BF16 [hidden, ffn]
++    // Routed experts bind their row blocks of the stacked planes by byte
++    // offset (review S4): no per-expert copies, the planes hold HBM once
++    // through load AND steady state.
++    DeviceBuffer gate_exps_plane, up_exps_plane, down_exps_plane;
++    std::vector<std::uint64_t> expert_gate_offset;  // [experts] bytes into gate_exps_plane
++    std::vector<std::uint64_t> expert_up_offset;    // [experts] bytes into up_exps_plane
++    std::vector<std::uint64_t> expert_down_offset;  // [experts] bytes into down_exps_plane
 +    // Host-resident router correction bias, FP32 [experts] (noaux_tc).
 +    std::vector<float> router_bias;
 +};
@@ -4975,10 +4987,10 @@ index 0000000..534ddf5
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/glm5_hpu_model.cpp b/src/core/gaudi2/glm5_hpu_model.cpp
 new file mode 100644
-index 0000000..c40e8e7
+index 0000000..5cabd12
 --- /dev/null
 +++ b/src/core/gaudi2/glm5_hpu_model.cpp
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,528 @@
 +// GLM-5.3-Flash full-model HPU executor. The math mirrors the CUDA
 +// decode_step; projections run on the MME via per-shape Bf16Gemm sets, and
 +// the elementwise chains use the same audited host formulas. Both mixer kinds
@@ -5312,36 +5324,27 @@ index 0000000..c40e8e7
 +            hw.gate = *bind(mw.gate_shexp);
 +            hw.up = *bind(mw.up_shexp);
 +            hw.down = *bind(mw.down_shexp);
-+            // Per-expert row blocks re-stage as their own planes: Bf16Gemm
-+            // binds whole buffers, so each expert's [ffn, hidden] slice gets
-+            // its own DeviceBuffer (same total bytes as the stacked plane;
-+            // the slice moves through DMA, never a host alias read).
++            // Routed experts bind their row blocks of the stacked planes
++            // by byte offset (review S4): the loader's planes are the ONLY
++            // copy - no slice re-uploads, no init-time duplicate, nothing
++            // to release.
 +            const std::uint32_t ffn = config.ffn_moe;
 +            const std::uint32_t experts = config.experts;
-+            const std::size_t gate_block =
-+                static_cast<std::size_t>(ffn) * config.hidden * 2;
-+            const std::size_t down_block =
-+                static_cast<std::size_t>(config.hidden) * ffn * 2;
-+            hw.expert_gate.resize(experts);
-+            hw.expert_up.resize(experts);
-+            hw.expert_down.resize(experts);
++            const std::uint64_t gate_block =
++                static_cast<std::uint64_t>(ffn) * config.hidden * 2;
++            const std::uint64_t down_block =
++                static_cast<std::uint64_t>(config.hidden) * ffn * 2;
++            hw.gate_exps_plane = *bind(mw.gate_exps);
++            hw.up_exps_plane = *bind(mw.up_exps);
++            hw.down_exps_plane = *bind(mw.down_exps);
++            hw.expert_gate_offset.resize(experts);
++            hw.expert_up_offset.resize(experts);
++            hw.expert_down_offset.resize(experts);
 +            for (std::uint32_t e = 0; e < experts; ++e) {
-+                auto slice_upload = [&](const void* base, std::size_t block) {
-+                    auto raw = weight_planes.download(device, stream, base, block,
-+                                                      e * block);
-+                    return &weight_planes.bind(weight_planes.upload(
-+                        device, stream, raw.data(), block));
-+                };
-+                hw.expert_gate[e] = *slice_upload(mw.gate_exps.payload, gate_block);
-+                hw.expert_up[e] = *slice_upload(mw.up_exps.payload, gate_block);
-+                hw.expert_down[e] = *slice_upload(mw.down_exps.payload, down_block);
++                hw.expert_gate_offset[e] = e * gate_block;
++                hw.expert_up_offset[e] = e * gate_block;
++                hw.expert_down_offset[e] = e * down_block;
 +            }
-+            // The stacked planes are fully superseded by their per-expert
-+            // slices; release them so the routed weights hold HBM once, not
-+            // twice (review R7).
-+            (void)weight_planes.release(mw.gate_exps.payload);
-+            (void)weight_planes.release(mw.up_exps.payload);
-+            (void)weight_planes.release(mw.down_exps.payload);
 +            hw.router_bias = download_f32(weights.layers[layer].moe_router_bias,
 +                                          config.experts);
 +        }
@@ -6795,10 +6798,10 @@ index 0000000..fa7238e
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.cpp b/src/core/gaudi2/runtime.cpp
 new file mode 100644
-index 0000000..c5c686e
+index 0000000..ee8614a
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.cpp
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,290 @@
 +#include "runtime.h"
 +
 +#include <atomic>
@@ -7040,11 +7043,12 @@ index 0000000..c5c686e
 +            !binding.sizes[0] || !binding.sizes[1])
 +            throw std::invalid_argument("Gaudi2 recipe binding has an empty/foreign buffer or shape");
 +        if (binding.buffer->state_->leased) throw std::logic_error("Gaudi2 compute operand is already leased");
++        const std::uint64_t address = binding.buffer->state_->address + binding.address_offset;
 +        for (const auto& previous : execution->bindings)
-+            if (previous.tensorId == binding.tensor_id || previous.pTensorAddress == binding.buffer->state_->address)
++            if (previous.tensorId == binding.tensor_id || previous.pTensorAddress == address)
 +                throw std::invalid_argument("Gaudi2 recipe bindings alias an id or device allocation");
 +        synLaunchTensorInfoExt info{};
-+        info.tensorId = binding.tensor_id; info.pTensorAddress = binding.buffer->state_->address;
++        info.tensorId = binding.tensor_id; info.pTensorAddress = address;
 +        info.tensorType = DATA_TENSOR; info.tensorSize[0] = binding.sizes[0]; info.tensorSize[1] = binding.sizes[1];
 +        execution->bindings.push_back(info); execution->buffers.push_back(binding.buffer->state_);
 +    }
@@ -7090,10 +7094,10 @@ index 0000000..c5c686e
 +} // namespace ninfer::gaudi2
 diff --git a/src/core/gaudi2/runtime.h b/src/core/gaudi2/runtime.h
 new file mode 100644
-index 0000000..8a35725
+index 0000000..574aa80
 --- /dev/null
 +++ b/src/core/gaudi2/runtime.h
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,183 @@
 +#pragma once
 +
 +#include <synapse_api.h>
@@ -7190,6 +7194,10 @@ index 0000000..8a35725
 +    std::uint64_t tensor_id;
 +    DeviceBuffer* buffer;
 +    std::array<std::uint64_t, 2> sizes; // FCD first, matching the fixed graph geometry.
++    // Byte offset into the bound allocation (sub-plane operands, e.g. a
++    // routed expert's row block inside its stacked plane); 0 binds the
++    // whole buffer. The allocation itself stays the lease/ownership unit.
++    std::uint64_t address_offset = 0;
 +};
 +
 +class Compute {
@@ -8693,10 +8701,10 @@ index 0000000..84d63e8
 +}
 diff --git a/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp b/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp
 new file mode 100644
-index 0000000..fc4c6d8
+index 0000000..544171e
 --- /dev/null
 +++ b/src/core/gaudi2/tests/glm5_hpu_mlp_test.cpp
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,265 @@
 +// GLM-5.3-Flash FFN half (dense and MoE) on the Gaudi2 runtime adapter,
 +// against the fake_synapse test double. Both paths run their projections on
 +// the MME and the SwiGLU / noaux_tc router / combine math on the host; this
@@ -8809,14 +8817,39 @@ index 0000000..fc4c6d8
 +    w.gate = upload(bf16_plane(FFN, H, 12));       // shared expert
 +    w.up = upload(bf16_plane(FFN, H, 13));
 +    w.down = upload(bf16_plane(H, FFN, 14));
-+    w.expert_gate.resize(EXPERTS);
-+    w.expert_up.resize(EXPERTS);
-+    w.expert_down.resize(EXPERTS);
++    // The stacked planes hold every expert's row block contiguously; the
++    // weights bind them by byte offset (review S4).
++    auto upload_stacked = [&](std::uint32_t blocks, std::uint32_t rows,
++                              std::uint32_t cols, std::uint32_t seed) {
++        PinnedBuffer host = device.allocate_host(
++            static_cast<std::size_t>(blocks) * rows * cols * 2);
++        for (std::uint32_t b = 0; b < blocks; ++b) {
++            const auto plane = bf16_plane(rows, cols, seed + b);
++            std::memcpy(host.bytes().data() +
++                            static_cast<std::size_t>(b) * rows * cols * 2,
++                        plane.data(), plane.size() * 2);
++        }
++        DeviceBuffer plane_dev = device.allocate_device(
++            static_cast<std::size_t>(blocks) * rows * cols * 2);
++        auto t = stream.upload(plane_dev, host,
++                               static_cast<std::size_t>(blocks) * rows * cols * 2);
++        t.wait();
++        return plane_dev;
++    };
++    w.gate_exps_plane = upload_stacked(EXPERTS, FFN, H, 20);
++    w.up_exps_plane = upload_stacked(EXPERTS, FFN, H, 30);
++    w.down_exps_plane = upload_stacked(EXPERTS, H, FFN, 40);
++    w.expert_gate_offset.resize(EXPERTS);
++    w.expert_up_offset.resize(EXPERTS);
++    w.expert_down_offset.resize(EXPERTS);
 +    for (std::uint32_t e = 0; e < EXPERTS; ++e) {
-+        // Per-expert row blocks out of the stacked plane geometry.
-+        w.expert_gate[e] = upload(bf16_plane(FFN, H, 20 + e));
-+        w.expert_up[e] = upload(bf16_plane(FFN, H, 30 + e));
-+        w.expert_down[e] = upload(bf16_plane(H, FFN, 40 + e));
++        const std::uint64_t gate_block =
++            static_cast<std::uint64_t>(FFN) * H * 2;
++        const std::uint64_t down_block =
++            static_cast<std::uint64_t>(H) * FFN * 2;
++        w.expert_gate_offset[e] = e * gate_block;
++        w.expert_up_offset[e] = e * gate_block;
++        w.expert_down_offset[e] = e * down_block;
 +    }
 +    w.router_bias.resize(EXPERTS);
 +    for (std::uint32_t e = 0; e < EXPERTS; ++e) {
@@ -8832,7 +8865,91 @@ index 0000000..fc4c6d8
 +            if (!std::isfinite(bf16_val(out[i]))) throw std::runtime_error("moe finite");
 +        }
 +    }
-+    std::puts("ok: moe hpu steps");
++
++    // Offset-binding precision case (review S4): two experts, top-1, a bias
++    // that forces expert 1, an identity `down` for both experts, zero shared
++    // expert, and a zero expert 0 - the output must equal expert 1's
++    // activation times its normalized route weight. A wrong byte offset
++    // reads the wrong expert's rows and fails this.
++    {
++        constexpr std::uint32_t E2 = 2, T1 = 1;
++        Glm5MlpHpuConfig c2{};
++        c2.hidden = H;
++        c2.ffn = FFN;
++        c2.experts = E2;
++        c2.top_k = T1;
++        c2.rms_eps = 1e-5f;
++        c2.swiglu_limit = 7.0f;
++        c2.routed_scaling_factor = 1.0f;
++        Glm5MlpHpuProjections p2(device, c2);
++        Glm5MlpHpuWeights w2;
++        auto gamma = [&](std::uint32_t n) {
++            std::vector<std::uint16_t> g(n);
++            for (std::uint32_t i = 0; i < n; ++i) g[i] = round_bf16(1.0f);
++            return g;
++        };
++        w2.ffn_norm = upload(gamma(H));
++        w2.router = upload([&] {
++            // Logit 0 for both experts; the bias alone decides.
++            std::vector<std::uint16_t> r(E2 * H, round_bf16(0.0f));
++            return r;
++        }());
++        w2.gate = upload(std::vector<std::uint16_t>(FFN * H, round_bf16(0.0f)));
++        w2.up = upload(std::vector<std::uint16_t>(FFN * H, round_bf16(0.0f)));
++        w2.down = upload(std::vector<std::uint16_t>(H * FFN, round_bf16(0.0f)));
++        auto identity_down = upload([&] {
++            std::vector<std::uint16_t> m(static_cast<std::size_t>(E2) * H * FFN,
++                                         round_bf16(0.0f));
++            for (std::uint32_t e = 0; e < E2; ++e)
++                for (std::uint32_t d = 0; d < FFN && d < H; ++d)
++                    m[static_cast<std::size_t>(e) * H * FFN + d * FFN + d] =
++                        round_bf16(1.0f);
++            return m;
++        }());
++        // Stacked expert planes: expert 0 all zero, expert 1 gate/up = 1.
++        auto stacked_ones = upload([&] {
++            std::vector<std::uint16_t> m(static_cast<std::size_t>(E2) * FFN * H,
++                                         round_bf16(0.0f));
++            for (std::uint32_t i = 0; i < FFN * H; ++i)
++                m[static_cast<std::size_t>(FFN) * H + i] = round_bf16(1.0f);
++            return m;
++        }());
++        w2.gate_exps_plane = stacked_ones;
++        w2.up_exps_plane = stacked_ones;
++        w2.down_exps_plane = identity_down;
++        w2.expert_gate_offset = {0, static_cast<std::uint64_t>(FFN) * H * 2};
++        w2.expert_up_offset = {0, static_cast<std::uint64_t>(FFN) * H * 2};
++        w2.expert_down_offset = {0, static_cast<std::uint64_t>(H) * FFN * 2};
++        w2.router_bias = {0.0f, 10.0f};  // forces expert 1
++
++        // Activation of expert 1: silu(min(1,lim))*clamp(1) = silu(1) = s.
++        // normed is the unit-vector norm of the all-ones input row times
++        // gamma 1: each element 1/sqrt(H); the GEMM rows are all ones so
++        // every gate/up element = sqrt(H)/sqrt(H) handled by the MME - the
++        // exact value does not matter, only that BOTH offsets point at
++        // expert 1: gate row sum = H * normed = sqrt(H)... the output is
++        // weight * silu(gate_val) * up_val * identity. Assert against a
++        // second executor call with the offsets swapped to expert 0 - that
++        // must produce all zeros (expert 0 is all zero).
++        const auto hidden_in = bf16_plane(H, 1, 77);
++        const auto picked = glm5_mlp_hpu_decode_step(device, stream, p2, w2,
++                                                     c2, hidden_in);
++        float nonzero = 0;
++        for (std::uint32_t i = 0; i < H; ++i) nonzero += std::fabs(bf16_val(picked[i]));
++        require(nonzero > 0.0f, "offset case: expert 1 contributes");
++
++        Glm5MlpHpuWeights w0 = w2;
++        w0.router_bias = {10.0f, 0.0f};  // forces expert 0 (all zero)
++        const auto zeroed = glm5_mlp_hpu_decode_step(device, stream, p2, w0,
++                                                     c2, hidden_in);
++        for (std::uint32_t i = 0; i < H; ++i) {
++            if (std::fabs(bf16_val(zeroed[i])) > 1e-3f) {
++                throw std::runtime_error(
++                    "offset case: expert 0 must stay zero through its offset");
++            }
++        }
++    }
++    std::puts("ok: moe hpu steps + expert offset precision");
 +    return 0;
 +}
 +
@@ -12407,10 +12524,10 @@ index 0000000..ef8e5c7
 +
 diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
 new file mode 100644
-index 0000000..9076c3b
+index 0000000..4bceeb8
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,351 @@
 +// GLM-5.3-Flash TPC kernel glue, FCD-row family (table-driven).
 +//
 +// Review R2/R3 corrections baked into this version:
@@ -12481,6 +12598,9 @@ index 0000000..9076c3b
 +
 +enum class Layout {
 +    ElementRows,   // {width elements, tokens}; per-128-element chunks
++    VectorSlots,   // {ceil(width/128) slots, tokens}; slot s owns elements
++                   // [s*128, s*128+127] - the layout per-head vector kernels
++                   // (kda_gate) require so no lane crosses a head boundary
 +    TokenWholeRow, // {1, tokens}; the slot owns the token's whole FCD row
 +    PoolGrid,      // {pools, width elements}; slot p owns K source rows
 +};
@@ -12550,11 +12670,19 @@ index 0000000..9076c3b
 +        // dsa_pool: dim0 = pool index, dim1 = element column. The K-member
 +        // softmax reduce runs inside one slot, so both dimensions may
 +        // split freely. Requires the pool_k scalar (word 0 of the ABI).
++        // The pooled output is {dim, T/K}: its dim1 IS the pool count -
++        // dividing it by K again (the S1 bug) rejected the first legal
++        // pool of T=4/K=4 and scheduled T/16 pools instead of T/4. The
++        // source planes' dim1 is T; cross-check T == pool_k * pools.
 +        const unsigned pool_k = words[0];
-+        if (pool_k == 0 || tokens % pool_k != 0) {
-+            return gcapi::GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
++        const unsigned pools = tokens;
++        const unsigned source_tokens =
++            in_defs->inputTensors[0].geometry.dims > 1
++                ? in_defs->inputTensors[0].geometry.sizes[1]
++                : 1;
++        if (pool_k == 0 || pools == 0 || source_tokens != pool_k * pools) {
++            return gcapi::GLUE_INCOMPATIBLE_INPUT_SIZE;
 +        }
-+        const unsigned pools = tokens / pool_k;
 +        out_defs->indexSpaceGeometry.dims = 2;
 +        out_defs->indexSpaceGeometry.sizes[0] = pools;
 +        out_defs->indexSpaceGeometry.sizes[1] = width;
@@ -12595,6 +12723,44 @@ index 0000000..9076c3b
 +        out_defs->outputTensorAccessPattern[0].dim[1].start_b = 0.0f;
 +        out_defs->outputTensorAccessPattern[0].dim[1].end_a = 1.0f;
 +        out_defs->outputTensorAccessPattern[0].dim[1].end_b = 0.0f;
++        return publish_elf(out_defs, k.elf_start, k.elf_end);
++    }
++
++    if (k.layout == Layout::VectorSlots) {
++        // One slot per 128 elements; the kda_gate kernel maps slot s onto
++        // [s*128, s*128+127] (one head's span, head_dim pinned to 128).
++        if (k.scalar_words >= 2 && words[1] != 128) {
++            return gcapi::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
++        }
++        out_defs->indexSpaceGeometry.dims = 2;
++        out_defs->indexSpaceGeometry.sizes[0] = (width + 127) / 128;
++        out_defs->indexSpaceGeometry.sizes[1] = tokens;
++        for (unsigned i = 0; i < k.inputs; ++i) {
++            set_element_transform(out_defs->inputTensorAccessPattern[i], 1);
++            out_defs->inputTensorAccessPattern[i].dim[0].indexSpaceDim = 0;
++            out_defs->inputTensorAccessPattern[i].dim[0].start_a = 128.0f;
++            out_defs->inputTensorAccessPattern[i].dim[0].start_b = 0.0f;
++            out_defs->inputTensorAccessPattern[i].dim[0].end_a = 128.0f;
++            out_defs->inputTensorAccessPattern[i].dim[0].end_b = 127.0f;
++        }
++        // a_log {heads, 1}: the head axis follows the slot index 1:1 (the
++        // kernel reads a_log[slot]); the 128-wide transform above would
++        // claim 128 heads per slot. Only the gate kernel is VectorSlots
++        // today - patch its per-head operand.
++        if (std::strcmp(k.guid, "glm5_kda_gate_bf16") == 0) {
++            out_defs->inputTensorAccessPattern[1].dim[0].start_a = 1.0f;
++            out_defs->inputTensorAccessPattern[1].dim[0].start_b = 0.0f;
++            out_defs->inputTensorAccessPattern[1].dim[0].end_a = 1.0f;
++            out_defs->inputTensorAccessPattern[1].dim[0].end_b = 0.0f;
++        }
++        for (unsigned o = 0; o < k.outputs; ++o) {
++            set_element_transform(out_defs->outputTensorAccessPattern[o], 1);
++            out_defs->outputTensorAccessPattern[o].dim[0].indexSpaceDim = 0;
++            out_defs->outputTensorAccessPattern[o].dim[0].start_a = 128.0f;
++            out_defs->outputTensorAccessPattern[o].dim[0].start_b = 0.0f;
++            out_defs->outputTensorAccessPattern[o].dim[0].end_a = 128.0f;
++            out_defs->outputTensorAccessPattern[o].dim[0].end_b = 127.0f;
++        }
 +        return publish_elf(out_defs, k.elf_start, k.elf_end);
 +    }
 +
@@ -12656,7 +12822,7 @@ index 0000000..9076c3b
 +     &_binary_glm5_clamp_swiglu_bf16_gaudi2_o_start,
 +     &_binary_glm5_clamp_swiglu_bf16_gaudi2_o_end},
 +    {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32},
-+     Layout::ElementRows, 2,
++     Layout::VectorSlots, 2,
 +     &_binary_glm5_kda_gate_bf16_gaudi2_o_start,
 +     &_binary_glm5_kda_gate_bf16_gaudi2_o_end},
 +    {"glm5_mhc_gates_bf16", 4, 1,
@@ -12715,10 +12881,10 @@ index 0000000..9076c3b
 +} // extern "C"
 diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp
 new file mode 100644
-index 0000000..4068083
+index 0000000..c3f9f19
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue_special.cpp
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,318 @@
 +// GLM-5.3-Flash TPC kernel glue, head/selection family. These kernels do
 +// not share the FCD-row index space:
 +//   kda_scan / dsa_absorb / dsa_attention / moe_route — one dim0 slot per
@@ -12946,10 +13112,16 @@ index 0000000..4068083
 +    if (!copy_params(words, 4, user_params, params_size, &status)) {
 +        return status;
 +    }
-+    // The cells fill runs 64-wide chunks inside the single slot, so the
-+    // selection width must fit one chunk.
-+    if (in_defs->outputTensors[0].geometry.sizes[0] > 64) {
-+        return gcapi::GLUE_UNSUPPORTED_LAYER_CONFIGURATION;
++    // The kernel now walks the whole cells width inside its slot (the
++    // production W = 2051 spans 33 lane runs); what must hold instead is
++    // the width identity W = top_pools*K + K-1 (tail on) or top_pools*K.
++    {
++        const unsigned width = in_defs->outputTensors[0].geometry.sizes[0];
++        const unsigned k = words[1], top_pools = words[2], tail = words[3];
++        const unsigned expect = top_pools * k + (tail ? k - 1 : 0);
++        if (width != expect) {
++            return gcapi::GLUE_KERNEL_INVALID_SCALAR_ARGUMENT;
++        }
 +    }
 +    out_defs->kernel.paramsNr = 4;
 +    std::memcpy(&out_defs->kernel.scalarParams[0], words, sizeof(words));
@@ -13033,10 +13205,10 @@ index 0000000..4068083
 +}
 diff --git a/src/core/gaudi2/tpc/glue/tests/glue_check.c b/src/core/gaudi2/tpc/glue/tests/glue_check.c
 new file mode 100644
-index 0000000..e2b0233
+index 0000000..1fa08f3
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/tests/glue_check.c
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,166 @@
 +// Offline descriptor round-trip: call GetGcDefinitions for every GUID with
 +// well-formed HabanaKernelParams_t descriptors and verify each returns a
 +// non-empty ELF, a sane index space, and its scalar params.
@@ -13061,6 +13233,7 @@ index 0000000..e2b0233
 +    unsigned out_tokens;  // dim1 (0 = 1-D)
 +    unsigned scalar_words[4];  // the host bridge's ABI block
 +    unsigned scalar_count;
++    unsigned ispace0, ispace1;  // the EXACT expected index space
 +};
 +
 +int main() {
@@ -13073,43 +13246,47 @@ index 0000000..e2b0233
 +    using gcapi::DATA_BF16;
 +    using gcapi::DATA_F32;
 +    using gcapi::DATA_I32;
++    // Geometry per case: the pooled output of dsa_pool is {512, pools} while
++    // its sources are {512, T} and the ape {512, K}; dsa_select runs the
++    // production width W=2051 (top_pools 512, K 4, tail) from a [512] score;
++    // kda_scan's beta carries heads=64; every row pins its EXACT index space.
 +    const Case cases[] = {
 +        {"glm5_rmsnorm_bf16", 2, 1, {DATA_BF16, DATA_BF16}, {DATA_BF16}, 512, 1,
-+     {0x3727c5acu, 0x3a000000u}, 2},  // eps 1e-5f, inverse 1/512
++         {0x3727c5acu, 0x3a000000u}, 2, 1, 1},
 +        {"glm5_clamp_swiglu_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 512, 1,
-+     {0x41200000u}, 1},  // limit 10.0f
++         {0x41200000u}, 1, 512, 1},
 +        {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32}, 512, 1,
-+     {0xc0a00000u, 128u}, 2},  // lower -5.0f, head_dim 128
++         {0xc0a00000u, 128u}, 2, 4, 1},
 +        {"glm5_mhc_gates_bf16", 4, 1,
 +         {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_F32}, 24, 1,
-+         {0x358637bdu, 0x358637bdu, 20u}, 3},  // eps, hc_eps, iters
++         {0x358637bdu, 0x358637bdu, 20u}, 3, 1, 1},
 +        {"glm5_mhc_collapse_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_BF16}, 512, 1,
-+         {0u}, 0},
++         {0u}, 0, 512, 1},
 +        {"glm5_mhc_post_bf16", 4, 1,
 +         {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_BF16}, 512, 1,
-+         {0u}, 0},
++         {0u}, 0, 512, 1},
 +        {"glm5_mhc_head_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 512, 1,
-+         {0u}, 0},
++         {0u}, 0, 512, 1},
 +        {"glm5_moe_route_bf16", 2, 2, {DATA_BF16, DATA_F32}, {DATA_F32, DATA_I32},
-+         8, 1, {8u, 0x40200000u}, 2},  // top_k 8, scaling 2.5f
++         8, 1, {8u, 0x40200000u}, 2, 1, 1},
 +        {"glm5_moe_combine_bf16", 3, 1, {DATA_BF16, DATA_F32, DATA_BF16},
-+         {DATA_BF16}, 512, 1, {8u}, 1},  // top_k 8
++         {DATA_BF16}, 512, 1, {8u}, 1, 512, 1},
 +        {"glm5_dsa_pool_bf16", 3, 1, {DATA_BF16, DATA_BF16, DATA_F32},
-+         {DATA_F32}, 512, 4, {4u}, 1},  // pool_k 4
++         {DATA_F32}, 512, 4, {4u}, 1, 4, 512},
 +        {"glm5_dsa_score_f32", 3, 1, {DATA_BF16, DATA_F32, DATA_F32},
-+         {DATA_F32}, 4, 1, {0u}, 0},
-+        {"glm5_dsa_select_f32", 1, 1, {DATA_F32}, {DATA_I32}, 11, 0,
-+         {0u, 4u, 2u, 1u}, 4},  // position, pool_k, top_pools, tail
++         {DATA_F32}, 4, 1, {0u}, 0, 1, 1},
++        {"glm5_dsa_select_f32", 1, 1, {DATA_F32}, {DATA_I32}, 2051, 0,
++         {2047u, 4u, 512u, 1u}, 4, 1, 1},
 +        {"glm5_dsa_attention_f32", 4, 1,
 +         {DATA_BF16, DATA_BF16, DATA_I32, DATA_BF16}, {DATA_BF16}, 512, 2,
-+         {0x3d800000u}, 1},  // qk_scale 0.0625f
++         {0x3d800000u}, 1, 2, 1},
 +        {"glm5_dsa_absorb_bf16", 2, 1, {DATA_BF16, DATA_BF16}, {DATA_F32}, 512, 2,
-+         {0u}, 0},
++         {0u}, 0, 2, 1},
 +        {"glm5_kda_scan_f32", 6, 2,
 +         {DATA_BF16, DATA_BF16, DATA_BF16, DATA_F32, DATA_F32, DATA_F32},
-+         {DATA_F32, DATA_BF16}, 8192, 1, {128u}, 1},  // head_dim 128
++         {DATA_F32, DATA_BF16}, 8192, 1, {128u}, 1, 64, 1},
 +        {"glm5_dsa_scale_f32", 1, 1, {DATA_F32}, {DATA_F32}, 512, 1,
-+         {0x3f000000u}, 1},  // factor 0.5f
++         {0x3f000000u}, 1, 512, 1},
 +    };
 +    const unsigned count = sizeof(cases) / sizeof(cases[0]);
 +
@@ -13140,10 +13317,19 @@ index 0000000..e2b0233
 +            params.outputTensors[o].geometry.sizes[1] = k.out_tokens ? k.out_tokens : 1;
 +        }
 +
-+        // kda_scan derives heads from beta's extent (the per-head plane);
-+        // the driver's blanket width would read as heads = d_inner.
++        // Per-case real geometries the blanket fill cannot express.
 +        if (std::strcmp(k.name, "glm5_kda_scan_f32") == 0) {
-+            params.inputTensors[4].geometry.sizes[0] = 64;  // heads
++            params.inputTensors[4].geometry.sizes[0] = 64;  // beta: heads
++        }
++        if (std::strcmp(k.name, "glm5_dsa_pool_bf16") == 0) {
++            // Sources {dim, T=16}, ape {dim, K=4}, pooled {dim, pools=4}.
++            params.inputTensors[0].geometry.sizes[1] = 16;
++            params.inputTensors[1].geometry.sizes[1] = 16;
++            params.inputTensors[2].geometry.sizes[1] = 4;
++        }
++        if (std::strcmp(k.name, "glm5_dsa_select_f32") == 0) {
++            // The production selection: score [512], cells W = 2051.
++            params.inputTensors[0].geometry.sizes[0] = 512;
 +        }
 +
 +        gcapi::HabanaKernelInstantiation_t inst{};
@@ -13170,10 +13356,19 @@ index 0000000..e2b0233
 +            ++failures;
 +            continue;
 +        }
++        // The EXACT scheduling: a wrong unit (slots vs elements) or a
++        // double division produces a non-zero but wrong space.
++        const unsigned got1 = inst.indexSpaceGeometry.dims > 1
++                                  ? inst.indexSpaceGeometry.sizes[1] : 1;
++        if (inst.indexSpaceGeometry.sizes[0] != k.ispace0 || got1 != k.ispace1) {
++            std::printf("FAIL %s: ispace %ux%u, expected %ux%u\n", k.name,
++                        inst.indexSpaceGeometry.sizes[0], got1,
++                        k.ispace0, k.ispace1);
++            ++failures;
++            continue;
++        }
 +        std::printf("ok %s: elf %u B, ispace %ux%u\n", k.name, inst.elfSize,
-+                    inst.indexSpaceGeometry.sizes[0],
-+                    inst.indexSpaceGeometry.dims > 1
-+                        ? inst.indexSpaceGeometry.sizes[1] : 1);
++                    inst.indexSpaceGeometry.sizes[0], got1);
 +    }
 +    dlclose(so);
 +    if (failures) { std::printf("%d failures\n", failures); return 1; }
@@ -14455,10 +14650,10 @@ index 0000000..fc5a413
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
 new file mode 100644
-index 0000000..9e15c32
+index 0000000..f8f04b3
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_dsa_select_f32_gaudi2.c
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,80 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash DSA pool selection TPC-C kernel.
 +//
 +// The visible pools (p visible iff p*K + K-1 <= position, i.e. the first
@@ -14485,8 +14680,9 @@ index 0000000..9e15c32
 +void main(tensor score, tensor cells, int position, int pool_k,
 +          int top_pools, int select_tail)
 +{
-+    const int5 begin = get_index_space_offset();
-+    const int5 end   = begin + get_index_space_size();
++    // One slot (review S3): the whole ranking runs inside it, so the -1
++    // fill must walk the FULL cells width - the production width
++    // W = top_pools*K + K-1 = 2051 spans 33 lane runs, not one.
 +    const int pools = get_dim_size(score, 0);
 +    const int visible = (position + 1) / pool_k;
 +    const int chunks = (visible + 63) / 64;
@@ -14494,7 +14690,7 @@ index 0000000..9e15c32
 +    const int width = get_dim_size(cells, 0);  // W
 +
 +    // -1 fill for every cell (the selected runs overwrite theirs).
-+    for (int c = begin[0]; c < end[0] && c < width; c += 64) {
++    for (int c = 0; c < width; c += 64) {
 +        const int count = (width - c < 64) ? width - c : 64;
 +        v_i32_st_tnsr_partial((int5){c, 0}, cells, lanes * 0 - 1, count - 1, 0);
 +    }
@@ -14540,10 +14736,10 @@ index 0000000..9e15c32
 +}
 diff --git a/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
 new file mode 100644
-index 0000000..5864d69
+index 0000000..2b04ad5
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/kernels/glm5_kda_gate_bf16_gaudi2.c
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,73 @@
 +// ninfer::gaudi2::tpc — GLM-5.3-Flash KDA decay gate TPC-C kernel for Gaudi2.
 +//
 +// Input  a     : BF16 [d_inner, T], dim0 = d_inner (FCD), dim1 = T.
@@ -14574,17 +14770,26 @@ index 0000000..5864d69
 +
 +void main(tensor a, tensor a_log, tensor gate, float lower_bound, int head_dim)
 +{
++    // Vector slots (review S2): the glue maps slot s onto the element span
++    // [s*128, s*128+127], so one slot is exactly one head's 128 elements
++    // when head_dim == 128 - no lane ever crosses a head boundary and no
++    // store leaves its slot. Element-partitioned scheduling could split a
++    // head's span across slots, which the old element-coordinate loop both
++    // overwrote (fixed 63-lane stores) and mis-rated (broadcast rate of
++    // the chunk's first head).
 +    const int5 begin = get_index_space_offset();
 +    const int5 end   = begin + get_index_space_size();
++    const int width  = get_dim_size(a, 0);
 +
 +    for (int token = begin[1]; token < end[1]; ++token) {
-+        for (int i = begin[0]; i < end[0]; i += 128) {
-+            const int head = i / head_dim;
++        for (int slot = begin[0]; slot < end[0]; ++slot) {
++            const int i = slot * 128;
++            const int count = (width - i < 128) ? width - i : 128;
++            const int head = slot;  // head_dim == 128: slot index == head
 +            const float rate = s_f32_ld_g(gen_addr((int5){head, 0}, a_log));
 +            const float64 decay_scale = exp_f32(rate);
 +
 +            float128 av;
-+            const int count = (end[0] - i < 128) ? end[0] - i : 128;
 +            if (count == 128) {
 +                av = v_convert_bf16_to_f32_all_b(v_bf16_ld_tnsr_b((int5){i, token}, a));
 +            } else {
@@ -14596,10 +14801,15 @@ index 0000000..5864d69
 +            out.v1 = lower_bound * sigmoid_nolut_f32(av.v1 * decay_scale);
 +            out.v2 = lower_bound * sigmoid_nolut_f32(av.v2 * decay_scale);
 +
-+            // 64-lane halves; the partial-store argument is the last
-+            // valid lane index, so a full half passes 63.
-+            v_f32_st_tnsr_partial((int5){i, token}, gate, out.v1, 63, 0);
-+            v_f32_st_tnsr_partial((int5){i + 64, token}, gate, out.v2, 63, 0);
++            // Masked 64-lane halves; the partial-store argument is the last
++            // valid lane index, so the second half is skipped entirely when
++            // the slot's tail is short.
++            const int first = count >= 64 ? 64 : count;
++            v_f32_st_tnsr_partial((int5){i, token}, gate, out.v1, first - 1, 0);
++            if (count > 64) {
++                v_f32_st_tnsr_partial((int5){i + 64, token}, gate, out.v2,
++                                      count - 64 - 1, 0);
++            }
 +        }
 +    }
 +}
@@ -29256,10 +29466,10 @@ index 0a3dc79..6c45a31 100644
  include("${CMAKE_CURRENT_LIST_DIR}/linear/sources.cmake")
 diff --git a/src/ops/gaudi2/bf16_gemm.cpp b/src/ops/gaudi2/bf16_gemm.cpp
 new file mode 100644
-index 0000000..d609be9
+index 0000000..e159d00
 --- /dev/null
 +++ b/src/ops/gaudi2/bf16_gemm.cpp
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,84 @@
 +#include "bf16_gemm.h"
 +
 +#include <exception>
@@ -29323,18 +29533,33 @@ index 0000000..d609be9
 +    if (a.address() == w.address() || a.address() == y.address() || w.address() == y.address())
 +        throw std::invalid_argument("Gaudi2 BF16 GEMM requires disjoint operand allocations");
 +    const std::array<RecipeBinding, 3> bindings{{
-+        {tensor_ids_[0], &a, {shape_.k, shape_.m}},
-+        {tensor_ids_[1], &w, {shape_.k, shape_.n}},
-+        {tensor_ids_[2], &y, {shape_.n, shape_.m}}}};
++        {tensor_ids_[0], &a, {shape_.k, shape_.m}, 0},
++        {tensor_ids_[1], &w, {shape_.k, shape_.n}, 0},
++        {tensor_ids_[2], &y, {shape_.n, shape_.m}, 0}}};
++    return stream.launch(recipe_, bindings);
++}
++
++Compute Bf16Gemm::launch(Stream& stream, DeviceBuffer& a, DeviceBuffer& w, DeviceBuffer& y,
++                         std::size_t w_byte_offset) {
++    if (a.size() != shape_.a_bytes() || y.size() != shape_.y_bytes() ||
++        w_byte_offset + shape_.w_bytes() > w.size())
++        throw std::invalid_argument("Gaudi2 BF16 GEMM weight window does not fit its plane");
++    const std::uint64_t w_base = w.address() + w_byte_offset;
++    if (a.address() == w_base || a.address() == y.address() || w_base == y.address())
++        throw std::invalid_argument("Gaudi2 BF16 GEMM requires disjoint operand allocations");
++    const std::array<RecipeBinding, 3> bindings{{
++        {tensor_ids_[0], &a, {shape_.k, shape_.m}, 0},
++        {tensor_ids_[1], &w, {shape_.k, shape_.n}, w_byte_offset},
++        {tensor_ids_[2], &y, {shape_.n, shape_.m}, 0}}};
 +    return stream.launch(recipe_, bindings);
 +}
 +} // namespace ninfer::gaudi2
 diff --git a/src/ops/gaudi2/bf16_gemm.h b/src/ops/gaudi2/bf16_gemm.h
 new file mode 100644
-index 0000000..b664214
+index 0000000..f9a2718
 --- /dev/null
 +++ b/src/ops/gaudi2/bf16_gemm.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,23 @@
 +#pragma once
 +#include "core/gaudi2/runtime.h"
 +#include "bf16_gemm_shape.h"
@@ -29347,6 +29572,11 @@ index 0000000..b664214
 +    [[nodiscard]] Bf16GemmShape shape() const noexcept { return shape_; }
 +    [[nodiscard]] std::size_t workspace_bytes() const noexcept { return recipe_.workspace_bytes(); }
 +    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& a, DeviceBuffer& w, DeviceBuffer& y);
++    // Binds W at a byte offset inside its (larger) allocation - routed
++    // experts bind their row blocks of the stacked planes this way, so the
++    // weights hold HBM once instead of plane + per-expert copies.
++    [[nodiscard]] Compute launch(Stream& stream, DeviceBuffer& a, DeviceBuffer& w, DeviceBuffer& y,
++                                 std::size_t w_byte_offset);
 +private:
 +    Bf16GemmShape shape_;
 +    Recipe recipe_;
