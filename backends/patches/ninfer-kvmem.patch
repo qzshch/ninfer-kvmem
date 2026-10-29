@@ -23935,10 +23935,10 @@ index 0000000..a32fc64
 +} // namespace ninfer::ops
 diff --git a/src/ops/kernel/glm5_kda.cuh b/src/ops/kernel/glm5_kda.cuh
 new file mode 100644
-index 0000000..bb70fb2
+index 0000000..b7832bc
 --- /dev/null
 +++ b/src/ops/kernel/glm5_kda.cuh
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,285 @@
 +#pragma once
 +
 +// ninfer::ops - GLM-5.3-Flash KDA kernels: safe-path gating, the causal short conv with SiLU,
@@ -23947,7 +23947,6 @@ index 0000000..bb70fb2
 +// semantics cross-checked against FLA, llama.cpp and Maya). This is the decode path: clarity
 +// over throughput, one token at a time.
 +
-+#include "ops/common/warp.cuh"
 +
 +#include <cuda_bf16.h>
 +
