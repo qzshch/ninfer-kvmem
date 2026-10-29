@@ -15314,7 +15314,7 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..e67c7d8
+index 0000000..db9b539
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
 @@ -0,0 +1,935 @@
@@ -15987,7 +15987,7 @@ index 0000000..e67c7d8
 +    ops::glm5_kda_chunk(q_conv_t, k_conv_t, v_conv_t, gate_t, beta_t, matrix_state,
 +                        scan_t, chunk, execution.stream());
 +    ops::glm5_kda_outgate(scan_t, g2_t, o_norm_w, scan_t, execution.stream());
-+    ops::linear(scan_t, w.wo, block_out, execution.stream());
++    ops::linear(scan_t, w.wo, block_out, execution);
 +}
 +
 +std::size_t dsa_block_prefill_scratch_bytes(std::uint32_t hidden, std::uint32_t heads,
@@ -16175,13 +16175,13 @@ index 0000000..e67c7d8
 +                                static_cast<std::int32_t>(index_dim)});
 +            Tensor iq_view(static_cast<std::uint8_t*>(iq) +
 +                               static_cast<std::size_t>(t) * index_heads * index_dim * 2,
-+                           DType::BF16,
++                           execution.device(), DType::BF16,
 +                           {static_cast<std::int32_t>(index_heads),
 +                            static_cast<std::int32_t>(index_dim)});
 +            Tensor score_t(scores, execution.device(), DType::FP32, {static_cast<std::int32_t>(visible)});
 +            Tensor w_view(static_cast<std::uint8_t*>(weights_f32) +
 +                              static_cast<std::size_t>(t) * index_heads * 4,
-+                          DType::FP32, {static_cast<std::int32_t>(index_heads)});
++                          execution.device(), DType::FP32, {static_cast<std::int32_t>(index_heads)});
 +            ops::glm5_dsa_score(iq_view, pooled_view, w_view, score_t, execution.stream());
 +            ops::glm5_dsa_select(score_t, position, static_cast<std::int32_t>(top_k / kpool),
 +                                 true, cells, execution.stream());
@@ -16196,7 +16196,7 @@ index 0000000..e67c7d8
 +        }
 +        Tensor q_abs_col(static_cast<std::uint8_t*>(q_abs_bf) +
 +                             static_cast<std::size_t>(t) * heads * kv_lora * 2,
-+                         DType::BF16,
++                         execution.device(), DType::BF16,
 +                         {static_cast<std::int32_t>(heads),
 +                          static_cast<std::int32_t>(kv_lora)});
 +        const Tensor wv_b_view(const_cast<void*>(w.wv_b.payload), execution.device(), DType::BF16,
@@ -16205,7 +16205,7 @@ index 0000000..e67c7d8
 +                                static_cast<std::int32_t>(heads)});
 +        Tensor attn_col(static_cast<std::uint8_t*>(attn_out) +
 +                            static_cast<std::size_t>(t) * heads * v_head * 2,
-+                        DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
++                        execution.device(), DType::BF16, {static_cast<std::int32_t>(heads * v_head), 1});
 +        ops::glm5_dsa_attention(q_abs_col, latents, cells, wv_b_view, attn_col,
 +                                static_cast<std::int32_t>(head_dim), execution.stream());
 +    }
@@ -16249,7 +16249,7 @@ index 0000000..e67c7d8
 +    ops::linear(normed_t, w.up, up_t, execution);
 +    Tensor act_t(activated, execution.device(), DType::BF16, {static_cast<std::int32_t>(ffn), tokens});
 +    ops::glm5_swiglu(gate_t, up_t, swiglu_limit, act_t, execution.stream());
-+    ops::linear(act_t, w.down, out, execution.stream());
++    ops::linear(act_t, w.down, out, execution);
 +}
 +
 +} // namespace ninfer::models::glm5::execution
@@ -17206,7 +17206,7 @@ index 0000000..154b80b
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/model.cpp b/src/models/glm5/execution/model.cpp
 new file mode 100644
-index 0000000..4b65a72
+index 0000000..01eca69
 --- /dev/null
 +++ b/src/models/glm5/execution/model.cpp
 @@ -0,0 +1,557 @@
@@ -17718,10 +17718,10 @@ index 0000000..4b65a72
 +            for (std::int32_t t = 0; t < tokens; ++t) {
 +                Tensor column_in(static_cast<std::uint8_t*>(collapsed) +
 +                                     static_cast<std::size_t>(t) * hidden * 2,
-+                                 DType::BF16, {hidden, 1});
++                                 execution.device(), DType::BF16, {hidden, 1});
 +                Tensor column_out(static_cast<std::uint8_t*>(block_out) +
 +                                      static_cast<std::size_t>(t) * hidden * 2,
-+                                  DType::BF16, {hidden, 1});
++                                  execution.device(), DType::BF16, {hidden, 1});
 +                moe_block_decode(lw.moe, column_in, router_bias, config.rms_eps,
 +                                 config.swiglu_limit, config.routed_scaling_factor,
 +                                 config.experts, config.num_experts_per_tok, config.ffn_moe,
@@ -17756,7 +17756,7 @@ index 0000000..4b65a72
 +        // on that column.
 +        Tensor last_column(static_cast<std::uint8_t*>(final_normed) +
 +                               static_cast<std::size_t>(tokens - 1) * hidden * 2,
-+                           DType::BF16, {hidden, 1});
++                           execution.device(), DType::BF16, {hidden, 1});
 +        ops::linear(last_column, w.lm_head, last_logits, execution);
 +        CUDA_CHECK(cudaMemcpyAsync(last_hidden.data,
 +                                   static_cast<std::uint8_t*>(final_normed) +
