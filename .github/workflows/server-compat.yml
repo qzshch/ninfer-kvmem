@@ -69,6 +69,36 @@ jobs:
       - run: cmake --build build --parallel 2
       - run: ctest --test-dir build --output-on-failure --no-tests=error
       - run: bash scripts/test_server_portable.sh build/portable
+  ninfer-model-chain:
+    needs: changes
+    if: needs.changes.outputs.run_cuda == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: nvidia/cuda:13.4.1-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: >-
+          apt-get update && apt-get install -y --no-install-recommends
+          git ca-certificates build-essential cmake ninja-build python3
+          pkg-config libhwloc-dev liburing-dev libssl-dev
+          libjpeg-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+      - uses: actions/checkout@v4
+      - name: Trust the checked-out workspace in the CUDA container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Prepare and verify the pinned ninfer integration
+        run: |
+          python3 scripts/prepare-backends.py --backend ninfer
+          python3 scripts/prepare-backends.py --backend ninfer --check
+      - name: Compile the patched ninfer model chain
+        run: |
+          cmake -S backends/ninfer -B build-ninfer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a \
+            -DNINFER_BUILD_APPS=OFF -DNINFER_BUILD_PRODUCT_SUPPORT=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-ninfer --target ninfer_model_loading --parallel 2
+
   host-windows:
     needs: changes
     if: needs.changes.outputs.run_ci == 'true'
@@ -130,7 +160,7 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd pkg-config libhwloc-dev liburing-dev libjpeg-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd
       - uses: actions/checkout@v4
       - name: Trust the checked-out workspace in the CUDA container
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -138,17 +168,6 @@ jobs:
         run: |
           python3 scripts/prepare-backends.py --backend llamacpp
           python3 scripts/prepare-backends.py --backend llamacpp --check
-      - name: Prepare the pinned ninfer integration
-        run: |
-          python3 scripts/prepare-backends.py --backend ninfer
-          python3 scripts/prepare-backends.py --backend ninfer --check
-      - name: Compile the patched ninfer model chain
-        run: |
-          cmake -S backends/ninfer -B build-ninfer -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a \
-            -DNINFER_BUILD_APPS=OFF -DNINFER_BUILD_PRODUCT_SUPPORT=OFF \
-            -DBUILD_TESTING=OFF
-          cmake --build build-ninfer --target ninfer_model_loading --parallel 2
       - name: Identify the compiler toolchain
         id: toolchain
         run: |
@@ -230,7 +249,7 @@ jobs:
   # Keep required status names; only verified documentation changes may skip builds.
   host-and-server-units-linux:
     if: ${{ always() }}
-    needs: [changes, host-linux, host-windows, cuda-build-linux, ninfer-pinned-sources]
+    needs: [changes, host-linux, host-windows, cuda-build-linux, ninfer-model-chain, ninfer-pinned-sources]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
