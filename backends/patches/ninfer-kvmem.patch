@@ -11081,10 +11081,10 @@ index 0000000..c3f9f19
 +}
 diff --git a/src/core/gaudi2/tpc/glue/tests/glue_check.c b/src/core/gaudi2/tpc/glue/tests/glue_check.c
 new file mode 100644
-index 0000000..2cb875d
+index 0000000..eaadc5e
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/tests/glue_check.c
-@@ -0,0 +1,183 @@
+@@ -0,0 +1,182 @@
 +// Offline descriptor round-trip: call GetGcDefinitions for every GUID with
 +// well-formed HabanaKernelParams_t descriptors and verify each returns a
 +// non-empty ELF, a sane index space, and its scalar params.
@@ -11247,8 +11247,7 @@ index 0000000..2cb875d
 +                pat[0].dim[0].start_a != 128.0f ||
 +                pat[0].dim[1].indexSpaceDim != 1 ||
 +                pat[0].dim[1].start_a != 1.0f) {
-+                std::printf("FAIL %s: access pattern axes unmapped
-+", k.name);
++                std::printf("FAIL %s: access pattern axes unmapped\n", k.name);
 +                ++failures;
 +                continue;
 +            }
