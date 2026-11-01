@@ -841,10 +841,10 @@ index 0000000..6fb7382
 +echo "RUN_EXIT=$?"
 diff --git a/src/core/gaudi2/CMakeLists.txt b/src/core/gaudi2/CMakeLists.txt
 new file mode 100644
-index 0000000..6d1afaa
+index 0000000..fe36f4a
 --- /dev/null
 +++ b/src/core/gaudi2/CMakeLists.txt
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,209 @@
 +add_library(ninfer_gaudi2_block_fp8 STATIC block_fp8.cpp)
 +target_compile_features(ninfer_gaudi2_block_fp8 PUBLIC cxx_std_20)
 +target_include_directories(ninfer_gaudi2_block_fp8 PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -907,7 +907,7 @@ index 0000000..6d1afaa
 +
 +add_executable(ninfer-gaudi2-glm5-hpu-model-test runtime.cpp ../../ops/gaudi2/bf16_gemm.cpp
 +  glm5_hpu_block.cpp glm5_hpu_dsa.cpp glm5_hpu_mlp.cpp glm5_hpu_model.cpp
-+  glm5_hpu_weights.cpp
++  glm5_hpu_weights.cpp ../memory.cpp
 +  tests/glm5_hpu_model_test.cpp
 +  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
 +target_compile_features(ninfer-gaudi2-glm5-hpu-model-test PRIVATE cxx_std_20)
@@ -923,6 +923,7 @@ index 0000000..6d1afaa
 +  glm5_hpu_block.cpp glm5_hpu_dsa.cpp glm5_hpu_mlp.cpp glm5_hpu_model.cpp
 +  glm5_hpu_weights.cpp glm5_hpu_session.cpp gguf_loader_hpu.cpp
 +  ../../models/glm5/execution/gguf_walk.cpp
++  ../memory.cpp
 +  ../../models/glm5/execution/gguf_file.cpp
 +  tests/glm5_hpu_session_test.cpp
 +  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp)
@@ -956,6 +957,7 @@ index 0000000..6d1afaa
 +# CUDA-free since the R1 split); no CUDA entry stubs needed.
 +add_executable(ninfer-gaudi2-gguf-hpu-test runtime.cpp glm5_hpu_weights.cpp gguf_loader_hpu.cpp
 +  ../../models/glm5/execution/gguf_walk.cpp
++  ../memory.cpp
 +  ../../models/glm5/execution/gguf_file.cpp
 +  tests/fake_synapse/fake_synapse.cpp tests/fake_synapse/fake_gemm.cpp
 +  tests/gguf_hpu_test.cpp)
@@ -1018,6 +1020,8 @@ index 0000000..6d1afaa
 +    glm5_hpu_weights.cpp glm5_hpu_model.cpp glm5_hpu_session.cpp
 +    gguf_loader_hpu.cpp kernel_library.cpp paged_kv_hpu.cpp qwen_hpu.cpp
 +    ../../models/glm5/execution/gguf_walk.cpp
++    ../memory.cpp
++  ../memory.cpp
 +    ../../models/glm5/execution/gguf_file.cpp)
 +  target_compile_features(ninfer_gaudi2_runtime_sdk_check PRIVATE cxx_std_20)
 +  if(MSVC)
@@ -16254,10 +16258,10 @@ index 0000000..db9b539
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/block.h b/src/models/glm5/execution/block.h
 new file mode 100644
-index 0000000..352e425
+index 0000000..1eb9766
 --- /dev/null
 +++ b/src/models/glm5/execution/block.h
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,219 @@
 +#pragma once
 +
 +// GLM-5.3-Flash single-token block decode assemblies: the KDA mixer block (verified), the
@@ -16287,8 +16291,10 @@ index 0000000..352e425
 +// A [N, K] BF16 row-major plane bound as the engine's contiguous A16 Weight.
 +// Inline: the GGUF loader and both backend entry points construct it.
 +[[nodiscard]] inline Weight bf16_weight(const void* payload, std::int32_t rows,
-+                                        std::int32_t columns) {
++                                        std::int32_t columns,
++                                        Device device = Device::cuda(0)) {
 +    Weight weight{};
++    weight.device = device;
 +    weight.qtype = QType::BF16;
 +    weight.layout = QuantLayout::Contiguous;
 +    weight.payload = payload;
@@ -16984,10 +16990,10 @@ index 0000000..8f3a225
 +} // namespace ninfer::models::glm5::execution
 diff --git a/src/models/glm5/execution/gguf_walk.cpp b/src/models/glm5/execution/gguf_walk.cpp
 new file mode 100644
-index 0000000..154b80b
+index 0000000..a5f72df
 --- /dev/null
 +++ b/src/models/glm5/execution/gguf_walk.cpp
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,216 @@
 +// GLM-5.3-Flash GGUF tensor walk - the backend-neutral half of the loader.
 +// This translation unit carries no CUDA declarations: both backends (CUDA
 +// gguf_loader.cpp, Gaudi2 gguf_loader_hpu.cpp) drive detail::load_gguf_walk
@@ -17097,6 +17103,7 @@ index 0000000..154b80b
 +    // builds FP32 tensor views over these payloads).
 +    auto scalar_weight = [](const void* payload, std::int32_t n) {
 +        Weight weight{};
++        weight.device = Device::cuda(0);
 +        weight.payload = payload;
 +        weight.qdata = payload;
 +        weight.payload_bytes = static_cast<std::uint64_t>(n) * 4;
@@ -31254,10 +31261,10 @@ index 0000000..0eff353
 +}
 diff --git a/tests/models/glm5/test_decode_step.cpp b/tests/models/glm5/test_decode_step.cpp
 new file mode 100644
-index 0000000..1952930
+index 0000000..2189b98
 --- /dev/null
 +++ b/tests/models/glm5/test_decode_step.cpp
-@@ -0,0 +1,604 @@
+@@ -0,0 +1,610 @@
 +// The GLM-5.3-Flash full decode step (mHC residual loop across a mixed layer stack)
 +// against a host oracle that chains the same per-block references. Two blocks at a small
 +// geometry: a KDA+MoE block then a DSA+dense block, covering both mixers and both MLPs.
@@ -31281,8 +31288,14 @@ index 0000000..1952930
 +#include <vector>
 +#include "core/device.h"
 +
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// A shared execution view: device 0's default stream, matching the old nullptr-stream calls.
++
 +// The Tensor constructors need the owning device; the tests run on device 0.
-+static ninfer::Device view_device() { static ninfer::DeviceContext ctx; return ctx.device(); }
 +
 +namespace {
 +
@@ -31825,8 +31838,8 @@ index 0000000..1952930
 +            Tensor logits_t(const_cast<void*>(d_logits.data()), view_device(), DType::BF16,
 +                            {static_cast<std::int32_t>(VOCAB), 1});
 +            execution::glm5_decode_step(mw, state, config, token_t, CACHE - 1, logits_t,
-+                                        d_scratch.data(), nullptr);
-+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                        d_scratch.data(), test_view());
++            CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        }
 +
 +        const auto logits = represented(download<__nv_bfloat16>(d_logits));
@@ -31864,10 +31877,10 @@ index 0000000..1952930
 +}
 diff --git a/tests/models/glm5/test_dsa_mlp_blocks.cpp b/tests/models/glm5/test_dsa_mlp_blocks.cpp
 new file mode 100644
-index 0000000..c2b1f2a
+index 0000000..398c655
 --- /dev/null
 +++ b/tests/models/glm5/test_dsa_mlp_blocks.cpp
-@@ -0,0 +1,658 @@
+@@ -0,0 +1,667 @@
 +// The GLM-5.3-Flash DSA block and the dense/MoE MLP blocks against chained host oracles
 +// with BF16 rounding at every representation boundary (the pattern the verified KDA block
 +// test established). Small probes pin the wiring; the audited geometry runs end to end.
@@ -31890,6 +31903,15 @@ index 0000000..c2b1f2a
 +#include <string>
 +#include <vector>
 +#include "core/device.h"
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// A shared execution view: device 0's default stream, matching the old nullptr-stream calls.
++
++// The Tensor constructors need the owning device; the test runs on device 0.
 +
 +namespace {
 +
@@ -32197,8 +32219,8 @@ index 0000000..c2b1f2a
 +        execution::dsa_block_decode(w, hidden_t, ape_t, latents_t, ikh_t, igh_t, pooled_t,
 +                                    cells_t, position, 1e-5f, heads, head_dim, q_lora, kv_lora,
 +                                    v_head, index_heads, index_dim, kpool, top_k, out_t,
-+                                    d_scratch.data(), nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                    d_scratch.data(), test_view());
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +    }
 +
 +    // ---- batched prefill cross-check: T sequential decode calls against one
@@ -32247,14 +32269,14 @@ index 0000000..c2b1f2a
 +                Tensor column(reinterpret_cast<void*>(
 +                                  static_cast<std::uint8_t*>(d_seq.data()) +
 +                                  static_cast<std::size_t>(t) * hidden * 2),
-+                              DType::BF16, {static_cast<std::int32_t>(hidden)});
++                              view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +                Tensor out_t(reinterpret_cast<void*>(static_cast<std::uint8_t*>(d_out_a.data()) +
 +                                                          static_cast<std::size_t>(t) * hidden * 2),
-+                             DType::BF16, {static_cast<std::int32_t>(hidden)});
++                             view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +                execution::dsa_block_decode(w, column, ape_t, lat_t, ik_t, ig_t, pool_t,
 +                                            cells_t, t, 1e-5f, heads, head_dim,
 +                                            q_lora, kv_lora, v_head, index_heads, index_dim,
-+                                            kpool, top_k, out_t, d_scratch.data(), nullptr);
++                                            kpool, top_k, out_t, d_scratch.data(), test_view());
 +            }
 +        }
 +        {
@@ -32270,9 +32292,9 @@ index 0000000..c2b1f2a
 +            execution::dsa_block_prefill(w, batch_t, ape_t, lat_t, ik_t, ig_t, pool_t, cells_t,
 +                                         0, 1e-5f, heads, head_dim, q_lora, kv_lora,
 +                                         v_head, index_heads, index_dim, kpool, top_k, out_t,
-+                                         d_scratch_b.data(), nullptr);
++                                         d_scratch_b.data(), test_view());
 +        }
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        const auto out_a = represented(download<__nv_bfloat16>(d_out_a));
 +        const auto out_b = represented(download<__nv_bfloat16>(d_out_b));
 +        for (std::size_t i = 0; i < out_a.size(); ++i) {
@@ -32363,8 +32385,8 @@ index 0000000..c2b1f2a
 +        w.down = execution::bf16_weight(d_d.data(), hidden, ffn);
 +        Tensor ht(const_cast<void*>(d_h.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +        Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
-+        execution::dense_mlp_decode(w, ht, 1e-5f, 10.0f, ffn, ot, d_scratch.data(), nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        execution::dense_mlp_decode(w, ht, 1e-5f, 10.0f, ffn, ot, d_scratch.data(), test_view());
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        check("dense_mlp", represented(download<__nv_bfloat16>(d_out)),
 +              {want.begin(), want.end()}, 0.05);
 +    }
@@ -32493,8 +32515,8 @@ index 0000000..c2b1f2a
 +    Tensor bt(const_cast<void*>(d_bias.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(experts)});
 +    Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +    execution::moe_block_decode(w, ht, bt, 1e-5f, 10.0f, 2.5f, experts, top_k, ffn, ot,
-+                                d_scratch.data(), nullptr);
-+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                d_scratch.data(), test_view());
++    CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +    check("moe_block", represented(download<__nv_bfloat16>(d_out)),
 +          std::vector<float>(want.begin(), want.end()), 0.08);
 +}
@@ -32528,10 +32550,10 @@ index 0000000..c2b1f2a
 +}
 diff --git a/tests/models/glm5/test_embed_prefill.cpp b/tests/models/glm5/test_embed_prefill.cpp
 new file mode 100644
-index 0000000..5c1cc02
+index 0000000..7d108d8
 --- /dev/null
 +++ b/tests/models/glm5/test_embed_prefill.cpp
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,332 @@
 +// Embedding lookup and multi-token prefill smoke: feed token IDs through the
 +// full decode chain (embedding + mHC + mixer + MLP + lm_head) and verify the
 +// logits are finite and differ between tokens (non-degenerate).
@@ -32550,8 +32572,14 @@ index 0000000..5c1cc02
 +#include <vector>
 +#include "core/device.h"
 +
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// A shared execution view: device 0's default stream, matching the old nullptr-stream calls.
++
 +// The Tensor constructors need the owning device; the tests run on device 0.
-+static ninfer::Device view_device() { static ninfer::DeviceContext ctx; return ctx.device(); }
 +
 +namespace {
 +
@@ -32747,8 +32775,8 @@ index 0000000..5c1cc02
 +        test::GuardedDeviceBuffer d_out(H * 2);
 +        Tensor out_t(const_cast<void*>(d_out.data()), view_device(), DType::BF16,
 +                     {static_cast<std::int32_t>(H), 1});
-+        execution::glm5_embed_token(mw, 5, H, out_t, nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        execution::glm5_embed_token(mw, 5, H, out_t, test_view());
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        const auto emb_row = represented(download<__nv_bfloat16>(d_out));
 +        // Compare with the expected row from the embedding table.
 +        bool match = true;
@@ -32768,8 +32796,8 @@ index 0000000..5c1cc02
 +    std::vector<std::vector<float>> token_logits(3);
 +    for (std::uint32_t tid = 0; tid < 3; ++tid) {
 +        execution::glm5_decode_token(mw, state, config, tid * 37 + 5, tid, logits_t,
-+                                     d_scratch.data(), nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                     d_scratch.data(), test_view());
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        token_logits[tid] = represented(download<__nv_bfloat16>(d_logits));
 +        std::uint32_t finite = 0;
 +        for (const auto v : token_logits[tid]) { finite += std::isfinite(v); }
@@ -32807,8 +32835,8 @@ index 0000000..5c1cc02
 +        const std::size_t pscratch = execution::glm5_prefill_scratch_bytes(config, 3);
 +        test::GuardedDeviceBuffer d_pscratch(pscratch);
 +        execution::glm5_prefill(mw, state, config, ids_t, 0, last_hidden_t, logits_t,
-+                                d_pscratch.data(), nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                d_pscratch.data(), test_view());
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        const auto prefill_logits = represented(download<__nv_bfloat16>(d_logits));
 +        std::uint32_t finite = 0;
 +        for (const auto v : prefill_logits) { finite += std::isfinite(v); }
@@ -32822,8 +32850,8 @@ index 0000000..5c1cc02
 +        for (std::uint32_t t = 0; t < 3; ++t) {
 +            execution::glm5_decode_token(mw, state, config,
 +                                         static_cast<std::uint32_t>(ids[t]), t, logits_t,
-+                                         d_scratch.data(), nullptr);
-+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                         d_scratch.data(), test_view());
++            CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        }
 +        const auto sequential_logits = represented(download<__nv_bfloat16>(d_logits));
 +        for (std::uint32_t i = 0; i < VOCAB; ++i) {
@@ -33074,10 +33102,10 @@ index 0000000..1316f5a
 +}
 diff --git a/tests/models/glm5/test_kda_block.cpp b/tests/models/glm5/test_kda_block.cpp
 new file mode 100644
-index 0000000..80dc1c6
+index 0000000..8936d67
 --- /dev/null
 +++ b/tests/models/glm5/test_kda_block.cpp
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,456 @@
 +// The GLM-5.3-Flash KDA block decode assembly against the host reference: the projections
 +// run as FP64 GEMV oracles, the mixer pieces call models/glm5/reference, and the whole
 +// chain is compared on the device at the audited 64x128 geometry and a small probe.
@@ -33100,6 +33128,13 @@ index 0000000..80dc1c6
 +#include <algorithm>
 +#include <vector>
 +#include "core/device.h"
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// A shared execution view: device 0's default stream, matching the old nullptr-stream calls.
 +
 +namespace {
 +
@@ -33339,9 +33374,9 @@ index 0000000..80dc1c6
 +                  {static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(head_dim), static_cast<std::int32_t>(heads)});
 +        Tensor out_t(const_cast<void*>(d_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +        execution::kda_block_decode(w, hidden_t, dt_t, alog_t, onw_t, cqs, cks, cvs, ms, -5.0f,
-+                                    heads, head_dim, 1e-5f, out_t, d_scratch.data(), nullptr,
++                                    heads, head_dim, 1e-5f, out_t, d_scratch.data(), test_view(),
 +                                    debug ? &dbg : nullptr);
-+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
++        CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +    }
 +    if (debug) {
 +        auto worst_of = [](const std::vector<float>& got, const std::vector<float>& want) {
@@ -33431,15 +33466,15 @@ index 0000000..80dc1c6
 +            for (std::uint32_t t = 0; t < BT; ++t) {
 +                Tensor column(reinterpret_cast<void*>(static_cast<std::uint8_t*>(d_hidden_a.data()) +
 +                                                       static_cast<std::size_t>(t) * hidden * 2),
-+                              DType::BF16, {static_cast<std::int32_t>(hidden)});
++                              view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +                Tensor out_t(reinterpret_cast<void*>(static_cast<std::uint8_t*>(d_out_a.data()) +
 +                                                          static_cast<std::size_t>(t) * hidden * 2),
-+                             DType::BF16, {static_cast<std::int32_t>(hidden)});
++                             view_device(), DType::BF16, {static_cast<std::int32_t>(hidden)});
 +                execution::kda_block_decode(w, column, dt_t, alog_t, onw_t, cqs, cks, cvs, ms,
 +                                            -5.0f, heads, head_dim, 1e-5f, out_t,
-+                                            d_scratch.data(), nullptr, nullptr);
++                                            d_scratch.data(), test_view(), nullptr);
 +            }
-+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++            CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        }
 +
 +        // Path B: one batched call.
@@ -33464,8 +33499,8 @@ index 0000000..80dc1c6
 +                         {static_cast<std::int32_t>(hidden), static_cast<std::int32_t>(BT)});
 +            execution::kda_block_prefill(w, batch_t, dt_t, alog_t, onw_t, cqs, cks, cvs, ms,
 +                                         -5.0f, heads, head_dim, 1e-5f, BCH, out_t,
-+                                         d_scratch_b.data(), nullptr);
-+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
++                                         d_scratch_b.data(), test_view());
++            CUDA_CHECK(cudaStreamSynchronize(test_view().stream()));
 +        }
 +
 +        const auto out_a = represented(download<__nv_bfloat16>(d_out_a));
@@ -33529,10 +33564,10 @@ index 0000000..80dc1c6
 +}
 diff --git a/tests/models/glm5/test_prefill_chunked.cpp b/tests/models/glm5/test_prefill_chunked.cpp
 new file mode 100644
-index 0000000..0cc5f38
+index 0000000..a9b4f21
 --- /dev/null
 +++ b/tests/models/glm5/test_prefill_chunked.cpp
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,413 @@
 +// GLM-5.3-Flash chunked prefill vs the per-token decode path, end to end on
 +// the device: the same weights and token sequence run twice — T sequential
 +// glm5_decode_token calls against one glm5_prefill_chunked call (chunk < T,
@@ -33556,8 +33591,14 @@ index 0000000..0cc5f38
 +#include <vector>
 +#include "core/device.h"
 +
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// A shared execution view: device 0's default stream, matching the old nullptr-stream calls.
++
 +// The Tensor constructors need the owning device; the tests run on device 0.
-+static ninfer::Device view_device() { static ninfer::DeviceContext ctx; return ctx.device(); }
 +
 +namespace {
 +
@@ -33877,7 +33918,7 @@ index 0000000..0cc5f38
 +    CUDA_CHECK(cudaMalloc(&d_scratch_a, scratch_decode));
 +    for (std::uint32_t t = 0; t < T; ++t) {
 +        execution::glm5_decode_token(mw, state_a, config, TOKENS[t], t, logits_a,
-+                                     d_scratch_a, 0);
++                                     d_scratch_a, test_view());
 +    }
 +    CUDA_CHECK(cudaStreamSynchronize(0));
 +
@@ -33895,7 +33936,7 @@ index 0000000..0cc5f38
 +    void* d_scratch_b = nullptr;
 +    CUDA_CHECK(cudaMalloc(&d_scratch_b, scratch_chunked));
 +    execution::glm5_prefill_chunked(mw, state_b, config, ids_t, 0, CHUNK, hidden_b, logits_b,
-+                                    d_scratch_b, 0);
++                                    d_scratch_b, test_view());
 +    CUDA_CHECK(cudaStreamSynchronize(0));
 +
 +    // Compare: logits, both states' persistent planes.
@@ -34370,10 +34411,10 @@ index 0000000..2857816
 +}
 diff --git a/tests/ops/test_glm5_dsa.cu b/tests/ops/test_glm5_dsa.cu
 new file mode 100644
-index 0000000..9d1f336
+index 0000000..b6b1739
 --- /dev/null
 +++ b/tests/ops/test_glm5_dsa.cu
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,310 @@
 +// GLM-5.3-Flash DSA ops and the KDA prefill loop against the ported host references, on the
 +// device. Small shapes pin the semantics (pool softmax, ReLU scoring, rank ties, tail,
 +// -1 exclusion); the audited 32x128/512-latent/2051-width profile runs end to end.
@@ -34394,6 +34435,13 @@ index 0000000..9d1f336
 +#include <exception>
 +#include <string>
 +#include <vector>
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// The Tensor constructors need the owning device; the test runs on device 0.
 +
 +namespace {
 +
@@ -34514,13 +34562,13 @@ index 0000000..9d1f336
 +    auto d_ape = upload(ape);
 +    test::GuardedDeviceBuffer d_pooled(pooled_want.size() * sizeof(float));
 +    {
-+        Tensor ikt(const_cast<void*>(d_ik.data()), DType::BF16,
++        Tensor ikt(const_cast<void*>(d_ik.data()), view_device(), DType::BF16,
 +                   {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(dim)});
-+        Tensor igt(const_cast<void*>(d_ig.data()), DType::BF16,
++        Tensor igt(const_cast<void*>(d_ig.data()), view_device(), DType::BF16,
 +                   {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(dim)});
-+        Tensor apt(const_cast<void*>(d_ape.data()), DType::FP32,
++        Tensor apt(const_cast<void*>(d_ape.data()), view_device(), DType::FP32,
 +                   {static_cast<std::int32_t>(kpool), static_cast<std::int32_t>(dim)});
-+        Tensor pt(const_cast<void*>(d_pooled.data()), DType::FP32,
++        Tensor pt(const_cast<void*>(d_pooled.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(pools), static_cast<std::int32_t>(dim)});
 +        glm5_dsa_pool(ikt, igt, apt, pt, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34531,12 +34579,12 @@ index 0000000..9d1f336
 +    auto d_weights = upload(weights_device);
 +    test::GuardedDeviceBuffer d_score(score_want.size() * sizeof(float));
 +    {
-+        Tensor iqt(const_cast<void*>(d_iq.data()), DType::BF16,
++        Tensor iqt(const_cast<void*>(d_iq.data()), view_device(), DType::BF16,
 +                   {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(dim)});
-+        Tensor pt(const_cast<void*>(d_pooled.data()), DType::FP32,
++        Tensor pt(const_cast<void*>(d_pooled.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(pools), static_cast<std::int32_t>(dim)});
-+        Tensor wt(const_cast<void*>(d_weights.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+        Tensor st(const_cast<void*>(d_score.data()), DType::FP32, {static_cast<std::int32_t>(pools)});
++        Tensor wt(const_cast<void*>(d_weights.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor st(const_cast<void*>(d_score.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(pools)});
 +        glm5_dsa_score(iqt, pt, wt, st, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
 +    }
@@ -34544,8 +34592,8 @@ index 0000000..9d1f336
 +
 +    test::GuardedDeviceBuffer d_cells(width * sizeof(std::int32_t));
 +    {
-+        Tensor st(const_cast<void*>(d_score.data()), DType::FP32, {static_cast<std::int32_t>(pools)});
-+        Tensor ct(const_cast<void*>(d_cells.data()), DType::I32,
++        Tensor st(const_cast<void*>(d_score.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(pools)});
++        Tensor ct(const_cast<void*>(d_cells.data()), view_device(), DType::I32,
 +                  {static_cast<std::int32_t>(width)});
 +        glm5_dsa_select(st, position, static_cast<std::int32_t>(top_pools), true, ct, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34568,15 +34616,15 @@ index 0000000..9d1f336
 +    auto d_wvb = upload(round_trip(wv_b));
 +    test::GuardedDeviceBuffer d_out(out_want.size() * sizeof(__nv_bfloat16));
 +    {
-+        Tensor qt(const_cast<void*>(d_qabs.data()), DType::BF16,
++        Tensor qt(const_cast<void*>(d_qabs.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(mla.heads), static_cast<std::int32_t>(lora)});
-+        Tensor lt(const_cast<void*>(d_latents.data()), DType::BF16,
++        Tensor lt(const_cast<void*>(d_latents.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(lora)});
-+        Tensor ct(const_cast<void*>(d_cells.data()), DType::I32, {static_cast<std::int32_t>(width)});
-+        Tensor wt(const_cast<void*>(d_wvb.data()), DType::BF16,
++        Tensor ct(const_cast<void*>(d_cells.data()), view_device(), DType::I32, {static_cast<std::int32_t>(width)});
++        Tensor wt(const_cast<void*>(d_wvb.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(lora), static_cast<std::int32_t>(v_head),
 +                   static_cast<std::int32_t>(mla.heads)});
-+        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16,
++        Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(mla.heads * v_head)});
 +        glm5_dsa_attention(qt, lt, ct, wt, ot, static_cast<std::int32_t>(qk_nope), nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34626,22 +34674,22 @@ index 0000000..9d1f336
 +    auto d_state = upload(state0);
 +    test::GuardedDeviceBuffer d_out(gated.size() * sizeof(__nv_bfloat16));
 +    {
-+        Tensor qt(const_cast<void*>(d_q.data()), DType::BF16,
++        Tensor qt(const_cast<void*>(d_q.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
-+        Tensor kt(const_cast<void*>(d_k.data()), DType::BF16,
++        Tensor kt(const_cast<void*>(d_k.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
-+        Tensor vt(const_cast<void*>(d_v.data()), DType::BF16,
++        Tensor vt(const_cast<void*>(d_v.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
-+        Tensor gt(const_cast<void*>(d_gate.data()), DType::FP32,
++        Tensor gt(const_cast<void*>(d_gate.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
-+        Tensor bt(const_cast<void*>(d_beta.data()), DType::FP32,
++        Tensor bt(const_cast<void*>(d_beta.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(tokens)});
-+        Tensor g2t(const_cast<void*>(d_g2.data()), DType::BF16,
++        Tensor g2t(const_cast<void*>(d_g2.data()), view_device(), DType::BF16,
 +                   {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
-+        Tensor wt(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(dk)});
-+        Tensor st(const_cast<void*>(d_state.data()), DType::FP32,
++        Tensor wt(const_cast<void*>(d_onw.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(dk)});
++        Tensor st(const_cast<void*>(d_state.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(dk), static_cast<std::int32_t>(dk), static_cast<std::int32_t>(heads)});
-+        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16,
++        Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(d_inner), static_cast<std::int32_t>(tokens)});
 +        glm5_kda_prefill(qt, kt, vt, gt, bt, g2t, wt, st, ot, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34679,10 +34727,10 @@ index 0000000..9d1f336
 +}
 diff --git a/tests/ops/test_glm5_kda.cu b/tests/ops/test_glm5_kda.cu
 new file mode 100644
-index 0000000..04c022e
+index 0000000..0c5f211
 --- /dev/null
 +++ b/tests/ops/test_glm5_kda.cu
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,234 @@
 +// GLM-5.3-Flash KDA decode ops against the ported host reference (models/glm5/reference),
 +// on the real device. Small shapes pin the semantics; the audited 64x128 profile runs the
 +// whole decode chain (conv -> gate -> recurrent step -> output gate) end to end.
@@ -34701,6 +34749,13 @@ index 0000000..04c022e
 +#include <exception>
 +#include <string>
 +#include <vector>
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// The Tensor constructors need the owning device; the test runs on device 0.
 +
 +namespace {
 +
@@ -34789,14 +34844,14 @@ index 0000000..04c022e
 +    test::GuardedDeviceBuffer d_gate(gate_want.size() * sizeof(float));
 +    test::GuardedDeviceBuffer d_beta(beta_want.size() * sizeof(float));
 +    {
-+        Tensor a(const_cast<void*>(d_a.data()), DType::BF16,
++        Tensor a(const_cast<void*>(d_a.data()), view_device(), DType::BF16,
 +                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
-+        Tensor b(const_cast<void*>(d_b.data()), DType::BF16,
++        Tensor b(const_cast<void*>(d_b.data()), view_device(), DType::BF16,
 +                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(heads)});
-+        Tensor log_t(const_cast<void*>(d_a_log.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+        Tensor g(const_cast<void*>(d_gate.data()), DType::FP32,
++        Tensor log_t(const_cast<void*>(d_a_log.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor g(const_cast<void*>(d_gate.data()), view_device(), DType::FP32,
 +                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
-+        Tensor be(const_cast<void*>(d_beta.data()), DType::FP32,
++        Tensor be(const_cast<void*>(d_beta.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(heads)});
 +        glm5_kda_gating(a, b, log_t, -5.0f, g, be, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34821,13 +34876,13 @@ index 0000000..04c022e
 +    auto d_state = upload(conv_state);
 +    test::GuardedDeviceBuffer d_out(out_want.size() * sizeof(__nv_bfloat16));
 +    {
-+        Tensor x(const_cast<void*>(d_x.data()), DType::BF16,
++        Tensor x(const_cast<void*>(d_x.data()), view_device(), DType::BF16,
 +                 {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
-+        Tensor w(const_cast<void*>(d_w.data()), DType::BF16,
++        Tensor w(const_cast<void*>(d_w.data()), view_device(), DType::BF16,
 +                 {static_cast<std::int32_t>(taps), static_cast<std::int32_t>(d_inner)});
-+        Tensor st(const_cast<void*>(d_state.data()), DType::FP32,
++        Tensor st(const_cast<void*>(d_state.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(taps - 1), static_cast<std::int32_t>(d_inner)});
-+        Tensor ot(const_cast<void*>(d_out.data()), DType::BF16,
++        Tensor ot(const_cast<void*>(d_out.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(d_inner)});
 +        glm5_kda_conv(x, w, st, ot, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -34867,16 +34922,16 @@ index 0000000..04c022e
 +    auto dstep_state = upload(state0);
 +    test::GuardedDeviceBuffer d_step_out(d_inner * sizeof(__nv_bfloat16));
 +    {
-+        Tensor qt(const_cast<void*>(d_q.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+        Tensor kt(const_cast<void*>(d_k.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+        Tensor vt(const_cast<void*>(d_v.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+        Tensor gt(const_cast<void*>(d_glast.data()), DType::FP32, {static_cast<std::int32_t>(d_inner)});
-+        Tensor bt(const_cast<void*>(d_blast.data()), DType::FP32, {static_cast<std::int32_t>(heads)});
-+        Tensor g2t(const_cast<void*>(d_g2.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
-+        Tensor wt(const_cast<void*>(d_onw.data()), DType::FP32, {static_cast<std::int32_t>(dk)});
-+        Tensor st(const_cast<void*>(dstep_state.data()), DType::FP32,
++        Tensor qt(const_cast<void*>(d_q.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor kt(const_cast<void*>(d_k.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor vt(const_cast<void*>(d_v.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor gt(const_cast<void*>(d_glast.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(d_inner)});
++        Tensor bt(const_cast<void*>(d_blast.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(heads)});
++        Tensor g2t(const_cast<void*>(d_g2.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor wt(const_cast<void*>(d_onw.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(dk)});
++        Tensor st(const_cast<void*>(dstep_state.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(dk), static_cast<std::int32_t>(dk), static_cast<std::int32_t>(heads)});
-+        Tensor ot(const_cast<void*>(d_step_out.data()), DType::BF16, {static_cast<std::int32_t>(d_inner)});
++        Tensor ot(const_cast<void*>(d_step_out.data()), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner)});
 +        glm5_kda_decode_step(qt, kt, vt, gt, bt, g2t, wt, st, ot, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
 +    }
@@ -34912,10 +34967,10 @@ index 0000000..04c022e
 +}
 diff --git a/tests/ops/test_glm5_kda_chunk.cu b/tests/ops/test_glm5_kda_chunk.cu
 new file mode 100644
-index 0000000..a7dd68c
+index 0000000..444fad4
 --- /dev/null
 +++ b/tests/ops/test_glm5_kda_chunk.cu
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,177 @@
 +// GLM-5.3-Flash KDA chunked prefill kernel against the host chunk reference
 +// (models/glm5/reference/kda_chunk_reference), on the real device. Two
 +// geometries: a small one pinning the algorithm shape and a wider one with
@@ -34938,6 +34993,13 @@ index 0000000..a7dd68c
 +#include <stdexcept>
 +#include <string>
 +#include <vector>
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// The Tensor constructors need the owning device.
 +
 +namespace {
 +
@@ -35040,20 +35102,20 @@ index 0000000..a7dd68c
 +        d_state = upload_bytes(state_initial);
 +    test::GuardedDeviceBuffer d_out(q_dev.size() * sizeof(__nv_bfloat16));
 +
-+    const Tensor tq{d_q.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++    const Tensor tq{d_q.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner),
 +                                            static_cast<std::int32_t>(tokens)}};
-+    const Tensor tk{d_k.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++    const Tensor tk{d_k.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner),
 +                                            static_cast<std::int32_t>(tokens)}};
-+    const Tensor tv{d_v.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++    const Tensor tv{d_v.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner),
 +                                            static_cast<std::int32_t>(tokens)}};
-+    const Tensor tgate{d_gate.data(), DType::FP32, {static_cast<std::int32_t>(d_inner),
++    const Tensor tgate{d_gate.data(), view_device(), DType::FP32, {static_cast<std::int32_t>(d_inner),
 +                                                  static_cast<std::int32_t>(tokens)}};
-+    const Tensor tbeta{d_beta.data(), DType::FP32, {static_cast<std::int32_t>(heads),
++    const Tensor tbeta{d_beta.data(), view_device(), DType::FP32, {static_cast<std::int32_t>(heads),
 +                                                  static_cast<std::int32_t>(tokens)}};
-+    Tensor tstate{d_state.data(), DType::FP32, {static_cast<std::int32_t>(dk),
++    Tensor tstate{d_state.data(), view_device(), DType::FP32, {static_cast<std::int32_t>(dk),
 +                                              static_cast<std::int32_t>(dk),
 +                                              static_cast<std::int32_t>(heads)}};
-+    Tensor tout{d_out.data(), DType::BF16, {static_cast<std::int32_t>(d_inner),
++    Tensor tout{d_out.data(), view_device(), DType::BF16, {static_cast<std::int32_t>(d_inner),
 +                                          static_cast<std::int32_t>(tokens)}};
 +
 +    {   // Upload self-check: what comes back from d_q before the kernel?
@@ -35088,10 +35150,10 @@ index 0000000..a7dd68c
 +}
 diff --git a/tests/ops/test_glm5_mhc.cu b/tests/ops/test_glm5_mhc.cu
 new file mode 100644
-index 0000000..faae966
+index 0000000..fd5afd2
 --- /dev/null
 +++ b/tests/ops/test_glm5_mhc.cu
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,196 @@
 +// GLM-5.3-Flash mHC ops against the ported host reference (models/glm5/reference), on the
 +// device. A small hidden pins the semantics including the Sinkhorn iteration count; the
 +// audited 16384-wide profile runs one full pre/post/head chain.
@@ -35110,6 +35172,13 @@ index 0000000..faae966
 +#include <exception>
 +#include <string>
 +#include <vector>
++
++// Shared device/execution view: one DeviceContext, so op device-identity checks pass.
++static ninfer::DeviceContext& test_context() { static ninfer::DeviceContext ctx; return ctx; }
++static ninfer::Device view_device() { return test_context().device(); }
++static const ninfer::CudaExecutionView& test_view() { static const auto view = test_context().execution_view(); return view; }
++
++// The Tensor constructors need the owning device; the test runs on device 0.
 +
 +namespace {
 +
@@ -35197,19 +35266,19 @@ index 0000000..faae966
 +    test::GuardedDeviceBuffer d_comb(comb_want.size() * sizeof(float));
 +    test::GuardedDeviceBuffer d_collapsed(collapsed_want.size() * sizeof(__nv_bfloat16));
 +    {
-+        Tensor st(const_cast<void*>(d_streams.data()), DType::BF16,
++        Tensor st(const_cast<void*>(d_streams.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
-+        Tensor ft(const_cast<void*>(d_fn.data()), DType::BF16,
++        Tensor ft(const_cast<void*>(d_fn.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(lanes), static_cast<std::int32_t>(plane)});
-+        Tensor bt(const_cast<void*>(d_base.data()), DType::FP32, {static_cast<std::int32_t>(lanes)});
-+        Tensor sc(const_cast<void*>(d_scale.data()), DType::FP32, {3});
-+        Tensor pt(const_cast<void*>(d_pre.data()), DType::FP32,
++        Tensor bt(const_cast<void*>(d_base.data()), view_device(), DType::FP32, {static_cast<std::int32_t>(lanes)});
++        Tensor sc(const_cast<void*>(d_scale.data()), view_device(), DType::FP32, {3});
++        Tensor pt(const_cast<void*>(d_pre.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
-+        Tensor pot(const_cast<void*>(d_post.data()), DType::FP32,
++        Tensor pot(const_cast<void*>(d_post.data()), view_device(), DType::FP32,
 +                   {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
-+        Tensor ct(const_cast<void*>(d_comb.data()), DType::FP32,
++        Tensor ct(const_cast<void*>(d_comb.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc), static_cast<std::int32_t>(hc)});
-+        Tensor co(const_cast<void*>(d_collapsed.data()), DType::BF16,
++        Tensor co(const_cast<void*>(d_collapsed.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
 +        glm5_mhc_pre(st, ft, bt, sc, 1e-5f, 1e-6f, 20, pt, pot, ct, co, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -35234,19 +35303,19 @@ index 0000000..faae966
 +    test::GuardedDeviceBuffer d_streams_out(tokens * plane * sizeof(__nv_bfloat16));
 +    test::GuardedDeviceBuffer d_head(tokens * hidden * sizeof(__nv_bfloat16));
 +    {
-+        Tensor bt(const_cast<void*>(d_block.data()), DType::BF16,
++        Tensor bt(const_cast<void*>(d_block.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
-+        Tensor rt(const_cast<void*>(d_residual.data()), DType::BF16,
++        Tensor rt(const_cast<void*>(d_residual.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
-+        Tensor pt(const_cast<void*>(d_post_in.data()), DType::FP32,
++        Tensor pt(const_cast<void*>(d_post_in.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc)});
-+        Tensor ct(const_cast<void*>(d_comb_in.data()), DType::FP32,
++        Tensor ct(const_cast<void*>(d_comb_in.data()), view_device(), DType::FP32,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hc), static_cast<std::int32_t>(hc)});
-+        Tensor ot(const_cast<void*>(d_streams_out.data()), DType::BF16,
++        Tensor ot(const_cast<void*>(d_streams_out.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(plane)});
 +        glm5_mhc_post(bt, rt, pt, ct, ot, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
-+        Tensor ht(const_cast<void*>(d_head.data()), DType::BF16,
++        Tensor ht(const_cast<void*>(d_head.data()), view_device(), DType::BF16,
 +                  {static_cast<std::int32_t>(tokens), static_cast<std::int32_t>(hidden)});
 +        glm5_mhc_head(ot, ht, nullptr);
 +        CUDA_CHECK(cudaStreamSynchronize(nullptr));
