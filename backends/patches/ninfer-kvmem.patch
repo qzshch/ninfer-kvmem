@@ -10391,10 +10391,10 @@ index 0000000..ef8e5c7
 +
 diff --git a/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
 new file mode 100644
-index 0000000..43c01e6
+index 0000000..0a99653
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/src/glm5_tpc_glue.cpp
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,371 @@
 +// GLM-5.3-Flash TPC kernel glue, FCD-row family (table-driven).
 +//
 +// Review R2/R3 corrections baked into this version:
@@ -10621,13 +10621,20 @@ index 0000000..43c01e6
 +        }
 +        // a_log {heads, 1}: the head axis follows the slot index 1:1 (the
 +        // kernel reads a_log[slot]); the 128-wide transform above would
-+        // claim 128 heads per slot. Only the gate kernel is VectorSlots
-+        // today - patch its per-head operand.
++        // claim 128 heads per slot, and the token axis must NOT track
++        // index dim1 - a_log has exactly one row, so every token reads the
++        // constant row 0 (review V3: the blanket identity left token 1
++        // reading a nonexistent row).
 +        if (std::strcmp(k.guid, "glm5_kda_gate_bf16") == 0) {
 +            out_defs->inputTensorAccessPattern[1].dim[0].start_a = 1.0f;
 +            out_defs->inputTensorAccessPattern[1].dim[0].start_b = 0.0f;
 +            out_defs->inputTensorAccessPattern[1].dim[0].end_a = 1.0f;
 +            out_defs->inputTensorAccessPattern[1].dim[0].end_b = 0.0f;
++            out_defs->inputTensorAccessPattern[1].dim[1].indexSpaceDim = 0xffffffff;
++            out_defs->inputTensorAccessPattern[1].dim[1].start_a = 0.0f;
++            out_defs->inputTensorAccessPattern[1].dim[1].start_b = 0.0f;
++            out_defs->inputTensorAccessPattern[1].dim[1].end_a = 0.0f;
++            out_defs->inputTensorAccessPattern[1].dim[1].end_b = 0.0f;
 +        }
 +        for (unsigned o = 0; o < k.outputs; ++o) {
 +            out_defs->outputTensorAccessPattern[o].dim[0].indexSpaceDim = 0;
@@ -11085,10 +11092,10 @@ index 0000000..c3f9f19
 +}
 diff --git a/src/core/gaudi2/tpc/glue/tests/glue_check.c b/src/core/gaudi2/tpc/glue/tests/glue_check.c
 new file mode 100644
-index 0000000..eaadc5e
+index 0000000..acebc40
 --- /dev/null
 +++ b/src/core/gaudi2/tpc/glue/tests/glue_check.c
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,195 @@
 +// Offline descriptor round-trip: call GetGcDefinitions for every GUID with
 +// well-formed HabanaKernelParams_t descriptors and verify each returns a
 +// non-empty ELF, a sane index space, and its scalar params.
@@ -11135,8 +11142,8 @@ index 0000000..eaadc5e
 +         {0x3727c5acu, 0x3a000000u}, 2, 1, 1},
 +        {"glm5_clamp_swiglu_bf16", 1, 1, {DATA_BF16}, {DATA_BF16}, 512, 1,
 +         {0x41200000u}, 1, 512, 1},
-+        {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32}, 512, 1,
-+         {0xc0a00000u, 128u}, 2, 4, 1},
++        {"glm5_kda_gate_bf16", 2, 1, {DATA_BF16, DATA_F32}, {DATA_F32}, 512, 2,
++         {0xc0a00000u, 128u}, 2, 4, 2},
 +        {"glm5_mhc_gates_bf16", 4, 1,
 +         {DATA_BF16, DATA_BF16, DATA_F32, DATA_F32}, {DATA_F32}, 24, 1,
 +         {0x358637bdu, 0x358637bdu, 20u}, 3, 1, 1},
@@ -11201,6 +11208,11 @@ index 0000000..eaadc5e
 +        if (std::strcmp(k.name, "glm5_kda_scan_f32") == 0) {
 +            params.inputTensors[4].geometry.sizes[0] = 64;  // beta: heads
 +        }
++        if (std::strcmp(k.name, "glm5_kda_gate_bf16") == 0) {
++            // a_log is {heads, 1}: four heads, exactly one row.
++            params.inputTensors[1].geometry.sizes[0] = 4;
++            params.inputTensors[1].geometry.sizes[1] = 1;
++        }
 +        if (std::strcmp(k.name, "glm5_dsa_pool_bf16") == 0) {
 +            // Sources {dim, T=16}, ape {dim, K=4}, pooled {dim, pools=4}.
 +            params.inputTensors[0].geometry.sizes[1] = 16;
@@ -11247,10 +11259,18 @@ index 0000000..eaadc5e
 +        if (std::strcmp(k.name, "glm5_kda_gate_bf16") == 0) {
 +            const gcapi::TensorAccessPattern_t* pat =
 +                inst.inputTensorAccessPattern;
++            // in0 (a): dim0 slots at 128, dim1 tokens 1:1 (T=2 audits the
++            // multi-token row); in1 (a_log): dim0 slots 1:1, dim1 the
++            // CONSTANT row 0 (never tracks the token axis - review V3).
 +            if (!pat || pat[0].dim[0].indexSpaceDim != 0 ||
 +                pat[0].dim[0].start_a != 128.0f ||
 +                pat[0].dim[1].indexSpaceDim != 1 ||
-+                pat[0].dim[1].start_a != 1.0f) {
++                pat[0].dim[1].start_a != 1.0f ||
++                pat[1].dim[0].indexSpaceDim != 0 ||
++                pat[1].dim[0].start_a != 1.0f ||
++                pat[1].dim[1].indexSpaceDim != 0xffffffffu ||
++                pat[1].dim[1].start_a != 0.0f ||
++                pat[1].dim[1].end_b != 0.0f) {
 +                std::printf("FAIL %s: access pattern axes unmapped\n", k.name);
 +                ++failures;
 +                continue;
@@ -15317,10 +15337,10 @@ index 0000000..c1905f9
 +} // namespace ninfer::models::glm5
 diff --git a/src/models/glm5/execution/block.cpp b/src/models/glm5/execution/block.cpp
 new file mode 100644
-index 0000000..db9b539
+index 0000000..51d86e6
 --- /dev/null
 +++ b/src/models/glm5/execution/block.cpp
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,952 @@
 +#include "models/glm5/execution/block.h"
 +// Opaque CUDA handles (forward-declared in block.h). Real builds include
 +// the CUDA runtime through the ops headers below; only a prep-only build
@@ -15523,6 +15543,7 @@ index 0000000..db9b539
 +        (static_cast<std::uint64_t>(position) + 1) / kpool;
 +    const std::uint64_t bytes =
 +        static_cast<std::uint64_t>(hidden) * 2 + static_cast<std::uint64_t>(q_lora) * 2 +
++        static_cast<std::uint64_t>(q_lora) * 2 + static_cast<std::uint64_t>(kv_lora) * 2 +  // norm scratch (V2)
 +        static_cast<std::uint64_t>(heads) * head_dim * 2 + static_cast<std::uint64_t>(kv_lora) * 2 +
 +        static_cast<std::uint64_t>(index_heads) * index_dim * 2 + index_dim * 2 * 3 +
 +        static_cast<std::uint64_t>(index_heads) * 4 * 2 +
@@ -15559,8 +15580,10 @@ index 0000000..db9b539
 +    };
 +    void* normed = take(hidden * 2);
 +    void* q_latent = take(q_lora * 2);
++    void* q_latent_nrm = take(q_lora * 2);
 +    void* q_heads = take(static_cast<std::size_t>(heads) * head_dim * 2);
 +    void* latent = take(kv_lora * 2);
++    void* latent_nrm = take(kv_lora * 2);
 +    void* iq = take(static_cast<std::size_t>(index_heads) * index_dim * 2);
 +    void* ik_raw = take(index_dim * 2);
 +    void* ik_normed = take(index_dim * 2);
@@ -15584,9 +15607,13 @@ index 0000000..db9b539
 +    ops::linear(normed_t, w.q_a, q_latent_t, execution);
 +    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), execution.device(), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
-+    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
++    // The upstream rmsnorm contract rejects in-place calls (operands must
++    // not overlap) - normalize into a dedicated scratch plane (review V2).
++    Tensor q_latent_n(q_latent_nrm, execution.device(), DType::BF16,
++                      {static_cast<std::int32_t>(q_lora), 1});
++    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_n, execution);
 +    Tensor q_heads_t(q_heads, execution.device(), DType::BF16, {static_cast<std::int32_t>(heads * head_dim), 1});
-+    ops::linear(q_latent_t, w.q_b, q_heads_t, execution);
++    ops::linear(q_latent_n, w.q_b, q_heads_t, execution);
 +    Tensor q_heads_view(q_heads, execution.device(), DType::BF16,
 +                        {static_cast<std::int32_t>(heads), static_cast<std::int32_t>(head_dim)});
 +    Tensor q_abs_t(q_abs, execution.device(), DType::FP32,
@@ -15601,10 +15628,12 @@ index 0000000..db9b539
 +    ops::linear(normed_t, w.kv_a, latent_t, execution);
 +    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), execution.device(), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
-+    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
++    Tensor latent_n(latent_nrm, execution.device(), DType::BF16,
++                     {static_cast<std::int32_t>(kv_lora), 1});
++    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_n, execution);
 +    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::uint8_t*>(latents.data) +
 +                                   static_cast<std::size_t>(position) * kv_lora * 2,
-+                               latent, kv_lora * 2, cudaMemcpyDeviceToDevice, execution.stream()));
++                               latent_nrm, kv_lora * 2, cudaMemcpyDeviceToDevice, execution.stream()));
 +
 +    // Indexer planes: query from the q latent, LayerNorm'd key and gate from the hidden.
 +    Tensor iq_t(iq, execution.device(), DType::BF16, {static_cast<std::int32_t>(index_heads * index_dim), 1});
@@ -16007,8 +16036,10 @@ index 0000000..db9b539
 +    };
 +    add(static_cast<std::uint64_t>(hidden) * tokens, 2);                      // normed
 +    add(static_cast<std::uint64_t>(q_lora) * tokens, 2);                      // q latent
++    add(static_cast<std::uint64_t>(q_lora) * tokens, 2);                      // q latent normed (V2)
 +    add(static_cast<std::uint64_t>(heads) * head_dim * tokens, 2);            // q heads
 +    add(static_cast<std::uint64_t>(kv_lora) * tokens, 2);                     // latents
++    add(static_cast<std::uint64_t>(kv_lora) * tokens, 2);                     // latents normed (V2)
 +    add(static_cast<std::uint64_t>(index_heads) * index_dim * tokens, 2);     // iq
 +    add(static_cast<std::uint64_t>(index_dim) * tokens, 6);                   // ik raw/normed + ig
 +    add(static_cast<std::uint64_t>(heads) * kv_lora * tokens, 4);             // q_abs F32
@@ -16048,8 +16079,10 @@ index 0000000..db9b539
 +    };
 +    void* normed = take(static_cast<std::size_t>(hidden) * tokens * 2);
 +    void* q_latent = take(static_cast<std::size_t>(q_lora) * tokens * 2);
++    void* q_latent_nrm = take(static_cast<std::size_t>(q_lora) * tokens * 2);
 +    void* q_heads = take(static_cast<std::size_t>(heads) * head_dim * tokens * 2);
 +    void* latent = take(static_cast<std::size_t>(kv_lora) * tokens * 2);
++    void* latent_nrm = take(static_cast<std::size_t>(kv_lora) * tokens * 2);
 +    void* iq = take(static_cast<std::size_t>(index_heads) * index_dim * tokens * 2);
 +    void* ik_raw = take(static_cast<std::size_t>(index_dim) * tokens * 2);
 +    void* ik_normed = take(static_cast<std::size_t>(index_dim) * tokens * 2);
@@ -16072,24 +16105,28 @@ index 0000000..db9b539
 +    ops::linear(normed_t, w.q_a, q_latent_t, execution);
 +    const Tensor q_norm_weight(const_cast<void*>(w.q_a_norm.payload), execution.device(), DType::BF16,
 +                               {static_cast<std::int32_t>(q_lora), 1});
-+    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_t, execution);
++    Tensor q_latent_n(q_latent_nrm, execution.device(), DType::BF16,
++                      {static_cast<std::int32_t>(q_lora), tokens});
++    ops::rmsnorm(q_latent_t, q_norm_weight, rms_eps, false, q_latent_n, execution);
 +    Tensor q_heads_t(q_heads, execution.device(), DType::BF16,
 +                     {static_cast<std::int32_t>(heads * head_dim), tokens});
-+    ops::linear(q_latent_t, w.q_b, q_heads_t, execution);
++    ops::linear(q_latent_n, w.q_b, q_heads_t, execution);
 +
 +    // kv side, batched; write every token's latent row into the cache.
 +    Tensor latent_t(latent, execution.device(), DType::BF16, {static_cast<std::int32_t>(kv_lora), tokens});
 +    ops::linear(normed_t, w.kv_a, latent_t, execution);
 +    const Tensor kv_norm_weight(const_cast<void*>(w.kv_a_norm.payload), execution.device(), DType::BF16,
 +                                {static_cast<std::int32_t>(kv_lora), 1});
-+    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_t, execution);
++    Tensor latent_n(latent_nrm, execution.device(), DType::BF16,
++                    {static_cast<std::int32_t>(kv_lora), tokens});
++    ops::rmsnorm(latent_t, kv_norm_weight, rms_eps, false, latent_n, execution);
 +    {
 +        // Strided scatter: destination rows first_position..+T of the cache
 +        // (FCD kv_lora), source the batched plane's columns.
 +        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::uint8_t*>(latents.data) +
 +                                         static_cast<std::size_t>(first_position) * kv_lora * 2,
 +                                     static_cast<std::size_t>(kv_lora) * 2,   // cache row pitch
-+                                     latent, static_cast<std::size_t>(kv_lora) * 2,  // src pitch
++                                     latent_nrm, static_cast<std::size_t>(kv_lora) * 2,  // src pitch (the normed plane)
 +                                     static_cast<std::size_t>(kv_lora) * 2, tokens,
 +                                     cudaMemcpyDeviceToDevice, execution.stream()));
 +    }
